@@ -31,7 +31,7 @@
 .accordion-floating > .accordion-section .accordion-content {
   max-height: min(
     calc(var(--pos-height) - var(--floating-header-height, 0px) - 2 * var(--border-width-1)),
-    calc(100dvh - var(--space-4) - var(--floating-header-height, 0px) - 2 * var(--border-width-1))
+    calc(var(--floating-area-height, 100dvh) - var(--space-4) - var(--floating-header-height, 0px) - 2 * var(--border-width-1))
   );
   overflow-y: auto;
   overflow-x: hidden;
@@ -230,7 +230,7 @@
    and Chromium's software compositor culls the plot under it at the vertically
    mirrored position: the plot's texture is bottom-left origin, and the culled
    part of it is drawn flipped. The page background then shows through at the
-   scroller's mirror image across the canvas centre — a band below a panel near
+   scroller's mirror image across the canvas center — a band below a panel near
    the top, above one near the bottom. In its own surface the window's opaque
    layers occlude only the window, never the plot. The surface is the size of
    the window, so it adds no full-screen pass to a plot frame. */
@@ -240,7 +240,10 @@
   /* A panel keeps the size it was given; a smaller viewport only clips it
      to itself, so widening the window again gives the size back. */
   max-width: calc(100vw - var(--space-4));
-  max-height: calc(100dvh - var(--space-4));
+  /* The area windows may use: the visible screen below the sidebar's
+     toggle and above a phone's bar and keyboard (`--floating-area-height`,
+     set by the dockable owner from the measure its clamp places them by). */
+  max-height: calc(var(--floating-area-height, 100dvh) - var(--space-4));
   /* Use flex column so the card fills the window */
   display: flex;
   flex-direction: column;
@@ -344,7 +347,7 @@ body.dock-resizing {
 
 /* Resize handles: four edges and four corners on the frame of a floating
    panel. Edges are 8 px bands straddling the border and corners 16 px
-   squares centred on it; a finger gets 24 px edges and 32 px corners. A
+   squares centered on it; a finger gets 24 px edges and 32 px corners. A
    handle reaches at most 12 px past the border, so with a window kept 8 px
    inside the viewport every handle's middle is on screen. A handle shows a
    2 px accent line along its border on hover, focus or drag; the
@@ -782,7 +785,7 @@ body.dock-dragging .accordion-panel:not(.accordion-floating) > .accordion-sectio
 }
 
 /* Four short lines: who made it and the contact address; docs, citing,
-   source, privacy and terms; the licence and accessibility; the build. Each
+   source, privacy and terms; the license and accessibility; the build. Each
    fits the narrowest sidebar (260px) on one line. */
 #copyright p {
   margin: 0;

@@ -75,7 +75,7 @@
  *    matrix it does not read (a `raw.X` or a layer next to `X`). On
  *    CELLxGENE's HLCA (2.3M cells, int64 pointers in gzip chunks of about
  *    1,250 rows) the three matrices' whole pointers were 19 of the 20 MB a
- *    1 % subsample's opening fetched. A read of some of the kept rows only
+ *    1% subsample's opening fetched. A read of some of the kept rows only
  *    (a gene sample: the first open cells) reads only theirs
  *    (`readRowPointers` given `rows`) and reads them as a matrix of their
  *    own (`rowsMatrix`): the first gene of a 2,011-cell sample of a view of
@@ -87,7 +87,7 @@
 
 import { formatCountOf } from '../../../utils/format-units.js';
 import { isArrayNode, isGroup, normalizeSelection, numericDtype } from '../../../formats/store.js';
-import { attributeValue, elementBytes, encodingType } from '../elements.js';
+import { AnnDataFormatError, attributeValue, elementBytes, encodingType } from '../elements.js';
 import { SLAB_BYTES } from '../values.js';
 import { valueArray, viewGroup } from './view-nodes.js';
 import { allocateTypedArray } from '../../sparse-column-index.js';
@@ -148,7 +148,7 @@ export function runsOfPositions(kept) {
     if (kept[i] > highest) highest = kept[i];
   }
   // Rows and positions as 32-bit integers when every end fits one (12 bytes
-  // a run, not 24: a 50 % uniform share of 5M cells is 2.5M runs).
+  // a run, not 24: a 50% uniform share of 5M cells is 2.5M runs).
   const Positions = highest + 1 <= 0xffffffff && kept.length <= 0xffffffff ? Uint32Array : Float64Array;
   const starts = allocateTypedArray(Positions, count, 'Kept row runs');
   const ends = allocateTypedArray(Positions, count, 'Kept row runs');
@@ -245,7 +245,7 @@ export class KeptPositions {
  * array form of `KeptPositions`: the one held when made, else one made for
  * this and let go): one write a row and one read a row in file order,
  * where the radix order makes two counting passes and two scattering ones
- * (a 50 % uniform share of 10M cells: 132 ms → about 40); fewer rows take
+ * (a 50% uniform share of 10M cells: 132 ms → about 40); fewer rows take
  * the radix order (the table would be mostly empty).
  *
  * @param {CellRows} cells
@@ -506,7 +506,7 @@ export class RowPointers {
  * Pointers between two ranges of kept rows' pointers up to which the two
  * are read and held as one (`readKeptRowPointers`): a range of its own holds
  * three numbers (its start, end and offset), as many as three pointers. A
- * 50 % uniform share's pointer ranges, a row or two apart, are then a few
+ * 50% uniform share's pointer ranges, a row or two apart, are then a few
  * ranges, not millions, each a fragment of the read.
  */
 const POINTER_GAP_MERGED = 3;
@@ -794,7 +794,7 @@ const sourceOrders = new WeakMap();
  * for empty runs beside others (`rankedOrder` compares those): they
  * are sorted as numbers (the engine's own sort of a typed array) and each
  * run placed at its start's rank, where a comparator sort of a subsample's
- * million single-row runs took 1.7 s of a 10 % share's first view (more than
+ * million single-row runs took 1.7 s of a 10% share's first view (more than
  * opening every cell). Every run of a view is ordered once and kept; a read
  * of a quarter of them or more takes its runs from that order, a smaller one
  * orders its own.
@@ -823,7 +823,7 @@ function runsBySource(runs, first, last) {
  * ascending by their value (equal ones in position order): a stable radix
  * order of their 32-bit words (`orderByKey`, the high words, when any is
  * used, ordered stably after the low ones), linear in the runs. A sort of
- * the values with a binary search placing each run took 2.3 s of a 50 %
+ * the values with a binary search placing each run took 2.3 s of a 50%
  * uniform share's first view of a 10M-cell file (5M single-row runs), more
  * than every cell's whole first view.
  */
@@ -892,7 +892,7 @@ const ROW_CHUNKS = new WeakMap();
  * lie in, ascending (`chunkOf`), and the position of the first row in each
  * (`firstAt`, one more: the rows' count): a pass over the rows, made once
  * for every column of that chunking read row by row (`rowWaves`), not once
- * a column (a 50 % share of 10M cells: 70 ms a column, its pricing as much).
+ * a column (a 50% share of 10M cells: 70 ms a column, its pricing as much).
  */
 function chunksOfRows(rows, chunkRows) {
   let byChunking = ROW_CHUNKS.get(rows);
@@ -952,7 +952,7 @@ function placeRows({ read, units, from, to }, { order, rows }, width, out) {
     const source = (row - unitStart) * width;
     const target = order[k] * width;
     // A 2-D embedding's two values as two copies, not a loop a row (5M
-    // rows of a 50 % share: a third of the placement).
+    // rows of a 50% share: a third of the placement).
     if (width === 2) {
       out[target] = block[source];
       out[target + 1] = block[source + 1];
@@ -1083,7 +1083,7 @@ export function gatheredArray(real, runs, { path = real.path, mergeGapBytes, chu
    * consecutive ones read as one range as every cell's slabs are, a wave at
    * most a slab of decoded rows, the next asked for while one is handed out; each row is one copy to its place, with
    * none of the pass's pieces listed, ordered or walked through a
-   * permutation (a 50 % uniform share of a 10M-cell file: its first view
+   * permutation (a 50% uniform share of a 10M-cell file: its first view
    * 4.7-7.0 s against every cell's 0.9 s, the same bytes, its 5M single-row
    * pieces placed through three permuted arrays a row). Each wave is
    * `{read, units, from, to}`: blocks `read[u]` of stored rows
@@ -1553,7 +1553,7 @@ export function gatheredArray(real, runs, { path = real.path, mergeGapBytes, chu
       const kept = chunks ?? new DecodedChunks(0);
       // Row by row in the rows' file order (`rowWaves`), each placed in its
       // view row as it is read: one slab of the view, in its order (a copy
-      // in file order and a scatter after it cost a 50 % share of 10M cells
+      // in file order and a scatter after it cost a 50% share of 10M cells
       // a pass more a column than every cell's read).
       let placed = null;
       for await (const wave of rowWaves(pairs, options)) {
@@ -1691,7 +1691,7 @@ export function keptEntries(pointers, rows) {
   const runIndex = !ascending && pointers instanceof RowPointers ? pointers.runIndexFor(rows) : null;
   const indexOfRun = r => (values === pointers ? rowRuns.starts[r] : walk !== null ? walk(rowRuns.starts[r]) : runIndex !== null ? runIndex[r] : pointers.indexOf(rowRuns.starts[r]));
   // Entry runs in typed arrays, at most one a row run (lists grown an item
-  // at a time held a 50 % uniform share's 2.5M runs as boxed numbers).
+  // at a time held a 50% uniform share's 2.5M runs as boxed numbers).
   let starts = allocateTypedArray(Float64Array, rowRuns.count, 'Kept entry runs');
   let ends = allocateTypedArray(Float64Array, rowRuns.count, 'Kept entry runs');
   let count = 0;
@@ -1772,7 +1772,17 @@ function csrOfRows(matrix, rows, keptOf, ctx, extra = {}) {
     ownAttributes: ['shape'],
     // Until its pointers are read, what describing the matrix may ask:
     // whether they are, and its stored `data` (dtype; stored values unknown).
-    extra: { rowPointersPending: () => false, ...extra, rowPointers: () => keptOf().rowPointers, storedData: () => matrix.get('data') },
+    // Its children are arrays made from its kept rows' pointers, so loading
+    // it loads the stored matrix and makes none of them: a load that reaches
+    // it (describing `obsm`, where a sparse array is listed as one that cannot
+    // be drawn) never asks for pointers not read yet.
+    extra: {
+      rowPointersPending: () => false,
+      ...extra,
+      rowPointers: () => keptOf().rowPointers,
+      storedData: () => matrix.get('data'),
+      load: (paths = [''], options = {}) => matrix.load(paths, options),
+    },
     children: () => passChildren(matrix, (key, node) => {
       if (key === 'indptr') {
         return pointerArray(node.path, keptOf().rowPointers);
@@ -2058,7 +2068,7 @@ export async function cellSubsetView(root, { nObs, kept, rows: given = null, mer
       readKeptRowPointers(entry.matrix.get('indptr'), cellRows, { mergeGapBytes, readOptions, known: pointersHeld(key), chunks, meter }).then(pointers => {
         const last = pointers.values[pointers.values.length - 1];
         if (last > entry.matrix.get('indices').shape[0]) {
-          throw new Error(`${path}: row pointers reach past its ${formatCountOf(entry.matrix.get('indices').shape[0], 'stored value')}`);
+          throw new AnnDataFormatError(`${path}: row pointers reach past its ${formatCountOf(entry.matrix.get('indices').shape[0], 'stored value')}`);
         }
         return pointers;
       })
@@ -2088,7 +2098,7 @@ export async function cellSubsetView(root, { nObs, kept, rows: given = null, mer
         ctx.partial.delete(key);
       });
       ctx.pointerReads.set(key, reading);
-      // A failed or cancelled read is tried again by the next read of the matrix.
+      // A failed or canceled read is tried again by the next read of the matrix.
       reading.catch(() => ctx.pointerReads.delete(key));
     }
     return reading;
@@ -2299,7 +2309,7 @@ export function keptChunkShare(pointers, rows, chunkElements, nnz = pointers[poi
  * given ascending are walked as they are), consecutive rows a span, [their
  * first's pointer, the pointer after their last): two pointer reads a run
  * of rows (`PointerCursor`, a walk forward), not two a row (a lookup a row,
- * a 50 % uniform share's 5M rows in open order, took 1.3 s of its first gene).
+ * a 50% uniform share's 5M rows in open order, took 1.3 s of its first gene).
  *
  * @param {Float64Array|RowPointers|{at: (row: number) => number}} pointers
  * @param {Uint32Array} rows - In any order
@@ -2392,7 +2402,7 @@ export function estimatedChunkShare(rows, nRows, nnz, chunkElements) {
   // fewer chunks than rows: chunk by chunk, the first kept row whose
   // entries end past the chunk's start found by halving, the chunk touched
   // when that row's entries start before its end -- a few looks a chunk,
-  // not a walk of every row (a 50 % share of 10M rows: 50 ms of opening).
+  // not a walk of every row (a 50% share of 10M rows: 50 ms of opening).
   if (perRow >= 1 && chunks < rows.length) {
     const kept = ascendingRowsOf(rows);
     let touched = 0;

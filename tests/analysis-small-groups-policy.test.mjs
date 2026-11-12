@@ -191,6 +191,9 @@ test('a marker run on a gene sample records each group\'s cells among it of its 
     ensureObsFieldLoaded: async () => ({ kind: 'category', codes, categories: ['T', 'B', 'NK'] }),
     getGeneKeys: async () => ['G1', 'G2'],
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
   };
   const options = optionsWith({ smallGroups: 'skip', minCells: 3 }, { T: 10, B: 8, NK: 2 });
   const { metadata } = await controller.runAnalysis({ options });

@@ -55,7 +55,7 @@ export function describeUnshownField(name, reason) {
  * @returns {string|null}
  */
 export function unshownChoiceReason(owner, token, error, changed) {
-  if (!isCancellation(error)) throw new TypeError('Only a cancelled field choice is unshown.');
+  if (!isCancellation(error)) throw new TypeError('Only a canceled field choice is unshown.');
   if (!owner.isCurrent(token)) return owner.retirementOf(token);
   if (cancellationKind(error) === 'user' || changed === null) return null;
   return requireReason(changed, 'A field choice change');

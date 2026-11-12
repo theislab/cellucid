@@ -7,12 +7,14 @@
  * came after the document (measured with its response held 4 s) WebKit
  * started the code 0.3 s in, in a page with no styles: no design token had a
  * value, and the analysis tools failed to load on one that resolved to
- * nothing. Markup hidden by a class (`class="welcome-modal hidden"`) was
- * displayed, so a spec that navigated and waited for the welcome dialog to be
- * visible saw the markup, pressed Escape before any listener existed, and the
- * page showed the dialog afterwards over a page the spec believed free of it
- * (Web contracts run 42180485733 and earlier, Linux WebKit: history-graph,
- * highlight-pulse, knn-missing, my-datasets).
+ * nothing. Markup hidden by a class (the welcome dialog was then a `div`
+ * with `class="welcome-modal hidden"`) was displayed, so a spec that navigated
+ * and waited for the welcome dialog to be visible saw the markup, pressed
+ * Escape before any listener existed, and the page showed the dialog
+ * afterwards over a page the spec believed free of it (Web contracts run
+ * 42180485733 and earlier, Linux WebKit: history-graph, highlight-pulse,
+ * knn-missing, my-datasets). The welcome is now a `<dialog>`, which is not
+ * displayed until opened in any page, styled or not.
  *
  * The style gate (index.html, CELLUCID_STYLE_GATE) is a script straight after
  * the stylesheet link: a script waits for the stylesheets before it in every
@@ -34,11 +36,11 @@ const HELD_MS = 2500;
 
 /**
  * Has the page note, at DOMContentLoaded and at the first statement of its
- * code (`data-code-started`, main.js), whether its styles are in: the welcome
- * dialog's markup is not displayed (`.welcome-modal.hidden`,
- * components/_welcome.css; `block` in a page without that rule) and the
- * design tokens have values (`--font-sans`, the one the analysis tools
- * failed on).
+ * code (`data-code-started`, main.js), whether its styles are in: the design
+ * tokens have values (`--font-sans`, the one the analysis tools failed on),
+ * and the welcome dialog, closed while the page is parsed, is laid out as its
+ * stylesheet says once the code has opened it (`.dialog-layer[open]`,
+ * components/_modals.css: `flex`; `block` in a page without that rule).
  */
 async function noteStylesAtStart(page) {
   await page.addInitScript(() => {
@@ -50,7 +52,7 @@ async function noteStylesAtStart(page) {
     document.addEventListener('DOMContentLoaded', () => {
       window.__stylesAtStart.parsed = styles();
     });
-    // Told at the end of the task that set the attribute: the code has shown
+    // Told at the end of the task that set the attribute: the code has opened
     // the dialog by then where it shows one (`flex`), in a styled page.
     new MutationObserver(() => {
       window.__stylesAtStart.code ??= styles();
@@ -78,7 +80,7 @@ for (const [name, held] of [
     // What the unstyled start broke: the dialog is dismissed once and stays so.
     await dismissWelcome(page);
     await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
-    await expect(page.locator('#welcome-modal')).toHaveClass(/\bhidden\b/);
+    await expect(page.locator('#welcome-modal')).not.toHaveAttribute('open');
     await expect(page.locator('#welcome-modal')).toBeHidden();
   });
 }

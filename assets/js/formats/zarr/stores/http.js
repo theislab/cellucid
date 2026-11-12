@@ -11,7 +11,9 @@
  * in use, `formats/io/link.js`); requests of background work (an activity marked
  * `background`) wait while any other request waits and never take the last
  * slot, as in the byte reader. An object the host answers 404 (or 410) for is absent, so
- * it reads as the fill value. An S3 or Google Cloud Storage bucket that does
+ * it reads as the fill value; so is one it answers with a web page (a
+ * single-page site's page for any path it has nothing at, sent as 200:
+ * `isWebPageAnswer`), since no Zarr object is HTML. An S3 or Google Cloud Storage bucket that does
  * not let the reader list it answers 403 for a missing object
  * (`io/s3.js` `bucketHidesMissing`). On such a bucket a 403 is that object
  * being absent for the two root metadata documents opening asks for in
@@ -30,7 +32,7 @@
  *
  * A sharded array reads byte ranges of its shards: the index with one
  * request (`Range: bytes=-N`, the last N bytes), then the inner chunks it
- * needs, neighbours merged into one request. Ranges asked for in one task
+ * needs, neighbors merged into one request. Ranges asked for in one task
  * are merged as the byte reader merges them: within the link's merge gap and
  * request size as measured (`formats/io/link.js`), the source's prior until
  * then. A suffix range is not a CORS-safelisted request, so a host that
@@ -119,7 +121,9 @@ import {
   isTransientFailure,
   isTransientAnswer,
   isTransientStatus,
+  isWebPageAnswer,
   requireAnsweredRange,
+  changedWhereServed,
   spreadOf,
   transientStatusError,
   withRetries,
@@ -257,6 +261,32 @@ export function httpStore(baseUrl, {
   /** Every request answered (the Transfers log). */
   const transferred = { requests: 0, bytes: 0 };
   const sizes = new Map();
+  /**
+   * Objects the host answered as absent while this store is open: absent
+   * still, as a Zarr writer leaves out a chunk that holds only the fill
+   * value, and a read of it is the fill value again. Asked once, however
+   * many reads touch it (a store rewritten meanwhile is refused by the
+   * reads that see it, `requireNotRewritten`). The page keeps them too, for
+   * the store's other openings of this version (`pageObjects`).
+   */
+  const absentKeys = new Set();
+  /** The host answered `key` as absent (after `requireNotGone`): remembered here, across visits under a content version, and in the page. */
+  const noteAbsent = (key, parts) => {
+    absentKeys.add(key);
+    parts?.keepAbsent(key);
+    if (!METADATA_KEYS.has(normalizeKey(key))) pageObjects()?.keepAbsent(key);
+  };
+  /** Whether `key` is known absent: by this store, across visits, or by the page for this version (metadata is always the host's). */
+  const knownAbsent = async (key, parts, signal) => {
+    if (absentKeys.has(key)) return true;
+    if (parts?.isAbsent(key)) return true;
+    if (METADATA_KEYS.has(normalizeKey(key))) return false;
+    if (await pageObjects()?.absent(key, { link: link ?? { responses: clock }, signal })) {
+      absentKeys.add(key);
+      return true;
+    }
+    return false;
+  };
   let suffixRanges = true;
   /**
    * What this browser keeps of the store's objects (`keeping`), asked at
@@ -536,13 +566,25 @@ export function httpStore(baseUrl, {
       }, signal, activity);
       const status = response.status;
       const transient = isTransientAnswer(response, said);
-      if (transient || absent.has(status) || (status !== 200 && status !== 206)) {
+      // A web page in place of an object is the host's page for a path it
+      // has nothing at (a single-page site answers every unknown path with
+      // it, 200): the object is absent, as a 404 says. No Zarr object is HTML.
+      const page = !transient && (status === 200 || status === 206) && isWebPageAnswer(response, bytes);
+      if (transient || page || absent.has(status) || (status !== 200 && status !== 206)) {
         // Whatever arrived is not what was read.
         if (arrived > 0) activity.fetched(-arrived, 0);
       }
       if (transient) throw transientStatusError(response, url, said);
-      if (absent.has(status)) return null;
+      if (page || absent.has(status)) return null;
       if (status === 403 && hidesMissing && (served || ROOT_PROBES.has(normalizeKey(key)))) return null;
+      if (status === 409) {
+        // The file its server made the store from changed on disk: every
+        // later read is refused too, nothing mixes two versions.
+        const changed = changedWhereServed(storeName, said, { url });
+        rewritten = changed.message;
+        (await keptParts())?.changed();
+        throw changed;
+      }
       if (status !== 200 && status !== 206) {
         throw new ByteSourceError(BYTE_SOURCE_FAILURES.HTTP, `${url}: the host answered HTTP ${status}.`, { status, url });
       }
@@ -570,15 +612,17 @@ export function httpStore(baseUrl, {
       // refusal now being its host refusing this network for now
       // (`refusesForNow`); before, a busy answer is reported after a few.
       delivered: () => served,
+      hosts,
     });
   }
 
   async function get(key, { signal = null, activity = null } = {}) {
     requireNotRewritten();
     const metadata = METADATA_KEYS.has(normalizeKey(key));
+    if (absentKeys.has(key)) return null;
     const parts = await keptParts();
-    // Answered absent before, under a version naming the store's content: absent still.
-    if (parts?.isAbsent(key)) return null;
+    // Answered absent before (by this store, under a version naming the store's content, or in this tab): absent still.
+    if (await knownAbsent(key, parts, signal)) return null;
     const size = parts?.objectInfo(key)?.size ?? null;
     const local = size === null ? null : await fromKept(parts, key, 0, size);
     if (local !== null) {
@@ -602,7 +646,7 @@ export function httpStore(baseUrl, {
     const result = await request(key, { signal, activity });
     if (result === null) {
       await requireNotGone(key);
-      parts?.keepAbsent(key);
+      noteAbsent(key, parts);
       return null;
     }
     sizes.set(key, result.bytes.length);
@@ -673,8 +717,9 @@ export function httpStore(baseUrl, {
   /** The size of `key` (from a fetch already made, what is kept of it, or a HEAD request), or null when absent. */
   async function sizeOf(key, options) {
     if (sizes.has(key)) return sizes.get(key);
+    if (absentKeys.has(key)) return null;
     const parts = await keptParts();
-    if (parts?.isAbsent(key)) return null;
+    if (await knownAbsent(key, parts, options?.signal ?? null)) return null;
     const keptSize = parts?.objectInfo(key)?.size ?? null;
     if (keptSize !== null) {
       sizes.set(key, keptSize);
@@ -682,7 +727,8 @@ export function httpStore(baseUrl, {
     }
     const result = await request(key, { ...options, method: 'HEAD' });
     if (result === null) {
-      parts?.keepAbsent(key);
+      await requireNotGone(key);
+      noteAbsent(key, parts);
       return null;
     }
     const size = Number(result.response.headers.get('Content-Length'));
@@ -702,8 +748,9 @@ export function httpStore(baseUrl, {
     requireNotRewritten();
     const whole = fromWhole(key);
     if (whole !== undefined) return whole.subarray(start, Math.min(end, whole.length));
+    if (absentKeys.has(key)) return null;
     const parts = await keptParts();
-    if (parts?.isAbsent(key)) return null;
+    if (await knownAbsent(key, parts, options.signal ?? null)) return null;
     const local = await fromKept(parts, key, start, end);
     if (local !== null) return local;
     const objects = pageObjects();
@@ -722,7 +769,7 @@ export function httpStore(baseUrl, {
     if (result === null) {
       activity?.planned?.(-(end - start));
       await requireNotGone(key);
-      parts?.keepAbsent(key);
+      noteAbsent(key, parts);
       return null;
     }
     if (result.response.status === 200) {
@@ -745,8 +792,11 @@ export function httpStore(baseUrl, {
     requireNotRewritten();
     const whole = fromWhole(key);
     if (whole !== undefined) return whole.subarray(Math.max(0, whole.length - length));
+    if (absentKeys.has(key)) return null;
+    const keptOf = await keptParts();
+    if (await knownAbsent(key, keptOf, options.signal ?? null)) return null;
     // An object whose size is kept: its last bytes are a range.
-    const keptSize = (await keptParts())?.objectInfo(key)?.size ?? null;
+    const keptSize = keptOf?.objectInfo(key)?.size ?? null;
     if (keptSize !== null && !sizes.has(key)) sizes.set(key, keptSize);
     const objects = pageObjects();
     const held = objects === null ? null : await objects.suffix(key, length, { link: link ?? { responses: clock }, signal: options.signal ?? null });
@@ -756,6 +806,7 @@ export function httpStore(baseUrl, {
         const result = await request(key, { ...options, range: `bytes=-${length}`, retryNetwork: false });
         if (result === null) {
           await requireNotGone(key);
+          noteAbsent(key, keptOf);
           return null;
         }
         const parts = await keptParts();
@@ -784,8 +835,8 @@ export function httpStore(baseUrl, {
 
   /**
    * Ranges of one object asked for in the same task (by any number of
-   * reads) are planned together: neighbours merged into one request by the
-   * link's gap (`batchedRanges`), cancelled only once every read waiting on
+   * reads) are planned together: neighbors merged into one request by the
+   * link's gap (`batchedRanges`), canceled only once every read waiting on
    * it has.
    */
   const batchedRange = batchedRanges({

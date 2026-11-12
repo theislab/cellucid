@@ -6,7 +6,7 @@
  *   finite uniforms and no WebGL error, on the surface the pane should have:
  *   the floor for a 3-D pane in orbit or free-fly, the dot surface otherwise.
  * - Switching through all six backgrounds in a multiview grid, mid-fade, is
- *   stable, keeps the page colour equal to the canvas colour, and the scene
+ *   stable, keeps the page color equal to the canvas color, and the scene
  *   goes quiet afterwards — also after a floor ↔ dots crossfade.
  * - A session carries the new values out and back.
  * - Figure export reproduces the backdrop in SVG and PNG.
@@ -116,7 +116,7 @@ async function setDimension(page, viewId, dimension) {
 
 /**
  * Count the studio pass's draws and record any non-finite value handed to
- * one of its uniforms. The studio program is recognised by its own source.
+ * one of its uniforms. The studio program is recognized by its own source.
  */
 async function installStudioProbe(page) {
   await page.evaluate(() => {
@@ -348,7 +348,7 @@ test('switching through every background in a grid is stable and the scene goes 
 
   for (const background of ['studio', 'studio-dark']) {
     await setControl(page, 'background-select', background);
-    // The page behind the canvas is exactly the colour the canvas clears to.
+    // The page behind the canvas is exactly the color the canvas clears to.
     const [r, g, b] = STUDIO_PALETTES[background].surface;
     await expect.poll(() => page.evaluate(
       () => getComputedStyle(document.body).backgroundColor,

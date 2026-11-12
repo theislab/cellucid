@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { describeApproval, describeConnection, describeConnectStatus } from '../assets/js/app/agent/connect/model.js';
+import { appName, describeApproval, describeConnection, describeConnectStatus } from '../assets/js/app/agent/connect/model.js';
 import { hasPendingConnectCode, takeConnectCode } from '../assets/js/app/agent/bridge/connect-code.js';
 import { pngSides, resultDataOf, toolResultOf } from '../assets/js/app/agent/bridge/mcp-content.js';
 import { RESULT_IMAGE_MAX_BYTES, RESULT_IMAGE_MAX_SIDE, VIEW_APP } from '../assets/js/app/agent/bridge/relay-protocol.js';
@@ -39,8 +39,8 @@ test('one short line per state, the whole sentence beside it', () => {
   assert.equal(offline.tone, 'warning');
   assert.match(offline.detail, /^The Cellucid relay cannot be reached\. Trying again in ~12 s; it reconnects by itself/);
   assert.equal(at(status('retrying', { retryAt: now + 200 })).text, 'Offline · retrying now');
-  assert.equal(at(status('refused')).text, 'Reload the page to reconnect');
-  assert.equal(at(status('unavailable')).text, 'Unavailable: site data is blocked');
+  assert.equal(at(status('refused')).text, 'Reload the page to reconnect.');
+  assert.equal(at(status('unavailable')).text, 'Unavailable: site data is blocked.');
   // One line in the sidebar: every short text stays short.
   for (const state of ['off', 'connecting', 'connected', 'retrying', 'refused', 'unavailable']) {
     assert.ok(at(status(state, { retryAt: now + 3_600_000 })).text.length <= 34, state);
@@ -53,11 +53,31 @@ test('a connection says who, through which host, since when and when last used',
     agent: 'Claude', client: 'Claude', host: 'claude.ai', createdAt: now - 3 * 86_400_000, lastUsedAt: now - 120_000,
   }, now), { title: 'Claude', meta: 'claude.ai · connected 3 d · used 2 min' });
   assert.deepEqual(describeConnection({
-    agent: 'Claude Code', client: 'Claude Code (cli)', host: null, createdAt: now, lastUsedAt: now,
-  }, now), { title: 'Claude Code (Claude Code (cli))', meta: 'an app on this computer · connected now · used now' });
+    agent: 'Claude', client: 'Claude Code', host: 'claude.ai', known: true, createdAt: now, lastUsedAt: now,
+  }, now), { title: 'Claude (Claude Code)', meta: 'claude.ai · connected now · used now' });
+  // F122: an app no host vouches for is named by its host (or as an app on this computer); its own name only in quotes.
+  assert.deepEqual(describeConnection({
+    agent: 'evil.example', client: 'Claude', host: 'evil.example', known: false, createdAt: now, lastUsedAt: now,
+  }, now), { title: 'evil.example (calls itself “Claude”)', meta: 'evil.example · connected now · used now' });
+  assert.deepEqual(describeConnection({
+    agent: 'An app on this computer', client: 'Claude Code (cli)', host: null, known: false, createdAt: now, lastUsedAt: now,
+  }, now), { title: 'An app on this computer (calls itself “Claude Code (cli)”)', meta: 'an app on this computer · connected now · used now' });
 });
 
-test('the approval says who asks, where the answer goes, and warns about an unknown app or a typed code', () => {
+test('F122: an app named "Claude" that no host vouches for is asked about by its host, its name only quoted', () => {
+  const fake = describeApproval({
+    display: 'ABCD-EFGH', via: 'link',
+    client: { agent: 'evil.example', name: 'Claude', host: 'evil.example', redirectHost: 'evil.example', loopback: false, known: false },
+  });
+  assert.equal(fake.title, 'Connect evil.example?');
+  assert.match(fake.who, /^evil\.example, which calls itself “Claude”, asks to work in Cellucid in this browser/);
+  assert.doesNotMatch(fake.title, /Claude/);
+  assert.deepEqual(fake.warnings, ['Allow only if you started connecting Cellucid from this app yourself, just now.']);
+  assert.equal(appName('Claude', 'Claude', true), 'Claude');
+  assert.equal(appName('An app on this computer', null, false), 'An app on this computer');
+});
+
+test('the approval says who asks, where the answer goes, and warns about an unknown app, a link or a typed code', () => {
   const known = describeApproval({
     display: 'ABCD-EFGH', via: 'link',
     client: { agent: 'Claude', name: 'Claude', host: 'claude.ai', redirectHost: 'claude.ai', loopback: false, known: true },
@@ -65,11 +85,14 @@ test('the approval says who asks, where the answer goes, and warns about an unkn
   assert.equal(known.title, 'Connect Claude?');
   assert.match(known.who, /^Claude \(claude\.ai\) asks to work in Cellucid in this browser/);
   assert.equal(known.where, 'The answer goes to claude.ai.');
-  assert.deepEqual(known.warnings, []);
+  // LG-W1: a link can come from anyone's Claude; the relay cannot tell whose.
+  assert.deepEqual(known.warnings, ['Allow only if you asked Claude to connect just now, never for a link someone sent you.']);
   const typed = describeApproval({
     display: 'ABCD-EFGH', via: 'typed',
-    client: { agent: 'Notes app', name: 'Notes app', host: null, redirectHost: '127.0.0.1', loopback: true, known: false },
+    client: { agent: 'An app on this computer', name: 'Notes app', host: null, redirectHost: '127.0.0.1', loopback: true, known: false },
   });
+  assert.equal(typed.title, 'Connect an app on this computer?');
+  assert.match(typed.who, /^An app on this computer, which calls itself “Notes app”, asks/);
   assert.equal(typed.where, 'The answer goes to an app on this computer (127.0.0.1).');
   assert.deepEqual(typed.warnings, [
     'Allow only if you started connecting Cellucid from this app yourself, just now.',

@@ -3,11 +3,11 @@
  * (plots/point-layer.js): their positions as Plotly computes them
  * (point-layout.js), their plot pixels, and the image.
  *
- * Every point is a disc of one colour drawn at the marker opacity, as Plotly's
+ * Every point is a disc of one color drawn at the marker opacity, as Plotly's
  * SVG marker is, so the layer's alpha at a pixel is `1 - Π(1 - opacity ×
- * coverage)` over the points covering it and its colour is the marker colour.
+ * coverage)` over the points covering it and its color is the marker color.
  * A disc's coverage of a pixel is measured on an 8 × 8 grid of samples, with
- * the disc's centre taken at the middle of its 1/8-pixel cell.
+ * the disc's center taken at the middle of its 1/8-pixel cell.
  *
  * Request: `{id, vals, layout, xAxis, yAxis, horizontal, width, height, scale,
  * radius, rgb: [r, g, b], alpha}` for a box or violin, or `{id, kind:
@@ -27,9 +27,9 @@ const SAMPLES = 8;
 
 /**
  * Coverage masks of a disc of `radius` device pixels for each 1/8-pixel
- * position of its centre: `masks[(sy * SUBPIXEL + sx)]` holds `side × side`
+ * position of its center: `masks[(sy * SUBPIXEL + sx)]` holds `side × side`
  * coverages of the pixels from `-reach` to `reach` around the pixel holding
- * the centre.
+ * the center.
  *
  * @param {number} radius
  */
@@ -133,7 +133,7 @@ export function rasterizePoints({ xs, ys, width, height, scale, radius, rgb, alp
 }
 
 /**
- * Points of several colours, drawn one over another in order (a scatter
+ * Points of several colors, drawn one over another in order (a scatter
  * trace's markers): each is a disc of `radius` in `palette[colorIndex[i]]`
  * (`[r, g, b, alpha]`), composed source-over as the SVG markers are.
  *
@@ -143,7 +143,7 @@ export function rasterizePoints({ xs, ys, width, height, scale, radius, rgb, alp
 export function rasterizeColoredPoints({ xs, ys, colorIndex, palette, width, height, scale, radius }) {
   const w = Math.max(1, Math.ceil(width * scale));
   const h = Math.max(1, Math.ceil(height * scale));
-  // Premultiplied colour and the light still passing through, per pixel.
+  // Premultiplied color and the light still passing through, per pixel.
   const red = new Float32Array(w * h);
   const green = new Float32Array(w * h);
   const blue = new Float32Array(w * h);

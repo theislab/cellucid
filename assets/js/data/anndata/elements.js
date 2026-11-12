@@ -21,6 +21,29 @@ import { isArrayNode, isGroup } from '../../formats/store.js';
 import { formatCountOf } from '../../utils/format-units.js';
 
 /**
+ * What a file holds breaks an AnnData element rule: its container (HDF5,
+ * Zarr) read fine, and an element in it is not what anndata writes (a
+ * dataframe without its index, a categorical code past its categories, a
+ * matrix whose shape disagrees with obs and var, sparse pointers that fall):
+ * a writer's error, a hand-built file, or damage. Every rule here and in
+ * `dataframe.js`, `sparse.js` and `values.js`, and every check of the
+ * reader's of what a file holds, refuses with it; a check of the reader's
+ * own work never does. `open.js` (`explainFormatError`) says it to the
+ * person as the file's problem, with what to do; anything else that fails
+ * is Cellucid's, and is shown as that.
+ */
+export class AnnDataFormatError extends Error {
+  /**
+   * @param {string} message - Names the element as the person finds it in their file
+   * @param {ErrorOptions} [options]
+   */
+  constructor(message, options) {
+    super(message, options);
+    this.name = 'AnnDataFormatError';
+  }
+}
+
+/**
  * How messages name the file and its storage.
  *
  * @typedef {Object} AnnDataFormat
@@ -95,7 +118,7 @@ export function encodingType(node) {
 export function requireExactStringAttribute(node, key, expected, label) {
   const value = attributeValue(node, key);
   if (typeof value !== 'string' || value !== expected) {
-    throw new Error(`${label} ${key} must be exactly '${expected}'`);
+    throw new AnnDataFormatError(`${label} ${key} must be exactly '${expected}'`);
   }
   return value;
 }
@@ -114,7 +137,7 @@ export function requireEncoding(node, expectedType, expectedVersion, label) {
  * @param {string} label
  */
 export function requireMapping(node, format, label) {
-  if (!isGroup(node)) throw new Error(`${label} must be a ${format.storage} mapping group`);
+  if (!isGroup(node)) throw new AnnDataFormatError(`${label} must be a ${format.storage} mapping group`);
   requireEncoding(node, 'dict', '0.1.0', label);
   return node;
 }
@@ -131,7 +154,7 @@ export function requireCategoricalOrdered(group, label) {
   if (Array.isArray(ordered) && ordered.length === 1) ordered = ordered[0];
   if (ordered === 0 || ordered === 1 || ordered === 0n || ordered === 1n) return Number(ordered) === 1;
   if (typeof ordered !== 'boolean') {
-    throw new Error(`${label} ordered must be a boolean attribute, as AnnData writes it`);
+    throw new AnnDataFormatError(`${label} ordered must be a boolean attribute, as AnnData writes it`);
   }
   return ordered;
 }
@@ -166,20 +189,20 @@ export function elementBytes(array) {
 }
 
 export function requireArray(node, format, label) {
-  if (!isArrayNode(node)) throw new Error(`${label} must be a ${format.storage} array`);
+  if (!isArrayNode(node)) throw new AnnDataFormatError(`${label} must be a ${format.storage} array`);
   return node;
 }
 
 /** A shape of non-negative safe integers, optionally of an exact rank. */
 export function shapeOf(node, label, expectedDimensions = null) {
   const raw = node?.shape;
-  if (!Array.isArray(raw)) throw new Error(`${label} shape is required`);
+  if (!Array.isArray(raw)) throw new AnnDataFormatError(`${label} shape is required`);
   const shape = raw.map(Number);
   if (shape.some(dimension => !Number.isSafeInteger(dimension) || dimension < 0)) {
-    throw new Error(`${label} shape dimensions must be non-negative safe integers`);
+    throw new AnnDataFormatError(`${label} shape dimensions must be non-negative safe integers`);
   }
   if (expectedDimensions !== null && shape.length !== expectedDimensions) {
-    throw new Error(
+    throw new AnnDataFormatError(
       `${label} must have exactly ${formatCountOf(expectedDimensions, 'dimension')}`
     );
   }
@@ -188,10 +211,10 @@ export function shapeOf(node, label, expectedDimensions = null) {
 
 /** A shape given as an attribute value (a sparse matrix's `shape`). */
 export function shapeFromAttribute(value, label) {
-  if (!Array.isArray(value)) throw new Error(`${label} shape is required`);
+  if (!Array.isArray(value)) throw new AnnDataFormatError(`${label} shape is required`);
   const shape = value.map(dimension => (typeof dimension === 'bigint' ? Number(dimension) : Number(dimension)));
   if (shape.some(dimension => !Number.isSafeInteger(dimension) || dimension < 0)) {
-    throw new Error(`${label} shape dimensions must be non-negative safe integers`);
+    throw new AnnDataFormatError(`${label} shape dimensions must be non-negative safe integers`);
   }
   return shape;
 }
@@ -200,14 +223,14 @@ export function validateOneDimensional(node, format, label, expectedLength = nul
   requireArray(node, format, label);
   const [length] = shapeOf(node, label, 1);
   if (expectedLength !== null && length !== expectedLength) {
-    throw new Error(`${label} length ${length} does not match ${expectedLength}`);
+    throw new AnnDataFormatError(`${label} length ${length} does not match ${expectedLength}`);
   }
   return length;
 }
 
 export function requirePrimitiveKind(array, label) {
   const kind = valueKind(array);
-  if (kind === 'unknown') throw new Error(`${label} uses an unsupported element type`);
+  if (kind === 'unknown') throw new AnnDataFormatError(`${label} uses an unsupported element type`);
   return kind;
 }
 
@@ -227,16 +250,16 @@ export function validateArrayEncoding(node, format, label, expectedType = null) 
   requireArray(node, format, label);
   const declared = encodingType(node);
   if (expectedType === null && declared !== 'array' && declared !== 'string-array') {
-    throw new Error(`${label} encoding-type must be exactly 'array' or 'string-array'`);
+    throw new AnnDataFormatError(`${label} encoding-type must be exactly 'array' or 'string-array'`);
   }
   const requiredType = expectedType ?? declared;
   requireEncoding(node, requiredType, '0.2.0', label);
   const kind = valueKind(node);
   if (requiredType === 'string-array' && kind !== 'string') {
-    throw new Error(`${label} declares string-array but does not use a string dtype`);
+    throw new AnnDataFormatError(`${label} declares string-array but does not use a string dtype`);
   }
   if (requiredType === 'array' && kind === 'string') {
-    throw new Error(`${label} declares array but uses a string dtype`);
+    throw new AnnDataFormatError(`${label} declares array but uses a string dtype`);
   }
   return requiredType;
 }
@@ -249,33 +272,33 @@ export function validateArrayEncoding(node, format, label, expectedType = null) 
  */
 export function validateDataFrame(node, format, label) {
   if (!isGroup(node)) {
-    throw new Error(`${label} is required and must be a ${format.storage} dataframe group`);
+    throw new AnnDataFormatError(`${label} is required and must be a ${format.storage} dataframe group`);
   }
   requireEncoding(node, 'dataframe', '0.2.0', label);
   const indexKey = attributeValue(node, '_index');
   if (typeof indexKey !== 'string' || indexKey.length === 0) {
-    throw new Error(`${label} _index must be a non-empty string`);
+    throw new AnnDataFormatError(`${label} _index must be a non-empty string`);
   }
   const rawOrder = attributeValue(node, 'column-order');
   const columnOrder = Array.isArray(rawOrder) ? rawOrder : null;
   if (columnOrder === null || columnOrder.some(key => typeof key !== 'string' || key.length === 0)) {
-    throw new Error(`${label} column-order must be an array of non-empty strings`);
+    throw new AnnDataFormatError(`${label} column-order must be an array of non-empty strings`);
   }
   const seen = new Set();
   for (const key of columnOrder) {
-    if (seen.has(key)) throw new Error(`${label} column-order contains duplicate column '${key}'`);
+    if (seen.has(key)) throw new AnnDataFormatError(`${label} column-order contains duplicate column '${key}'`);
     // A column named as the index holds the index's values: anndata writes
     // it once and lists it as a column too.
     seen.add(key);
   }
-  if (!node.has(indexKey)) throw new Error(`${label} index child '${indexKey}' was not found`);
+  if (!node.has(indexKey)) throw new AnnDataFormatError(`${label} index child '${indexKey}' was not found`);
   // A declared column that is not there is that column's defect, left out
   // of the dataset with the reason (`dataframe.js` `columnDefect`).
   // Files from anndata 0.7 keep categories there; they are read through
   // `older-layouts.js`, so one here, unless it is a column of that name, is
   // a dataframe that mixes two layouts.
   if (node.has('__categories') && !seen.has('__categories')) {
-    throw new Error(
+    throw new AnnDataFormatError(
       `${label} declares the current dataframe encoding but keeps categories in '__categories' as anndata 0.7 did; write the file again with one AnnData release`
     );
   }

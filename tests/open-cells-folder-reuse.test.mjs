@@ -21,17 +21,25 @@ import test from 'node:test';
 // open before are no prefix.
 import { LINK_AT_REST, holdMachineAtRest } from './helpers/machine-at-rest.mjs';
 
-import { annData, categorical, dataFrame, dense, mapping, sparse, strings, zarrEntries } from './helpers/anndata-store.mjs';
+import { annData, array, categorical, dataFrame, dense, mapping, sparse, strings, zarrEntries } from './helpers/anndata-store.mjs';
+import { priorityPositions } from '../assets/js/data/anndata/priority-layout.js';
 import { cellsToOpen, createAnnDataReaderHandler } from '../assets/js/data/anndata-reader-worker.js';
 import { createMulberry32 } from '../assets/js/app/utils/random-utils.js';
 
 holdMachineAtRest({ link: LINK_AT_REST });
 
 const CELLS = 1200;
+const PRIORITY_SEED = 11;
+const scalar = value => array([BigInt(value)], { dtype: '<i8', shape: [], chunks: [], attrs: { 'encoding-type': 'numeric-scalar', 'encoding-version': '0.2.0' } });
 const GENES = 60;
 const BASE = 'https://host.example/store.zarr/';
 
-function storeFiles() {
+/**
+ * The store; `priority`: in a priority order (`prepare()`'s: its cells
+ * ordered by a seed, `uns['cellucid']['priority']`), so each step of a
+ * growth reads the next rows of its columns.
+ */
+function storeFiles({ priority = false } = {}) {
   const random = createMulberry32(11);
   const data = [];
   const indices = [];
@@ -53,7 +61,9 @@ function storeFiles() {
     obs: dataFrame({
       _index: strings(Array.from({ length: CELLS }, (_, i) => `c${i}`), { chunks: [200] }),
       cluster: categorical(Int8Array.from({ length: CELLS }, (_, i) => i % 3), ['a', 'b', 'c']),
+      ...(priority ? { cellucid_original_position: array(priorityPositions(PRIORITY_SEED, CELLS), { dtype: '<u4', chunks: [64] }) } : {}),
     }),
+    ...(priority ? { uns: mapping({ cellucid: mapping({ priority: mapping({ seed: scalar(PRIORITY_SEED), specVersion: scalar(1), nObs: scalar(CELLS) }) }) }) } : {}),
     var: dataFrame({ _index: strings(Array.from({ length: GENES }, (_, g) => `g${g}`)) }),
     obsm: mapping({ X_umap: dense(Float32Array.from({ length: CELLS * 2 }, () => random()), [CELLS, 2], { chunks: [200, 2] }) }),
     X,
@@ -72,14 +82,18 @@ function storeFiles() {
  * (null: none; a string: its ETag; `{etag, modified}`: an ETag and a write
  * time), and every request is recorded.
  */
-function serveStore(t, files, validator) {
+function serveStore(t, files, validator, { delayOf = () => 0 } = {}) {
   const original = globalThis.fetch;
   const requests = [];
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input instanceof Request ? input.url : input);
     const method = init.method ?? 'GET';
     const key = decodeURIComponent(url.slice(BASE.length));
-    requests.push({ key, method });
+    const record = { key, method, sent: performance.now(), answered: null };
+    requests.push(record);
+    const delay = delayOf(key, method);
+    if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+    record.answered = performance.now();
     const bytes = files.get(key);
     if (bytes === undefined) return new Response('absent', { status: 404 });
     const tag = validator(key);
@@ -158,6 +172,45 @@ for (const [label, validatorOf] of [
     await call('close');
   });
 }
+
+test('a growth step reads beside the folder\'s version check, not after it; read from a folder found changed, it is opened anew (F170)', async t => {
+  // Each step of a progressive opening waited one round trip for a HEAD of
+  // `.zmetadata` before its first read, in series (R9P-1: about 4% of a 3G
+  // opening). The HEAD answers slowly here: the step's reads go out first.
+  const files = storeFiles({ priority: true });
+  let version = 1;
+  let slowHead = false;
+  const requests = serveStore(t, files, () => `"served-${version}"`, {
+    delayOf: (key, method) => (slowHead && key === '.zmetadata' && method === 'HEAD' ? 250 : 0),
+  });
+  const call = handler();
+  const source = { url: BASE, name: 'store.zarr' };
+  // The store's own order: each step reads the next rows of its order.
+  const grown = k => ({ ...request(k), seed: PRIORITY_SEED });
+  await call('open', { source, cellSubset: grown(100) });
+  slowHead = true;
+  let before = requests.length;
+  const raised = await call('open', { source, cellSubset: grown(900), reopen: true });
+  assert.equal(raised.sameVersion, true, 'unchanged: taken over');
+  assert.equal(raised.nObs, 900);
+  let step = requests.slice(before);
+  const head = step.find(item => item.key === '.zmetadata' && item.method === 'HEAD');
+  assert.ok(head, 'the version is asked');
+  const beside = step.filter(item => item.key !== '.zmetadata' && item.sent < head.answered);
+  assert.ok(beside.length > 0, 'the step read before the version check answered');
+  // A new version (other bytes): the step read through the held store is
+  // discarded, never shown, whether it finished or failed on the bytes it
+  // met, and the folder is opened anew.
+  version = 2;
+  for (const [key, bytes] of files) if (key !== '.zmetadata') files.set(key, bytes.map(byte => byte ^ 0x5a));
+  before = requests.length;
+  const changed = await call('open', { source, cellSubset: grown(1100), reopen: true }).catch(error => error);
+  step = requests.slice(before).filter(item => item.key === '.zmetadata').map(item => item.method);
+  assert.equal(step[0], 'HEAD');
+  assert.ok(step.includes('GET'), 'opened anew: its metadata read again');
+  assert.notEqual(changed.sameVersion, true);
+  await call('close');
+});
 
 test('a folder whose host names no version is opened anew on Apply', async t => {
   const files = storeFiles();

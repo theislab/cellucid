@@ -15,7 +15,7 @@
  * were not read; the description, two lines with "More"; the bytes read
  * so far while it is read in place; and a "Details" disclosure with the rest
  * (source, citation, format, size, where it is kept, what was not read, obs
- * fields, embeddings, layers, raw, neighbour graph, latent space, vector
+ * fields, embeddings, layers, raw, neighbor graph, latent space, vector
  * fields). Long values wrap; nothing is cut with an ellipsis.
  *
  * A request for in-place data that fails for a moment and is made again is
@@ -25,16 +25,16 @@
  * @module ui/modules/dataset-card
  */
 
-import { formatCompactCount } from '../components/display-format.js';
 import { renderFactList } from '../components/controls.js';
 import { getTransferLog } from '../../../data/transfer-log.js';
 import { INPUT_FORMATS, inputFormat } from '../../../data/input-formats.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { getOpeningProgress } from '../../../data/opening-progress.js';
 import { READ_IN_PARTS_INSTEAD, wholeReadKept, wholeReadLine } from '../../../data/whole-read-notice.js';
-import { formatBytes, formatCount, formatCountOf, countNoun } from '../../../utils/format-units.js';
+import { formatBytes, formatCount, formatCountOf, countNoun, formatShare, formatCompactCount } from '../../../utils/format-units.js';
 import { describeSubsampleMethod } from '../../../data/subsample.js';
 import { onAbort } from '../../../utils/abort.js';
+import { NO_DATASET_LABEL } from '../no-dataset.js';
 
 const CARD_DOM_KEYS = Object.freeze([
   'root',
@@ -259,7 +259,7 @@ export function describeDetails(metadata, storage, mapping, countedEdges = null,
   const graph = mapping === null ? graphOf(stats) : mapping.graph;
   const graphValue = describeGraph(graph !== null && graph.edges === null && countedEdges !== null ? { edges: countedEdges } : graph);
   rows.push({
-    label: 'Neighbour graph',
+    label: 'Neighbor graph',
     value: graph !== null && cells?.kept != null && graphShare !== null
       ? `${graphValue} (${describeGraphShare(graphShare)})`
       : graphValue,
@@ -276,7 +276,7 @@ function graphOf(stats) {
 }
 
 /**
- * How much of its neighbour graph a subsample keeps: the share of the open
+ * How much of its neighbor graph a subsample keeps: the share of the open
  * cells' edges that join two open cells (the others lead to cells left out,
  * and cannot be drawn).
  *
@@ -285,9 +285,7 @@ function graphOf(stats) {
  */
 export function describeGraphShare({ kept, of }) {
   if (of === 0) return 'no edge of the open cells';
-  const percent = (100 * kept) / of;
-  const shown = percent >= 10 || percent === 0 ? Math.round(percent) : Number(percent.toPrecision(2));
-  return `${shown} % of the open cells' edges; the others lead to cells not open`;
+  return `${formatShare(kept, of)} of the open cells' edges; the others lead to cells not open`;
 }
 
 /**
@@ -418,7 +416,7 @@ export function initDatasetCard({
     }
     const rows = describeDetails(metadata, storage, mapping, loadedEdges, cells, graphShare);
     // The graph's value is found again when its edges are counted.
-    renderFactList(elements.detailsList, rows.map(row => (row.label === 'Neighbour graph' ? { ...row, id: 'dataset-connectivity' } : row)));
+    renderFactList(elements.detailsList, rows.map(row => (row.label === 'Neighbor graph' ? { ...row, id: 'dataset-connectivity' } : row)));
     setText(elements.genes, formatCompactCount(mapping?.genes ?? metadata.stats.n_genes));
   }
 
@@ -544,7 +542,7 @@ export function initDatasetCard({
     graphShare = null;
     clearRetryNotice();
     hideFacts();
-    setText(elements.name, 'No dataset open');
+    setText(elements.name, NO_DATASET_LABEL);
     setState('empty');
   }
 

@@ -25,7 +25,7 @@
 
 import { validateDatasetId } from '../data/data-source.js';
 import { validateRemoteServerUrl } from '../data/remote-source.js';
-import { SUBSAMPLE_URL_PARAMETERS, subsampleUrlEntries } from './subsample-url.js';
+import { SUBSAMPLE_URL_PARAMETERS, linkedSubsampleSpec, subsampleUrlEntries } from './subsample-url.js';
 import { getProviderRegistry } from '../data/sources/registry.js';
 import { linkLeavesOutParts } from '../data/sources/link-credentials.js';
 
@@ -129,11 +129,9 @@ export function prepareUrlForDatasetSelection(selection) {
  */
 function chosenSubsampleEntries(source, datasetId) {
   const annData = typeof source.getAnnDataSource === 'function' ? source.getAnnDataSource(datasetId) : null;
-  const subset = annData?.getCellSubset?.() ?? null;
-  // Only a specification a link reproduces exactly: never cells fitted to
-  // the device, nor a restored set its specification no longer gives.
-  if (subset === null || subset.kept === null || subset.autoFit !== null || subset.reproduced === false) return [];
-  return subsampleUrlEntries(subset.spec);
+  // Only a specification a link reproduces exactly (`linkedSubsampleSpec`).
+  const spec = linkedSubsampleSpec(annData?.getCellSubset?.() ?? null);
+  return spec === null ? [] : subsampleUrlEntries(spec);
 }
 
 /**

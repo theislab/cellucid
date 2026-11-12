@@ -1361,3 +1361,46 @@ test('a read nobody waits for any more is cancelled in the loader; one still wan
   assert.equal(signals.get('obsm:velocity_umap_2d').aborted, true);
   assert.equal(signals.get('obsm:X_umap_2d').aborted, true);
 });
+
+test('an opening stopped while its first view is read stops that read: initialize answers at once and the read is told to stop', async () => {
+  // Found 2026-11-10 on a 1.6 Mbps link: an Apply superseded by another dataset kept reading
+  // the first view's embedding for ~15 s (the read joined no caller that could stop it).
+  let readSignal = null;
+  let readStarted;
+  const started = new Promise(resolve => { readStarted = resolve; });
+  const loader = {
+    nObs: 2,
+    obsKeys: [],
+    async getDatasetMetadata() {
+      return {
+        stats: { n_cells: 2, n_genes: 0, n_categorical_fields: 0, n_continuous_fields: 0 },
+        probes: mappingProbes({ nObs: 2, obsm: { X_umap_2d: 2 } }),
+        obs_fields: []
+      };
+    },
+    readObsmColumns(key, columns, options = {}) {
+      readSignal = options.signal ?? null;
+      readStarted();
+      // A read that answers only when told to stop (a stalled link).
+      return new Promise((_, reject) => {
+        readSignal?.addEventListener('abort', () => reject(readSignal.reason), { once: true });
+      });
+    },
+    close() {}
+  };
+  const adapter = new BaseAnnDataAdapter(withObsmPayloads(loader));
+  const opening = new AbortController();
+  const initialized = adapter.initialize({ signal: opening.signal });
+  await started;
+  // Everything else of initialize() is done; only the first view's read is under way.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  opening.abort(new Error('another dataset was chosen'));
+  const answered = await Promise.race([
+    initialized.then(() => 'resolved', error => error.message),
+    new Promise(resolve => setTimeout(() => resolve('still reading'), 500)),
+  ]);
+  assert.equal(answered, 'another dataset was chosen');
+  assert.notEqual(readSignal, null, 'the read is given a signal');
+  assert.equal(readSignal.aborted, true, 'the read is told to stop');
+  assert.equal(adapter._metadata, null);
+});

@@ -24,7 +24,6 @@ import {
   pickSelectModeDom,
 } from './highlight/exact-contract.js';
 import { requireExactKeys } from '../../../utils/exact-record.js';
-import { deleteRetiredHighlightDrafts } from '../../history/autosave-store.js';
 
 const REQUIRED_STATE_METHODS = Object.freeze([
   'getActiveField',
@@ -104,8 +103,6 @@ export function initHighlightControls(options) {
     'Highlight controls options'
   );
   const { state, viewer, dom, viewerHostSource } = options;
-  // Dead storage an earlier Cellucid left in this origin (deleted, never read).
-  deleteRetiredHighlightDrafts();
   requireMethods(state, 'Highlight state', REQUIRED_STATE_METHODS);
   requireMethods(viewer, 'Highlight viewer', REQUIRED_VIEWER_METHODS);
   requireViewerHostSource(viewerHostSource);

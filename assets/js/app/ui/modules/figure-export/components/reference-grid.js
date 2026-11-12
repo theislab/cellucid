@@ -2,7 +2,7 @@
  * @fileoverview Vector reproduction of the viewer's reference grid box.
  *
  * WHAT THE VIEWER DRAWS
- * `drawGrid()` (`rendering/viewer.js`) rasterises six quads forming a cube of
+ * `drawGrid()` (`rendering/viewer.js`) rasterizes six quads forming a cube of
  * half-extent `GRID_SIZE`, shading each fragment with `GRID_FS_SOURCE`
  * (`rendering/shaders/edge-grid-shaders.js`). The shader is a pure line
  * pattern: minor rules every `u_gridSpacing`, major rules every fifth, a frame
@@ -13,25 +13,25 @@
  * Straight 3D lines project to straight 2D lines, so the grid is exactly
  * representable as `<line>` elements and Canvas2D strokes. That keeps a
  * full-vector SVG fully editable — a figure whose grid arrives as an embedded
- * bitmap cannot be recoloured or removed in Illustrator — and it lets PNG and
+ * bitmap cannot be recolored or removed in Illustrator — and it lets PNG and
  * SVG consume one geometry model, so the two formats can never disagree.
  *
- * HOW THE SHADER'S PER-FRAGMENT COLOUR BECOMES A STROKE
- * At a line centre the shader produces
+ * HOW THE SHADER'S PER-FRAGMENT COLOR BECOMES A STROKE
+ * At a line center the shader produces
  *
  *   effectiveOpacity eo = u_gridOpacity * u_planeAlpha
  *   gridMix             = clamp(minor*minorStrength + major*majorStrength
  *                               + frame*frameStrength, 0, 1)
- *   colour              = mix(surfaceColor, u_gridColor, gridMix)
- *                         then mix(., axisColour, axisStrength) on an origin rule
+ *   color              = mix(surfaceColor, u_gridColor, gridMix)
+ *                         then mix(., axisColor, axisStrength) on an origin rule
  *   alpha               = eo                         (0.55 + 0.45 * lineMask, lineMask = 1)
  *
  * and away from every rule it produces `surfaceColor` at `0.55 * eo`, which
  * differs from the background by at most 0.005 in 0..1 — under 1.3/255 — so the
  * plane surfaces are not drawn at all.
  *
- * Each rule is therefore emitted as one opaque stroke whose colour is the
- * shader's fragment colour already composited at `eo` over the background the
+ * Each rule is therefore emitted as one opaque stroke whose color is the
+ * shader's fragment color already composited at `eo` over the background the
  * figure will actually have. Opaque strokes are what make crossings correct:
  * the shader takes `max()` across the two rule families, so a crossing must be
  * as dark as one rule, not as dark as two, which is exactly what an opaque
@@ -61,7 +61,7 @@
  * @module ui/modules/figure-export/components/reference-grid
  */
 
-import { hexToRgb01, rgb01ToHex } from '../utils/color-utils.js';
+import { hexOfRgb01, rgb01OfHex } from '../../../../../utils/hex-color.js';
 import {
   clipSegmentDepthRange,
   createPlotProjection,
@@ -195,7 +195,7 @@ function enumerateRuleCoordinates(size, spacing) {
 }
 
 /**
- * The concentric colour bands of one rule, widest first.
+ * The concentric color bands of one rule, widest first.
  *
  * @returns {{ halfWidthWorld: number; color: string }[]}
  */
@@ -238,12 +238,12 @@ function buildRuleBands({
     if (gridMix <= 0 && axisMix <= 0) continue;
     let rgb = mixRgb(surfaceRgb, lineColor, gridMix);
     if (axisMix > 0) rgb = mixRgb(rgb, axisColor, axisMix);
-    // The shader's fragment alpha at a rule centre is exactly `eo`; folding it
-    // into the stroke colour keeps overdraw at crossings single-composited.
+    // The shader's fragment alpha at a rule center is exactly `eo`; folding it
+    // into the stroke color keeps overdraw at crossings single-composited.
     const composited = mixRgb(surfaceRgb, rgb, effectiveOpacity);
     bands.push({
       halfWidthWorld: half * lineWidth,
-      color: rgb01ToHex(composited),
+      color: hexOfRgb01(composited),
     });
   }
   return bands;
@@ -252,13 +252,13 @@ function buildRuleBands({
 /**
  * The surface the reference layer composites over.
  *
- * `rgb` is the colour its marks are composited onto. A transparent figure has
+ * `rgb` is the color its marks are composited onto. A transparent figure has
  * no paper for the layer to sit on, so its marks are composited over the
  * viewer's own background — they then look exactly as they do on screen, and
  * everything between them stays transparent.
  *
  * `viewerPaper` is true when the figure's paper is exactly the viewer's own
- * surface colour (`Background: Match viewer`, or a custom colour equal to
+ * surface color (`Background: Match viewer`, or a custom color equal to
  * it): only then is the studio backdrop's glow, a lightening of that surface,
  * part of the picture.
  *
@@ -282,7 +282,7 @@ export function resolveReferenceGridSurface({
   if (background === 'transparent') {
     return Object.freeze({ rgb: viewerSurface, viewerPaper: false });
   }
-  const rgb = hexToRgb01(backgroundColor);
+  const rgb = rgb01OfHex(backgroundColor);
   if (rgb === null) {
     throw new TypeError(
       'Reference grid export requires an exact #RRGGBB figure background.'
@@ -290,7 +290,7 @@ export function resolveReferenceGridSurface({
   }
   return Object.freeze({
     rgb,
-    viewerPaper: rgb01ToHex(rgb) === rgb01ToHex(viewerSurface),
+    viewerPaper: hexOfRgb01(rgb) === hexOfRgb01(viewerSurface),
   });
 }
 
@@ -346,19 +346,19 @@ export function buildReferenceGridModel({
     throw new TypeError('Reference grid export requires a positive plot rectangle.');
   }
 
-  const surface = assertRgb01(layerSurface?.rgb, 'Reference grid surface colour');
-  const lineColor = assertRgb01(appearance.lineColor, 'Reference grid line colour');
+  const surface = assertRgb01(layerSurface?.rgb, 'Reference grid surface color');
+  const lineColor = assertRgb01(appearance.lineColor, 'Reference grid line color');
   const axisColors = {
-    x: assertRgb01(appearance.axisColors.x, 'Reference grid X-axis colour'),
-    y: assertRgb01(appearance.axisColors.y, 'Reference grid Y-axis colour'),
-    z: assertRgb01(appearance.axisColors.z, 'Reference grid Z-axis colour'),
+    x: assertRgb01(appearance.axisColors.x, 'Reference grid X-axis color'),
+    y: assertRgb01(appearance.axisColors.y, 'Reference grid Y-axis color'),
+    z: assertRgb01(appearance.axisColors.z, 'Reference grid Z-axis color'),
   };
 
   // `isLightBg` is decided by the surface the shader mixes against, which is
-  // the viewer's own background — never the figure's chosen paper colour.
+  // the viewer's own background — never the figure's chosen paper color.
   const shaderSurface = assertRgb01(
     appearance.surfaceColor,
-    'Reference grid viewer surface colour'
+    'Reference grid viewer surface color'
   );
   const bgLuma =
     shaderSurface[0] * LUMA_WEIGHTS[0] +

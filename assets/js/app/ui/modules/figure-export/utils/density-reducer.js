@@ -30,7 +30,7 @@
 import { clamp } from '../../../../utils/number-utils.js';
 import { createMulberry32 } from '../../../../utils/random-utils.js';
 import { requirePositionArray } from '../../../../../rendering/position-layout.js';
-import { assertCropRect01, cropRect01ToPx } from './crop.js';
+import { figureSourceRect, projectIntoSource } from './plot-fit.js';
 import {
   MIN_VISIBLE_ALPHA_BYTE,
   POINT_VISIBILITY_THRESHOLD,
@@ -42,18 +42,17 @@ import {
 
 /**
  * @typedef {object} ReducedViewportPoints
- * @property {Float32Array} x - viewport-space x (0..viewportWidth)
- * @property {Float32Array} y - viewport-space y (0..viewportHeight)
+ * @property {Float32Array} x - source-local viewport-space x (0..viewportWidth):
+ *   viewport pixels from the left edge of the view or of the framing crop
+ * @property {Float32Array} y - source-local viewport-space y (0..viewportHeight)
  * @property {Uint8Array} rgba - packed RGBA uint8 (n*4), alpha is NOT premultiplied
  * @property {Float32Array} alpha - per-point alpha (0..1)
  * @property {Uint32Array} index - source point index for each reduced point
- * @property {Float32Array} sourcePositions - the reduced points' source
- *   coordinates as XYZ triples (n*3), with zero for the axes a 1-D or 2-D
- *   embedding does not have
  * @property {Uint8Array} highlighted - sampled renderer highlight byte per point
  * @property {number} scannedSourceCount - unique primary/sparse source IDs examined
  * @property {number} candidateSourceCount - source IDs eligible before the preview scan cap
- * @property {number} viewportWidth
+ * @property {number} viewportWidth - the source's size (`figureSourceRect`):
+ *   the viewport's, or the framing crop's, in viewport pixels
  * @property {number} viewportHeight
  */
 
@@ -73,7 +72,6 @@ function createEmptyReducedViewportPoints(
     rgba: new Uint8Array(0),
     alpha: new Float32Array(0),
     index: new Uint32Array(0),
-    sourcePositions: new Float32Array(0),
     highlighted: new Uint8Array(0),
     scannedSourceCount,
     candidateSourceCount,
@@ -298,18 +296,12 @@ export function reducePointsByDensity({
   const scanRemainderStep = primaryScanCount === 0
     ? 0
     : candidateCount % primaryScanCount;
-  const viewportW = Math.max(1, renderState.viewportWidth || 1);
-  const viewportH = Math.max(1, renderState.viewportHeight || 1);
   const mvp = renderState.mvpMatrix;
-
-  const crop01 = assertCropRect01(crop);
-  const cropPx = cropRect01ToPx(crop01, viewportW, viewportH);
-  const hasCrop = Boolean(
-    cropPx &&
-    (cropPx.width < viewportW - 0.5 || cropPx.height < viewportH - 0.5 || cropPx.x > 0.5 || cropPx.y > 0.5)
-  );
-  const effW = hasCrop ? cropPx.width : viewportW;
-  const effH = hasCrop ? cropPx.height : viewportH;
+  const source = figureSourceRect({ renderState, crop });
+  const effW = source.width;
+  const effH = source.height;
+  // A projected point: source-local x, y (viewport pixels) and NDC depth.
+  const local = new Float64Array(3);
   if (requestedTotal === 0) {
     return createEmptyReducedViewportPoints(
       effW,
@@ -371,33 +363,9 @@ export function reducePointsByDensity({
     const y = dimension > 1 ? positions[ix + 1] : 0;
     const z = dimension > 2 ? positions[ix + 2] : 0;
 
-    const clipX = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
-    const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
-    const clipZ = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
-    const clipW = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-    if (!Number.isFinite(clipW) || clipW <= 0) continue;
-
-    const ndcX = clipX / clipW;
-    const ndcY = clipY / clipW;
-    const ndcZ = clipZ / clipW;
-    if (
-      ndcX < -1 ||
-      ndcX > 1 ||
-      ndcY < -1 ||
-      ndcY > 1 ||
-      ndcZ < -1 ||
-      ndcZ > 1
-    ) {
-      continue;
-    }
-
-    let vx = (ndcX * 0.5 + 0.5) * viewportW;
-    let vy = (-ndcY * 0.5 + 0.5) * viewportH;
-    if (hasCrop && cropPx) {
-      if (vx < cropPx.x || vx > cropPx.x + cropPx.width || vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
-      vx -= cropPx.x;
-      vy -= cropPx.y;
-    }
+    if (!projectIntoSource(mvp, source, x, y, z, local)) continue;
+    const vx = local[0];
+    const vy = local[1];
 
     const cx = clampInt((vx / effW) * cols, 0, cols - 1);
     const cy = clampInt((vy / effH) * rows, 0, rows - 1);
@@ -433,44 +401,9 @@ export function reducePointsByDensity({
       const x = positions[ix];
       const y = dimension > 1 ? positions[ix + 1] : 0;
       const z = dimension > 2 ? positions[ix + 2] : 0;
-      const clipX =
-        mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
-      const clipY =
-        mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
-      const clipZ =
-        mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
-      const clipW =
-        mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-      if (!Number.isFinite(clipW) || clipW <= 0) continue;
-
-      const ndcX = clipX / clipW;
-      const ndcY = clipY / clipW;
-      const ndcZ = clipZ / clipW;
-      if (
-        ndcX < -1 ||
-        ndcX > 1 ||
-        ndcY < -1 ||
-        ndcY > 1 ||
-        ndcZ < -1 ||
-        ndcZ > 1
-      ) {
-        continue;
-      }
-
-      let vx = (ndcX * 0.5 + 0.5) * viewportW;
-      let vy = (-ndcY * 0.5 + 0.5) * viewportH;
-      if (hasCrop && cropPx) {
-        if (
-          vx < cropPx.x ||
-          vx > cropPx.x + cropPx.width ||
-          vy < cropPx.y ||
-          vy > cropPx.y + cropPx.height
-        ) {
-          continue;
-        }
-        vx -= cropPx.x;
-        vy -= cropPx.y;
-      }
+      if (!projectIntoSource(mvp, source, x, y, z, local)) continue;
+      const vx = local[0];
+      const vy = local[1];
 
       const cx = clampInt((vx / effW) * cols, 0, cols - 1);
       const cy = clampInt((vy / effH) * rows, 0, rows - 1);
@@ -558,7 +491,6 @@ export function reducePointsByDensity({
   const outRGBA = new Uint8Array(outCount * 4);
   const outA = new Float32Array(outCount);
   const outIndex = new Uint32Array(outCount);
-  const outSourcePositions = new Float32Array(outCount * 3);
   const outHighlighted = new Uint8Array(outCount);
 
   const seenHighlights = new Uint32Array(cellCount);
@@ -598,33 +530,9 @@ export function reducePointsByDensity({
     const y = dimension > 1 ? positions[ix + 1] : 0;
     const z = dimension > 2 ? positions[ix + 2] : 0;
 
-    const clipX = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
-    const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
-    const clipZ = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
-    const clipW = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-    if (!Number.isFinite(clipW) || clipW <= 0) continue;
-
-    const ndcX = clipX / clipW;
-    const ndcY = clipY / clipW;
-    const ndcZ = clipZ / clipW;
-    if (
-      ndcX < -1 ||
-      ndcX > 1 ||
-      ndcY < -1 ||
-      ndcY > 1 ||
-      ndcZ < -1 ||
-      ndcZ > 1
-    ) {
-      continue;
-    }
-
-    let vx = (ndcX * 0.5 + 0.5) * viewportW;
-    let vy = (-ndcY * 0.5 + 0.5) * viewportH;
-    if (hasCrop && cropPx) {
-      if (vx < cropPx.x || vx > cropPx.x + cropPx.width || vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
-      vx -= cropPx.x;
-      vy -= cropPx.y;
-    }
+    if (!projectIntoSource(mvp, source, x, y, z, local)) continue;
+    const vx = local[0];
+    const vy = local[1];
 
     const cx = clampInt((vx / effW) * cols, 0, cols - 1);
     const cy = clampInt((vy / effH) * rows, 0, rows - 1);
@@ -664,10 +572,6 @@ export function reducePointsByDensity({
     outRGBA[oj + 3] = 255;
     outA[slot] = a;
     outIndex[slot] = i;
-    const outputPositionIndex = slot * 3;
-    outSourcePositions[outputPositionIndex] = x;
-    outSourcePositions[outputPositionIndex + 1] = y;
-    outSourcePositions[outputPositionIndex + 2] = z;
     outHighlighted[slot] = isHighlighted
       ? highlightArray[i]
       : 0;
@@ -694,44 +598,9 @@ export function reducePointsByDensity({
       const x = positions[ix];
       const y = dimension > 1 ? positions[ix + 1] : 0;
       const z = dimension > 2 ? positions[ix + 2] : 0;
-      const clipX =
-        mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
-      const clipY =
-        mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
-      const clipZ =
-        mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
-      const clipW =
-        mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-      if (!Number.isFinite(clipW) || clipW <= 0) continue;
-
-      const ndcX = clipX / clipW;
-      const ndcY = clipY / clipW;
-      const ndcZ = clipZ / clipW;
-      if (
-        ndcX < -1 ||
-        ndcX > 1 ||
-        ndcY < -1 ||
-        ndcY > 1 ||
-        ndcZ < -1 ||
-        ndcZ > 1
-      ) {
-        continue;
-      }
-
-      let vx = (ndcX * 0.5 + 0.5) * viewportW;
-      let vy = (-ndcY * 0.5 + 0.5) * viewportH;
-      if (hasCrop && cropPx) {
-        if (
-          vx < cropPx.x ||
-          vx > cropPx.x + cropPx.width ||
-          vy < cropPx.y ||
-          vy > cropPx.y + cropPx.height
-        ) {
-          continue;
-        }
-        vx -= cropPx.x;
-        vy -= cropPx.y;
-      }
+      if (!projectIntoSource(mvp, source, x, y, z, local)) continue;
+      const vx = local[0];
+      const vy = local[1];
 
       const cx = clampInt((vx / effW) * cols, 0, cols - 1);
       const cy = clampInt((vy / effH) * rows, 0, rows - 1);
@@ -759,10 +628,6 @@ export function reducePointsByDensity({
       outRGBA[outputColorIndex + 3] = 255;
       outA[slot] = a;
       outIndex[slot] = i;
-      const outputPositionIndex = slot * 3;
-      outSourcePositions[outputPositionIndex] = x;
-      outSourcePositions[outputPositionIndex + 1] = y;
-      outSourcePositions[outputPositionIndex + 2] = z;
       outHighlighted[slot] = highlightArray[i];
     }
   }
@@ -773,7 +638,6 @@ export function reducePointsByDensity({
     rgba: outRGBA,
     alpha: outA,
     index: outIndex,
-    sourcePositions: outSourcePositions,
     highlighted: outHighlighted,
     scannedSourceCount:
       primaryScanCount + supplementalScanCount,

@@ -11,11 +11,13 @@
  * @module utils/debug
  */
 
+import { webStorage } from './web-storage.js';
+
 function getDebugEnabled() {
   if (typeof window === 'undefined') return false;
   if (window.CELLUCID_DEBUG) return true;
   try {
-    return localStorage.getItem('CELLUCID_DEBUG') === 'true';
+    return webStorage('localStorage')?.getItem('CELLUCID_DEBUG') === 'true';
   } catch {
     return false;
   }

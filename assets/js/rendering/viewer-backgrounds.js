@@ -10,7 +10,7 @@
  * Three owners cannot import a module and restate it instead: the
  * `#background-select` options and the `<html data-viewer-background>`
  * default in `index.html`, the early bootstrap `app/ui/core/theme-init.js`
- * (a classic script that runs before any module), and the page colours in
+ * (a classic script that runs before any module), and the page colors in
  * `assets/css`. `tests/viewer-background-enum-contract.test.mjs` holds all of
  * them to this list, so a background cannot exist in one place only.
  *
@@ -40,6 +40,24 @@ export const VIEWER_BACKGROUND_GROUPS = Object.freeze([
   Object.freeze({ label: 'Light', backgrounds: Object.freeze(['white', 'grid', 'studio', 'atelier', 'abyss', 'aurora']) }),
   Object.freeze({ label: 'Dark', backgrounds: Object.freeze(['black', 'grid-dark', 'studio-dark', 'nebula', 'abyss-dark', 'aurora-dark']) }),
 ]);
+
+/**
+ * A background's twin for a theme: the background in that theme's group at the
+ * same place (Studio (light) ↔ Studio (dark), Atelier ↔ Nebula, White ↔
+ * Black); itself when it is already in that group. A background the person
+ * never chose follows the theme by it (owner, 2026-11-10); one they chose stays.
+ *
+ * @param {string} background
+ * @param {'light'|'dark'} theme
+ * @returns {string}
+ */
+export function backgroundForTheme(background, theme) {
+  const [light, dark] = VIEWER_BACKGROUND_GROUPS.map(group => group.backgrounds);
+  const from = theme === 'dark' ? light : dark;
+  const to = theme === 'dark' ? dark : light;
+  const index = from.indexOf(background);
+  return index === -1 ? background : to[index];
+}
 
 /** The background a first visit opens with (`<html data-viewer-background>`). */
 export const DEFAULT_VIEWER_BACKGROUND = 'studio';

@@ -13,9 +13,10 @@
  * @module app/history/exports/step-text
  */
 
-import { formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { formatBound, formatCount, formatCountOf } from '../../../utils/format-units.js';
 import { domainName } from '../../actions/domains.js';
 import { idNumber, nameKey, OUTSIDE_CHANGE_TYPE } from '../model.js';
+import { upperFirst } from '../../../utils/text-case.js';
 
 /** The type of the step the history keeps for a change made outside an action (`model.js`). */
 export { OUTSIDE_CHANGE_TYPE };
@@ -26,7 +27,7 @@ export { OUTSIDE_CHANGE_TYPE };
  * only present it (camera, panels, render settings, kept views, colors).
  */
 export const METHOD_DOMAINS = Object.freeze(new Set([
-  'mapping', 'field-overlays', 'gene-sets', 'active-field', 'filters', 'visibility', 'highlights', 'analysis',
+  'mapping', 'expression', 'field-overlays', 'gene-sets', 'active-field', 'filters', 'visibility', 'highlights', 'analysis',
 ]));
 
 const AGENT_KEYS = new Map([['claude', 'claude'], ['chatgpt', 'chatgpt']]);
@@ -133,7 +134,7 @@ export function parameterLabel(key) {
     .replace(/[_-]+/g, ' ')
     .trim()
     .toLowerCase();
-  return words.length === 0 ? String(key) : words[0].toUpperCase() + words.slice(1);
+  return words.length === 0 ? String(key) : upperFirst(words);
 }
 
 const LIST_SHOWN = 5;
@@ -145,8 +146,7 @@ function isFieldReference(value) {
 }
 
 function shortNumber(value) {
-  if (Number.isInteger(value)) return formatCount(value);
-  return String(Number(value.toPrecision(6)));
+  return Number.isInteger(value) ? formatCount(value) : formatBound(value);
 }
 
 /**
@@ -293,21 +293,3 @@ export function runHeadings(runs) {
   });
 }
 
-/**
- * Upper-case the first letter of a step's sentence unless it is already a
- * name ("Colored by cell_type", "PCA computed").
- */
-export function sentenceStart(text) {
-  return text.length === 0 ? text : text[0].toUpperCase() + text.slice(1);
-}
-
-/**
- * Lower-case the first word of a step's sentence for use inside a sentence,
- * unless it reads as a name (an acronym, a gene: "PCA", "CD3E").
- */
-export function inSentence(text) {
-  if (text.length < 2) return text;
-  const first = text.split(/\s/, 1)[0];
-  if (first.length > 1 && first === first.toUpperCase()) return text;
-  return text[0].toLowerCase() + text.slice(1);
-}

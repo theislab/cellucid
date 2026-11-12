@@ -30,11 +30,11 @@ measured per engine, what was tried and reverted, and the open items, in
 | Exports | `25_decisions_exports.md` |
 | Served store and notebook widgets (Python, R) | `26_decisions_served_store_and_widgets.md` |
 | Memory model | `27_decisions_memory_model.md` |
-| Rendering layers (unread cells, zero grey, alpha layers, LOD) | `28_decisions_rendering_layers.md` |
+| Rendering layers (unread cells, zero gray, alpha layers, LOD) | `28_decisions_rendering_layers.md` |
 
 Update the page in the same change as the code it describes. Pages 23–27
 end with **Known issues (pre-commit)**: the defects, regressions and
-unverified behaviour known at the last commit.
+unverified behavior known at the last commit.
 
 ## Layers (as the tree stands)
 
@@ -83,7 +83,7 @@ leave `assets/workers/` out of searches.
 
 | To change… | Start at | Then |
 | --- | --- | --- |
-| What a file or folder is recognised as | `data/input-formats.js` (mirror: `input_formats.json` in Python and R, digest-pinned) | `data/anndata/open.js`, `data/anndata/views/index.js`, `data/anndata/transcode/index.js` |
+| What a file or folder is recognized as | `data/input-formats.js` (mirror: `input_formats.json` in Python and R, digest-pinned) | `data/anndata/open.js`, `data/anndata/views/index.js`, `data/anndata/transcode/index.js` |
 | How reads become requests (merging gaps, request size, concurrency) | `formats/io/byte-reader.js` (`planMergeGap`, `requestPieceBytes`) | `formats/io/link.js`, `formats/io/byte-source.js` (`REMOTE_POLICY`, `LOCAL_POLICY`) |
 | The link model (round trip, bandwidth, protocol, stalls) | `formats/io/link.js` | `formats/io/hosts.js` (per host), `data/host-link-memory.js` (earlier visits) |
 | Rate limits and retries of a host | `formats/io/hosts.js` (`createHostBook`: `admit`, `pace`, `budget`) | `formats/io/byte-source.js` (`isTransientFailure`, `retryWaitMs`) |
@@ -103,8 +103,13 @@ leave `assets/workers/` out of searches.
 | Decoders (codec choice, WebAssembly, workers) | `formats/io/decode-pool.js` | `formats/io/decoder-choice.js`, `formats/io/wasm-codecs.js` (`scripts/build-wasm-codecs.mjs`), `formats/io/inflate.js` |
 | A link provider | `data/sources/providers/<host>.js` | `data/sources/registry.js`, `data/sources/auth/` |
 | The reader worker's API | `data/anndata-reader-worker.js` | `data/anndata-reader-client.js` (`AnnDataReaderClient`), `data/anndata/reader.js` (`AnnDataReader`) |
-| How unread / zero / coloured cells are drawn | `rendering/alpha-visibility.js`, `rendering/read-cell-layer.js` | `rendering/high-perf-renderer.js`, `rendering/high-perf/read-cell-index.js` |
+| How unread / zero / colored cells are drawn | `rendering/alpha-visibility.js`, `rendering/read-cell-layer.js` | `rendering/high-perf-renderer.js`, `rendering/high-perf/read-cell-index.js` |
 | Points, LOD, frame time | `rendering/high-perf-renderer.js` | `rendering/high-perf/`, `rendering/viewer.js` |
+| What moves under reduced motion (the preference, and each mover drawn by script) | `utils/reduced-motion.js` (`prefersReducedMotion`, `onReducedMotionChange`; CSS: `assets/css/base/_accessibility.css`) | `rendering/viewer.js` (fades, studio surface, camera glide and zoom easing, the overlay context's `reducedMotion`, a redraw on change), `rendering/overlays/velocity/velocity-overlay.js` (`stillFlowTrace`: a still picture of the flow), `rendering/backdrops/backdrop-look-renderer.js`, `app/ui/modules/cinematic-camera/playback-controller.js`, `app/ui/modules/state/tour.js` |
+| Why a control is off (an input or a select turned off says why: its tooltip, a refused `setting.set`) | `ui/core/control-availability.js` (`setControlAvailability`, `unavailableReasonOf`; contract `tests/control-availability-contract.test.mjs`) | every owner that turns one off; `state-serializer/ui-controls.js` (`settingRecordOf`), `ui/core/deferred-control-readiness.js` |
+| What a slider's value reads as, for any value (its readout here and a value of the past in the history: "Grid density: 48³", not a position) | `ui/core/control-readout.js` (`defineControlReadout`, `controlReadout`; contract `tests/settings-describe-readout.test.mjs`) | the slider's owner (`render-controls.js`, `main.js` connectivity) writes its readout with it; `state/domains/settings.js` `describe` |
+| A dialog (every modal: the welcome, the license, a confirmation, Cite, Share, the history's, the community annotation dialogs, agent approvals): opening, focus in and back, Escape, the backdrop, keys kept from the page, stacking, the notification cards over it | `app/ui/components/app-dialog.js` (`wireAppDialog`, `keepAboveModals`: a native `<dialog>` opened with `showModal()`, the only modal implementation; contract `tests/app-dialog-contract.test.mjs`) | `ui/components/confirm-dialog.js` (the one confirmation), `ui/modules/community-annotation/modal-shell.js` and `community-annotation-voting-modal.js` (their shells), CSS `assets/css/components/_modals.css` (App dialogs: `.app-dialog`, `.dialog-layer`) |
+| A keyboard shortcut or key (a page-wide key, a camera key, a keyed widget's keys; who a key belongs to) | `app/ui/onboarding/shortcut-table.js` (the one table: the Keyboard shortcuts panel, the page's key listener `keyboard-shortcuts.js` with `provideShortcut`, and the docs page `scripts/generate-shortcut-reference.mjs` are made from it) | `utils/key-ownership.js` (`isPageKey`: a text field, a dropdown, a menu, a list or a dialog keeps its keys), `rendering/navigation-keys.js` (`NAVIGATION_KEYS`, the held-key ledger), `ui/keyboard-move.js` (`MOVE_KEYS`), `ui/modules/state/graph.js` (the History list); contract `tests/keyboard-shortcut-table-contract.test.mjs` |
 | An action (a new one, its parameters, what it changes, its label and pseudocode) | `app/actions/definitions/<area>.js` (pure; `touches` names every domain it can change) | the module that owns the state provides its implementation (`app/actions/README.md`, Implementations); `tests/action-catalog-contract.test.mjs`; `node scripts/generate-relay-bundle.mjs`; the step by step is developer doc 29 (action layer, state domains and history) |
 | A new `DataState` method or viewer API method, or a module that calls one that changes state | `app/actions/classification.js` (`reads()`, `internal(reason)` or `mutates(domains, actions)`; `MUTATION_OWNERS` for the modules that may call a `mutates` method) | `tests/action-method-classification-contract.test.mjs`, `tests/action-mutation-owners-contract.test.mjs`; a control dispatches the action instead (`app/actions/control-dispatch.js`) |
 | How a step names a field, a gene, a category, a highlight page or a view, and what is said when none matches | `app/actions/targets/` (`fields.js`, `pages.js`, `views.js`, `names.js`) | `app/actions/definitions/params.js` (the parameter schemas that name them) |
@@ -122,9 +127,9 @@ leave `assets/workers/` out of searches.
 | Claude and ChatGPT as a connector (the relay, approving a connection, the Agents panel, the view card in the chat) | `app/agent/bridge/` (`relay-protocol.js`: the wire both ends share; `README.md`) | `app/agent/connect/` (the panel and its dialogs), `relay/` (the Worker; `README.md`, `view-app.js`), `node scripts/generate-relay-bundle.mjs` |
 | An agent app on this computer driving a host viewer (`cellucid mcp` of the Python or R package: the `agent_*` commands and events of the viewer channel, the local connection, its tool list) | `app/agent/bridge/agent-calls.js` (the one engine for agents from outside the tab), `app/agent/bridge/local-agents.js` (what the packages read: `mcp-tools.json`) | `data/viewer-protocol.js` + `data/viewer-host-source.js` (`onAgent`), `app/main.js` (the wiring), `app/agent/presence/` (`questionFor`, `answer`, `onPermissionsChanged`), `node scripts/generate-action-catalog.mjs` (writes `mcp-tools.json` here and in both packages); developer doc 31 |
 | Community annotation (the panel, Pull and Publish, an agent's read and vote, what is not published, two tabs, renamed fields) | `app/ui/modules/community-annotation-controls.js` (the controller; `annotation.*` actions) | `app/ui/modules/community-annotation/published-baseline.js` (published view, pending changes, a vote alone), `app/community-annotations/runtime-context.js` (scope, paused here), `app/community-annotations/field-names.js` (keys on the dataset's names), `app/community-annotations/session.js`, `github-sync.js`; developer doc of community annotation in `cellucid-python/docs/user_guide/web_app/j_community_annotation/` |
-| Opening a dataset by name (an agent's `dataset.open`) | `app/ui/modules/dataset-open-action.js` | `app/actions/targets/datasets.js` (names), `app/actions/definitions/datasets.js`, `data/whole-download.js` (`setWholeDownloadGate`: asking before a whole download) |
+| Opening a dataset by name (an agent's `dataset.open`) | `app/ui/modules/dataset-open-action.js` | `app/actions/targets/datasets.js` (names), `app/actions/definitions/datasets.js`, `data/whole-download.js` (`setWholeDownloadGate`: asking before a whole download), `app/ui/modules/seen-addresses.js` (asking before a link the person has not seen in this tab: `opensLinks`, `ctx.confirmLink`) |
 | Analysis | `app/analysis/` | developer doc 11 |
-| How a gene is chosen by name (search, Enter, an analysis's "colour by", gene sets), and what is said when none is | `app/utils/gene-lookup.js` (`rankGeneMatches`, `resolveTypedGene`, `resolveExactGene`, `describeUnavailableGene`) | `app/ui/modules/field-selector-gene-expression.js` (`selectGene`: a choice is work on the open cells and follows its gene across a gene list replaced, `DataState.locateVarField`), `app/ui/modules/field-interaction-owner.js` (`describeUnshownField`), `app/analysis/shared/gene-sets.js` (`resolveGenes`) |
+| How a gene is chosen by name (search, Enter, an analysis's "color by", gene sets), and what is said when none is | `app/utils/gene-lookup.js` (`rankGeneMatches`, `resolveTypedGene`, `resolveExactGene`, `describeUnavailableGene`) | `app/ui/modules/field-selector-gene-expression.js` (`selectGene`: a choice is work on the open cells and follows its gene across a gene list replaced, `DataState.locateVarField`), `app/ui/modules/field-interaction-owner.js` (`describeUnshownField`), `app/analysis/shared/gene-sets.js` (`resolveGenes`) |
 
 ## Rules that hold everywhere
 
@@ -151,3 +156,12 @@ leave `assets/workers/` out of searches.
   register it after what it undoes exists (the queue entry, the remover it
   uses). Work that starts with a stopped signal throws before doing anything
   (`throwIfAborted`). Enforced by `tests/abort-listener-contract.test.mjs`.
+- What a piece of the page registers it releases in its own teardown:
+  listeners (an `AbortController` per owner, its `signal` on each one),
+  observers (`disconnect`), timers and frames, workers (`terminate`, or a
+  pool under `workers/idle-retirement.js`), WebGL objects and object URLs.
+  Opening another dataset, closing a window, docking a panel, New chat and
+  removing a view each end an owner. A long day of use therefore holds the
+  same after each round: `tests/browser/day-of-use-lifecycle.spec.mjs`
+  (Chromium) plays the same round twice and names every listener,
+  controller, worker, timer and live GPU object that one more round left.

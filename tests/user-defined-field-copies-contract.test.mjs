@@ -10,10 +10,10 @@
  * centroids wrote them into the registry's table and found none in its own
  * ("Normalized user-defined centroids of layout ... were not published"),
  * and an edit made in a kept view left the live copy (the registry's object)
- * with the new categories under colours indexed for the old ones. A field
+ * with the new categories under colors indexed for the old ones. A field
  * deleted, restored or purged in one view stayed as it was in the others.
  *
- * Each copy now takes the new definition at once, keeping its own colours
+ * Each copy now takes the new definition at once, keeping its own colors
  * and hidden categories by category, and follows the field's deletion when
  * its view is shown, as a dataset field's copy follows the delete registry.
  */
@@ -40,7 +40,7 @@ const GREEN = [0, 1, 0];
 const BLUE = [0, 0, 1];
 const GREY = [0.5, 0.5, 0.5];
 
-test('a view carries its colours and hidden categories through each edit, by category', () => {
+test('a view carries its colors and hidden categories through each edit, by category', () => {
   const state = { colors: colorsOf([RED, GREEN, BLUE, GREY]), visible: visibleOf([true, false, true, false]) };
   const plain = carried => ({ colors: rgbListOf({ _categoryColors: carried.colors }), visible: visibleListOf({ _categoryVisible: carried.visible }) });
   const asDrawn = rgbList => rgbListOf({ _categoryColors: colorsOf(rgbList) });
@@ -64,7 +64,7 @@ test('a view carries its colours and hidden categories through each edit, by cat
     visible: [false, true, false],
   });
 
-  // Merge 'a' (dragged) into 'b': the merged category has a's colour and is
+  // Merge 'a' (dragged) into 'b': the merged category has a's color and is
   // shown because a was.
   const merged = carryCategoryStateThroughMerge(
     buildMergeCategoriesTransform(['a', 'b', 'c', 'd'], 0, 1),
@@ -77,7 +77,7 @@ test('a view carries its colours and hidden categories through each edit, by cat
     visible: [true, true, false],
   });
 
-  // Another list: by label; a new label gets its palette colour, shown.
+  // Another list: by label; a new label gets its palette color, shown.
   assert.deepEqual(
     plain(carryCategoryStateByCategory(['a', 'b', 'c', 'd'], ['d', 'x', 'b'], state)),
     { colors: asDrawn([GREY, [...getCategoryColor(1)], GREEN]), visible: [false, true, false] }
@@ -184,7 +184,7 @@ function assertSharesDefinition(state, id, label) {
 
 test('a category deleted in the live view reaches the kept view, which then computes another layout', async () => {
   const { state, manager, fieldIndex, id } = await sceneWithKeptView();
-  // The kept view (focused) hides 'c' and recolours 'a'.
+  // The kept view (focused) hides 'c' and recolors 'a'.
   const kept = state.obsData.fields[fieldIndex];
   state.setColorForCategory(kept, 0, RED);
   state.setVisibilityForCategory(kept, 2, false);
@@ -213,7 +213,7 @@ test('a category deleted in the live view reaches the kept view, which then comp
   assertSharesDefinition(state, id, 'after the kept view computed 3D');
 });
 
-test('a category merged in a kept view leaves the live copy its own colours, by category', async () => {
+test('a category merged in a kept view leaves the live copy its own colors, by category', async () => {
   const { state, fieldIndex, id } = await sceneWithKeptView();
   state.setActiveView('live');
   const live = state.obsData.fields[fieldIndex];
@@ -232,7 +232,7 @@ test('a category merged in a kept view leaves the live copy its own colours, by 
   assert.equal(state.centroidPositions.length / 3, 2);
 });
 
-test('a consensus column rebuilt in place reaches every view, which keeps its colours by label', async () => {
+test('a consensus column rebuilt in place reaches every view, which keeps its colors by label', async () => {
   const { state, fieldIndex, id } = await sceneWithKeptView();
   const kept = state.obsData.fields[fieldIndex];
   state.setColorForCategory(kept, 2, GREEN);
@@ -273,4 +273,44 @@ test('a field deleted, restored or purged in one view is so in every view once s
     assert.equal(copy.codes, null);
     assert.deepEqual(copy.categories, []);
   }
+});
+
+test('two deleted fields of one name: Restore and Delete for good each act on the one named by its place (R9F-4)', async t => {
+  const { getActions } = await import('../assets/js/app/actions/index.js');
+  const { ActionRefused } = await import('../assets/js/app/actions/dispatcher.js');
+  const { installFieldActions } = await import('../assets/js/app/state/actions/field-actions.js');
+  const { getFieldRegistry } = await import('../assets/js/app/utils/field-registry.js');
+  const { state } = await createScene();
+  const remove = installFieldActions({ state });
+  t.after(remove);
+  const actions = getActions();
+  const make = (key, codes) => state.upsertUserDefinedCategoricalField({ key, categories: ['a', 'b'], codes: Uint8Array.from(codes) }).fieldIndex;
+  // "regions" deleted, then another field renamed "regions" and deleted: Deleted fields lists both.
+  const first = make('regions', [0, 0, 0, 0, 1, 1, 1, 1]);
+  await actions.dispatch('field.delete', { field: { source: 'obs', key: 'regions' } });
+  const second = make('zones', [1, 1, 1, 1, 0, 0, 0, 0]);
+  await actions.dispatch('field.rename', { field: { source: 'obs', key: 'zones' }, name: 'regions' });
+  await actions.dispatch('field.delete', { field: { source: 'obs', key: 'regions' } });
+  const deleted = () => getFieldRegistry().getDeletedFields('obs').map(entry => entry.field);
+  assert.deepEqual(deleted().map(field => field.key), ['regions', 'regions']);
+  const [firstField, secondField] = [state.obsData.fields[first], state.obsData.fields[second]];
+  assert.deepEqual(deleted(), [firstField, secondField]);
+
+  // Named by its name alone, it is ambiguous: the refusal says how to name one.
+  await assert.rejects(
+    actions.dispatch('field.restore', { field: { source: 'obs', key: 'regions' } }),
+    error => error instanceof ActionRefused && /^2 deleted fields are named "regions"; say which with `which`: 1 or 2, in the order Deleted fields lists them\.$/.test(error.message),
+  );
+  // The second (as Deleted fields lists them) comes back; the first stays deleted.
+  await actions.dispatch('field.restore', { field: { source: 'obs', key: 'regions' }, which: 2 });
+  assert.equal(secondField._isDeleted, false);
+  assert.equal(firstField._isDeleted, true);
+  assert.deepEqual(deleted(), [firstField]);
+  // One left of the name: `which` is not needed, and past the count it is refused.
+  await assert.rejects(
+    actions.dispatch('field.purge', { field: { source: 'obs', key: 'regions' }, which: 2 }),
+    /There is one deleted field named "regions"; `which` 2 names none\./,
+  );
+  await actions.dispatch('field.purge', { field: { source: 'obs', key: 'regions' } });
+  assert.equal(firstField._isPurged, true);
 });

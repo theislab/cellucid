@@ -3,7 +3,7 @@
  * wrong: a host that hides paths starting with `_` or `.` (Jekyll, GitHub
  * Pages without `.nojekyll`) is refused instead of reading anndata's
  * `obs/_index` as empty, at no round trip in sequence for a host that serves
- * everything; and a cancelled open or read leaves no unhandled rejection.
+ * everything; and a canceled open or read leaves no unhandled rejection.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -247,7 +247,7 @@ test('cancelling one read of a merged range leaves the others waiting for it; th
   assert.equal(aborted, 0, 'the request goes on for B');
   pending[0]();
   assert.deepEqual((await readB)[0], data.subarray(200, 300));
-  // Both withdraw: the request is cancelled.
+  // Both withdraw: the request is canceled.
   const c = new AbortController();
   const d = new AbortController();
   const readC = store.getRanges('X/1', [{ offset: 0, length: 100 }], { signal: c.signal });
@@ -259,4 +259,33 @@ test('cancelling one read of a merged range leaves the others waiting for it; th
   await assert.rejects(readD);
   await until(() => aborted > 0, 'the shared request stopped');
   assert.equal(aborted, 1, 'the shared request stopped once nobody waited');
+});
+
+test('a served store whose file changed on disk (409 from cellucid serve) is refused with the server\'s sentence, and every later read too (R9S-9)', async () => {
+  // A file written again while `cellucid serve` served it: every chunk was
+  // answered 500 with an HDF5 error, said as the server failing ("try again
+  // later"). The server now answers 409 with what to do; the store says it
+  // as it is and reads nothing more of either version.
+  const entries = await corpusEntries('anndata/v2.zarr');
+  const why = 'atlas.h5ad changed on disk since the server opened it: serve it again (restart cellucid serve, or show the viewer again) to read it as it is now.';
+  let changed = false;
+  const base = hostFetch(entries);
+  const fetchImpl = async (url, init = {}) => {
+    if (changed) return new Response(why, { status: 409, headers: { 'Content-Type': 'text/plain', 'Content-Length': String(new TextEncoder().encode(why).length) } });
+    return base(url, init);
+  };
+  const root = await openZarr(httpStore('http://127.0.0.1:8765/host/', { fetch: fetchImpl }));
+  changed = true;
+  await assert.rejects(root.get('obs/n_genes').read(), error => {
+    assert.equal(error.code, 'changed');
+    assert.equal(error.message, why);
+    return true;
+  });
+  changed = false;
+  // Nothing of the store is read any more, even where the host answers again.
+  await assert.rejects(root.get('obsm/X_umap').read(), error => error.message === why);
+  // A 409 without a sentence of its own is said in Cellucid's words.
+  const { changedWhereServed } = await import('../assets/js/formats/io/byte-source.js');
+  assert.equal(changedWhereServed('atlas.zarr', null).message,
+    'atlas.zarr changed where it is served while it was open (HTTP 409): serve it again, or open it again, to read it as it is now.');
 });

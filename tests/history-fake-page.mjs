@@ -66,7 +66,7 @@ export function deferred() {
 let trackers = 0;
 
 /** A history on the fake page, started; `act` answers an action's outcome, `step` the step it made. */
-export async function makePage({ offDomains = () => [], slow = null, extra = [], provide = () => {} } = {}) {
+export async function makePage({ offDomains = () => [], slow = null, extra = [], provide = () => {}, openSaved = null } = {}) {
   const page = fakePage();
   const dispatcher = createActionDispatcher({ catalog: createActionCatalog([...definitions, ...extra, ...historyActions]) });
   dispatcher.provide('a.set', ({ v }) => { page.state.a = v; });
@@ -80,7 +80,7 @@ export async function makePage({ offDomains = () => [], slow = null, extra = [],
   let t = 0;
   const history = createHistory({
     dispatcher, domains: page.domains, dataset: { id: 'd1', name: 'Demo', cellOrder: null },
-    newTrackerId: () => trackerId(++trackers), now: () => ++t * 1000, offDomains,
+    newTrackerId: () => trackerId(++trackers), now: () => ++t * 1000, offDomains, openSaved,
   });
   await history.startTracker();
   const act = async (type, params = {}, meta = {}) => (await dispatcher.dispatch(type, params, meta)).outcome;

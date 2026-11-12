@@ -47,7 +47,7 @@ function compensatedMean(values, pivot) {
 }
 
 /**
- * The mean and centred sum of squares of an array, about a pivot: the
+ * The mean and centered sum of squares of an array, about a pivot: the
  * values less the pivot are averaged (`compensatedMean`) and squared about
  * that, so values far from zero but close to each other (1e8 apart by 1e-3:
  * a timestamp, a count with an offset) keep every digit of their spread when
@@ -843,7 +843,7 @@ export function ascendingOrder(values) {
 
 /**
  * Largest number of distinct values a rank kernel will tabulate before it
- * switches to sorting. Count-derived expression (raw counts, or normalised
+ * switches to sorting. Count-derived expression (raw counts, or normalized
  * counts of a sparse matrix) carries few distinct values per gene even across
  * half a million cells, and there the tabulated form is exact and far cheaper
  * than any sort. `data-worker.js` bounds
@@ -1565,12 +1565,12 @@ export function isValidNumber(value) {
 }
 
 /**
- * Centred second moments of the finite (x, y) pairs, computed in two passes.
+ * Centered second moments of the finite (x, y) pairs, computed in two passes.
  *
  * The one-pass form `n·Σx² − (Σx)²` cancels catastrophically: for a constant
  * variable whose value is not exactly representable (0.1, 23.4, …) it comes
  * out as a tiny negative number, so its square root is NaN, and with a large
- * offset it loses every significant digit. Centring on the mean first keeps
+ * offset it loses every significant digit. Centering on the mean first keeps
  * the sums non-negative and exact for a constant variable, which is detected
  * from its range and reported with a sum of squares of exactly zero.
  *
@@ -1625,7 +1625,7 @@ export function pairedCentredMoments(xs, ys) {
 }
 
 /**
- * Pearson coefficient from centred moments, clamped to [-1, 1] against
+ * Pearson coefficient from centered moments, clamped to [-1, 1] against
  * final-bit round-off; NaN when either variable has no variance: a constant
  * says nothing about a correlation (SciPy returns NaN with a
  * `ConstantInputWarning`), and r = 0 would read as evidence of none.

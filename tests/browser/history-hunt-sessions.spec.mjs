@@ -235,24 +235,23 @@ test('damaged and truncated files are refused, and nothing changes', async ({ pa
   expect(outcomes.filter(outcome => outcome.restored || !outcome.unchanged)).toEqual([]);
 });
 
-test('a hand-edited file whose shown values cannot be put back is refused whole: nothing half-applied', async ({ page }, testInfo) => {
+test('a hand-edited file whose shown values cannot be put back is restored but for that part, which keeps what was shown (F155)', async ({ page }, testInfo) => {
   test.setTimeout(300_000);
   await open(page);
   await buildHistory(page);
   const bytes = await save(page, testInfo, 'hunt-edit.cellucid-session');
-  const before = await wholeHistory(page);
+  // Each domain refused is one part: named with its own words, left as shown; the rest of the file is restored.
   const edits = {
-    // A later domain refuses: the earlier ones were already put back.
-    'camera names a view that is not there': whole => editShown(whole, 'camera', value => { value.views.push(structuredClone(value.views[0])); }),
-    'filters name a field the dataset lacks': whole => editShown(whole, 'filters', value => {
+    'camera names a view that is not there': ['Camera', whole => editShown(whole, 'camera', value => { value.views.push(structuredClone(value.views[0])); })],
+    'filters name a field the dataset lacks': ['Filters', whole => editShown(whole, 'filters', value => {
       value.views[0].push({ field: { source: 'obs', key: 'no_such_field' }, hidden: ['x'] });
-    }),
-    'highlights hold a cell past the dataset': whole => editShown(whole, 'highlights', value => {
+    })],
+    'highlights hold a cell past the dataset': ['Highlights', whole => editShown(whole, 'highlights', value => {
       value.pages[0].groups[0].cells = Uint32Array.from([1, 2, 999999]);
-    }),
+    })],
   };
   const outcomes = [];
-  for (const [label, edit] of Object.entries(edits)) {
+  for (const [label, [part, edit]] of Object.entries(edits)) {
     const whole = await readWholeSession(bytes);
     await edit(whole);
     const edited = await writeWholeSession(whole);
@@ -261,10 +260,10 @@ test('a hand-edited file whose shown values cannot be put back is refused whole:
     await expect.poll(async () => (await messages(page)).length).toBeGreaterThan(0);
     await settled(page);
     const said = await messages(page);
-    const now = await wholeHistory(page);
-    outcomes.push({ label, restored: said.includes(RESTORED), unchanged: JSON.stringify(now) === JSON.stringify(before), said });
+    const named = new RegExp(`^Session restored but for 1 part\\. ${part} could not be restored: .+ It is left as it was shown\\.$`);
+    outcomes.push({ label, restored: said.includes(RESTORED), named: said.some(text => named.test(text)), said });
   }
-  expect(outcomes.filter(outcome => outcome.restored || !outcome.unchanged)).toEqual([]);
+  expect(outcomes.filter(outcome => outcome.restored || !outcome.named)).toEqual([]);
 });
 
 /** Change, on a copy, the value one domain shows at the active head, wherever a step holds it. */

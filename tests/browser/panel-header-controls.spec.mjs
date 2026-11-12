@@ -17,6 +17,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { tabKey } from './helpers/dialog-keys.mjs';
 import { expectFloatingSettled, openCollapsedPanels } from './helpers/panels.mjs';
 
 const DATASET_URL =
@@ -214,7 +215,7 @@ test('a panel toggles from the keyboard, and Tab reaches its controls next to it
   browserName,
 }) => {
   // WebKit, like Safari, tabs through buttons only with Option held.
-  const tab = browserName === 'webkit' ? 'Alt+Tab' : 'Tab';
+  const tab = tabKey(browserName);
   await openDataset(page);
   const details = page.locator(`#${PANEL}`);
   const summary = details.locator('> summary');
@@ -285,6 +286,79 @@ test('docking and undocking by button never toggles the panel, and focus follows
   await expect(details).toHaveAttribute('open', '');
   expect(await toggles(page, PANEL)).toBe(2); // a torn-off panel opens
 
+  expect(productErrors).toEqual([]);
+});
+
+test('Dock all brings every floating section back to its place', async ({
+  page,
+}) => {
+  // F126 (bug hunt): with every section undocked the sidebar stayed a column
+  // of logo and footer, and the way back was each window's own dock button.
+  const productErrors = observeProductErrors(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openDataset(page);
+  const sectionOrder = () => page.evaluate(() => [...document.querySelectorAll(
+    '#sidebar .accordion > .accordion-panel > details.accordion-section',
+  )].map(details => details.id));
+  const order = await sectionOrder();
+  expect(order.length).toBeGreaterThan(2);
+  const dockAll = page.getByRole('button', { name: /^Dock all \d+ panels back into the sidebar$/ });
+  await expect(page.locator('#dock-all-panels-btn')).toBeHidden();
+
+  await control(page, PANEL, 'accordion-undock-btn').click();
+  await expect(page.locator('#dock-all-panels-btn')).toHaveText('Dock Visualization');
+  for (const id of order.filter(id => id !== PANEL)) {
+    await control(page, id, 'accordion-undock-btn').click();
+  }
+  await expect(page.locator('#sidebar .accordion > .accordion-panel')).toHaveCount(0);
+  await expect(dockAll).toHaveText(`Dock all ${order.length} panels`);
+  // Where the emptied column shows it: below the logo, where the sections begin.
+  const placement = await page.evaluate(() => {
+    const button = document.getElementById('dock-all-panels-btn');
+    // Its words on one line, whole inside the button.
+    const words = document.createRange();
+    words.selectNodeContents(button);
+    const lines = new Set([...words.getClientRects()].map(rect => Math.round(rect.top)));
+    const text = words.getBoundingClientRect();
+    const box = button.getBoundingClientRect();
+    return {
+      afterBrand: button.previousElementSibling?.classList.contains('sidebar-brand') === true,
+      beforeSections: button.nextElementSibling?.classList.contains('accordion') === true,
+      oneLine: lines.size === 1 && text.left >= box.left - 0.5 && text.right <= box.right + 0.5,
+    };
+  });
+  expect(placement).toEqual({ afterBrand: true, beforeSections: true, oneLine: true });
+
+  await dockAll.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator('#floating-panels-root > .accordion-panel')).toHaveCount(0);
+  expect(await sectionOrder()).toEqual(order);
+  await expect(page.locator('#dock-all-panels-btn')).toBeHidden();
+  await expect(control(page, order[0], 'accordion-undock-btn')).toBeFocused();
+  expect(productErrors).toEqual([]);
+});
+
+test('a tall floating panel stays inside the screen when the window shrinks', async ({
+  page,
+}) => {
+  // S2 (bug hunt): a window under the sidebar's toggle was capped at the
+  // viewport less its margins, so after a shrink its foot ran past the screen
+  // by the toggle's height; and a window still in its lift animation
+  // (scaled) was measured short and left past the foot.
+  const productErrors = observeProductErrors(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openDataset(page);
+  for (const id of [PANEL, OTHER_PANEL]) {
+    await control(page, id, 'accordion-undock-btn').click();
+    await expect(frameOf(page, id)).toHaveClass(/\baccordion-floating\b/);
+  }
+  for (const size of [{ width: 900, height: 700 }, { width: 1280, height: 520 }]) {
+    await page.setViewportSize(size);
+    for (const id of [PANEL, OTHER_PANEL]) {
+      await expect.poll(() => frameOf(page, id).evaluate(frame => Math.round(frame.getBoundingClientRect().bottom)))
+        .toBeLessThanOrEqual(size.height - 8);
+    }
+  }
   expect(productErrors).toEqual([]);
 });
 

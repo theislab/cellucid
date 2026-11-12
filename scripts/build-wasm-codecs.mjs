@@ -1,4 +1,4 @@
-// The WebAssembly decoders: `assets/wasm/codecs.wasm` and the licences of the
+// The WebAssembly decoders: `assets/wasm/codecs.wasm` and the licenses of the
 // code in it (`assets/wasm/LICENSES/`), built from pinned upstream releases.
 //
 // - Zstandard 1.5.6 (decompression only), LZ4 1.10.0 (block decoding) and
@@ -71,7 +71,7 @@ export const SOURCES = Object.freeze({
   },
 });
 
-/** The licence of each part of the module, as shipped beside it, from its source tree. */
+/** The license of each part of the module, as shipped beside it, from its source tree. */
 export const LICENSES = Object.freeze([
   { name: 'zstd.txt', source: 'zstd', path: 'LICENSE' },
   { name: 'lz4.txt', source: 'lz4', path: 'lib/LICENSE' },
@@ -164,7 +164,7 @@ export async function inputs({ cache, offline = false }) {
   return { zig: join(zigTree, process.platform === 'win32' ? 'zig.exe' : 'zig'), trees };
 }
 
-/** The module's bytes and its licences, by path under the repository. */
+/** The module's bytes and its licenses, by path under the repository. */
 export function build({ zig, trees, cache }) {
   const version = execFileSync(zig, ['version'], { encoding: 'utf8' }).trim();
   if (version !== ZIG_VERSION) throw new Error(`${zig} is zig ${version}, not ${ZIG_VERSION}.`);

@@ -31,7 +31,9 @@ export const FLOATING_MARGIN = 8;
  * @param {number} box.width
  * @param {number} box.height
  * @param {number} box.viewportWidth
- * @param {number} box.viewportHeight
+ * @param {number} box.viewportHeight - The area's bottom edge (the bar's top on a phone)
+ * @param {number} [box.viewportTop] - The area's top edge: below the sidebar's
+ *   toggle while it shows (`floatingArea`), 0 otherwise
  * @returns {{x: number, y: number}}
  */
 export function clampFloatingPosition({
@@ -40,13 +42,15 @@ export function clampFloatingPosition({
   width,
   height,
   viewportWidth,
-  viewportHeight
+  viewportHeight,
+  viewportTop = 0
 }) {
+  const minTop = viewportTop + FLOATING_MARGIN;
   const maxLeft = Math.max(FLOATING_MARGIN, viewportWidth - width - FLOATING_MARGIN);
-  const maxTop = Math.max(FLOATING_MARGIN, viewportHeight - height - FLOATING_MARGIN);
+  const maxTop = Math.max(minTop, viewportHeight - height - FLOATING_MARGIN);
   return {
     x: Math.min(Math.max(left, FLOATING_MARGIN), maxLeft),
-    y: Math.min(Math.max(top, FLOATING_MARGIN), maxTop)
+    y: Math.min(Math.max(top, minTop), maxTop)
   };
 }
 
@@ -80,6 +84,7 @@ export function clearOfOpenHeaders({
   minHeight,
   viewportWidth,
   viewportHeight,
+  viewportTop = 0,
   headers,
   step,
   reach
@@ -90,7 +95,7 @@ export function clearOfOpenHeaders({
     );
   }
   const clamp = (x, y, h) => clampFloatingPosition({
-    left: x, top: y, width, height: h, viewportWidth, viewportHeight
+    left: x, top: y, width, height: h, viewportWidth, viewportHeight, viewportTop
   });
   const covered = ({ x, y }, h) => headers.filter(header =>
     x - reach < header.right && x + width + reach > header.left
@@ -167,6 +172,7 @@ export function resizeFloatingRect({
   minHeight,
   viewportWidth,
   viewportHeight,
+  viewportTop = 0,
   snap = null
 }) {
   if (!RESIZE_EDGES.includes(edge)) {
@@ -174,7 +180,7 @@ export function resizeFloatingRect({
   }
   const lowX = FLOATING_MARGIN;
   const highX = Math.max(lowX, viewportWidth - FLOATING_MARGIN);
-  const lowY = FLOATING_MARGIN;
+  const lowY = viewportTop + FLOATING_MARGIN;
   const highY = Math.max(lowY, viewportHeight - FLOATING_MARGIN);
   let left = start.left;
   let top = start.top;
@@ -272,18 +278,18 @@ export function keyboardResizeTravel(edge, key, step, { viewportWidth, viewportH
  * sidebar, inside the margin. When the free area is narrower than the
  * window's minimum, the whole viewport is used.
  *
- * @param {{sidebarRight: number, minWidth: number, viewportWidth: number, viewportHeight: number}} args
+ * @param {{sidebarRight: number, minWidth: number, viewportWidth: number, viewportHeight: number, viewportTop?: number}} args
  * @returns {{left: number, top: number, width: number, height: number}}
  */
-export function maximizedFloatingRect({ sidebarRight, minWidth, viewportWidth, viewportHeight }) {
+export function maximizedFloatingRect({ sidebarRight, minWidth, viewportWidth, viewportHeight, viewportTop = 0 }) {
   const besideSidebar = sidebarRight + FLOATING_MARGIN;
   const freeWidth = viewportWidth - besideSidebar - FLOATING_MARGIN;
   const left = sidebarRight > 0 && freeWidth >= minWidth ? besideSidebar : FLOATING_MARGIN;
   return {
     left,
-    top: FLOATING_MARGIN,
+    top: viewportTop + FLOATING_MARGIN,
     width: Math.max(0, viewportWidth - left - FLOATING_MARGIN),
-    height: Math.max(0, viewportHeight - 2 * FLOATING_MARGIN)
+    height: Math.max(0, viewportHeight - viewportTop - 2 * FLOATING_MARGIN)
   };
 }
 
@@ -305,6 +311,7 @@ export function maximizedFloatingRect({ sidebarRight, minWidth, viewportWidth, v
 export function floatingSnapTargets({
   viewportWidth,
   viewportHeight,
+  viewportTop = 0,
   sidebarRight,
   sidebarWidth,
   others,
@@ -315,7 +322,7 @@ export function floatingSnapTargets({
   const freeRight = viewportWidth - FLOATING_MARGIN;
   const xs = [FLOATING_MARGIN, freeRight, (freeLeft + freeRight) / 2];
   if (sidebarRight > 0) xs.push(freeLeft);
-  const ys = [FLOATING_MARGIN, viewportHeight - FLOATING_MARGIN, viewportHeight / 2];
+  const ys = [viewportTop + FLOATING_MARGIN, viewportHeight - FLOATING_MARGIN, (viewportTop + viewportHeight) / 2];
   for (const other of others) {
     xs.push(other.left, other.right);
     ys.push(other.top, other.bottom);

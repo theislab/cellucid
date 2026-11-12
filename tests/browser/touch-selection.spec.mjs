@@ -48,7 +48,7 @@ async function openDataset(page) {
   );
 }
 
-async function colourByCellType(page) {
+async function colorByCellType(page) {
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
   // An annotation press reads the pressed pane's field from the state, so
@@ -308,7 +308,7 @@ test.describe('on a phone', () => {
   }) => {
     const productErrors = observeProductErrors(page);
     await openDataset(page);
-    await colourByCellType(page);
+    await colorByCellType(page);
     await turnOnSelectMode(page);
     await closeSidebar(page);
     const [point] = await findCellPoints(page, 1);
@@ -480,7 +480,7 @@ test.describe('on a tablet in multiview', () => {
   }) => {
     const productErrors = observeProductErrors(page);
     await openDataset(page);
-    await colourByCellType(page);
+    await colorByCellType(page);
     await page.locator('#split-keep-view-btn').tap();
     await expect(page.locator('.split-badge')).toHaveCount(2);
     const viewIds = await page.evaluate(() => [
@@ -549,7 +549,7 @@ test.describe('with a mouse', () => {
   }) => {
     const productErrors = observeProductErrors(page);
     await openDataset(page);
-    await colourByCellType(page);
+    await colorByCellType(page);
     expect(await page.evaluate(() => matchMedia('(any-pointer: coarse)').matches))
       .toBe(false);
     await expect(page.locator('#select-bar')).toBeHidden();
@@ -622,7 +622,7 @@ for (const theme of ['light', 'dark']) {
           width: trackStyle.width,
         };
       });
-      // A colour sampled mid-transition is neither state, so every sample
+      // A color sampled mid-transition is neither state, so every sample
       // waits until the switch's own transitions (track and knob) have ended.
       const settled = () => expect.poll(() => toggle.evaluate(element =>
         element.getAnimations({ subtree: true }).length)).toBe(0);

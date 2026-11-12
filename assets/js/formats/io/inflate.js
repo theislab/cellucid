@@ -33,7 +33,7 @@
  * hand the thread back (`NATIVE_CODEC_SLICE_MS`), so a long payload is never
  * one task.
  *
- * The output stream's reader is read to its end (or cancelled) and then
+ * The output stream's reader is read to its end (or canceled) and then
  * dropped, never released (`releaseLock()`): WebKit runs the release's
  * JavaScript while holding a lock its garbage collector takes when it visits
  * the reader, so a collection that starts during the release never finishes,
@@ -73,7 +73,7 @@ function requireDecompressionStream(format, label) {
  * Input bytes handed to a native decompressor per pull.
  *
  * Every supported engine's `DecompressionStream` inflates each written chunk
- * to completion before it honours backpressure, so a whole payload written as
+ * to completion before it honors backpressure, so a whole payload written as
  * one chunk lets a DEFLATE bomb expand without bound before any reader limit
  * can cancel it. Feeding the input in slices of this size bounds the output
  * produced past a reader's limit to DEFLATE's maximum expansion of one slice

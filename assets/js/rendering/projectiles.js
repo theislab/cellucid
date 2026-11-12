@@ -9,6 +9,7 @@
  */
 
 import { configureStraightAlphaBlending } from './gl-utils.js';
+import { pointScaleFor } from './point-sprite.js';
 import {
   readPositionBounds,
   readPositionXYZ,
@@ -678,6 +679,7 @@ export function createProjectileSystem({
     basePointSize,
     sizeAttenuation,
     fov,
+    pointSizeMax,
   }) {
     if (projectilePointCount === 0) return;
 
@@ -689,8 +691,8 @@ export function createProjectileSystem({
     // Use the same point size as data points so bullets match
     gl.uniform1f(centroidUniformLocations.pointSize, basePointSize);
     gl.uniform1f(centroidUniformLocations.sizeAttenuation, sizeAttenuation);
-    gl.uniform1f(centroidUniformLocations.viewportHeight, viewportHeight);
-    gl.uniform1f(centroidUniformLocations.fov, fov);
+    gl.uniform1f(centroidUniformLocations.pointScale, pointScaleFor(viewportHeight, fov));
+    gl.uniform1f(centroidUniformLocations.pointSizeMax, pointSizeMax);
 
     gl.bindVertexArray(projectileVao);
     gl.bindBuffer(gl.ARRAY_BUFFER, projectilePositionBuffer);
@@ -720,6 +722,7 @@ export function createProjectileSystem({
     basePointSize,
     sizeAttenuation,
     fov,
+    pointSizeMax,
   }) {
     const count = impactFlashes.length;
     if (count === 0) return;
@@ -731,8 +734,8 @@ export function createProjectileSystem({
     // Impact flashes are larger for visual pop
     gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 1.8);
     gl.uniform1f(centroidUniformLocations.sizeAttenuation, sizeAttenuation);
-    gl.uniform1f(centroidUniformLocations.viewportHeight, viewportHeight);
-    gl.uniform1f(centroidUniformLocations.fov, fov);
+    gl.uniform1f(centroidUniformLocations.pointScale, pointScaleFor(viewportHeight, fov));
+    gl.uniform1f(centroidUniformLocations.pointSizeMax, pointSizeMax);
 
     let renderFailure;
     try {

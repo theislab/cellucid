@@ -49,7 +49,7 @@ import { LOD_FULL_DETAIL_ADMISSION_LEVEL } from './renderer-contracts.js';
  * Depth of the draw units the stored point order is grouped by, per
  * dimension level (see `numberDrawUnits` and `buildDrawOrder`).
  *
- * In 3D the units are the tree's leaves: neighbouring points stored next to
+ * In 3D the units are the tree's leaves: neighboring points stored next to
  * each other are drawn next to each other, which with the depth test makes a
  * 10M-point full-detail frame about 4x cheaper than source order.
  *

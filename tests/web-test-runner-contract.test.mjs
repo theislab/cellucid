@@ -34,7 +34,7 @@ test('a slow file that keeps finishing tests passes; a hung one is stopped and n
   try {
     // The stall clock of a file starts when its process is started, so the
     // time to start one (two Node processes, the network guard, the test
-    // module) counts towards its first test. That time is this machine's, now,
+    // module) counts toward its first test. That time is this machine's, now,
     // under this run's load, never assumed: measured here on a file of one
     // empty test, and the bound set well above it.
     const trivial = path.join(dir, 'trivial.test.mjs');
@@ -53,7 +53,7 @@ test('a slow file that keeps finishing tests passes; a hung one is stopped and n
     // finishing one every quarter of it.
     writeFileSync(slow, `import test from 'node:test';\nfor (let i = 0; i < 6; i++) test(\`step \${i}\`, () => new Promise(resolve => setTimeout(resolve, ${stepMs})));\n`);
     // Hung with the event loop still busy (a timer), as a real hang is: a
-    // promise pending on an empty loop is cancelled by Node 22 itself
+    // promise pending on an empty loop is canceled by Node 22 itself
     // ("Promise resolution is still pending but the event loop has already
     // resolved"), not hung.
     writeFileSync(hung, "import test from 'node:test';\ntest('finishes', () => {});\ntest('never settles', () => new Promise(() => { setInterval(() => {}, 1000); }));\n");

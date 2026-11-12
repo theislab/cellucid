@@ -174,6 +174,34 @@ test('a file gone or changed since is not reopened under its dataset\'s name, an
   assert.equal(await keptLocalFile('id', store), null);
 });
 
+test('a file that cannot be read now, or whose leave was withdrawn, is said so and kept for the next try (R9S-8)', async () => {
+  // Any failure to read a kept handle was "no longer where it was opened
+  // from (moved, renamed or deleted)" and forgot the handle: a file in use,
+  // or in a cloud folder and not downloaded (NotReadableError), lost its
+  // place in My datasets for good.
+  const store = mapStore();
+  let failure = null;
+  const file = fileOf('cells.h5ad', 3);
+  const handle = fileHandle('cells.h5ad', () => {
+    if (failure !== null) throw new DOMException('The file could not be read.', failure);
+    return file;
+  });
+  await keepLocalFile('id', { handle, files: [file], kind: 'file' }, store);
+  failure = 'NotReadableError';
+  await assert.rejects(readKeptLocalFile('id', await keptLocalFile('id', store), { store }), error => {
+    assert.equal(error.details.reopen, 'unreadable');
+    assert.equal(error.message, '"cells.h5ad" could not be read just now: it may be in use by another program, or not on this ' +
+      'computer yet (a file in a cloud folder before it downloads). Try again in a moment, or choose it with Open… › File… to open it.');
+    return true;
+  });
+  assert.notEqual(await keptLocalFile('id', store), null, 'kept for the next try');
+  failure = 'NotAllowedError';
+  await assert.rejects(readKeptLocalFile('id', await keptLocalFile('id', store), { store }), error => error.details.reopen === 'refused');
+  assert.notEqual(await keptLocalFile('id', store), null);
+  failure = null;
+  assert.deepEqual(await readKeptLocalFile('id', await keptLocalFile('id', store), { store }), [file], 'read once it can be');
+});
+
 test('a folder is kept with the digest of every file\'s path, size and time, and refused when any of them changed', async () => {
   const store = mapStore();
   const at = (name, size, time = T0) => {

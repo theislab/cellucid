@@ -1,0 +1,240 @@
+{
+  "examples": [
+    {
+      "in": "panel",
+      "options": {
+        "bins": 2,
+        "cells": "x",
+        "controlSize": 1,
+        "geneSets": [
+          {
+            "genes": [
+              "x"
+            ],
+            "name": "x"
+          }
+        ],
+        "groupBy": "x",
+        "groups": {
+          "mode": "all"
+        },
+        "layout": "side",
+        "maxRank": 1,
+        "method": "mean",
+        "plotType": "violinplot",
+        "rescale": "none",
+        "seed": 0
+      },
+      "show": false
+    },
+    {
+      "in": "panel",
+      "options": {
+        "bins": 2,
+        "cells": "x",
+        "controlSize": 1,
+        "geneSets": [
+          {
+            "genes": [
+              "x"
+            ],
+            "name": "x"
+          }
+        ],
+        "groupBy": "x",
+        "groups": {
+          "mode": "all"
+        },
+        "layout": "side",
+        "maxRank": 1,
+        "method": "mean",
+        "plotType": "violinplot",
+        "rescale": "none",
+        "seed": 0
+      },
+      "show": false
+    },
+    {
+      "in": "panel",
+      "options": {
+        "bins": 2,
+        "cells": "x",
+        "controlSize": 1,
+        "geneSets": [
+          {
+            "genes": [
+              "x"
+            ],
+            "name": "x"
+          }
+        ],
+        "groupBy": "x",
+        "groups": {
+          "ids": [
+            "x"
+          ],
+          "mode": "subset"
+        },
+        "layout": "side",
+        "maxRank": 1,
+        "method": "mean",
+        "plotType": "violinplot",
+        "rescale": "none",
+        "seed": 0
+      },
+      "show": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "in": {
+        "default": "panel",
+        "oneOf": [
+          {
+            "const": "panel",
+            "type": "string"
+          },
+          {
+            "minimum": 1,
+            "type": "integer"
+          }
+        ]
+      },
+      "options": {
+        "additionalProperties": false,
+        "properties": {
+          "bins": {
+            "minimum": 2,
+            "type": "integer"
+          },
+          "cells": {
+            "type": "string"
+          },
+          "controlSize": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "geneSets": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "genes": {
+                  "items": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "name": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "genes"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "groupBy": {
+            "type": "string"
+          },
+          "groups": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "mode": {
+                    "const": "all",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "ids": {
+                    "items": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "mode": {
+                    "const": "subset",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode",
+                  "ids"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "layout": {
+            "enum": [
+              "side",
+              "each"
+            ],
+            "type": "string"
+          },
+          "maxRank": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "method": {
+            "enum": [
+              "mean",
+              "median",
+              "mean_z",
+              "module",
+              "ucell"
+            ],
+            "type": "string"
+          },
+          "plotType": {
+            "enum": [
+              "violinplot",
+              "boxplot",
+              "histogram"
+            ],
+            "type": "string"
+          },
+          "rescale": {
+            "enum": [
+              "none",
+              "zscore",
+              "minmax"
+            ],
+            "type": "string"
+          },
+          "seed": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "show": {
+        "default": false,
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "options"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.signature.set",
+  "version": 2
+}

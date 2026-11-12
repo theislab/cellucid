@@ -7,6 +7,7 @@
 
 import { PlotFactory, PlotRegistry, PlotHelpers, COMMON_HOVER_STYLE } from '../plot-factory.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
+import { formatPercent } from '../../../../utils/format-units.js';
 
 const barplotDefinition = {
   id: 'barplot',
@@ -94,7 +95,7 @@ const barplotDefinition = {
         }
 
         if (showValues) {
-          trace.text = displayValues.map(v => normalize ? v.toFixed(1) + '%' : PlotHelpers.formatNumber(v, 0));
+          trace.text = displayValues.map(v => normalize ? formatPercent(v, 1) : PlotHelpers.formatNumber(v, 0));
           trace.textposition = 'outside';
           trace.textfont = { size: 9 };
         }

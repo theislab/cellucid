@@ -18,6 +18,7 @@ import {
   mergeOptions
 } from './analysis-types.js';
 import { filterFiniteNumbers, getFiniteMinMax, mean } from '../shared/number-utils.js';
+import { formatCompactCount } from '../../../utils/format-units.js';
 import { debug, debugWarn, debugError } from '../shared/debug-utils.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
 import { getPageColor, PAGE_COLORS } from '../../utils/page-colors.js';
@@ -44,7 +45,6 @@ export class BasePluginRegistry {
     this._requiredMethods = options.requiredMethods || [];
     this._plugins = new Map();
     this._initialized = false;
-    this._eventHandlers = new Map();
   }
 
   /**
@@ -53,7 +53,6 @@ export class BasePluginRegistry {
   async init() {
     if (this._initialized) return;
     this._initialized = true;
-    this._emit('init');
   }
 
   /**
@@ -96,8 +95,6 @@ export class BasePluginRegistry {
     // Store plugin
     this._plugins.set(plugin.id, normalized);
 
-    this._emit('register', { plugin: normalized });
-
     return true;
   }
 
@@ -127,12 +124,7 @@ export class BasePluginRegistry {
    * @returns {boolean} True if plugin was removed
    */
   unregister(id) {
-    const existed = this._plugins.has(id);
-    this._plugins.delete(id);
-    if (existed) {
-      this._emit('unregister', { id });
-    }
-    return existed;
+    return this._plugins.delete(id);
   }
 
   /**
@@ -143,7 +135,6 @@ export class BasePluginRegistry {
     const count = this._plugins.size;
     if (count === 0) return 0;
     this._plugins.clear();
-    this._emit('clear', { count });
     return count;
   }
 
@@ -222,49 +213,6 @@ export class BasePluginRegistry {
     if (!plugin) return options;
 
     return mergeOptions(plugin.defaultOptions, options);
-  }
-
-  /**
-   * Add event handler
-   * @param {string} event - Event name
-   * @param {Function} handler - Handler function
-   */
-  on(event, handler) {
-    if (!this._eventHandlers.has(event)) {
-      this._eventHandlers.set(event, []);
-    }
-    this._eventHandlers.get(event).push(handler);
-  }
-
-  /**
-   * Remove event handler
-   * @param {string} event - Event name
-   * @param {Function} handler - Handler function
-   */
-  off(event, handler) {
-    const handlers = this._eventHandlers.get(event);
-    if (handlers) {
-      const idx = handlers.indexOf(handler);
-      if (idx >= 0) handlers.splice(idx, 1);
-    }
-  }
-
-  /**
-   * Emit an event
-   * @param {string} event - Event name
-   * @param {Object} [data] - Event data
-   */
-  _emit(event, data = {}) {
-    const handlers = this._eventHandlers.get(event);
-    if (handlers) {
-      for (const handler of handlers) {
-        try {
-          handler(data);
-        } catch (e) {
-          debugError(this._name, 'Event handler error:', e);
-        }
-      }
-    }
   }
 
   /**
@@ -448,12 +396,7 @@ export const PlotHelpers = {
     if (typeof value !== 'number' || !Number.isFinite(value)) {
       return 'N/A';
     }
-    if (Math.abs(value) >= 1000000) {
-      return (value / 1000000).toFixed(1) + 'M';
-    }
-    if (Math.abs(value) >= 1000) {
-      return (value / 1000).toFixed(1) + 'K';
-    }
+    if (Math.abs(value) >= 1000) return formatCompactCount(value);
     if (Number.isInteger(value)) {
       return value.toString();
     }

@@ -1,16 +1,19 @@
 /**
  * Pseudobulk differential expression (analysis overhaul Phase 2): each
- * sample's cells of a group form one unit, a gene's unit value is its mean
- * over those cells (per-unit sums from the dot plot's one-pass kernel), and the
- * test is Welch's t between the two sides' unit means. References are SciPy
- * `ttest_ind(equal_var=False)` on the same per-sample means. A sample with
- * fewer of a side's cells than the minimum per sample is left out of that
- * side (audit F-8), and counted.
+ * sample's cells of a group form one unit, a gene's unit value (a matrix
+ * that is not counts) is its mean over those cells (per-unit sums from the
+ * dot plot's one-pass kernel), and the fit is limma's (`~ group`; one gene:
+ * too few to moderate, so its own residual variance). References are R
+ * limma 3.68.5 `lmFit` + `eBayes(trend = TRUE)` on the same per-sample means
+ * (NA for a sample short of measured cells). A sample with fewer of a
+ * side's cells than the minimum per sample is left out of that side (audit
+ * F-8), and counted. The counts path and moderation over many genes:
+ * `analysis-pseudobulk-limma.test.mjs`.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { pseudobulkGeneTest, pseudobulkUnits } from '../assets/js/app/analysis/stats/pseudobulk.js';
+import { pseudobulkLimma, pseudobulkUnits } from '../assets/js/app/analysis/stats/pseudobulk.js';
 import {
   createGroupSummaryContext,
   summarizeGenesByGroup
@@ -29,6 +32,21 @@ const CELLS = [
   [2, 4, 0.4], [2, 4, 0], // B, sample 4: mean 0.2
   [0, 2, 50], // neither group
 ];
+
+/** One gene's fit from its unit sums (values as stored, not counts). */
+function geneTest(sum, expressing, measured, unitSide, minCellsPerSample) {
+  const unitCount = unitSide.length;
+  const { genes } = pseudobulkLimma({
+    sums: Float64Array.from(sum), measured, expressing, geneCount: 1,
+    units: { unitCount, unitSide, unitSample: Int32Array.from({ length: unitCount }, (_, unit) => unit) },
+    counts: false, minCellsPerSample, foldChange: { mode: 'stored', base: null }
+  });
+  const of = key => genes[key][0];
+  return {
+    meanA: of('meanA'), meanB: of('meanB'), pctA: of('pctA'), pctB: of('pctB'), log2FoldChange: of('log2FoldChange'),
+    statistic: of('statistic'), pValue: of('pValue'), nA: of('nA'), nB: of('nB')
+  };
+}
 
 function fixture() {
   const codes = Uint8Array.from(CELLS, ([, sample]) => sample);
@@ -49,7 +67,7 @@ test('each sample of each side is one unit; cells without a sample are left out'
   assert.deepEqual([...units.cellUnit], [0, 0, 1, 1, 2, -1, 3, 3, 4, 5, 5, 6, 6, -1]);
 });
 
-test('the sample-level Welch t matches SciPy on the per-sample means, from one pass of unit sums', () => {
+test('the sample-level t matches limma on the per-sample means, from one pass of unit sums', () => {
   const { codes, cellsA, cellsB, column } = fixture();
   const units = pseudobulkUnits(cellsA, cellsB, codes, MISSING, CELLS.length, 1);
   const context = createGroupSummaryContext(units.cellUnit, units.unitCount);
@@ -58,12 +76,11 @@ test('the sample-level Welch t matches SciPy on the per-sample means, from one p
   const sparse = { length: column.length, indices, values: Float32Array.from(indices, cell => column[cell]) };
   for (const gene of [column, sparse]) {
     const summary = summarizeGenesByGroup(context, [gene], 0, 0);
-    const row = pseudobulkGeneTest(summary.sum, summary.expressing, summary.measured, units.unitSide, { mode: 'stored', base: null }, 1);
-    assert.ok(Math.abs(row.statistic - 1.8972714457968962) < 1e-6, `t ${row.statistic}`);
-    assert.ok(Math.abs(row.pValue - 0.14098385787293172) < 1e-6, `p ${row.pValue}`);
+    const row = geneTest(summary.sum, summary.expressing, summary.measured, units.unitSide, 1);
+    assert.ok(Math.abs(row.statistic - 2.006022230728274) < 1e-6, `t ${row.statistic}`);
+    assert.ok(Math.abs(row.pValue - 0.10115864056452907) < 1e-6, `p ${row.pValue}`);
     assert.ok(Math.abs(row.meanA - (1 + 2.5 + 3) / 3) < 1e-6);
     assert.ok(Math.abs(row.meanB - (0.5 + 0.7 + 1.9 + 0.2) / 4) < 1e-6);
-    assert.equal(row.score, row.statistic);
     assert.equal(row.nA, 3);
     assert.equal(row.nB, 4);
     // Cells above 0: A 4 of 5 grouped, B 5 of 7.
@@ -73,16 +90,17 @@ test('the sample-level Welch t matches SciPy on the per-sample means, from one p
   }
 });
 
-test('a second SciPy reference, and a side with one sample is not tested', () => {
+test('a second limma reference, and a side with one sample is still fit (its variance from the other side)', () => {
   const sizes = Uint32Array.of(1, 1, 1, 1, 1);
   const side = Uint8Array.of(1, 1, 2, 2, 2);
-  const row = pseudobulkGeneTest(Float64Array.of(0.25, 0.75, 1.5, 2, 4), Uint32Array.of(1, 1, 1, 1, 1), sizes, side, { mode: 'stored', base: null }, 1);
-  assert.ok(Math.abs(row.statistic - -2.4886840673530206) < 1e-6);
-  assert.ok(Math.abs(row.pValue - 0.10985495793161469) < 1e-6);
-  const lone = pseudobulkGeneTest(Float64Array.of(1, 2, 3), Uint32Array.of(1, 1, 1), Uint32Array.of(1, 1, 1), Uint8Array.of(1, 2, 2), { mode: 'stored', base: null }, 1);
+  const row = geneTest(Float64Array.of(0.25, 0.75, 1.5, 2, 4), Uint32Array.of(1, 1, 1, 1, 1), sizes, side, 1);
+  assert.ok(Math.abs(row.statistic - -1.9930915164897594) < 1e-6);
+  assert.ok(Math.abs(row.pValue - 0.14026243996564908) < 1e-6);
+  // limma fits ~ group on 1 + 2 samples: one residual df.
+  const lone = geneTest(Float64Array.of(1, 2, 3), Uint32Array.of(1, 1, 1), Uint32Array.of(1, 1, 1), Uint8Array.of(1, 2, 2), 1);
   assert.equal(lone.nA, 1);
-  assert.ok(Number.isNaN(lone.pValue));
-  assert.ok(Number.isNaN(lone.log2FoldChange));
+  assert.ok(Math.abs(lone.statistic - -1.7320508075688763) < 1e-6);
+  assert.ok(Math.abs(lone.pValue - 0.33333333333333343) < 1e-6);
 });
 
 test('a sample with fewer cells than the minimum is left out of its side, and counted', () => {
@@ -99,10 +117,10 @@ test('a sample with fewer cells than the minimum is left out of its side, and co
   assert.deepEqual([...units.cellUnit], [0, 0, 1, 1, -1, -1, 2, 2, -1, 3, 3, 4, 4, -1]);
   const context = createGroupSummaryContext(units.cellUnit, units.unitCount);
   const summary = summarizeGenesByGroup(context, [column], 0, 0);
-  const row = pseudobulkGeneTest(summary.sum, summary.expressing, summary.measured, units.unitSide, { mode: 'stored', base: null }, 2);
-  // SciPy: ttest_ind([1.0, 2.5], [0.5, 1.9, 0.2], equal_var=False).
-  assert.ok(Math.abs(row.statistic - 0.9655534140000175) < 1e-6, `t ${row.statistic}`);
-  assert.ok(Math.abs(row.pValue - 0.4370900714010908) < 1e-6, `p ${row.pValue}`);
+  const row = geneTest(summary.sum, summary.expressing, summary.measured, units.unitSide, 2);
+  // limma: lmFit(c(1.0, 2.5, 0.5, 1.9, 0.2), ~ group), eBayes.
+  assert.ok(Math.abs(row.statistic - 1.0067122891834714) < 1e-6, `t ${row.statistic}`);
+  assert.ok(Math.abs(row.pValue - 0.38823601425710602) < 1e-6, `p ${row.pValue}`);
   assert.equal(row.nA, 2);
   assert.equal(row.nB, 3);
 });
@@ -121,25 +139,24 @@ test('a cell without a value (NaN) is out of its unit mean, and a unit short of 
     const summary = summarizeGenesByGroup(context, [gene], 0, 0);
     assert.deepEqual([...summary.measured], [2, 1, 1, 2, 0, 2, 2]);
     assert.deepEqual([...summary.sizes], [2, 2, 1, 2, 1, 2, 2]);
-    const row = pseudobulkGeneTest(summary.sum, summary.expressing, summary.measured, units.unitSide, { mode: 'stored', base: null }, 1);
-    // SciPy: ttest_ind([1.0, 2.5, 3.0], [0.5, 1.9, 0.2], equal_var=False):
-    // B's sample 1 has no measured cell and is out; A's sample 1 is its one cell.
+    const row = geneTest(summary.sum, summary.expressing, summary.measured, units.unitSide, 1);
+    // limma on c(1.0, 2.5, 3.0) and c(0.5, NA, 1.9, 0.2): B's sample 1 has
+    // no measured cell and is missing; A's sample 1 is its one cell.
     assert.equal(row.nA, 3);
     assert.equal(row.nB, 3);
     assert.ok(Math.abs(row.meanA - (1 + 2.5 + 3) / 3) < 1e-6, `meanA ${row.meanA}`);
     assert.ok(Math.abs(row.meanB - (0.5 + 1.9 + 0.2) / 3) < 1e-6, `meanB ${row.meanB}`);
-    assert.ok(Math.abs(row.statistic - 1.6306719195138268) < 1e-6, `t ${row.statistic}`);
-    assert.ok(Math.abs(row.pValue - 0.17961422961821016) < 1e-6, `p ${row.pValue}`);
+    assert.ok(Math.abs(row.statistic - 1.6306719195138273) < 1e-6, `t ${row.statistic}`);
+    assert.ok(Math.abs(row.pValue - 0.17829396619779228) < 1e-6, `p ${row.pValue}`);
     // Shares over the measured cells: A 3 of 4 measured above 0, B 4 of 6.
     assert.ok(Math.abs(row.pctA - 75) < 1e-9, `pctA ${row.pctA}`);
     assert.ok(Math.abs(row.pctB - (400 / 6)) < 1e-9, `pctB ${row.pctB}`);
-    // With two measured cells needed, A's samples 1 and 2 (one each) are out too.
-    const strict = pseudobulkGeneTest(summary.sum, summary.expressing, summary.measured, units.unitSide, { mode: 'stored', base: null }, 2);
+    // With two measured cells needed, A's samples 1 and 2 (one each) are
+    // missing too: limma on c(1.0, NA, NA) and c(0.5, NA, 1.9, 0.2).
+    const strict = geneTest(summary.sum, summary.expressing, summary.measured, units.unitSide, 2);
     assert.equal(strict.nA, 1);
-    assert.ok(Number.isNaN(strict.pValue), 'one sample of A: not tested');
+    assert.ok(Math.abs(strict.statistic - 0.12725695259515582) < 1e-6, `t ${strict.statistic}`);
+    assert.ok(Math.abs(strict.pValue - 0.91037785701035567) < 1e-6, `p ${strict.pValue}`);
   }
-  assert.throws(
-    () => pseudobulkGeneTest(Float64Array.of(1), Uint32Array.of(1), Uint32Array.of(1), Uint8Array.of(1), { mode: 'stored', base: null }, 0),
-    /positive integer/
-  );
+  assert.throws(() => geneTest(Float64Array.of(1, 2), Uint32Array.of(1, 1), Uint32Array.of(1, 1), Uint8Array.of(1, 2), 0), /positive integer/);
 });

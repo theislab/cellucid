@@ -1683,7 +1683,7 @@ class GPUCloudNoiseGenerationTransaction {
     if (!this._settled) {
       this._state = 'cancelled';
       this._settled = true;
-      this._rejectCompletion(cancelled('superseded', message ?? 'GPU cloud-noise generation was cancelled.'));
+      this._rejectCompletion(cancelled('superseded', message ?? 'GPU cloud-noise generation was canceled.'));
     } else if (this._state === 'completed') {
       this._state = 'cancelled';
     }

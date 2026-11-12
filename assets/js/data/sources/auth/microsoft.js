@@ -8,7 +8,7 @@
  *    popup to Microsoft's sign-in page (the `common` authority: personal and
  *    work or school accounts). Opened straight at Microsoft's address, the
  *    popup would be Safari's to hand to a Mac's single sign-on extension
- *    (Microsoft's, which an organisation's Company Portal installs): Safari
+ *    (Microsoft's, which an organization's Company Portal installs): Safari
  *    then signs in with the Mac's work account in a window nobody sees,
  *    renders Microsoft's answer there ("Need admin approval") and closes it,
  *    before any page of Cellucid's is reached. A popup opened on this site
@@ -35,7 +35,7 @@
  * Cellucid asks for `Files.Read` first: enough for personal accounts and the
  * files shared with them, and for a work account's own files. Reading a file
  * a colleague shared needs `Files.Read.All`, asked for only then; in most
- * organisations an administrator approves that once for everyone.
+ * organizations an administrator approves that once for everyone.
  *
  * The access token (about an hour) is kept for the tab in the shared sign-in
  * store (`sessionStorage`: it survives a reload of the tab). The refresh token
@@ -55,7 +55,7 @@ import { embeddedInOtherSite, embeddingOrigin, pageOrigin } from './page-context
 import { createPkce } from './pkce.js';
 import { finalSignInFailure, getSignInSteps } from './sign-in.js';
 import { readSignInRecord, removeSignIn, setSignInExpiry, writeSignInRecord } from './token-store.js';
-import { onAbort } from '../../../utils/abort.js';
+import { abortReason, onAbort } from '../../../utils/abort.js';
 
 export const GRAPH = 'https://graph.microsoft.com';
 export const FILES_READ = `${GRAPH}/Files.Read`;
@@ -135,8 +135,8 @@ const POLICY_CODES = new Set([53000, 53001, 53002, 53003, 530032, 50097]);
 const SITE_CODES = new Set([50011, 50194, 70001, 70011, 700016, 700054, 500113, 9002326, 9002331, 7000218]);
 const TRANSIENT_CODES = new Set([90033, 50196, 50058]);
 
-/** The organisation Microsoft names in its answer ("An administrator of <name> has set a policy …"), or null. */
-function organisationOf(description) {
+/** The organization Microsoft names in its answer ("An administrator of <name> has set a policy …"), or null. */
+function organizationOf(description) {
   const named = /administrator of (.+?) (?:has|have) /i.exec(String(description ?? ''));
   return named === null ? null : named[1].trim();
 }
@@ -167,8 +167,8 @@ function failure(message, code, { final = false, retryAction = null, help = null
  */
 export function describeMicrosoftError(error, description = '', subcode = null) {
   const code = Number(/AADSTS(\d+)/.exec(`${error ?? ''} ${description ?? ''}`)?.[1] ?? NaN);
-  const organisation = organisationOf(description);
-  const yours = organisation === null ? 'Your organisation' : `Your organisation (${organisation})`;
+  const organization = organizationOf(description);
+  const yours = organization === null ? 'Your organization' : `Your organization (${organization})`;
   if (ADMIN_APPROVAL_CODES.has(code)) {
     return failure(
       `${yours} lets only an administrator approve Cellucid. Ask your IT administrator to approve it ` +
@@ -206,7 +206,7 @@ export function describeMicrosoftError(error, description = '', subcode = null) 
   if (code === 65004 || error === 'access_denied' || subcode === 'cancel') {
     return failure(
       'Microsoft sign-in ended without Cellucid\'s permission. If you declined it, sign in again and accept. ' +
-      'If Microsoft said "Need admin approval", your organisation lets only an administrator approve ' +
+      'If Microsoft said "Need admin approval", your organization lets only an administrator approve ' +
       'Cellucid: ask your IT administrator (the Cellucid documentation, "Work and school accounts: ' +
       'administrator approval", says how), or sign in with a personal Microsoft account.',
       'DECLINED',
@@ -282,6 +282,7 @@ export function createMicrosoftAuth({
     const askedAt = now();
     let response;
     try {
+      // Raw fetch: a one-time code or a rotating refresh token, never abandoned as stalled nor sent twice.
       response = await fetchImpl(`https://login.microsoftonline.com/${authority()}/oauth2/v2.0/token`, {
         method: 'POST',
         // A form body is a simple request: no preflight.
@@ -392,7 +393,7 @@ export function createMicrosoftAuth({
       };
       const ended = () => {
         stop();
-        reject(signal.reason);
+        reject(abortReason(signal));
       };
       const settle = token => {
         nextPrompt = null;

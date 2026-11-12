@@ -9,7 +9,7 @@
  * cells and their coordinates, not the obs schema, so the same dataset written
  * again from the same embedding with one more cell type restores cleanly with
  * every category after the insertion point shifted by one. A registry keyed by
- * position would then move a rename onto its neighbour and colour, label, and
+ * position would then move a rename onto its neighbor and color, label, and
  * export those cells under a name that is not theirs — silently, because
  * nothing downstream can tell a deliberate rename from a displaced one.
  *

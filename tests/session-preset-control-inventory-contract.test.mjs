@@ -7,7 +7,7 @@
  * (CEL-0224). The settings domain refuses the value with `Session UI state is
  * missing current control "<id>"`, the starting view fails as a whole, and the
  * visible result is that the advertised camera never applies and no field is
- * coloured. Removing a control is equally fatal in the other direction: the
+ * colored. Removing a control is equally fatal in the other direction: the
  * preset then carries a key the interface no longer has, and the domain
  * refuses with `... does not exist in the current interface`.
  *
@@ -29,7 +29,7 @@
  * `DOMAIN_OWNED_IDS`, `SERIALIZABLE_INPUT_TYPES` and the one map that splits it
  * between domains (`controlDomainOf`) — all live in the control serializer
  * (`createUiControlSerializer`) and are applied by that module here exactly as
- * they are in the browser. A further *filter* added there is honoured by this
+ * they are in the browser. A further *filter* added there is honored by this
  * file the day it lands, with no edit. That is the whole point: a restated
  * list would be the same defect one level up.
  *
@@ -55,7 +55,7 @@
  *
  * The comparison deliberately stops short of control *values*. A value is not
  * statically decidable: `#velocity-field` ships with no options at all and is
- * populated from the loaded dataset, and a colour input with no `value`
+ * populated from the loaded dataset, and a color input with no `value`
  * attribute reports a value the browser supplies rather than the markup. A
  * guard that judged values from static markup would fail on correct presets,
  * which is the failure mode that would make it worse than nothing. Values are
@@ -711,7 +711,7 @@ test('every published preset records the current control inventory', async (t) =
       assert.fail(
         `${preset.label} no longer records the control inventory index.html `
           + 'produces, so the sample refuses the whole document and neither the '
-          + 'advertised camera nor the advertised colouring applies.\n'
+          + 'advertised camera nor the advertised coloring applies.\n'
           + `  controls the markup has and the preset lacks: `
           + `${missingFromPreset.join(', ') || '(none)'}\n`
           + `  controls the preset has and the markup lacks: `
@@ -982,7 +982,7 @@ test('a domain-owned control does not trip the guard wherever it sits', () => {
 
 test('a control whose id was minted on the page never enters the inventory', () => {
   // A continuous legend rebuilds its range sliders with `createDomId` ids
-  // (`minimum-1b`) on every render. A session that recorded one named a
+  // (`minimum--1b`) on every render. A session that recorded one named a
   // control no other page has, and loading it was refused. Any minted id is
   // page-local by construction, so the serializer leaves such controls out;
   // a stable id beside it still enters.
@@ -996,4 +996,12 @@ test('a control whose id was minted on the page never enters the inventory', () 
   ));
   assert.equal(Object.hasOwn(added.controls, mintedId), false);
   assert.equal(Object.hasOwn(added.controls, stableId), true);
+  // An id made from a minted one (`<minted>-trigger`) is the page's own too.
+  const derivedId = `${createDomId('maximum')}-input`;
+  const derived = deriveInventory(insertAfterTagOf(
+    indexHtml,
+    anchorInput.id,
+    `<input id="${derivedId}" type="checkbox">`,
+  ));
+  assert.equal(Object.hasOwn(derived.controls, derivedId), false);
 });

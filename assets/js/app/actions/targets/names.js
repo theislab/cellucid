@@ -92,9 +92,40 @@ export function listNames(names) {
   return `${quoted.slice(0, LISTED_NAMES).join(', ')} and ${quoted.length - LISTED_NAMES} more`;
 }
 
-/** A category as the legend shows it (a number or a boolean category as its text). */
+/**
+ * A category's identity as text (a number or a boolean category as its
+ * text): what actions, sessions and community annotation name it by.
+ * Shown to a person or an agent through `categoryDisplayName`.
+ */
 export function categoryLabel(value) {
   if (typeof value === 'string') return value;
   if (typeof value === 'number') return value.toString();
   return value ? 'true' : 'false';
+}
+
+/** How a category with no name is shown: one empty, one of white space alone. Never stored. */
+export const EMPTY_CATEGORY_NAME = '(empty)';
+export const BLANK_CATEGORY_NAME = '(blank)';
+
+/** Whether a category has no name to show (empty, or white space alone): it is shown quietly. */
+export function isUnnamedCategory(value) {
+  return typeof value === 'string' && value.trim() === '';
+}
+
+/**
+ * A category's name as a person or an agent reads it, the one display rule
+ * of every place a category is named (legend, hover card, menus, filters,
+ * figure legends, analysis groups, agent reads): `categoryLabel`, a category
+ * with no name as `(empty)` or `(blank)`, and a name with white space at an
+ * end in quotes (`" x "`), so it is told from `x`. The value itself is
+ * unchanged in the data, sessions and exported values; a step naming a
+ * category by its display name finds it (`targets/fields.js`).
+ *
+ * @param {string|number|boolean} value
+ * @returns {string}
+ */
+export function categoryDisplayName(value) {
+  if (isUnnamedCategory(value)) return value === '' ? EMPTY_CATEGORY_NAME : BLANK_CATEGORY_NAME;
+  if (typeof value === 'string' && value !== value.trim()) return JSON.stringify(value);
+  return categoryLabel(value);
 }

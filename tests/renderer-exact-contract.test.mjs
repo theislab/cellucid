@@ -399,7 +399,7 @@ test('recoloring preserves the exact alpha generation through a position publica
 
   renderer.updatePositions(nextPositions, 2);
 
-  // Colour, alpha and the pending recolor survive unchanged; only the
+  // Color, alpha and the pending recolor survive unchanged; only the
   // position stream is new.
   assert.strictEqual(renderer._colors, nextColors);
   assert.strictEqual(renderer.buffers.colors, colorBuffer);
@@ -444,7 +444,7 @@ test('a recolor is gathered into the live draw order once, at its flush, retryin
       assert.ok(data instanceof Uint32Array, 'gathered one RGBA8 word a point (the GPU pass, stood in for)');
       if (rejectUpload) {
         // A write into accepted storage fails synchronously or not at all.
-        throw new TypeError('WebGL rejected the colour upload.');
+        throw new TypeError('WebGL rejected the color upload.');
       }
       const bytes = new Uint8Array(data.buffer, data.byteOffset + srcOffset * 4, length * 4);
       const rgba = [];
@@ -498,7 +498,7 @@ test('a recolor is gathered into the live draw order once, at its flush, retryin
   assert.equal(renderer._colorsDirty, true);
 
   rejectUpload = true;
-  assert.throws(() => renderer.flushBufferUpdates(3), /rejected the colour upload/);
+  assert.throws(() => renderer.flushBufferUpdates(3), /rejected the color upload/);
   assert.equal(renderer._colorsDirty, true, 'a rejected upload stays dirty');
   assert.deepEqual(uploads, []);
 
@@ -895,6 +895,8 @@ test('overlay contexts require exact per-view render state', () => {
     fogColor: [1, 1, 1],
     cameraPosition: [0, 0, 3],
     cameraDistance: 3,
+    // The sprite cap (rendering/point-sprite.js).
+    pointSizeMax: 160,
     useAlphaTexture: false,
   };
   const hpRenderer = {
@@ -1070,10 +1072,60 @@ test('shader-accurate rasterization rejects incomplete export state', () => {
       renderState: null,
       outputWidthPx: 100,
       outputHeightPx: 100,
+      viewRect01: { x: 0, y: 0, width: 1, height: 1 },
       pointSizePx: 4,
     }),
     /renderState.*required|missing.*renderState/i
   );
+});
+
+test('shader-accurate rasterization names a missing sprite cap before any GL call', () => {
+  const identity = () => Float32Array.from([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  const complete = () => ({
+    antialias: true,
+    cameraPosition: [0, 0, 3],
+    fogColor: [0, 0, 0],
+    fogDensity: 0,
+    fogFar: 3.5,
+    fogNear: 2.5,
+    fov: 1,
+    lightDir: [0, 0, 1],
+    lightingStrength: 0,
+    modelMatrix: identity(),
+    mvpMatrix: identity(),
+    pointSize: 4,
+    pointSizeMax: 160,
+    projectionMatrix: identity(),
+    shaderQuality: 'full',
+    sizeAttenuation: 1,
+    viewMatrix: identity(),
+    viewportHeight: 16,
+    viewportWidth: 16,
+  });
+  const rasterize = (renderState) => rasterizePointsWebgl({
+    positions: Float32Array.from([0, 0, 0]),
+    dimension: 3,
+    colors: Uint8Array.from([255, 255, 255, 255]),
+    renderState,
+    outputWidthPx: 16,
+    outputHeightPx: 16,
+    viewRect01: { x: 0, y: 0, width: 1, height: 1 },
+    pointSizePx: 4,
+  });
+  // A render state built by hand before the sprite cap existed (F97) drew
+  // with a NaN cap.
+  for (const [key, value, pattern] of [
+    ['pointSizeMax', undefined, /renderState\.pointSizeMax must be a finite positive number/],
+    ['pointSizeMax', 0, /renderState\.pointSizeMax must be a finite positive number/],
+  ]) {
+    const renderState = complete();
+    if (value === undefined) delete renderState[key];
+    else renderState[key] = value;
+    assert.throws(() => rasterize(renderState), pattern, `${key} = ${String(value)}`);
+  }
+  // A complete state passes the check (and then needs a GL context, which
+  // Node has not).
+  assert.throws(() => rasterize(complete()), (error) => !/pointSizeMax/.test(error.message));
 });
 
 test('figure export never changes format, strategy, backend, or fidelity', async () => {

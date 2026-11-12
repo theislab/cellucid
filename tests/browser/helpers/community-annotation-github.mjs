@@ -199,7 +199,7 @@ export async function installAnnotationRepository(target, {
       if (hook === 'abort') return route.abort('internetdisconnected');
       if (hook && typeof hook === 'object') return json(hook.body ?? { error: 'error' }, hook.status);
     }
-    // Asked without its condition: Playwright cannot fulfil a 304 on WebKit
+    // Asked without its condition: Playwright cannot fulfill a 304 on WebKit
     // ("Cannot fulfill with redirect status"), so the repository is always
     // answered in full here; the sync tests cover the 304 path.
     const { 'if-none-match': _condition, ...unconditional } = headers;

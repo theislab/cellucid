@@ -46,7 +46,7 @@ export function createCpuPermuter(gl) {
   // `orderedSlots`; every later slot holds its own point.
   const sourceOf = (order, slot) => (order === null ? slot : order.sourceOf(slot));
   const permuter = {
-    /** Writes by words a point: 1 (colours, 1D positions), 2, 3. */
+    /** Writes by words a point: 1 (colors, 1D positions), 2, 3. */
     wordWrites: { 1: 0, 2: 0, 3: 0 },
     writeWords(target, source, order, wordsPerPoint) {
       requireOrder(order);

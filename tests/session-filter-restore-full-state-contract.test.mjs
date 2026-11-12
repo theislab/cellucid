@@ -1,5 +1,5 @@
 /**
- * Restoring filters and colours reproduces the exact saved state.
+ * Restoring filters and colors reproduces the exact saved state.
  *
  * A `filters` or `colors` state domain value (`app/state/domains/filters.js`,
  * `colors.js`) is the complete state of every field, not a patch: restoring
@@ -139,7 +139,7 @@ test('restoring a state reproduces it exactly instead of merging onto the curren
   const harness = createHarness();
   const { state, cellType, score } = harness;
 
-  // --- State A: one hidden category, one recoloured category, linear scale.
+  // --- State A: one hidden category, one recolored category, linear scale.
   state.setVisibilityForCategory(cellType, 0, false);
   state.setColorForCategory(cellType, 2, [0.1, 0.2, 0.3]);
   const stateA = captureBoth(harness);
@@ -193,7 +193,7 @@ test('restoring a state reproduces it exactly instead of merging onto the curren
   assert.deepEqual(
     rgbAt(cellType, 2),
     drawn([0.1, 0.2, 0.3]),
-    'The recolour that state A did record must still be applied.',
+    'The recolor that state A did record must still be applied.',
   );
   assert.deepEqual(rgbAt(cellType, 1), drawn(getCategoryColor(1)));
 });
@@ -204,7 +204,7 @@ test('restoring a state clears fields its values never mention', async () => {
 
   const pristineState = snapshotEffectiveState(state);
   const empty = captureBoth(harness);
-  assert.deepEqual(empty, { filters: { views: [[]] }, colors: { views: [[]] } }, 'An untouched dataset records no filters or colours.');
+  assert.deepEqual(empty, { filters: { views: [[]] }, colors: { views: [[]] } }, 'An untouched dataset records no filters or colors.');
 
   state.setVisibilityForCategory(cellType, 0, false);
   state.ensureContinuousMetadata(score);
@@ -224,18 +224,18 @@ test('restoring a state clears fields its values never mention', async () => {
   );
 });
 
-test('a narrowed filter does not drag the restored colour range with it', async () => {
+test('a narrowed filter does not drag the restored color range with it', async () => {
   const saving = createHarness();
 
-  // Stats are {1, 8}. Narrow only the filter; the colour range stays at the
-  // full data range, and the colour domain follows the colour range because
+  // Stats are {1, 8}. Narrow only the filter; the color range stays at the
+  // full data range, and the color domain follows the color range because
   // `_useFilterColorRange` defaults to true.
   saving.state.ensureContinuousMetadata(saving.score);
   saving.score._continuousFilter = { min: 3, max: 6 };
   assert.deepEqual(saving.score._continuousColorRange, { min: 1, max: 8 });
 
   const stateB = captureBoth(saving);
-  assert.deepEqual(stateB.colors, { views: [[]] }, 'the colour range is measured against the data, never the filter');
+  assert.deepEqual(stateB.colors, { views: [[]] }, 'the color range is measured against the data, never the filter');
   const expectedState = snapshotEffectiveState(saving.state);
 
   // Restore it in a freshly opened tab, where nothing has been materialized yet.
@@ -245,7 +245,7 @@ test('a narrowed filter does not drag the restored colour range with it', async 
   assert.deepEqual(
     loading.score._continuousColorRange,
     { min: 1, max: 8 },
-    'The restored colour range must be the full data range, not the narrowed filter.',
+    'The restored color range must be the full data range, not the narrowed filter.',
   );
   assert.deepEqual(
     snapshotEffectiveState(loading.state),
@@ -255,7 +255,7 @@ test('a narrowed filter does not drag the restored colour range with it', async 
   assert.deepEqual(captureBoth(loading), stateB);
 });
 
-test('gray for zero is a colour of its own: restored, and off when a value does not say it', async () => {
+test('gray for zero is a color of its own: restored, and off when a value does not say it', async () => {
   const saving = createHarness();
   saving.state.ensureContinuousMetadata(saving.gene);
   saving.gene._zeroGray = true;

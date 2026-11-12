@@ -222,6 +222,26 @@ export function exactRestorable(tracker, entry) {
   return true;
 }
 
+/**
+ * The steps whose group `entry` changed, as ids: every step, in the tracker
+ * now, of each run its patches name (before and after). A group edit records
+ * the runs, never the member steps (`edit.membership`), so whatever writes
+ * steps out as they change (the autosave, told by the history's `edited`
+ * event) learns of them here; without them a grouped step was kept without
+ * its group, and the history kept in this browser no longer opened ("a group
+ * cuts the run of turn …").
+ * @param {object} tracker - live
+ * @param {{before: {memberships: object[]}, after: {memberships: object[]}}} entry
+ * @returns {Set<string>}
+ */
+export function membershipStepIds(tracker, entry) {
+  const ids = new Set();
+  for (const membership of [...entry.before.memberships, ...entry.after.memberships]) {
+    for (const step of runOrNull(tracker, membership) ?? []) ids.add(step.id);
+  }
+  return ids;
+}
+
 /** A membership's steps, or null when they are not one line of the tracker now. */
 function runOrNull(tracker, membership) {
   try {
@@ -264,7 +284,7 @@ export function restoreNameClash(tracker, entry) {
 }
 
 /**
- * Put back what an edit kept (a failed, cancelled or invalid edit changes
+ * Put back what an edit kept (a failed, canceled or invalid edit changes
  * nothing): its records, its tracker fields and its groups' runs.
  */
 export function rollbackEdit(edit) {

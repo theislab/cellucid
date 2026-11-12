@@ -10,7 +10,7 @@
  *   uploads a per-point index: a steady frame and a camera move upload
  *   nothing;
  * - a store adopts its tree order in the frame that needs it, on the GPU, positions and
- *   every colour stream of the views drawing it together;
+ *   every color stream of the views drawing it together;
  * - views drawing one geometry draw it through the same permutation.
  */
 import { DEFAULT_CELL_PRIORITY, OPEN_ORDER_PRIORITY } from '../assets/js/data/cell-priority.js';
@@ -262,7 +262,7 @@ function createRenderer(gl, {
     positionBuffer.allocate(pointCount, 8, gl.STATIC_DRAW, allocate, 'test positions');
     positionBuffer.write(positions);
     colorBuffer = new PointStore(gl, segmentPoints);
-    colorBuffer.allocate(pointCount, 4, gl.DYNAMIC_DRAW, allocate, 'test colours');
+    colorBuffer.allocate(pointCount, 4, gl.DYNAMIC_DRAW, allocate, 'test colors');
     colorBuffer.write(colors);
   }
   const renderer = Object.assign(Object.create(HighPerfRenderer.prototype), {
@@ -332,6 +332,8 @@ function params(viewId, { mvp = matrix(0.5), forceLOD = -1 } = {}) {
   return {
     autoFog: false,
     cameraDistance: 4,
+    // The sprite cap (rendering/point-sprite.js).
+    pointSizeMax: 160,
     cameraPosition: Float32Array.from([0, 0, 4]),
     dimensionLevel: 2,
     fogColor: Float32Array.from([0, 0, 0]),
@@ -498,7 +500,7 @@ test('full detail draws every stored point, a reduced level its prefix', t => {
   assert.strictEqual(draws[0].unit1, renderer._liveOrder.texture);
 });
 
-test('the store adopts its tree order in the frame that needs it: positions and colours together, gathered on the GPU', t => {
+test('the store adopts its tree order in the frame that needs it: positions and colors together, gathered on the GPU', t => {
   silenceCalculationNotifications(t);
   const gl = createGl();
   const pointCount = 140_000;
@@ -511,7 +513,7 @@ test('the store adopts its tree order in the frame that needs it: positions and 
   assert.ok(renderer._liveOrder !== null, 'adopted in the first frame');
   assert.strictEqual(renderer._liveColorOrder, renderer._liveOrder);
   assert.equal(renderer._perViewState.get('live').lodConverging, false, 'no frames kept alive for the adoption');
-  // One GPU pass for the positions (2 words a point), one for the colours.
+  // One GPU pass for the positions (2 words a point), one for the colors.
   assert.equal(renderer._permuter.wordWrites[2], 1);
   assert.equal(renderer._permuter.wordWrites[1], 1);
   // The frame drew from the ordered store.
@@ -537,7 +539,7 @@ test('the store adopts its tree order in the frame that needs it: positions and 
   );
 });
 
-test('a view of the live geometry draws through the live permutation, its colours regathered once', t => {
+test('a view of the live geometry draws through the live permutation, its colors regathered once', t => {
   silenceCalculationNotifications(t);
   const gl = createGl();
   const { renderer, positions, colors } = createRenderer(gl, { lod: true, pointCount: 3_000 });
@@ -583,12 +585,12 @@ test('a view of the live geometry draws through the live permutation, its colour
   assert.strictEqual(snapshotDraw.unit0, snapshot.alphaTexture, 'its own source-order alpha');
   assert.strictEqual(snapshot.colorOwner.order, renderer._liveOrder);
   const regather = uploadsSince(gl, mark);
-  // The view's colours in the new order live in the store it now draws; the
+  // The view's colors in the new order live in the store it now draws; the
   // source-order store it left is kept for its order, not rewritten.
   const orderedStore = snapshot.colorOwner.buffer;
   assert.ok(
     regather.length > 0 && regather.every(call => call.buffer === bufferOf(orderedStore)),
-    'only the view\'s own colour store is written',
+    'only the view\'s own color store is written',
   );
   assert.ok(gl._state.live.buffers.has(bufferOf(colorBuffer)), 'the store for the order it left is kept');
   const stored = gl._state.stores.get(bufferOf(orderedStore));
@@ -602,7 +604,7 @@ test('a view of the live geometry draws through the live permutation, its colour
 
   mark = gl._state.calls.length;
   renderer.renderWithSnapshot('kept', params('kept'));
-  assert.deepEqual(uploadsSince(gl, mark), [], 'colours already in order are not regathered');
+  assert.deepEqual(uploadsSince(gl, mark), [], 'colors already in order are not regathered');
 });
 
 test('evicting a retained geometry deletes its permutation texture with its store', () => {
@@ -643,7 +645,7 @@ test('evicting a retained geometry deletes its permutation texture with its stor
 
 // ---------------------------------------------------------------------------
 // Cost budget (the regression check behind the renderer benchmarks): what an
-// ordered store costs in GPU bytes a point, and what a recolour sends.
+// ordered store costs in GPU bytes a point, and what a recolor sends.
 // ---------------------------------------------------------------------------
 
 test('LOD and culling keep no second copy: a 2D store costs 8 + 4 + 4 bytes a point on the GPU', t => {
@@ -655,7 +657,7 @@ test('LOD and culling keep no second copy: a 2D store costs 8 + 4 + 4 bytes a po
   assert.ok(renderer._liveOrder !== null);
   renderer._refreshGpuMemoryStats();
   const permutationBytes = renderer._liveOrder.plan.texels * 4;
-  // Positions (x, y Float32) + RGBA8 colours + the R32UI permutation, plus
+  // Positions (x, y Float32) + RGBA8 colors + the R32UI permutation, plus
   // the 4-byte dummy texture: nothing scales with the LOD level count or the
   // culled node count.
   assert.equal(
@@ -668,7 +670,7 @@ test('LOD and culling keep no second copy: a 2D store costs 8 + 4 + 4 bytes a po
   );
 });
 
-test('a recolour of an ordered store sends 4 bytes a point once and gathers nothing on the CPU', t => {
+test('a recolor of an ordered store sends 4 bytes a point once and gathers nothing on the CPU', t => {
   silenceCalculationNotifications(t);
   const gl = createGl();
   const pointCount = 6_000;
@@ -691,11 +693,11 @@ test('a recolour of an ordered store sends 4 bytes a point once and gathers noth
     [['bufferSubData', bufferOf(renderer.buffers.colors), pointCount * 4]],
     'the stand-in for the GPU pass is the only write, 4 bytes a point',
   );
-  // The colour path reads no draw-order index on the CPU: the renderer's
-  // colour writers hand the permutation to the GPU.
+  // The color path reads no draw-order index on the CPU: the renderer's
+  // color writers hand the permutation to the GPU.
   for (const name of ['_writeOrderedColors', '_publishLiveColors', '_adoptDrawOrder', '_swapColorStore']) {
     const source = HighPerfRenderer.prototype[name].toString();
-    assert.doesNotMatch(source, /colorWords\[|words\[indices|colorView\[/, `${name} must not gather colours on the CPU`);
+    assert.doesNotMatch(source, /colorWords\[|words\[indices|colorView\[/, `${name} must not gather colors on the CPU`);
   }
 });
 
@@ -793,7 +795,7 @@ test('without culling or LOD, a lookup tree reorders the store: the view is sett
   assert.equal(renderer.isPresentedGeometrySettled(), true);
 });
 
-test('colour stores kept for an order are deleted when the order is retired', () => {
+test('color stores kept for an order are deleted when the order is retired', () => {
   const gl = createGl();
   const { renderer } = createRenderer(gl);
   renderer._liveColorCache = new Map();
@@ -872,9 +874,9 @@ test('a store in many segments draws the slots one store draws, in the same orde
       }
       const words = new Uint32Array(pointCount * 2);
       renderer.buffers.positions.read(words);
-      const colours = new Uint32Array(pointCount);
-      renderer.buffers.colors.read(colours);
-      return { frames, words, colours, segments: renderer.buffers.positions.segments.length };
+      const colors = new Uint32Array(pointCount);
+      renderer.buffers.colors.read(colors);
+      return { frames, words, colors, segments: renderer.buffers.positions.segments.length };
     });
     const [whole, ...split] = runs;
     assert.equal(whole.segments, 1);
@@ -885,7 +887,7 @@ test('a store in many segments draws the slots one store draws, in the same orde
         assert.deepEqual(run.frames[name], slots, `${name}, ${run.segments} segments, multi-draw ${multiDraw}`);
       }
       assert.deepEqual(run.words, whole.words, 'positions gathered into the draw order, bit for bit');
-      assert.deepEqual(run.colours, whole.colours, 'colours gathered into the draw order, bit for bit');
+      assert.deepEqual(run.colors, whole.colors, 'colors gathered into the draw order, bit for bit');
     }
   }
 });
@@ -894,8 +896,9 @@ test('a draw order the store cannot adopt is said once, the view draws full deta
   silenceCalculationNotifications(t);
   const notifications = getNotificationCenter();
   const errors = [];
+  const details = [];
   const previousError = notifications.error;
-  notifications.error = message => { errors.push(String(message)); };
+  notifications.error = (message, options = {}) => { errors.push(String(message)); details.push(options.details); };
   t.after(() => { notifications.error = previousError; });
   const gl = createGl();
   const pointCount = 5_000;
@@ -918,7 +921,9 @@ test('a draw order the store cannot adopt is said once, the view draws full deta
   }
   assert.equal(gathers, 1, 'not retried every frame');
   assert.equal(errors.length, 1, 'said once');
-  assert.match(errors[0], /Levels of detail and culling are off for the live view: its 5,000 points could not be put in draw order on the GPU \(GPU permute could not allocate/);
+  // Said for the person, the GPU's own words under Details.
+  assert.equal(errors[0], 'Drawing the live view may be slower: the graphics card could not sort its 5,000 cells, so every cell is drawn at full detail.');
+  assert.match(details[0], /GPU permute could not allocate/);
   renderer._presentedViewIds = ['live'];
   assert.equal(renderer.isPresentedGeometrySettled(), true, 'the view draws its final picture');
   // Memory released since does not retry it (every deletion counts as a
@@ -965,7 +970,7 @@ function createRankRenderer(gl, pointCount, cloud = null) {
   return { renderer, positions: cloud?.positions ?? positions, colors: cloud?.colors ?? colors };
 }
 
-/** Each slot's source cell must hold that cell's words, in the position and colour stores. */
+/** Each slot's source cell must hold that cell's words, in the position and color stores. */
 function assertStoreHolds(renderer, label) {
   const order = renderer._liveOrder;
   const n = renderer.pointCount;
@@ -1038,7 +1043,7 @@ test('a store takes its tree order band by band; every level draws its own cells
   while (renderer._liveOrder?.drawOrder !== tree.drawOrder) {
     const { order } = renderer._advanceStoreOrder(LIVE_STORE_FOR_TEST, renderer._liveOrder, tree.drawOrder, 1);
     steps += 1;
-    assert.equal(renderer._liveColorOrder, order, 'the colours follow each step');
+    assert.equal(renderer._liveColorOrder, order, 'the colors follow each step');
     assertLevelsAreRankPrefixes(renderer, `step ${steps}`);
     assertStoreHolds(renderer, `step ${steps}`);
   }
@@ -1202,7 +1207,7 @@ test('cells resized while their tree builds in the worker cancel that build; mid
   assert.deepEqual(read(renderer.buffers.colors, 17_000, 4), read(direct.buffers.colors, 17_000, 4));
 });
 
-test('a recolour with the same colours in another array sends nothing; the same array rewritten is sent again', t => {
+test('a recolor with the same colors in another array sends nothing; the same array rewritten is sent again', t => {
   silenceCalculationNotifications(t);
   const gl = createGl();
   const { renderer, colors } = createRenderer(gl, { pointCount: 5_000 });
@@ -1225,8 +1230,9 @@ test('a band whose deferred error check fails gives the order up: the store is w
   silenceCalculationNotifications(t);
   const notifications = getNotificationCenter();
   const errors = [];
+  const details = [];
   const previousError = notifications.error;
-  notifications.error = message => { errors.push(String(message)); };
+  notifications.error = (message, options = {}) => { errors.push(String(message)); details.push(options.details); };
   t.after(() => { notifications.error = previousError; });
   const gl = createGl();
   const { renderer } = createRankRenderer(gl, 30_000);
@@ -1246,7 +1252,8 @@ test('a band whose deferred error check fails gives the order up: the store is w
   assert.equal(renderer._liveOrder, null);
   assert.equal(renderer._colorsDirty, true);
   assert.equal(errors.length, 1);
-  assert.match(errors[0], /Culling and the tree's draw order are off for the live view/);
+  assert.match(errors[0], /^Drawing the live view may be slower: the graphics card could not sort its [\d,]+ cells, so cells off screen are drawn too\.$/);
+  assert.equal(typeof details[0], 'string');
   renderer.render(params('live', { forceLOD: 2 }));
   assertStoreHolds(renderer, 'after the failure');
   assert.equal(renderer._liveOrder, null, 'not tried again until LOD or culling is toggled');
@@ -1368,7 +1375,7 @@ test('cells drawn beneath the others (a field\'s no-value grey) take a pass of t
   renderer.updateColors(colors);
   const single = drawsOf(ladder.length - 2);
   assert.deepEqual(single.passes, [0]);
-  // A sparse field: most cells grey beneath (BENEATH_ALPHA_BYTE), every tenth coloured.
+  // A sparse field: most cells gray beneath (BENEATH_ALPHA_BYTE), every tenth colored.
   for (let cell = 0; cell < pointCount; cell++) colors[cell * 4 + 3] = cell % 10 === 0 ? 255 : BENEATH_ALPHA_BYTE;
   renderer.updateColors(colors);
   for (const level of [0, 5, ladder.length - 2, -1]) {
@@ -1424,7 +1431,7 @@ test('cells not read are drawn first, then the cells read from their own slot li
   assert.ok(fits > 0, 'a reduced level holds more cells than are read');
   for (const level of [fits, -1]) {
     const drawn = drawsOf(level);
-    assert.deepEqual(drawn.passes, [3, 1, 2, 0], `level ${level}: not read, then the grey, then the coloured, then reset`);
+    assert.deepEqual(drawn.passes, [3, 1, 2, 0], `level ${level}: not read, then the grey, then the colored, then reset`);
     const elements = drawn.draws.filter(draw => draw.kind === 'elements');
     const arrays = drawn.draws.filter(draw => draw.kind === 'arrays');
     // The cells not read: the level's ranges; each read layer: every read cell by its slot.
@@ -1499,23 +1506,23 @@ test('a growth toward a known target makes its stores and alpha texture once: la
   assert.ok(first.allocations > 0);
   assert.equal(renderer.buffers.positions.allocatedByteLength, 30_000 * 8, 'the position store is made for the target');
   assert.equal(renderer.buffers.positions.byteLength, 24_000 * 8, 'and holds the cells shown');
-  assert.equal(renderer._colorGpuByteLength, 24_000 * 4, 'the accepted colour bytes are the cells shown');
+  assert.equal(renderer._colorGpuByteLength, 24_000 * 4, 'the accepted color bytes are the cells shown');
   assert.equal(renderer._alphaTexPlan.itemCount, 24_000);
   assert.ok(renderer._alphaTexPlan.texels >= 30_000, 'the alpha texture is made for the target');
   // A frame draws the cells shown while the stores have room for more: the
-  // colours are published into the store (its accepted bytes are the cells').
-  const recoloured = prefix(24_000).colors.slice();
-  for (let cell = 0; cell < 24_000; cell++) recoloured[cell * 4] ^= 0xff;
-  renderer.updateColors(recoloured);
+  // colors are published into the store (its accepted bytes are the cells').
+  const recolored = prefix(24_000).colors.slice();
+  for (let cell = 0; cell < 24_000; cell++) recolored[cell * 4] ^= 0xff;
+  renderer.updateColors(recolored);
   renderer.beginFrame();
   renderer.render(params('live'));
-  assert.equal(renderer._colorsDirty, false, 'the recolour was published');
+  assert.equal(renderer._colorsDirty, false, 'the recolor was published');
   // Every later step up to it, and a cut, only writes.
   const second = step(30_000, 30_000);
   assert.deepEqual([second.allocations, second.errors], [0, 0], 'no allocation and no error read back on a step that fits');
   const width = renderer._alphaTexPlan.width;
   assert.ok(second.alphaBytes <= (30_000 - Math.floor(24_000 / width) * width) + width, 'only the rows from the old count on are sent');
-  // The colours changed over the kept cells (the recolour above): they go
+  // The colors changed over the kept cells (the recolor above): they go
   // up whole at the next frame.
   renderer.beginFrame();
   renderer.render(params('live'));

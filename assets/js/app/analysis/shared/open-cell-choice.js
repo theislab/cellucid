@@ -9,7 +9,7 @@
  * - **uniform** is; so is **stratified, proportional** with no minimum per
  *   category (a uniform sample within each category, at the file's
  *   proportions).
- * - **blocks** (whole runs of neighbouring cells; the default subsample of a
+ * - **blocks** (whole runs of neighboring cells; the default subsample of a
  *   file Cellucid did not write) is a cluster sample: a file stored by
  *   sample or by cell type loses whole samples or types, and the cells of
  *   one block are alike, so proportions can be far from the file's and
@@ -29,16 +29,10 @@
  * @module shared/open-cell-choice
  */
 
-import { formatCount, formatCountOf, formatOpenCells } from '../../../utils/format-units.js';
+import { formatCount, formatCountOf, formatOpenCells, formatShare, formatCompactCount } from '../../../utils/format-units.js';
 import { GENES_READ_PLACE, geneSampleText } from '../../../data/gene-read-plan.js';
-import { formatCompactCount } from '../../ui/components/display-format.js';
 
-function percentOf(open, of) {
-  const percent = (100 * open) / of;
-  return `${percent >= 10 ? Math.round(percent) : percent >= 1 ? percent.toFixed(1) : percent.toPrecision(2)}%`;
-}
-
-const NOT_THE_FILE = 'Open every cell, or a uniform subsample, to analyse the file.';
+const NOT_THE_FILE = 'Open every cell, or a uniform subsample, to analyze the file.';
 
 /**
  * How the open cells of `identity` were chosen, for a result computed on
@@ -115,7 +109,7 @@ function describeSubsetChoice(identity) {
   const open = identity.n;
   const of = identity.nOriginal;
   const cells = formatOpenCells(open, of);
-  const share = percentOf(open, of);
+  const share = formatShare(open, of);
   const choice = identity.choice ?? null;
   const spec = choice?.spec ?? null;
   const described = (method, representative, words, title, field = null) => Object.freeze({
@@ -131,7 +125,7 @@ function describeSubsetChoice(identity) {
 
   if (choice?.chunked === true) {
     return described('chunks', false, 'first chunks',
-      `Computed on ${cells}: the subsample's cells in the parts of the file read so far, while it opens. They lie in whole runs of neighbouring cells, not a sample of the file, so proportions and p-values are of these cells only. Run again once the opening has finished.`);
+      `Computed on ${cells}: the subsample's cells in the parts of the file read so far, while it opens. They lie in whole runs of neighboring cells, not a sample of the file, so proportions and p-values are of these cells only. Run again once the opening has finished.`);
   }
   if (spec === null) {
     return described('unknown', false, 'subsample',
@@ -143,7 +137,7 @@ function describeSubsetChoice(identity) {
         `Computed on ${cells}, a uniform random sample of the file. Proportions and p-values are of these cells and estimate the file's.`);
     case 'blocks':
       return described('blocks', false, 'blocks',
-        `Computed on ${cells}: whole blocks of ${spec.blockSize} neighbouring cells, not a random sample of the file. A file stored by sample or by cell type loses whole samples or types, and the cells of one block are alike, so proportions can be far from the file's and p-values overstate the evidence. ${NOT_THE_FILE}`);
+        `Computed on ${cells}: whole blocks of ${spec.blockSize} neighboring cells, not a random sample of the file. A file stored by sample or by cell type loses whole samples or types, and the cells of one block are alike, so proportions can be far from the file's and p-values overstate the evidence. ${NOT_THE_FILE}`);
     case 'stratified': {
       const field = spec.field;
       if (spec.allocation === 'proportional' && spec.minPerCategory === 0) {

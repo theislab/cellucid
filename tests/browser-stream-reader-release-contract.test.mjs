@@ -10,7 +10,7 @@
  * reader thread (`formats/io/inflate.js`) hung on opening that way, and its
  * page then hung its teardown.
  *
- * A reader that has been read to its end or cancelled holds nothing anyone
+ * A reader that has been read to its end or canceled holds nothing anyone
  * else needs: it is dropped. The community-annotation Cloudflare Worker
  * (`_worker-code.js`) runs on workerd, never in a browser.
  */

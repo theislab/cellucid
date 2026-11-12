@@ -397,6 +397,30 @@ test('PlotRegistry preserves exact option schemas, values, and type statistics',
   }
 });
 
+test('PlotRegistry keeps every member a plot type declares', async t => {
+  const pluginId = 'own-members-probe';
+  t.after(() => PlotRegistry.unregister(pluginId));
+  PlotRegistry.unregister(pluginId);
+  assert.equal(PlotRegistry.register({
+    id: pluginId,
+    supportedTypes: ['any'],
+    fitTickLabels: false,
+    summary() { return 'own helper'; },
+    render() { return this.summary(); },
+  }), true);
+  const registered = PlotRegistry.get(pluginId);
+  // A flag PlotFactory reads, and a helper a method reaches through `this`.
+  assert.equal(registered.fitTickLabels, false);
+  assert.equal(registered.render(), 'own helper');
+
+  // The plot types themselves: the dot plot names every gene and group itself,
+  // the volcano's CSV reads its own summary.
+  const { default: volcanoPlotDefinition } = await import('../assets/js/app/analysis/plots/types/volcanoplot.js');
+  await import('../assets/js/app/analysis/plots/types/dotplot.js');
+  assert.equal(PlotRegistry.get('dotplot').fitTickLabels, false);
+  assert.equal(PlotRegistry.get(volcanoPlotDefinition.id).getSummary, volcanoPlotDefinition.getSummary);
+});
+
 test('analysis form value publishers preserve every prototype-named key', () => {
   const valuesByKey = new Map(
     PROTOTYPE_PROPERTY_NAMES.map((key, index) => [

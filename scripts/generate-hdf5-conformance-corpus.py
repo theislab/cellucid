@@ -129,8 +129,8 @@ def enum_kinds(group):
     boolean = h5py.enum_dtype({"FALSE": 0, "TRUE": 1}, basetype="i1")
     dataset(group, "bool_enum", (np.arange(100) % 3 == 0).astype("i1"), dtype=boolean)
     dataset(group, "numpy_bool", np.arange(100) % 4 == 0)
-    colours = h5py.enum_dtype({"red": 0, "green": 5, "blue": 200}, basetype="u1")
-    dataset(group, "enum_u1", np.array([0, 5, 200, 5] * 10, dtype="u1"), dtype=colours)
+    colors = h5py.enum_dtype({"red": 0, "green": 5, "blue": 200}, basetype="u1")
+    dataset(group, "enum_u1", np.array([0, 5, 200, 5] * 10, dtype="u1"), dtype=colors)
     dataset(group, "bool_scalar", np.bool_(True))
 
 

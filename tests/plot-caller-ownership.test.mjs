@@ -545,6 +545,8 @@ test('Genes modal close waits for its running child candidate to settle', { conc
       const modal = document.createElement('div');
       modal._cleanupDone = false;
       modal._cleanupFns = [];
+      // Never opened through `openModal`, so no app dialog.
+      modal._appDialog = null;
       modal._plotContainer = document.createElement('div');
       modal.appendChild(modal._plotContainer);
       document.body.appendChild(modal);
@@ -698,7 +700,7 @@ test('Detailed exports lease the exact committed modal child across replacement'
         _statsContent: null,
         _annotationsContent: null,
       };
-      ui._currentPageData = [{ pageId: 'page-A' }];
+      ui._currentPageData = [{ pageId: 'page-A', variableInfo: { name: 'score', kind: 'continuous' } }];
       ui._currentConfig = {
         dataSource: {
           type: 'continuous_obs',

@@ -1,5 +1,5 @@
 /**
- * Analysis loads must not be serialised.
+ * Analysis loads must not be serialized.
  *
  * Every field or gene read can be its own request, so the number that decides
  * how long an analysis waits is not how many requests it makes but how many of

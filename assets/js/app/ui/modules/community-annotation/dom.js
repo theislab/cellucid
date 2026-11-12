@@ -41,14 +41,6 @@ export function hasAtLeastUnicodeCodePoints(value, minimum) {
 }
 
 export function downloadJsonAsFile(filename, json) {
-  if (
-    typeof filename !== 'string' ||
-    !filename ||
-    /^\s|\s$/.test(filename) ||
-    /[\\/:*?"<>|]/.test(filename)
-  ) {
-    throw new Error('Download filename must be an exact portable filename');
-  }
   const payload = JSON.stringify(json, null, 2) + '\n';
   downloadBlob(new Blob([payload], { type: 'application/json' }), filename);
 }
@@ -66,7 +58,7 @@ const STATUS_TONES = new Set(['ok', 'warn', 'danger']);
 
 /**
  * One decorative status glyph (dataset, GitHub, repo, copy, gear,
- * disconnect), drawn in the current text colour.
+ * disconnect), drawn in the current text color.
  *
  * @param {keyof typeof STATUS_ICON_PATHS} name
  * @returns {SVGSVGElement}

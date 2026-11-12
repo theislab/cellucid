@@ -42,26 +42,6 @@ export function openExternal(url) {
   return true;
 }
 
-export async function copyTextToClipboard(text) {
-  if (
-    typeof text !== 'string' ||
-    !text ||
-    /^\s|\s$/.test(text)
-  ) {
-    return false;
-  }
-  const value = text;
-  if (
-    typeof navigator !== 'undefined' &&
-    navigator.clipboard &&
-    typeof navigator.clipboard.writeText === 'function'
-  ) {
-    await navigator.clipboard.writeText(value);
-    return true;
-  }
-  throw new TypeError('Community annotation copying requires navigator.clipboard.writeText()');
-}
-
 /**
  * What to tell the person when GitHub sign-in or repository discovery could
  * not reach the Worker. A Worker never reached (no answer this page may

@@ -25,23 +25,14 @@
 
 import { getNotificationCenter } from '../../notification-center.js';
 import { PLACES, placePath } from '../place-names.js';
+import { setControlAvailability } from '../core/control-availability.js';
 import { getActions } from '../../actions/index.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
-import { resolveViewName, viewNameOf } from '../../actions/targets/views.js';
+import { resolveViewName, viewLabelOf, viewNameOf, withViewLabel } from '../../actions/targets/views.js';
 import { throwIfAborted } from '../../../utils/abort.js';
+import { representationOptionText } from '../../../data/representation-names.js';
 
 const CYCLE_NOTICE_MS = 2200;
-
-/**
- * The text of one picker option: the representation's short name and its
- * dimension.
- *
- * @param {{name: string, dimension: number}} representation
- * @returns {string}
- */
-export function representationOptionText(representation) {
-  return `${representation.name} · ${representation.dimension}D`;
-}
 
 /**
  * The hover text of one option: what it is read from, and whether it is the
@@ -157,12 +148,11 @@ export function initRepresentationControls({ state, viewer, dom, callbacks }) {
     select.value = current;
     const shown = representations.find(item => item.layoutKey === current);
     select.title = shown === undefined ? '' : representationOptionTitle(shown);
-    select.disabled = busy || representations.length < 2;
-    if (busy) {
-      select.title = 'Switching…';
-    } else if (representations.length < 2) {
-      select.title = `This dataset shows one embedding. Turn more on in ${placePath(PLACES.session, PLACES.dataMapping)}.`;
-    }
+    setControlAvailability(select, busy
+      ? 'another embedding is being shown; try again once it is'
+      : representations.length < 2
+        ? `this dataset shows one embedding; turn more on in ${placePath(PLACES.session, PLACES.dataMapping)}`
+        : null);
   }
 
   /** What `layoutKey` is called in a notice: "t-SNE". */
@@ -275,11 +265,15 @@ export function initRepresentationControls({ state, viewer, dom, callbacks }) {
       const viewId = resolveViewName(viewer, view);
       throwIfAborted(signal);
       try {
-        await state.setViewEmbeddingRef(viewId, embedding);
+        await state.setViewEmbeddingRef(viewId, embedding, { signal });
       } catch (error) {
         throw asRefusal(error);
       }
-      return { view };
+      // The step names it as the picker does ("UMAP · 2D").
+      const shown = state.getEnabledRepresentations().find(item => item.ref?.key === embedding.key
+        && item.ref.columns.length === embedding.columns.length
+        && item.ref.columns.every((column, index) => column === embedding.columns[index]));
+      return withViewLabel(viewLabelOf(viewer, viewId), shown === undefined ? { view } : { view, embedding: representationOptionText(shown) });
     }),
     actions.provide('view.embedding.default', async ({ view, dimension }, { signal }) => {
       requireOpen();
@@ -290,11 +284,11 @@ export function initRepresentationControls({ state, viewer, dom, callbacks }) {
       throwIfAborted(signal);
       let layoutKey;
       try {
-        layoutKey = await state.showDefaultRepresentation(viewId, dimension);
+        layoutKey = await state.showDefaultRepresentation(viewId, dimension, { signal });
       } catch (error) {
         throw asRefusal(error);
       }
-      return { view, embedding: nameOf(layoutKey) };
+      return withViewLabel(viewLabelOf(viewer, viewId), { view, embedding: nameOf(layoutKey) });
     }),
     actions.provide('view.embedding.cycle', async ({ view, dimension }, { signal }) => {
       requireOpen();
@@ -305,11 +299,11 @@ export function initRepresentationControls({ state, viewer, dom, callbacks }) {
       throwIfAborted(signal);
       let result;
       try {
-        result = await state.cycleRepresentation(viewId, dimension);
+        result = await state.cycleRepresentation(viewId, dimension, { signal });
       } catch (error) {
         throw asRefusal(error);
       }
-      return { view, embedding: nameOf(result.layoutKey), position: result.position, count: result.count };
+      return withViewLabel(viewLabelOf(viewer, viewId), { view, embedding: nameOf(result.layoutKey), position: result.position, count: result.count });
     }),
   ];
 

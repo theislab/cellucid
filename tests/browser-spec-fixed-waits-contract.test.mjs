@@ -107,10 +107,24 @@ const ALLOWED_FIXED_WAITS = Object.freeze([
   },
   {
     file: 'tests/browser/community-annotation-startup-lifecycle.spec.mjs',
-    source: 'await page.waitForTimeout(',
+    source: 'await page.waitForTimeout(3_000);',
     count: 1,
     kind: 'time',
-    reason: 'Past the owner retry\'s due time (after it has fired), so a request it wrongly issued would have reached the route.',
+    reason: 'No role check on a timer of its own (round 9: the transport\'s retries are the one policy): the absence of requests past the host\'s named reset is the subject.',
+  },
+  {
+    file: 'tests/browser/community-annotation-startup-lifecycle.spec.mjs',
+    source: 'await page.waitForTimeout(400);',
+    count: 1,
+    kind: 'time',
+    reason: 'A role check asked for during a held Pull must not run beside it: after its continuations settle, a window in which a request it wrongly issued would have reached the route.',
+  },
+  {
+    file: 'tests/browser/select-bar.spec.mjs',
+    source: 'await page.waitForTimeout(800);',
+    count: 1,
+    kind: 'time',
+    reason: '`nextPress`: past the double-tap time (Chromium counts taps 400 ms apart, a desktop double click 500 ms), so a tap on what took a primary button\'s place is a new press, not the double tap `press-guard.js` drops: time is the subject.',
   },
   {
     file: 'tests/browser/data-source-failure-modes.spec.mjs',

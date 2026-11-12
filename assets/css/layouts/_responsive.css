@@ -85,7 +85,7 @@
     right: 0;
     bottom: 0;
     /* Above the floating windows: one moved or grown over the foot of the
-       screen leaves the bar on top. Dialogs (--z-modal) stay above it. */
+       screen leaves the bar on top. Dialogs (the top layer) stay above it. */
     z-index: calc(var(--z-floating) + 1);
     display: flex;
     align-items: center;
@@ -165,13 +165,13 @@
      --control-hit-extend (3px) above and below their drawn box with an
      invisible ::after (_buttons.css), so a finger gets 42px; between stacked
      boxed controls the 6px gap is exactly the two extensions, so no hit area
-     overlaps its neighbour. A one-line field cannot carry a pseudo-element,
+     overlaps its neighbor. A one-line field cannot carry a pseudo-element,
      so its border box grows by the same 3px above and below in transparent
      border and its frame is drawn inset (components/_controls.css);
    - option rows (a checkbox and its text, a switch) are drawn
      --control-row-min (36px) tall and carry the same 3px extension, and
      stacked rows keep 6px between them; a disclosure header is a full-width
-     36px row whose neighbours are rows of the same list;
+     36px row whose neighbors are rows of the same list;
    - the type scale moves up one step, so text stays readable at arm's length
      and keeps its flat shape (title one step above the base, secondary text
      one step below).
@@ -184,7 +184,7 @@
    field (input, select or textarea) whose text is under 16px, and that zoom
    threw the full-screen menu off the side of the screen. Instead,
    ui/core/viewport-init.js adds maximum-scale=1 to the viewport on iOS and
-   iPadOS only: there it stops the focus zoom while Safari still honours the
+   iPadOS only: there it stops the focus zoom while Safari still honors the
    user's own pinch zoom (it ignores maximum-scale for pinch since iOS 10).
    Android Chrome would lose page pinch zoom under maximum-scale, an
    accessibility cost, so it never gets it; it does not zoom on focus. */
@@ -290,8 +290,6 @@
     opacity: var(--opacity-90);
   }
 
-  .highlight-page-tab-combine,
-  .highlight-page-tab-delete,
   .analysis-preview-plot .modebar,
   .analysis-modal-plot .modebar {
     opacity: 1;

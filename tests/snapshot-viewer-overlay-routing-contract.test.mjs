@@ -39,6 +39,8 @@ function createRenderParams(useAlphaTexture = false) {
     fogColor: [1, 1, 1],
     cameraPosition: [0, 0, 3],
     cameraDistance: 3,
+    // The sprite cap (rendering/point-sprite.js).
+    pointSizeMax: 160,
     useAlphaTexture,
   };
 }
@@ -65,6 +67,7 @@ function createContextOptions({
     renderParams,
     timeSeconds: 1,
     deltaTimeSeconds: 1 / 60,
+    reducedMotion: false,
     isSnapshot,
     dimensionLevel: 3,
     layoutKey: '3d',

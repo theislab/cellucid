@@ -23,6 +23,7 @@
  * @module genes-panel/clustering-engine
  */
 
+import { formatBytes, formatCountOf } from '../../../utils/format-units.js';
 import {
   reorderRows,
   reorderCols,
@@ -49,12 +50,11 @@ import { DEFAULTS, ANALYSIS_PHASES } from './constants.js';
  * @returns {string}
  */
 function clusteringRefusal(axis, count, requiredBytes, budgetBytes) {
-  const megabytes = bytes => Math.ceil(bytes / 2 ** 20).toLocaleString('en-US');
-  const items = axis === 'rows' ? 'genes' : 'groups';
+  const [item, items] = axis === 'rows' ? ['gene', 'genes'] : ['group', 'groups'];
   return (
-    `Clustering ${count.toLocaleString('en-US')} ${items} needs about ` +
-    `${megabytes(requiredBytes)} MB of memory, more than the ` +
-    `${megabytes(budgetBytes)} MB this device gives an analysis. Show fewer ` +
+    `Clustering ${formatCountOf(count, item, items)} needs about ` +
+    `${formatBytes(requiredBytes)} of memory, more than the ` +
+    `${formatBytes(budgetBytes)} this device gives an analysis. Show fewer ` +
     `${items}, or turn clustering of ${items} off.`
   );
 }
@@ -212,7 +212,7 @@ export class ClusteringEngine {
       onProgress({
         phase: ANALYSIS_PHASES.CLUSTERING,
         progress: 10,
-        message: doClusterRows ? 'Clustering genes...' : 'Clustering groups...'
+        message: doClusterRows ? 'Clustering genes…' : 'Clustering groups…'
       });
     }
     const computeManager = getComputeManager();

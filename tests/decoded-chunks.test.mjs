@@ -55,11 +55,11 @@ test('a failed decode is not kept; chunks let go keep nothing more', async () =>
 
 test('the store\'s own decoded-chunk caches and the reader\'s chunks hold one budget together, never twice it', async () => {
   const { DecodedBudget } = await import('../assets/js/formats/io/decoded-budget.js');
-  const { ByteLru } = await import('../assets/js/formats/zarr/cache.js');
-  const { ByteCache } = await import('../assets/js/formats/hdf5/lru.js');
-  for (const StoreCache of [ByteLru, ByteCache]) {
+  const { ByteCache } = await import('../assets/js/formats/io/byte-cache.js');
+  {
     const budget = new DecodedBudget(128);
-    const store = new StoreCache(budget);
+    // A Zarr store's or an HDF5 file's own cache (one class for both).
+    const store = new ByteCache(budget);
     const chunks = new DecodedChunks(budget);
     for (const key of ['s1', 's2', 's3', 's4']) store.set(key, block(4), 16);
     assert.equal(store.bytes, 64);
@@ -75,7 +75,7 @@ test('the store\'s own decoded-chunk caches and the reader\'s chunks hold one bu
     assert.ok(decoded, 'c1, its oldest, went');
     // A chunk larger than what the reader holds takes room from the store's cache.
     await chunks.get('big', async () => block(24));
-    assert.ok(budget.heldBytes <= 128, `${StoreCache.name}: ${budget.heldBytes} bytes held`);
+    assert.ok(budget.heldBytes <= 128, `${budget.heldBytes} bytes held`);
     assert.ok(store.bytes < 64, 'the store\'s oldest went once the reader\'s own were not enough');
     // Let go (the store's last opening closed): it holds nothing and counts nothing.
     chunks.release();
@@ -113,8 +113,8 @@ test('a decode shared by two reads goes on when one is cancelled: the other gets
   const first = chunks.get('x|0', decode, { signal: cancelled.signal });
   const second = chunks.get('x|0', decode, { signal: new AbortController().signal });
   const third = chunks.get('x|0', decode, {});
-  cancelled.abort(new DOMException('first cancelled', 'AbortError'));
-  await assert.rejects(first, error => error.message === 'first cancelled');
+  cancelled.abort(new DOMException('first canceled', 'AbortError'));
+  await assert.rejects(first, error => error.message === 'first canceled');
   assert.equal(decodeSignal.aborted, false, 'the others still wait: the decode goes on');
   finish(block(4));
   assert.equal((await second).length, 4);
@@ -155,7 +155,7 @@ test('chunks held by several openings go only when the last lets go', async () =
 
 test('a subsample\'s view: a read cancelled never fails another read of the same rows through the store\'s chunks', async () => {
   const { gatheredArray, runsOfPositions } = await import('../assets/js/data/anndata/views/cell-subset.js');
-  // A chunked 1-D array of 100 rows in 10-row chunks whose read honours its signal.
+  // A chunked 1-D array of 100 rows in 10-row chunks whose read honors its signal.
   let reads = 0;
   const real = {
     kind: 'array', path: 'obs/x', name: 'x', attrs: {}, attributeType: () => null,
@@ -189,10 +189,10 @@ test('decoded chunks stay while nothing asks for their room, and every store\'s 
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   const { DecodedBudget, heldDecodedBytes, trimDecodedChunks } = await import('../assets/js/formats/io/decoded-budget.js');
   const { WORKER_IDLE_MS } = await import('../assets/js/workers/idle-retirement.js');
-  const { ByteLru } = await import('../assets/js/formats/zarr/cache.js');
-  const { ByteCache } = await import('../assets/js/formats/hdf5/lru.js');
+  const { ByteCache } = await import('../assets/js/formats/io/byte-cache.js');
   const budget = new DecodedBudget(1024);
-  const zarr = new ByteLru(budget);
+  // A Zarr store's and an HDF5 file's caches on one budget.
+  const zarr = new ByteCache(budget);
   const hdf5 = new ByteCache(budget);
   const chunks = new DecodedChunks(budget);
   zarr.set('z', block(4), 16);
@@ -206,7 +206,7 @@ test('decoded chunks stay while nothing asks for their room, and every store\'s 
   // A budget read whenever it is used follows the share as it changes.
   let share = 1024;
   const following = new DecodedBudget(() => share);
-  const other = new ByteLru(following);
+  const other = new ByteCache(following);
   other.set('o1', block(4), 16);
   other.set('o2', block(4), 16);
   share = 16;
@@ -223,7 +223,7 @@ test('decoded chunks stay while nothing asks for their room, and every store\'s 
   await chunks.get('c', async () => { decoded = true; return block(4); });
   assert.equal(decoded, true, 'a chunk asked for after is decoded again');
   // A store's structure (shard indexes) is not decoded chunks: never counted or trimmed.
-  const indexes = new ByteLru(new DecodedBudget(1024, { structure: true }));
+  const indexes = new ByteCache(new DecodedBudget(1024, { structure: true }));
   indexes.set('shard', block(4), 16);
   trimDecodedChunks(0);
   assert.ok(indexes.get('shard'));

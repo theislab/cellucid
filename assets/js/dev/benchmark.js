@@ -21,16 +21,52 @@ import {
   MAX_SYNTHETIC_COUNT,
   MIN_SYNTHETIC_COUNT
 } from '../app/ui/modules/benchmark/generation-contract.js';
-import { formatCompactCount as formatNumber } from '../app/ui/components/display-format.js';
 import { PLACES } from '../app/ui/place-names.js';
-import { formatCountOf, formatCount, countNoun } from '../utils/format-units.js';
+import { formatCountOf, formatCount, countNoun, formatCompactCount as formatNumber, formatDuration } from '../utils/format-units.js';
 import { allocateLargeArray } from '../utils/large-arrays.js';
+import { webStorage, webStorageKeeps } from '../utils/web-storage.js';
+import { realmHosts } from '../formats/io/hosts.js';
 
 const glbBufferPromises = new Map();
+
+/**
+ * A sweep's frame-time multiplier (largest points against smallest, most
+ * points drawn against fewest) above which that cost is named a bound.
+ */
+const BOUND_RESPONSE = 1.5;
+
+/**
+ * The frame rate at and above which the analysis calls frames smooth: within
+ * a 60 Hz display's refresh, allowing for the timer's jitter. Below it the
+ * panel names a primary bottleneck and frame-time advice.
+ */
+export const SMOOTH_FPS = 55;
+
+/**
+ * `callback` as a frame or timer callback of a measurement whose promise it
+ * rejects when it throws. A throw inside an animation-frame or timer callback
+ * reaches no caller: without this the measurement never settles, so the
+ * panel says "Measuring performance…" for good and the viewer the analysis
+ * paused stays paused (a render parameter the renderer's contract added,
+ * missing from `_getDefaultRenderParams`, did exactly that).
+ *
+ * @param {(...args: any[]) => void} callback
+ * @param {(error: unknown) => void} reject
+ * @returns {(...args: any[]) => void}
+ */
+function rejectingOnThrow(callback, reject) {
+  return (...args) => {
+    try {
+      callback(...args);
+    } catch (error) {
+      reject(error);
+    }
+  };
+}
 const MEBIBYTE = 1024 * 1024;
 // Before the renderer publishes its measured figure, GPU memory is estimated
 // from what the points renderer stores per cell: 4 bytes per position axis
-// (positions keep exactly the embedding's dimension), 4 bytes of RGBA colour
+// (positions keep exactly the embedding's dimension), 4 bytes of RGBA color
 // and 1 byte of alpha. Measured: 13 B/point in 2D and 17 B/point in 3D.
 const GPU_POSITION_BYTES_PER_AXIS = 4;
 const GPU_COLOR_AND_ALPHA_BYTES_PER_POINT = 5;
@@ -1308,7 +1344,7 @@ export class SyntheticDataGenerator {
 
     for (let i = 0; i < count; i++) {
       if (i > 0 && i % logInterval === 0) {
-        console.log(`[GLB] Sampled ${(i / 1000).toFixed(0)}K / ${(count / 1000).toFixed(0)}K points...`);
+        console.log(`[GLB] Sampled ${formatNumber(i)} / ${formatNumber(count)} ${countNoun(count, 'point')}...`);
       }
 
       const idx = i * 3;
@@ -1647,10 +1683,20 @@ export { PerformanceTracker } from
  *   console.log(analyzer.formatReport());
  */
 export class BottleneckAnalyzer {
-  constructor(gl, renderer, host) {
+  /**
+   * @param {WebGL2RenderingContext|null} gl - The viewer's context
+   * @param {Object} renderer - The viewer's HighPerfRenderer
+   * @param {Object|null} host - The viewer (paused while the analysis draws)
+   * @param {{pointSizeMax: number}} [sprite] -
+   *   The sprite cap the analysis draws with, as the viewer draws
+   *   (`rendering/point-sprite.js` `pointSpriteCap`: handed in by the panel,
+   *   since this module reaches no renderer module)
+   */
+  constructor(gl, renderer, host, sprite = null) {
     this.gl = gl;
     this.renderer = renderer;
     this.host = host;
+    this.sprite = sprite;
     this.gpuTimer = null;
     this.results = null;
 
@@ -1844,12 +1890,12 @@ export class BottleneckAnalyzer {
     // Default render params
     const renderParams = this._getDefaultRenderParams();
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       let frameCount = 0;
       let warmupCount = 0;
       let lastTime = performance.now();
 
-      const measure = () => {
+      const measure = rejectingOnThrow(() => {
         const now = performance.now();
         const frameTime = now - lastTime;
         lastTime = now;
@@ -1933,7 +1979,7 @@ export class BottleneckAnalyzer {
         };
 
         resolve(stats);
-      };
+      }, reject);
 
       requestAnimationFrame(measure);
     });
@@ -2016,7 +2062,7 @@ export class BottleneckAnalyzer {
       // tested, and so did every individual term inside them — fog, lighting,
       // the alpha texture fetch, the round discard. Depth writes are on and
       // submission order is uncorrelated with depth, so roughly 95% of
-      // rasterised fragments are killed before the fragment shader runs.
+      // rasterized fragments are killed before the fragment shader runs.
       // (A 2-D view has no depth test; there, with antialiasing on, a dense
       // embedding is bound by blending and `Light`/`Ultra-light` took about
       // half of `Full`'s frame time — see the shader-quality tooltip.)
@@ -2091,10 +2137,10 @@ export class BottleneckAnalyzer {
     const gpuFrameTimes = [];
     const cpuFrameTimes = [];
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       let frameCount = 0;
 
-      const measure = () => {
+      const measure = rejectingOnThrow(() => {
         if (frameCount < config.testFrames / 2) {
           const cpuStart = performance.now();
           const gpuQuery = this.gpuTimer.begin('gpu_analysis');
@@ -2117,7 +2163,7 @@ export class BottleneckAnalyzer {
         }
 
         // Final poll to get remaining queries
-        setTimeout(() => {
+        setTimeout(rejectingOnThrow(() => {
           for (let i = 0; i < 10; i++) {
             const completed = this.gpuTimer.poll();
             for (const result of completed) {
@@ -2144,8 +2190,8 @@ export class BottleneckAnalyzer {
               cpu: Math.max(0, 16.67 - avgCPU)
             }
           });
-        }, 200);
-      };
+        }, reject), 200);
+      }, reject);
 
       requestAnimationFrame(measure);
     });
@@ -2205,10 +2251,13 @@ export class BottleneckAnalyzer {
     const fragmentBoundScore = pointSizeScaling.scalingFactor;
     const vertexBoundScore = lodScaling.scalingFactor;
 
+    // Each score is the frame-time multiplier its sweep measured. A frame
+    // drawn within the display's refresh shows neither (every frame of the
+    // sweep lasts one refresh), so nothing is called a bound then.
     let boundType = 'balanced';
-    if (fragmentBoundScore > 1.5 && fragmentBoundScore > vertexBoundScore) {
+    if (fragmentBoundScore > BOUND_RESPONSE && fragmentBoundScore > vertexBoundScore) {
       boundType = 'fragment';
-    } else if (vertexBoundScore > 1.5 && vertexBoundScore > fragmentBoundScore) {
+    } else if (vertexBoundScore > BOUND_RESPONSE && vertexBoundScore > fragmentBoundScore) {
       boundType = 'vertex';
     }
 
@@ -2565,13 +2614,17 @@ export class BottleneckAnalyzer {
       bottlenecks.push({
         type: 'Fragment/Fill Rate',
         severity: 'contributing',
-        evidence: `Point size scaling factor: ${boundAnalysis.analysis.fragmentBoundScore.toFixed(2)}`
+        evidence: `frames take ${boundAnalysis.analysis.fragmentBoundScore.toFixed(2)}× as long with ` +
+          `${boundAnalysis.pointSizeScaling.largestPointSize} px points as with ` +
+          `${boundAnalysis.pointSizeScaling.smallestPointSize} px`
       });
     } else if (boundAnalysis.boundType === 'vertex') {
       bottlenecks.push({
         type: 'Vertex Processing',
         severity: 'contributing',
-        evidence: `LOD scaling factor: ${boundAnalysis.analysis.vertexBoundScore.toFixed(2)}`
+        evidence: `frames take ${boundAnalysis.analysis.vertexBoundScore.toFixed(2)}× as long drawing ` +
+          `${formatCountOf(boundAnalysis.lodScaling.mostPoints, 'cell')} as drawing ` +
+          `${formatCountOf(boundAnalysis.lodScaling.fewestPoints, 'cell')}`
       });
     }
 
@@ -2651,8 +2704,10 @@ export class BottleneckAnalyzer {
     // FPS-based urgency
     const urgency = fps < 15 ? 'critical' : fps < 30 ? 'high' : fps < 45 ? 'medium' : 'low';
 
-    // GPU bound recommendations
-    if (gpuAnalysis.available && gpuAnalysis.boundBy === 'GPU') {
+    // GPU bound recommendations: only for frames slower than smooth. A frame
+    // drawn within the refresh is bound by the display, whatever the GPU's
+    // share of it, and lowering its quality gains nothing a person sees.
+    if (gpuAnalysis.available && gpuAnalysis.boundBy === 'GPU' && fps < SMOOTH_FPS) {
       recommendations.push({
         priority: 1,
         category: 'GPU',
@@ -2913,6 +2968,13 @@ export class BottleneckAnalyzer {
   }
 
   _getDefaultRenderParams() {
+    const sprite = this.sprite;
+    if (sprite === null || sprite === undefined || !Number.isFinite(sprite.pointSizeMax)) {
+      throw new TypeError(
+        'Bottleneck analysis draws with the viewer\'s sprite: construct it with ' +
+        '{pointSizeMax} as app/main.js does; received ' + String(sprite && JSON.stringify(sprite)) + '.'
+      );
+    }
     const identityMatrix = new Float32Array([
       1, 0, 0, 0,
       0, 1, 0, 0,
@@ -2938,6 +3000,9 @@ export class BottleneckAnalyzer {
       lightingStrength: 0.0,
       cameraPosition: [0, 0, 5],
       cameraDistance: 5.0,
+      // The sprite cap every pass draws with (the constructor's `sprite`):
+      // the cap this GPU allows.
+      pointSizeMax: sprite.pointSizeMax,
       forceLOD: -1,
       quality: this.renderer.activeQuality,
       viewId: 'benchmark',
@@ -2972,25 +3037,23 @@ export class BottleneckAnalyzer {
       );
     }
 
-    // Calculate how frame time scales with point size
+    // How much longer a frame takes with the largest points than with the
+    // smallest: the fill's share of the frame, as a multiplier of it (1: the
+    // pixels covered cost nothing measurable).
     const baseline = pointSizeTests[sizes[0]].avg;
     const largest = pointSizeTests[sizes[sizes.length - 1]].avg;
     const sizeRatio = sizes[sizes.length - 1] / sizes[0];
     const timeRatio = largest / baseline;
 
-    // Perfect quadratic scaling would be sizeRatio^2 (area)
-    // Perfect linear would be sizeRatio
-    // Less than linear suggests vertex bound
-
     return {
-      scalingFactor: timeRatio / sizeRatio,
+      scalingFactor: timeRatio,
       baselineMs: baseline,
       largestMs: largest,
       smallestPointSize: sizes[0],
       largestPointSize: sizes[sizes.length - 1],
       sizeRatio,
       timeRatio,
-      interpretation: timeRatio > sizeRatio * 1.5 ? 'fragment-heavy' : 'balanced'
+      interpretation: timeRatio > BOUND_RESPONSE ? 'fragment-heavy' : 'balanced'
     };
   }
 
@@ -3004,29 +3067,39 @@ export class BottleneckAnalyzer {
       );
     }
 
-    const finest = lodTests[levels[0]];
-    const coarsest = lodTests[levels[levels.length - 1]];
+    // Ordered by the points each level drew, not by its index: level 0 is
+    // the smallest sample and the last level every cell, so ordering by
+    // index read a frame that does not follow the point count (a GPU with
+    // room to spare) as the most vertex-bound one (round 9, R9P-3).
+    const byPoints = levels.map(level => lodTests[level]).sort((a, b) => a.visiblePoints - b.visiblePoints);
+    const fewest = byPoints[0];
+    const most = byPoints[byPoints.length - 1];
+    if (!(fewest.visiblePoints > 0) || !(fewest.avg > 0)) {
+      throw new Error('LOD scaling requires a level that drew points in a measured time.');
+    }
 
-    const pointRatio = finest.visiblePoints / (coarsest.visiblePoints || 1);
-    const timeRatio = finest.avg / (coarsest.avg || 1);
+    // How much longer a frame of the most points takes than one of the
+    // fewest: the points' share of the frame, as a multiplier of it.
+    const pointRatio = most.visiblePoints / fewest.visiblePoints;
+    const timeRatio = most.avg / fewest.avg;
 
     return {
-      scalingFactor: timeRatio / pointRatio,
-      finestPoints: finest.visiblePoints,
-      coarsestPoints: coarsest.visiblePoints,
+      scalingFactor: timeRatio,
+      fewestPoints: fewest.visiblePoints,
+      mostPoints: most.visiblePoints,
       pointRatio,
       timeRatio,
-      interpretation: timeRatio > pointRatio * 0.8 ? 'vertex-heavy' : 'balanced'
+      interpretation: timeRatio > BOUND_RESPONSE ? 'vertex-heavy' : 'balanced'
     };
   }
 
   _explainBoundType(boundType, fragmentScore, vertexScore) {
     switch (boundType) {
       case 'fragment':
-        return `Frame time scales significantly with point size (${fragmentScore.toFixed(2)}x). ` +
+        return `Frames take ${fragmentScore.toFixed(2)}× as long with the largest points as with the smallest. ` +
                `The GPU is spending most time filling pixels. Reduce point size, shrink the window, or turn antialiasing off.`;
       case 'vertex':
-        return `Frame time scales significantly with vertex count (${vertexScore.toFixed(2)}x). ` +
+        return `Frames take ${vertexScore.toFixed(2)}× as long drawing every cell as drawing the fewest. ` +
                `The GPU is bottlenecked on vertex processing. Use more aggressive LOD or frustum culling.`;
       default:
         return `Performance is relatively balanced between vertex and fragment processing. ` +
@@ -3163,9 +3236,7 @@ export class BottleneckAnalyzer {
    * Format large numbers with K/M suffix
    */
   _formatNumber(num) {
-    if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
-    if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
-    return String(Math.round(num));
+    return formatNumber(num);
   }
 
   /**
@@ -3524,7 +3595,7 @@ export class BottleneckAnalyzer {
 
       <div style="margin-top: ${10 * scale}px; text-align: center; color: #6b7280; font-size: ${9 * scale}px;">
         Gap to 60 FPS: <span style="color: ${urgencyColors[recs.urgency]};">${recs.gapToTarget.toFixed(1)} FPS</span>
-        &nbsp;|&nbsp; Analysis time: ${(r.analysisTimeMs / 1000).toFixed(1)}s
+        &nbsp;|&nbsp; Analysis time: ${formatDuration(r.analysisTimeMs)}
       </div>
     `;
 
@@ -3965,14 +4036,7 @@ export class BenchmarkReporter {
    * Check localStorage availability
    */
   _checkLocalStorage() {
-    try {
-      const test = '__storage_test__';
-      localStorage.setItem(test, test);
-      localStorage.removeItem(test);
-      return true;
-    } catch {
-      return false;
-    }
+    return webStorageKeeps();
   }
 
   /**
@@ -3980,9 +4044,11 @@ export class BenchmarkReporter {
    */
   _checkSessionStorage() {
     try {
+      const kept = webStorage('sessionStorage');
+      if (kept === null) return false;
       const test = '__storage_test__';
-      sessionStorage.setItem(test, test);
-      sessionStorage.removeItem(test);
+      kept.setItem(test, test);
+      kept.removeItem(test);
       return true;
     } catch {
       return false;
@@ -4008,7 +4074,7 @@ export class BenchmarkReporter {
     const connection = nav.connection || nav.mozConnection || nav.webkitConnection;
 
     const network = {
-      online: typeof navigator !== 'undefined' ? navigator.onLine : null,
+      online: realmHosts.online(),
       connection: connection ? {
         effectiveType: connection.effectiveType || null,
         type: connection.type || null,
@@ -4304,12 +4370,13 @@ export class BenchmarkReporter {
 
     // localStorage
     try {
-      if (typeof localStorage !== 'undefined') {
+      const kept = webStorage('localStorage');
+      if (kept !== null) {
         storage.localStorage = {
           available: true,
-          length: localStorage.length,
-          keys: Array.from({ length: Math.min(localStorage.length, 50) }, (_, i) => localStorage.key(i)),
-          estimatedSizeKB: this._estimateStorageSize(localStorage)
+          length: kept.length,
+          keys: Array.from({ length: Math.min(kept.length, 50) }, (_, i) => kept.key(i)),
+          estimatedSizeKB: this._estimateStorageSize(kept)
         };
       }
     } catch {
@@ -4318,12 +4385,13 @@ export class BenchmarkReporter {
 
     // sessionStorage
     try {
-      if (typeof sessionStorage !== 'undefined') {
+      const kept = webStorage('sessionStorage');
+      if (kept !== null) {
         storage.sessionStorage = {
           available: true,
-          length: sessionStorage.length,
-          keys: Array.from({ length: Math.min(sessionStorage.length, 50) }, (_, i) => sessionStorage.key(i)),
-          estimatedSizeKB: this._estimateStorageSize(sessionStorage)
+          length: kept.length,
+          keys: Array.from({ length: Math.min(kept.length, 50) }, (_, i) => kept.key(i)),
+          estimatedSizeKB: this._estimateStorageSize(kept)
         };
       }
     } catch {

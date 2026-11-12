@@ -1,10 +1,10 @@
 /**
- * Neighbour-graph extraction: turns one stored adjacency matrix (`obsp`,
+ * Neighbor-graph extraction: turns one stored adjacency matrix (`obsp`,
  * dense or CSR/CSC) into the `ConnectivityEdges` payload the reader worker
  * hands to the page -- the forward adjacency of the unique undirected edges
  * (each edge once, at its smaller cell) with each edge's drawing strength.
  * Which edges a pane shows, and in what order, is computed from it
- * (rendering/connectivity-edge-selection.js); a cell's whole neighbour list
+ * (rendering/connectivity-edge-selection.js); a cell's whole neighbor list
  * (the k-NN tool's) is read from the file by row (`getConnectivityRows`).
  *
  * Gene-expression columns are read by `data/anndata/matrix-access.js`, not
@@ -25,7 +25,7 @@ import { formatBytes, formatCountOf } from '../utils/format-units.js';
 const CONNECTIVITY_STEP_ENTRIES = 1 << 18;
 
 /**
- * The edges of one neighbour graph as the reader worker hands them to the
+ * The edges of one neighbor graph as the reader worker hands them to the
  * page: everything the page needs, computed beside the matrix, so the page
  * neither walks nor checks the graph again. An edge is a unique undirected
  * pair `source < destination`; edge `e` is the e-th in source, then
@@ -33,7 +33,7 @@ const CONNECTIVITY_STEP_ENTRIES = 1 << 18;
  * a cell (a k = 15 graph of 50M cells: 350M edges, 3.0 GB).
  *
  * - `forwardOffsets` (`nCells + 1`): cell `c`'s edges are `forwardOffsets[c]
- *   .. forwardOffsets[c + 1]` (its forward neighbours: the cells above it it
+ *   .. forwardOffsets[c + 1]` (its forward neighbors: the cells above it it
  *   is joined to).
  * - `partners` (at least `nEdges`): edge `e`'s destination, ascending within
  *   each cell's edges.
@@ -175,7 +175,7 @@ async function drain(steps) {
  */
 export async function connectivityEdgesFromLines(lines, nCells, { run = work => work() } = {}) {
   const relabel = lines.relabel ?? null;
-  if (relabel !== null && relabel.nCells !== nCells) throw new Error('Connectivity lines are relabelled onto another count of cells');
+  if (relabel !== null && relabel.nCells !== nCells) throw new Error('Connectivity lines are relabeled onto another count of cells');
   const builder = createEdgeBuilder(relabel === null ? nCells : relabel.positions.length, lines.nnz, lines.float32, { relabel });
   try {
     for await (const slab of lines.slabs) await run(() => drain(builder.add(slab)));
@@ -204,7 +204,7 @@ export async function connectivityEdgesFromLines(lines, nCells, { run = work => 
  * four are held (12 bytes an edge, and 4 a cell twice:
  * `connectivityEdgeBytes` `relabelCells`). Each walk a typed loop of its
  * own (`placeRelabelled`): a closure an edge, and a count after the last
- * line, made a 50 % share's edges of a 10M-cell graph cost more than every
+ * line, made a 50% share's edges of a 10M-cell graph cost more than every
  * cell's.
  *
  * @param {{edges: ConnectivityEdges & {cellOffsets: Uint32Array}|null}} held
@@ -357,10 +357,10 @@ function sortEdges(partners, strengths, first, end) {
 }
 
 /**
- * Some cells' neighbours from the edges held (`ConnectivityEdges`), as the
+ * Some cells' neighbors from the edges held (`ConnectivityEdges`), as the
  * reader answers them from the file (`AnnDataReader.getConnectivityRows`:
  * cell `cells[i]`'s at `neighbors[offsets[i] .. offsets[i + 1]]`, `cells`
- * distinct): the same neighbours (no self, no stored zero, open cells only),
+ * distinct): the same neighbors (no self, no stored zero, open cells only),
  * ascending. Two passes over every edge, one bit a cell beside: what a large
  * k-NN frontier costs when the page holds the edges anyway (a frontier of
  * 65,536 cells of a 10M-cell file took 1.7 s from the file). Yields between
@@ -414,7 +414,7 @@ export async function forwardEdgeRows(edges, cells, { signal = null } = {}) {
       const own = (asked[cell >>> 5] & (1 << (cell & 31))) !== 0 ? slotOf(cell) : -1;
       for (let edge = first; edge < end; edge++) {
         const partner = partners[edge];
-        // An edge `cell < partner` is a neighbour of both, met in ascending order.
+        // An edge `cell < partner` is a neighbor of both, met in ascending order.
         if ((asked[partner >>> 5] & (1 << (partner & 31))) !== 0) {
           const slot = slotOf(partner);
           if (fill === null) offsets[slot + 1]++;
@@ -435,7 +435,7 @@ export async function forwardEdgeRows(edges, cells, { signal = null } = {}) {
   };
   await pass(null);
   for (let i = 0; i < cells.length; i++) offsets[i + 1] += offsets[i];
-  const neighbors = allocateTypedArray(Uint32Array, offsets[cells.length], 'Connectivity row neighbours');
+  const neighbors = allocateTypedArray(Uint32Array, offsets[cells.length], 'Connectivity row neighbors');
   await pass(neighbors);
   return { offsets, neighbors };
 }
@@ -460,7 +460,7 @@ export function denseConnectivitySlab(values, start, end, nCells) {
     if (connectivityWeight(values[index], label) !== 0) stored++;
   }
   const pointers = allocateTypedArray(Float64Array, end - start + 1, 'Connectivity row pointers');
-  const indices = allocateTypedArray(Int32Array, stored, 'Connectivity neighbours');
+  const indices = allocateTypedArray(Int32Array, stored, 'Connectivity neighbors');
   const data = allocateTypedArray(values instanceof Float32Array ? Float32Array : Float64Array, stored, 'Connectivity weights');
   let at = 0;
   for (let row = 0; row < end - start; row++) {
@@ -505,7 +505,7 @@ function lineSorter() {
   return function sort(indices, data, from, to) {
     const length = to - from;
     if (lineIndices.length < length) {
-      lineIndices = allocateTypedArray(Float64Array, 2 * length, 'Connectivity neighbours');
+      lineIndices = allocateTypedArray(Float64Array, 2 * length, 'Connectivity neighbors');
       lineData = allocateTypedArray(Float64Array, 2 * length, 'Connectivity weights');
     }
     // Weights a typed array cannot hold as a number (a plain array's
@@ -594,14 +594,14 @@ export function connectivityEdgeBytes({ nCells, nnz, float32, relabelCells = nul
  * A symmetric matrix is its own transpose, so a row of CSR and a column of
  * CSC are the same line, read with the major axis as the source. As line
  * `major` arrives, the lines before it are known: its upper entries
- * (`minor > major`, its forward neighbours) are its edges, numbered after
+ * (`minor > major`, its forward neighbors) are its edges, numbered after
  * every earlier line's (edge `e` is the e-th in source, then destination
  * order), each kept with its partner and exact weight; its lower entries
  * (`minor < major`) must each be the partner placed at the next edge of
  * line `minor`, met in ascending `major`. Once every line has arrived,
  * every edge must have met its partner, and each weight becomes its
  * strength relative to the strongest. A self-loop (a diagonal entry: Seurat
- * counts each cell among its own neighbours) is no edge anyone can draw,
+ * counts each cell among its own neighbors) is no edge anyone can draw,
  * and is left out as a stored zero is; symmetry is unaffected, a diagonal
  * entry being its own transpose.
  *
@@ -637,7 +637,7 @@ function createEdgeBuilder(nCells, nnz, float32, { relabel = null } = {}) {
   const allowance = memoryAllowanceBytes();
   if (plan.build > allowance) {
     const refusal = new RangeError(
-      `The neighbour graph's ${formatCountOf(plan.edges, 'edge')} need ${formatBytes(plan.build)} to build ` +
+      `The neighbor graph's ${formatCountOf(plan.edges, 'edge')} need ${formatBytes(plan.build)} to build ` +
       `and ${formatBytes(plan.held)} to show, more than this device's ${formatBytes(allowance)} for Cellucid.`
     );
     refusal.code = 'TOO_LARGE';

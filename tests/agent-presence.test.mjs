@@ -25,6 +25,7 @@ import { ACTION_CONFIRMS, createActionCatalog, defineAction } from '../assets/js
 import { ActionRefused, createActionDispatcher } from '../assets/js/app/actions/dispatcher.js';
 import { cancelled, onAbort } from '../assets/js/utils/abort.js';
 import { setup } from './helpers/history-fixtures.mjs';
+import { appName } from '../assets/js/app/agent/connect/model.js';
 
 const NO_PARAMS = Object.freeze({ type: 'object', additionalProperties: false, properties: {} });
 const CLAUDE = Object.freeze({ origin: 'agent', agent: 'Claude', turn: 'turn-1' });
@@ -42,7 +43,7 @@ test('the dispatcher tells every dispatch, reads included, as it starts and ends
   const events = [];
   dispatcher.subscribe(event => events.push([event.kind, event.type, event.meta.origin, event.meta.agent, event.meta.turn, event.step ?? null]));
   const read = await dispatcher.dispatch('fields.list', {}, CLAUDE);
-  assert.deepEqual(read, { outcome: { fields: ['a'] }, step: null });
+  assert.deepEqual(read, { outcome: { fields: ['a'] }, step: null, unrecorded: null });
   await dispatcher.dispatch('color.by', { field: 'x' });
   assert.deepEqual(events, [
     ['start', 'fields.list', 'agent', 'Claude', 'turn-1', null],
@@ -168,7 +169,9 @@ test('the confirmer\'s answer is what the agent reads: Allow runs it, Deny refus
 });
 
 test('a confirm card says who asks, what, why, and the parameters; every kind of asking has its reason', () => {
-  assert.deepEqual(Object.keys(CONFIRM_REASONS).sort(), [...ACTION_CONFIRMS].sort());
+  // Every definition's confirm kind, and the question an opensLinks action asks of its own (F121).
+  // Besides the definitions' kinds, the questions an implementation asks of its own: an unseen link, work not kept.
+  assert.deepEqual(Object.keys(CONFIRM_REASONS).sort(), [...ACTION_CONFIRMS, 'unseen-link', 'replaces-unkept'].sort());
   const definition = defineAction({
     type: 'dataset.download', title: 'Download a dataset', summary: 'x', group: 'Data',
     params: { type: 'object', additionalProperties: false, properties: { url: { type: 'string' }, cells: { type: 'array', items: { type: 'integer' }, 'x-cells': true } } },
@@ -176,14 +179,14 @@ test('a confirm card says who asks, what, why, and the parameters; every kind of
   });
   assert.deepEqual(confirmTextOf({ definition, params: { url: 'https://x.org/a.h5ad', cells: [1, 2, 3] }, meta: { agent: 'ChatGPT' } }), {
     who: 'ChatGPT',
-    what: 'ChatGPT asks to download a dataset: “x”.',
+    what: 'ChatGPT asks to download a dataset: https://x.org/a.h5ad.',
     why: 'It downloads a lot of data, which takes time and may cost on a metered connection.',
     facts: [{ label: 'Url', value: 'https://x.org/a.h5ad' }, { label: 'Cells', value: '3 cells' }],
   });
 });
 
 test('the activity of agent turns: acting, done with its steps, read-only turns going, the person acting, a new turn, stopped, undone', () => {
-  const titles = { 'color.by': 'Colour by a field', 'fields.list': 'List fields' };
+  const titles = { 'color.by': 'Color by a field', 'fields.list': 'List fields' };
   const activity = createAgentActivity({ titleOf: type => titles[type] });
   const meta = (turn, agent = 'Claude') => ({ origin: 'agent', agent, turn });
   const m1 = meta('t1');
@@ -194,9 +197,9 @@ test('the activity of agent turns: acting, done with its steps, read-only turns 
 
   const m2 = meta('t1');
   activity.onDispatch({ kind: 'start', type: 'color.by', meta: m2 });
-  activity.onDispatch({ kind: 'done', type: 'color.by', meta: m2, step: { label: 'Coloured by leiden' } });
-  assert.deepEqual(activity.lines().map(line => [line.key, line.state, line.steps, line.lastLabel]), [[turnKey('Claude', 't1'), 'done', 1, 'Coloured by leiden']]);
-  assert.equal(activityTextOf(activity.lines()[0]), 'Claude · 1 step · Coloured by leiden');
+  activity.onDispatch({ kind: 'done', type: 'color.by', meta: m2, step: { label: 'Colored by leiden' } });
+  assert.deepEqual(activity.lines().map(line => [line.key, line.state, line.steps, line.lastLabel]), [[turnKey('Claude', 't1'), 'done', 1, 'Colored by leiden']]);
+  assert.equal(activityTextOf(activity.lines()[0]), 'Claude · 1 step · Colored by leiden');
 
   // A step of anyone else's: the finished turn steps aside.
   assert.equal(activity.onDispatch({ kind: 'done', type: 'color.by', meta: { origin: 'user' }, step: { label: 'x' } }), true);
@@ -214,9 +217,9 @@ test('the activity of agent turns: acting, done with its steps, read-only turns 
   // A failed action leaves the turn as it was; stopped and undone say so.
   const m4 = meta('t3');
   activity.onDispatch({ kind: 'start', type: 'color.by', meta: m4 });
-  assert.equal(activityTextOf(activity.lines().find(line => line.turn === 't3')), 'Claude is working · 1 step · Colour by a field');
+  assert.equal(activityTextOf(activity.lines().find(line => line.turn === 't3')), 'Claude is working · 1 step · Color by a field');
   // While the history's recording is paused, the line starts with ⏸ (History v2 §3.15.1).
-  assert.equal(activityTextOf(activity.lines().find(line => line.turn === 't3'), { paused: true }), '⏸ Claude is working · 1 step · Colour by a field');
+  assert.equal(activityTextOf(activity.lines().find(line => line.turn === 't3'), { paused: true }), '⏸ Claude is working · 1 step · Color by a field');
   activity.markStopped(turnKey('Claude', 't3'));
   activity.onDispatch({ kind: 'failed', type: 'color.by', meta: m4, error: new Error('x') });
   assert.equal(activityTextOf(activity.lines().find(line => line.turn === 't3')), 'Claude stopped · 1 step');
@@ -228,7 +231,7 @@ test('the activity of agent turns: acting, done with its steps, read-only turns 
 });
 
 test('two agents of one name at once (the chat\'s Claude, Claude Desktop through the connector): two lines, neither replacing the other, each named with its way in', () => {
-  const activity = createAgentActivity({ titleOf: () => 'Colour by a field' });
+  const activity = createAgentActivity({ titleOf: () => 'Color by a field' });
   const chat = { id: 'chat-1', kind: 'chat' };
   const desktop = { id: 'g1', kind: 'connector', client: 'Claude Desktop', host: 'claude.ai' };
   const run = meta => {
@@ -251,11 +254,24 @@ test('two agents of one name at once (the chat\'s Claude, Claude Desktop through
   assert.equal(agentLabel('Claude', null), 'Claude');
   assert.equal(agentLabel('ChatGPT', { kind: 'connector', client: 'ChatGPT', host: 'chatgpt.com' }), 'ChatGPT (chatgpt.com)');
   assert.equal(agentLabel('Claude', { kind: 'connector', client: null, host: null }), 'Claude (connector)');
+  assert.equal(agentLabel('Claude', { kind: 'connector', client: 'Claude Desktop', host: 'claude.ai', known: true }), 'Claude (Claude Desktop)');
+  // L26-4 / F122: an app no site vouches for is its host (or an app on this computer), its own name only quoted:
+  // two of them are told apart, and none passes for Claude.
+  // The relay client names such an agent as Manage… does (`appName`); the label adds nothing to it.
+  const fake = appName('evil.example', 'Claude', false);
+  assert.equal(agentLabel(fake, { kind: 'connector', client: 'Claude', host: 'evil.example', known: false }), 'evil.example (calls itself “Claude”)');
+  const phone = appName('An app on this computer', 'Claude on my phone', false);
+  assert.equal(agentLabel(phone, { kind: 'connector', client: 'Claude on my phone', host: null, known: false }),
+    'An app on this computer (calls itself “Claude on my phone”)');
+  assert.notEqual(phone, appName('An app on this computer', 'Claude', false), 'two unvouched apps on this computer are told apart');
+  assert.equal(agentLabel('An app on this computer', { kind: 'connector', client: null, host: null, known: false }), 'An app on this computer (connector)');
   const definition = defineAction({
-    type: 'color.by', title: 'Colour the cells by a field or gene', summary: 'x', group: 'Colours',
+    type: 'color.by', title: 'Color the cells by a field or gene', summary: 'x', group: 'Colors',
     params: { type: 'object', additionalProperties: false, properties: {} }, touches: ['colors'], reads: [], effect: 'view', describe: () => 'x', code: () => 'x',
   });
-  assert.equal(confirmTextOf({ definition, params: {}, meta: { agent: 'Claude', connection: desktop } }).what, 'Claude (Claude Desktop) asks to colour the cells by a field or gene: “x”.');
+  assert.equal(confirmTextOf({ definition, params: {}, meta: { agent: 'Claude', connection: desktop } }).what, 'Claude (Claude Desktop) asks to color the cells by a field or gene.');
+  // Null is a request too: the coloring taken away.
+  assert.equal(confirmTextOf({ definition, params: { field: null }, meta: { agent: 'Claude', connection: chat } }).what, 'Claude (chat) asks to color the cells by a field or gene: no field.');
   assert.equal(confirmTextOf({ definition, params: {}, meta: { agent: 'Claude', connection: chat } }).who, 'Claude');
 });
 
@@ -270,7 +286,7 @@ test('a surface\'s own turn: acting from its start, its stop called by the line\
   assert.equal(activityTextOf(activity.lines()[0]), 'Claude is working');
   const m = { origin: 'agent', agent: 'Claude', turn: 't9' };
   activity.onDispatch({ kind: 'start', type: 'color.by', meta: m });
-  activity.onDispatch({ kind: 'done', type: 'color.by', meta: m, step: { label: 'Coloured by x' } });
+  activity.onDispatch({ kind: 'done', type: 'color.by', meta: m, step: { label: 'Colored by x' } });
   assert.equal(activity.lines()[0].state, 'acting', 'still attached: the model may call again');
   activity.markStopped(turnKey('Claude', 't9'))();
   assert.equal(stops, 1);
@@ -290,7 +306,7 @@ function memoryStorage() {
   return { values, getItem: name => values.get(name) ?? null, setItem: (name, value) => { values.set(name, String(value)); }, removeItem: name => values.delete(name) };
 }
 
-const COLOUR = Object.freeze({ type: 'color.by', title: 'Colour by', confirm: null });
+const COLOR = Object.freeze({ type: 'color.by', title: 'Color by', confirm: null });
 const WRITE = Object.freeze({ type: 'figure.export', title: 'Export a figure', confirm: 'writes-file' });
 
 test('every agent change asks the confirmer with its estimate; reads do not; a move of the history does; a failed estimate is none', async () => {
@@ -395,14 +411,14 @@ test('permissions: a question\'s kinds, the strictest setting decides, heavy fro
 });
 
 test('permissions: what a refused agent reads, what every agent is told, and the estimate on the card', () => {
-  assert.equal(deniedSentence(COLOUR, 'change'),
-    'The person\'s settings in Cellucid do not let agents change anything in this tab, so “Colour by” was not done. '
+  assert.equal(deniedSentence(COLOR, 'change'),
+    'The person\'s settings in Cellucid do not let agents change anything in this tab, so “Color by” was not done. '
     + 'Do not try again; tell the person if it is needed (they can change it in the chat settings, Permissions).');
   for (const kind of PERMISSION_KINDS) assert.match(deniedSentence(WRITE, kind), /^The person's settings in Cellucid do not let agents \S/);
   assert.deepEqual(Object.keys(KIND_LABELS), [...PERMISSION_KINDS]);
   assert.equal(permissionsForAgent(normalizePermissions(null)),
     'The person\'s permissions for agents in Cellucid now (Ask before heavy or irreversible): changes in this tab: run without asking. '
-    + 'heavy work (longer than about 10 s); writing files; deleting what was saved; large downloads; publishing; pausing the history: are asked of the person first (you wait for the answer). '
+    + 'heavy work (longer than about 10 s); writing files; deleting what was saved; large downloads; publishing; pausing the history; opening links not seen in this tab; replacing work that is not kept: are asked of the person first (you wait for the answer). '
     + 'Reads need no permission.');
   assert.match(permissionsForAgent(normalizePermissions({ kinds: PERMISSION_MODES['read-only'].kinds })), /\(Read only\): .*: are refused\. Reads need no permission\.$/);
   assert.equal(estimateText(null), null);
@@ -446,10 +462,10 @@ test('the history applying its own steps again (an undone turn\'s others) is no 
   const activity = createAgentActivity();
   const m = { origin: 'agent', agent: 'Claude', turn: 't1' };
   activity.onDispatch({ kind: 'start', type: 'color.by', meta: m });
-  activity.onDispatch({ kind: 'done', type: 'color.by', meta: m, step: { label: 'Coloured by x' } });
+  activity.onDispatch({ kind: 'done', type: 'color.by', meta: m, step: { label: 'Colored by x' } });
   const before = activity.lines().map(line => [line.state, line.steps]);
   assert.equal(activity.onDispatch({ kind: 'start', type: 'color.by', meta: { ...m, internal: true } }), false);
-  assert.equal(activity.onDispatch({ kind: 'done', type: 'color.by', meta: { ...m, internal: true }, step: { label: 'Coloured by x' } }), false);
+  assert.equal(activity.onDispatch({ kind: 'done', type: 'color.by', meta: { ...m, internal: true }, step: { label: 'Colored by x' } }), false);
   assert.equal(activity.onDispatch({ kind: 'done', type: 'camera.set', meta: { origin: 'user', internal: true }, step: { label: 'Camera' } }), false);
   assert.deepEqual(activity.lines().map(line => [line.state, line.steps]), before);
 });
@@ -463,7 +479,7 @@ test('a question waiting for the person makes its turn act (Stop on its line) be
   activity.onDispatch({ kind: 'start', type: 'color.by', meta });
   release();
   assert.equal(activity.lines()[0].state, 'acting');
-  activity.onDispatch({ kind: 'done', type: 'color.by', meta, step: { id: 's1', label: 'Coloured' } });
+  activity.onDispatch({ kind: 'done', type: 'color.by', meta, step: { id: 's1', label: 'Colored' } });
   assert.equal(activity.lines()[0].state, 'done');
   release();
   // Declined or withdrawn before it ran: a turn that took no step goes away; one stopped stays stopped.
@@ -516,7 +532,8 @@ test('a notebook is asked before it publishes, as an agent is; nothing else of i
   ]);
   // The card names the notebook and what exactly it publishes; a grant is kept for that notebook.
   const text = confirmTextOf({ definition: definitions[0], params: { label: 'T cell' }, meta: { origin: 'host', host: 'python' }, detail: 'It publishes to owner/repo.' });
-  assert.equal(text.what, 'Python (notebook) asks to publish a vote: “Voted T cell up”.');
+  // What would be done, never the step's past-tense sentence ("Voted T cell up" before the answer).
+  assert.equal(text.what, 'Python (notebook) asks to publish a vote: T cell.');
   assert.equal(text.why, 'It publishes to owner/repo.');
   assert.equal(grantKey({ origin: 'host', host: 'r' }, 'publishes'), 'host:r\u0000publishes');
   assert.equal(actorLabel({ origin: 'host', host: null }), 'The notebook');
@@ -526,12 +543,30 @@ test('the activity line counts what a turn did outside the state, and keeps a tu
   const activity = createAgentActivity({ outsideOf: (type, params, outcome) => (outcome?.published === false ? null : { one: 'vote published', other: 'votes published' }) });
   const meta = { origin: 'agent', agent: 'Claude', turn: 't1' };
   for (const published of [true, false, true]) {
-    activity.onDispatch({ kind: 'start', type: 'annotation.vote', meta });
-    activity.onDispatch({ kind: 'done', type: 'annotation.vote', meta, step: null, outcome: { published } });
+    activity.onDispatch({ kind: 'start', type: 'annotation.publish', meta });
+    activity.onDispatch({ kind: 'done', type: 'annotation.publish', meta, step: null, outcome: { published } });
   }
   const [line] = activity.lines();
   assert.equal(line.state, 'done');
   assert.equal(line.steps, 0);
   assert.deepEqual(line.outside, [{ one: 'vote published', other: 'votes published', count: 2 }]);
   assert.equal(activityTextOf(line), 'Claude · 2 votes published, not undoable');
+});
+
+test('a turn counts steps, not actions: a change merged into the step before is that one step (R9R-6)', () => {
+  const activity = createAgentActivity({ titleOf: type => type });
+  const meta = () => ({ origin: 'agent', agent: 'Claude', turn: 't-merge' });
+  const set = (id, label) => {
+    const m = meta();
+    activity.onDispatch({ kind: 'start', type: 'setting.set', meta: m });
+    activity.onDispatch({ kind: 'done', type: 'setting.set', meta: m, step: { id, label } });
+  };
+  // A slider set three times by the agent: one step (coalesced), then another setting.
+  set('s5', 'Grid density: set to 32³');
+  set('s5', 'Grid density: set to 128³');
+  set('s5', 'Grid density: set to 48³');
+  set('s6', 'Ray quality: set to Balanced');
+  const [line] = activity.lines();
+  assert.equal(line.steps, 2);
+  assert.equal(activityTextOf(line), 'Claude · 2 steps · Ray quality: set to Balanced');
 });

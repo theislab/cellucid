@@ -59,7 +59,7 @@
  * (`sparse-column-index.js` `KeptReads`): read whole, one read of each
  * array, at its first gene when the memory kept for gene indexes holds it
  * (counted there), every gene from memory then; otherwise the genes asked
- * for together in one range per run of neighbouring genes, never a read per
+ * for together in one range per run of neighboring genes, never a read per
  * gene. A run priced slower to read than to build again is not used.
  *
  * **What a gene read checks.** Each gene's stored piece of every
@@ -69,7 +69,7 @@
  * match is damage: the run is removed, the index built again (and kept
  * again), and the gene read from it, so a damaged copy is never served. A
  * CRC-32 finds every accidental change of up to 32 bits and all but one in
- * 2^32 of the others; it is no defence against a deliberate one.
+ * 2^32 of the others; it is no defense against a deliberate one.
  *
  * @module data/anndata/kept-column-index
  */

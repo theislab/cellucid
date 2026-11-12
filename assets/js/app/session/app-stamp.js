@@ -1,17 +1,17 @@
 /**
  * @fileoverview What wrote a session file: the Cellucid version and the
- * action catalogue it was written with (`app`), and the parameter schema of
+ * action catalog it was written with (`app`), and the parameter schema of
  * each action its steps use (`actions`), so a reader knows which steps it can
  * replay (History v2 §3.8).
  *
- * - `app.catalog` is the SHA-256 of the catalogue document's canonical text
+ * - `app.catalog` is the SHA-256 of the catalog document's canonical text
  *   ({@link canonicalCatalogText}), the same text
  *   `scripts/generate-action-catalog.mjs` writes and the three repositories
  *   pin.
  * - `actions` is one `{type, version, params}` per action type and version
- *   the recorded steps use that this catalogue knows, sorted; `params` is the
+ *   the recorded steps use that this catalog knows, sorted; `params` is the
  *   SHA-256 of that version's parameters shape (`actionParamsShape`) as
- *   canonical JSON (keys sorted, no white space) when this catalogue is at
+ *   canonical JSON (keys sorted, no white space) when this catalog is at
  *   that version, null for an earlier one. A step whose type and version are
  *   not listed was recorded with another version.
  *
@@ -21,7 +21,7 @@
  */
 
 import { actionParamsShape, catalogDocument } from '../actions/catalog.js';
-import { sha256Hex } from '../utils/sha256.js';
+import { sha256Hex } from '../../utils/sha256.js';
 import { OUTSIDE_CHANGE_TYPE } from '../history/model.js';
 
 /** `value` with every object's keys sorted, recursively (lists keep their order). */
@@ -33,7 +33,7 @@ export function sortedKeys(value) {
   return value;
 }
 
-/** The catalogue document's canonical text: keys sorted, two-space indent, a final newline. */
+/** The catalog document's canonical text: keys sorted, two-space indent, a final newline. */
 export function canonicalCatalogText(catalog) {
   return `${JSON.stringify(sortedKeys(catalogDocument(catalog)), null, 2)}\n`;
 }
@@ -46,7 +46,7 @@ function textDigest(text) {
   return sha256Hex(encoder.encode(text));
 }
 
-/** The SHA-256 of a catalogue's canonical text (once per catalogue). */
+/** The SHA-256 of a catalog's canonical text (once per catalog). */
 export function catalogDigest(catalog) {
   if (!catalogDigests.has(catalog)) catalogDigests.set(catalog, textDigest(canonicalCatalogText(catalog)));
   return catalogDigests.get(catalog);
@@ -62,6 +62,45 @@ export async function appStamp({ catalog, version }) {
   return { version, catalog: await catalogDigest(catalog) };
 }
 
+/** `a` against `b` as release versions (`0.9.8`, `0.10.0rc1`): numbers compared as numbers, -1, 0 or 1. */
+export function compareVersions(a, b) {
+  const parts = text => String(text).match(/\d+|[A-Za-z]+/g) ?? [];
+  const [x, y] = [parts(a), parts(b)];
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const [p, q] = [x[i] ?? '', y[i] ?? ''];
+    if (p === q) continue;
+    const [m, n] = [Number(p), Number(q)];
+    if (p !== '' && q !== '' && Number.isFinite(m) && Number.isFinite(n)) return m < n ? -1 : 1;
+    // A pre-release tag (`rc1`) comes before the release it leads to; then text order.
+    if (p === '') return /^\d/.test(q) ? -1 : 1;
+    if (q === '') return /^\d/.test(p) ? 1 : -1;
+    return p < q ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Whether a saved history (a session file, a saved state of this browser)
+ * was written by another version of Cellucid than this page, from its `app`
+ * stamp (F155): `'earlier'` when it names an earlier version, or this
+ * version with another action catalog (a build of it before this one),
+ * `'newer'` when it names a later version, null when it was written by
+ * this version and catalog, or names none. A part such a history holds
+ * that this version cannot read is said as that, never as a problem inside
+ * Cellucid (`session-serializer.js` `describeUnrestored`).
+ *
+ * @param {{version?: unknown, catalog?: unknown}|null|undefined} app - the history's `app` stamp
+ * @param {{catalog: object, version: string|null}} page - this page's catalog and version
+ * @returns {Promise<'earlier'|'newer'|null>}
+ */
+export async function writtenByOtherVersion(app, { catalog, version }) {
+  if (app === null || typeof app !== 'object' || typeof app.version !== 'string') return null;
+  const order = typeof version === 'string' ? compareVersions(app.version, version) : 0;
+  if (order > 0) return 'newer';
+  if (order < 0) return 'earlier';
+  return app.catalog === await catalogDigest(catalog) ? null : 'earlier';
+}
+
 /** The SHA-256 of one action's parameters shape (`actionParamsShape` of its schema) as canonical JSON. */
 export function paramsDigest(definition) {
   if (!paramDigests.has(definition)) paramDigests.set(definition, textDigest(JSON.stringify(sortedKeys(actionParamsShape(definition.params)))));
@@ -71,9 +110,9 @@ export function paramsDigest(definition) {
 /**
  * The `actions` stamp: one per action type and version the recorded steps
  * use (`kind: 'action'`), sorted by type then version, with the digest of
- * that version's parameters shape when this catalogue is at that version,
+ * that version's parameters shape when this catalog is at that version,
  * null for an earlier one (its upgraders take it forward). A type this
- * catalogue lacks is not stamped: a reader shows its steps as recorded with
+ * catalog lacks is not stamped: a reader shows its steps as recorded with
  * another version.
  *
  * @param {Iterable<{kind: string, type: string|null, v: number|null}>} steps
@@ -94,10 +133,10 @@ export async function actionStamps(steps, catalog) {
 }
 
 /**
- * The action types of a file this catalogue cannot replay as recorded, each
- * with the sentence the history shows for its steps: a type this catalogue
+ * The action types of a file this catalog cannot replay as recorded, each
+ * with the sentence the history shows for its steps: a type this catalog
  * lacks or the writer did not stamp at the step's version; a version newer
- * than this catalogue's; the version this catalogue is at, with another
+ * than this catalog's; the version this catalog is at, with another
  * parameters shape. An older version is upgraded by a replay
  * (`upgradeParams`). Changes made outside an action are skipped by a replay
  * and never listed.

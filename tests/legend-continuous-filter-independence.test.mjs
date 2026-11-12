@@ -55,6 +55,14 @@ class FakeElement {
     return [];
   }
 
+  focus() {
+    this.ownerDocument.focused = this;
+  }
+
+  contains(node) {
+    return node === this || this.children.some((child) => child.contains?.(node));
+  }
+
   set innerHTML(_value) {
     this.children = [];
   }
@@ -149,7 +157,7 @@ function renderLegend(values, prepare = () => {}) {
     getVarFields() {
       return this.varData.fields;
     },
-    // A DataState is an event emitter: a colour change says so (`colors:changed`).
+    // A DataState is an event emitter: a color change says so (`colors:changed`).
     emit() {},
   };
   for (const name of Object.getOwnPropertyNames(DataStateColorMethods.prototype)) {
@@ -189,9 +197,21 @@ function renderLegend(values, prepare = () => {}) {
   const boxes = nodes.filter((node) => node.tagName === 'input' && node.type === 'text');
   const buttons = nodes.filter((node) => node.tagName === 'button');
   const switchNamed = (label) => buttons.find((node) => node.attributes.role === 'switch' && node.children.some((child) => child.textContent === label));
+  // The legend's controls as drawn now (a rebuild replaces them).
+  const drawn = () => {
+    const all = [];
+    (function walk(node) {
+      all.push(node);
+      node.children.forEach(walk);
+    })(legendEl);
+    return all;
+  };
   return {
     field,
     state,
+    drawn,
+    // The legend drawn again (another field and back, another view, a session).
+    redraw: () => legend.render(field),
     visibilityPublications,
     minSlider: sliders[0],
     maxSlider: sliders[1],
@@ -210,7 +230,7 @@ function renderLegend(values, prepare = () => {}) {
   };
 }
 
-test('a log colour scale never stops the range filter from applying', async () => {
+test('a log color scale never stops the range filter from applying', async () => {
   const legend = renderLegend([0, 0.5, 5, 10]);
   await legend.fire(legend.logToggle, 'click');
   assert.equal(legend.field._useLogScale, true);
@@ -253,7 +273,7 @@ test('the slider track ends are the exact data bounds', async () => {
 });
 
 test('a bound is typed exactly, a slider sets a short one, and only the moved bound changes (NS-10)', async () => {
-  // total_counts from 500 to 100,000: a 1 % step was 995 counts, so "≥ 1,500" could not be set.
+  // total_counts from 500 to 100,000: a 1% step was 995 counts, so "≥ 1,500" could not be set.
   const legend = renderLegend([500, 900, 1500, 2000, 40000, 100000]);
   legend.minBox.value = '1500';
   await legend.fire(legend.minBox, 'change');
@@ -297,11 +317,11 @@ test('drawing the legend does not rewrite the filter it displays', () => {
   assert.deepEqual(legend.field._continuousFilter, { min: 1.234, max: 8.765 });
 });
 
-test('a colour range following a filter of "≥ 1" on counts keeps the cells at 1 coloured; with gray for zero, only zeros are gray (NS-10)', async () => {
+test('a color range following a filter of "≥ 1" on counts keeps the cells at 1 colored; with gray for zero, only zeros are gray (NS-10)', async () => {
   const { NEUTRAL_GRAY_UINT8 } = await import('../assets/js/app/state/core/constants.js');
   const counts = [0, 0, 1, 1, 1, 2, 5, 9];
   const legend = renderLegend(counts);
-  // Coloured as a gene with gray for zero on: count data has a gray floor at its zeros.
+  // Colored as a gene with gray for zero on: count data has a gray floor at its zeros.
   legend.state.activeFieldSource = 'var';
   legend.state.setContinuousZeroGray(0, true);
   legend.minBox.value = '1';
@@ -312,7 +332,7 @@ test('a colour range following a filter of "≥ 1" on counts keeps the cells at 
   const colors = legend.state.colorsArray;
   const isGray = cell => colors[cell * 4] === NEUTRAL_GRAY_UINT8 && colors[cell * 4 + 1] === NEUTRAL_GRAY_UINT8 && colors[cell * 4 + 2] === NEUTRAL_GRAY_UINT8 && colors[cell * 4 + 3] !== 255;
   assert.deepEqual(counts.map((_, cell) => isGray(cell)), [true, true, false, false, false, false, false, false]);
-  // The cells at the bound take the colormap's lowest colour, opaque.
+  // The cells at the bound take the colormap's lowest color, opaque.
   assert.equal(colors[2 * 4 + 3], 255);
 });
 
@@ -329,8 +349,8 @@ test('a diverging colormap over data spanning 0 is centred there; a sequential o
   assert.deepEqual([domain.min, domain.max, domain.centered], [-4, 4, true]);
   const model = scaled.state.updateLegendState(scaled.field);
   assert.equal(model.colorbar.centered, true);
-  assert.equal(buildColorScaleNote(model, model.colorbar.min, model.colorbar.max), 'Color scale centred at 0');
-  // The colour of 0 is the map's middle.
+  assert.equal(buildColorScaleNote(model, model.colorbar.min, model.colorbar.max), 'Color scale centered at 0');
+  // The color of 0 is the map's middle.
   const values = Float32Array.of(-4, 0, 4);
   const { writeContinuousColors } = await import('../assets/js/app/state/managers/continuous-colors.js');
   const rdbu = CONTINUOUS_COLORMAPS.find(map => map.id === 'rdbu');
@@ -345,7 +365,7 @@ test('a diverging colormap over data spanning 0 is centred there; a sequential o
   assert.deepEqual(positive.state.getContinuousColorDomain(positive.field).min, Math.fround(1));
 });
 
-test('gray for zero is off by default: a gene\'s 0 takes the scale\'s lowest colour; on, it is gray beneath; never for an obs field or data with negatives', async () => {
+test('gray for zero is off by default: a gene\'s 0 takes the scale\'s lowest color; on, it is gray beneath; never for an obs field or data with negatives', async () => {
   const { NEUTRAL_GRAY_UINT8 } = await import('../assets/js/app/state/core/constants.js');
   const { getColormap, getColormapByteTable } = await import('../assets/js/data/palettes.js');
   const { BENEATH_ALPHA_BYTE } = await import('../assets/js/rendering/alpha-visibility.js');
@@ -357,7 +377,7 @@ test('gray for zero is off by default: a gene\'s 0 takes the scale\'s lowest col
   legend.state.updateColorsContinuous(legend.field, { expression: false });
   assert.equal(gray(0), false);
   assert.equal(legend.state.getLegendModel(legend.field).zeroGray.applies, false);
-  // A gene, the switch off (the default): the lowest colour, opaque.
+  // A gene, the switch off (the default): the lowest color, opaque.
   legend.state.varData = { fields: [legend.field] };
   legend.state.activeFieldSource = 'var';
   assert.equal(legend.field._zeroGray, false);
@@ -366,11 +386,11 @@ test('gray for zero is off by default: a gene\'s 0 takes the scale\'s lowest col
   assert.deepEqual(Array.from(colors.subarray(0, 3)), lowest);
   assert.equal(colors[3], 255);
   assert.deepEqual(legend.state.getLegendModel(legend.field).zeroGray, { enabled: false, applies: true, drawn: false });
-  // On: zeros gray beneath, the expressing cells coloured.
+  // On: zeros gray beneath, the expressing cells colored.
   legend.state.setContinuousZeroGray(0, true);
   assert.deepEqual(counts.map((_, cell) => gray(cell)), [true, true, false, false]);
   assert.deepEqual(legend.state.getLegendModel(legend.field).zeroGray, { enabled: true, applies: true, drawn: true });
-  // Off again: the lowest colour again.
+  // Off again: the lowest color again.
   legend.state.setContinuousZeroGray(0, false);
   assert.equal(gray(0), false);
   // A log scale draws 0 gray either way (it has no logarithm): said by the model.
@@ -387,3 +407,59 @@ test('gray for zero is off by default: a gene\'s 0 takes the scale\'s lowest col
   assert.equal(scaled.state.getLegendModel(scaled.field).zeroGray.applies, false);
 });
 
+
+// A click as the page delivers it: the legend's palette controls stop it.
+async function press(node) {
+  node.listeners.click.forEach((listener) => listener({ target: node, stopPropagation() {} }));
+  runFrames();
+  await settle();
+  runFrames();
+}
+const paletteBar = (legend) => legend.drawn().find((node) => node.className === 'colorbar-gradient');
+const paletteOption = (legend, label) => legend.drawn().find((node) => String(node.className ?? '').startsWith('colormap-option') && node.children.some((child) => child.textContent === label));
+const liveSwitch = (legend) => legend.drawn().find((node) => node.attributes.role === 'switch' && node.children.some((child) => child.textContent === 'Live filtering'));
+
+test('the palette menu marks the palette the field is drawn in now, and choosing it applies it (R9F-1)', async () => {
+  const legend = renderLegend([0, 1, 2, 3]);
+  await press(paletteBar(legend));
+  await press(paletteOption(legend, 'Plasma'));
+  assert.equal(legend.field._colormapId, 'plasma');
+  // Set elsewhere (an undo, an agent): the menu marks it, and Plasma can be chosen again.
+  legend.state.setContinuousColormap(0, 'viridis');
+  await press(paletteBar(legend));
+  assert.equal(paletteOption(legend, 'Viridis').attributes['aria-pressed'], 'true');
+  assert.equal(paletteOption(legend, 'Plasma').attributes['aria-pressed'], 'false');
+  await press(paletteOption(legend, 'Plasma'));
+  assert.equal(legend.field._colormapId, 'plasma');
+});
+
+test('choosing a palette keeps Live filtering off and the bounds moved but not filtered (R9F-1)', async () => {
+  const legend = renderLegend([0, 1, 2, 3, 4]);
+  await legend.fire(liveSwitch(legend), 'click');
+  assert.equal(liveSwitch(legend).attributes['aria-checked'], 'false');
+  legend.minBox.value = '2';
+  await legend.fire(legend.minBox, 'change');
+  assert.deepEqual(legend.field._continuousFilter, { min: 0, max: 4 });
+  await press(paletteBar(legend));
+  await press(paletteOption(legend, 'Magma'));
+  assert.equal(legend.field._colormapId, 'magma');
+  assert.equal(liveSwitch(legend).attributes['aria-checked'], 'false');
+  assert.equal(legend.drawn().find((node) => node === legend.minBox)?.value, '2');
+  assert.equal(paletteBar(legend).attributes['aria-label'], 'Color palette: Magma');
+});
+
+test('Live filtering, turned off, stays off when the legend is drawn again (R9F-2)', async () => {
+  const legend = renderLegend([0, 1, 2, 3, 4]);
+  await legend.fire(liveSwitch(legend), 'click');
+  legend.redraw();
+  assert.equal(liveSwitch(legend).attributes['aria-checked'], 'false');
+  const filterButton = legend.drawn().find((node) => node.tagName === 'button' && node.textContent === 'Filter');
+  assert.equal(filterButton.hidden, false);
+  // A bound typed is not applied until Filter.
+  const box = legend.drawn().filter((node) => node.tagName === 'input' && node.type === 'text')[0];
+  box.value = '3';
+  await legend.fire(box, 'change');
+  assert.deepEqual(legend.field._continuousFilter, { min: 0, max: 4 });
+  await legend.fire(filterButton, 'click');
+  assert.deepEqual(legend.field._continuousFilter, { min: 3, max: 4 });
+});

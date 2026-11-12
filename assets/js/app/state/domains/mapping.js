@@ -23,6 +23,8 @@
 
 import { MAPPING_GROUP_LABELS, describeMappingGroupValue } from '../../../data/dataset-mapping.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { requireExpressionTransform } from '../../../data/expression-transform.js';
+import { NO_DATASET_LABEL } from '../../ui/no-dataset.js';
 
 /**
  * @param {{state: object, refreshUi: () => void}} options
@@ -33,7 +35,11 @@ export function createMappingDomain({ state, refreshUi }) {
       const mapping = state.getDataMapping();
       return mapping === null ? null : structuredClone(mapping);
     },
-    async restore(value) {
+    // The Expression values put back with it (`target('expression')`) are
+    // the ones its matrix is shown in at once: a matrix is never summed for
+    // values the restore does not end on. `heavy`: the running action's
+    // `ctx.heavy`, asked before a matrix's cells' totals are summed.
+    async restore(value, { heavy = null, target = () => undefined, signal = null } = {}) {
       const current = state.getDataMapping();
       if (JSON.stringify(current) === JSON.stringify(value)) return;
       if (value === null || current === null) {
@@ -41,11 +47,18 @@ export function createMappingDomain({ state, refreshUi }) {
           ? 'The data mapping to restore belongs to no dataset, and a dataset is open.'
           : 'A data mapping cannot be restored while no dataset is open.');
       }
-      await state.applyDataMapping(value, { origin: 'session' });
+      const expression = target('expression');
+      await state.applyDataMapping(value, {
+        origin: 'session',
+        heavy,
+        // The move's Stop (F147): the restore ends with it.
+        signal,
+        ...(expression === undefined ? {} : { expression: requireExpressionTransform(expression, 'The expression values to restore') }),
+      });
       refreshUi();
     },
     describe(a, b) {
-      if (a === null || b === null) return [b === null ? 'No dataset' : 'Dataset opened'];
+      if (a === null || b === null) return [b === null ? NO_DATASET_LABEL : 'Dataset opened'];
       const lines = [];
       if (JSON.stringify(a.embeddings) !== JSON.stringify(b.embeddings)) {
         const before = new Set(a.embeddings?.enabled?.map(ref => JSON.stringify(ref)) ?? []);

@@ -6,7 +6,7 @@
  * (`--data`, e.g. a folder served by any web host on loopback). Steps: the
  * first picture (with the requests sent to the data's host before it), every
  * cell asked for, the first gene, another gene, 100 genes at once, and a
- * differential-expression read (50 genes over ~13 % of the cells the gene
+ * differential-expression read (50 genes over ~13% of the cells the gene
  * sample holds), each timed inside the page; the browser's peak resident
  * memory; on a failure, the page's last console lines and 5xx answers.
  *

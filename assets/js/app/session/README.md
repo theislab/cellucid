@@ -83,12 +83,12 @@ someone asks for one (the printable report, an agent's `view.picture`) and never
 The manifest also carries the dataset fingerprint (below), where the dataset opens from
 (`source`; null when the share keeps the dataset's name only), the cells and genes it was saved on
 (`cells`, `genes`), `requires` (every dataset observation field and gene the shown state uses, read
-from the filters, colours and active-field values and the highlight groups' fields, checked before
+from the filters, colors and active-field values and the highlight groups' fields, checked before
 anything is put back), what wrote it (`app`: `{version, catalog}`, the Cellucid version and the
-SHA-256 of the action catalogue document), the actions its steps use (`actions`:
+SHA-256 of the action catalog document), the actions its steps use (`actions`:
 `[{type, version, params}]`, one stamp per action and version its steps and journal use, sorted by
 type then version; `params` is the SHA-256 of that version's params shape, `actionParamsShape` as
-canonical JSON, when the writer's catalogue is at that version, else null), what the share chose
+canonical JSON, when the writer's catalog is at that version, else null), what the share chose
 (`scope`, below), the page chrome it carries outside its history (`chrome`: `{pressed: {<group id>:
 <button id>}}`, the pressed button of each pressed-button group, `data-state-serializer-pressed-group`,
 today the selection tool `highlight-mode`, CEL-0249; written from the page at a save and kept in every
@@ -123,11 +123,11 @@ and each step of a `steps` chunk is
   the id of the last of them, the one exception to ids never being reused, so a step or a branch
   after them keeps its parent; it carries their notes and bookmarks (`carried`), and its `count`
   adds up theirs.
-- **`v`**: the version of the action's parameters the step was recorded with (the catalogue's
+- **`v`**: the version of the action's parameters the step was recorded with (the catalog's
   `version`). A step is replayable here when its type is known and: its `v` is below this
-  catalogue's version (the action's upgraders, `upgradeParams` in `app/actions/catalog.js`, bring
+  catalog's version (the action's upgraders, `upgradeParams` in `app/actions/catalog.js`, bring
   its parameters up before it is dispatched), or equal with its stamp's `params` digest equal to
-  this catalogue's; a `v` above it, or an equal one with another digest, is "Recorded with another
+  this catalog's; a `v` above it, or an equal one with another digest, is "Recorded with another
   version: shown, not replayable", its values still restored. Every version keeps examples
   (`tests/fixtures/action-versions/`).
 - **Groups** (`Group`: `{id, name, createdAt, by, notes}`): a named run of consecutive steps of one
@@ -175,10 +175,11 @@ journal, times, source}`) is what the file holds:
 A file is checked whole (`validateSession`): unique branch, tracker and bookmark names; each
 branch's steps one line from its fork step to its tip; every step on a branch it holds; the head on
 the active branch's path; every `replayOf`, `start.from` and journal record well formed. A file
-from another catalogue loads: a step whose type this catalogue lacks, or whose `actions` digest
-differs from this catalogue's, is shown ("Recorded with another version (0.9.8): shown, not
+from another catalog loads: a step whose type this catalog lacks, or whose `actions` digest
+differs from this catalog's, is shown ("Recorded with another version (0.9.8): shown, not
 replayable") and its values restore; a domain this version lacks is refused, naming the domain and
-the version that wrote it.
+the version that wrote it. A user field's intersection labels are keyed by the pages they
+combine ("0+2", `state/domains/field-overlays.js`); no other key is read.
 
 Every manifest chunk has exactly `id`, `kind`, `priority`, `codec`, `storedBytes`,
 `uncompressedBytes` and its kind's own keys (`steps`, `journal`: `tracker`; `array`: `digest`,
@@ -241,7 +242,7 @@ cells are in the same order.
 
 `dataMapping` names the stored arrays the dataset is shown with: the embeddings that are on
 (`embeddings.enabled`, any number of each dimension), the default of each dimension
-(`embeddings.defaults`), the vector bindings, the neighbour graph, gene names, expression matrix
+(`embeddings.defaults`), the vector bindings, the neighbor graph, gene names, expression matrix
 and latent space. It is resolved once per load by `data/dataset-mapping.js` and changed in the
 Session › Data mapping panel. A dataset is shown before its gene list is read
 (`state/managers/var-axis.js`), and capture and restore wait for it (`whenGenesListed`), so
@@ -252,7 +253,7 @@ columns. `cellOrder.dimension` is that layout's dimension, exactly 1, 2, or 3. `
 is 16 lowercase hex characters: the cell-order digest of `data/cell-order-digest.js` over the
 stored values of that embedding's columns (rounded to float32), each open cell named by its
 original position: per cell, two MurmurHash3 lanes of (original position, x, y, z words; the zero
-word for an axis a 1D or 2D embedding lacks), summed over the cells, then finalised with the cell
+word for an axis a 1D or 2D embedding lacks), summed over the cells, then finalized with the cell
 count. `getDatasetFingerprint()` asks `dimensionManager.getCellOrderDigest(layoutKey)`, which the
 reader worker answers from the sums it made as it read the embedding
 (`EmbeddingPayloads.cellOrderDigest`).
@@ -263,7 +264,7 @@ Why the stored values, by original position:
   cell.
 - Observation and variable names are also invariant under a row permutation, so they cannot
   detect the change either.
-- Display coordinates are centred and scaled by the bounds of the cells an embedding was first
+- Display coordinates are centered and scaled by the bounds of the cells an embedding was first
   read for, a frame an opening grown or cut in place keeps: they depend on how the cells were
   opened. The stored values do not, so the same cells digest alike whole, grown, after **Apply**,
   cut in place to a session's share, in priority order or as given.

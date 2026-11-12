@@ -29,7 +29,7 @@
  *   action declares values-only, `valuesOnlyUpgrade`, refuses instead, and
  *   that is its record);
  * - when a version of an action has no file, or a file names an action, or a
- *   version, the catalogue does not record;
+ *   version, the catalog does not record;
  * - when a file's bytes differ from the digest the test pins (a file deleted
  *   and written again, or edited by hand).
  *
@@ -37,10 +37,10 @@
  *   node scripts/generate-action-versions.mjs --check    # exit 1 when a file is missing, stale or orphaned
  *   node scripts/generate-action-versions.mjs --digests  # print the digest list the test pins
  *
- * An action removed from the catalogue (or that no longer records steps)
+ * An action removed from the catalog (or that no longer records steps)
  * takes its files with it: nothing can replay its steps any more ("Recorded
  * with another version"). The files are canonical JSON (keys sorted,
- * two-space indent, one trailing newline), as the catalogue is.
+ * two-space indent, one trailing newline), as the catalog is.
  */
 
 import { createHash } from 'node:crypto';
@@ -128,7 +128,7 @@ export function versionProblems(definitions, files) {
     if (file.type === null) { problems.push(`${file.name} is not named <type>@<version>.json`); continue; }
     if (changed.has(file.name)) continue;
     if (!catalog.has(file.type) || catalog.get(file.type).version === null) {
-      problems.push(`${file.name} names an action whose steps the catalogue does not record (run node scripts/generate-action-versions.mjs to remove it)`);
+      problems.push(`${file.name} names an action whose steps the catalog does not record (run node scripts/generate-action-versions.mjs to remove it)`);
       continue;
     }
     const definition = catalog.get(file.type);

@@ -87,13 +87,19 @@ export function taskTiming(tuner) {
 
 /**
  * What a task carries in its payload: its delivery, or its genes read here
- * (whole columns, or a cell subset's block).
+ * (whole columns, or a cell subset's block). Genes read here are in the
+ * run's values already (`runGeneStream`'s `values`); delivered genes come as
+ * stored and the task names the run's values (`transform`,
+ * `compute/task-values.js` `taskTransform`), which the thread it runs on puts
+ * them in.
  *
  * @param {GeneTask} task
- * @returns {{delivery: Object}|{columns: Array}|{block: Object}}
+ * @param {{scale: string|null, log1p: boolean}|null} [transform] - The run's
+ *   (`taskTransform`); null for a run on the values as stored
+ * @returns {{delivery: Object, transform?: Object}|{columns: Array}|{block: Object}}
  */
-export function taskGenes(task) {
-  if (task.delivery !== null) return { delivery: task.delivery };
+export function taskGenes(task, transform = null) {
+  if (task.delivery !== null) return transform === null ? { delivery: task.delivery } : { delivery: task.delivery, transform };
   return task.block === null ? { columns: task.columns } : { block: task.block };
 }
 
@@ -165,6 +171,10 @@ function requireGeneList(genes) {
  *   each gene's every cell. Every gene must then be read from the source
  *   (`DataLayer.isGeneDeliverable`).
  * @param {string} [options.matrix='mapped'] - The expression matrix read
+ * @param {import('../data/data-layer.js').RunValues|null} [options.values] - The
+ *   values the genes read here are given in (`DataLayer.runValues`; null: as
+ *   stored); the matrix's now when omitted. Delivered genes come as stored:
+ *   `dispatch` names the run's values (`taskGenes(task, transform)`)
  * @param {string|null} [options.owner] - The job the reads are for
  * @param {'normal'|'bulk'} [options.priority='bulk'] - The reads' priority
  *   (`data/fetch-scheduler.js`): one of a long run's, or work the user
@@ -188,6 +198,7 @@ export async function runGeneStream({
   split = null,
   cells = null,
   matrix = 'mapped',
+  values: runValues = undefined,
   owner = null,
   priority = 'bulk',
   dispatch,
@@ -309,7 +320,7 @@ export async function runGeneStream({
   /** A cell subset's block of `indices`' genes, read here: a task of each `perTask` of them. */
   const readSubsetHere = async (indices, perTask) => {
     const keys = indices.map(index => genes[index]);
-    const block = await dataLayer.readGeneCellSubset(keys, cells, { signal: reads.signal, owner, matrix, runGenes: runGenesFrom(indices) });
+    const block = await dataLayer.readGeneCellSubset(keys, cells, { signal: reads.signal, owner, matrix, values: runValues, runGenes: runGenesFrom(indices) });
     if (block === null) {
       throw new TypeError(`This dataset cannot read ${formatCountOf(keys.length, 'gene')} in some cells`);
     }
@@ -336,6 +347,7 @@ export async function runGeneStream({
         signal: reads.signal,
         owner,
         matrix,
+        values: runValues,
       });
       if (!isSparseColumn(values) && !(values instanceof Float32Array)) {
         throw new TypeError(`Gene "${genes[index]}" must read as one Float32Array or its non-zero entries`);
@@ -505,6 +517,8 @@ export async function runGeneStream({
  *   Takes each gene in turn (read only: a dense column may be a view's);
  *   false stops the pass
  * @param {string} [options.matrix='mapped']
+ * @param {import('../data/data-layer.js').RunValues|null} [options.values] - The
+ *   values the genes are given in (`DataLayer.runValues`); the matrix's now when omitted
  * @param {string|null} [options.owner] - The job the reads are for
  * @param {AbortSignal|null} [options.signal]
  * @param {() => boolean} [options.isCurrent]
@@ -517,6 +531,7 @@ export async function visitGeneColumnsHere({
   genes,
   visit,
   matrix = 'mapped',
+  values = undefined,
   owner = null,
   signal = null,
   isCurrent = () => true,
@@ -537,7 +552,7 @@ export async function visitGeneColumnsHere({
       if (!isCurrent()) return false;
       const batch = genes.slice(first, first + Math.max(1, tuner.bufferedTasks() * tuner.genesPerTask()));
       const readStart = performance.now();
-      const columns = await dataLayer.readGeneColumns(batch, { isCurrent, registerInvalidationCleanup, signal, owner, matrix });
+      const columns = await dataLayer.readGeneColumns(batch, { isCurrent, registerInvalidationCleanup, signal, owner, matrix, values });
       held = columns.reduce((sum, column) => sum + columnBytes(column), 0);
       noteMemoryChanged();
       tuner.observeRead({ bytes: held, ms: performance.now() - readStart, genes: batch.length });

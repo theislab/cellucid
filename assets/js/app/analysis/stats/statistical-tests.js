@@ -19,12 +19,14 @@ import {
   computeRanksWithTies,
   ascendingOrder,
   mannWhitneyU as computeMannWhitneyU,
+  tTwoSidedPValue,
   welchTTestFromMoments
 } from '../compute/math-utils.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
 import { chiSquaredIndependence, fisherExact2x2 } from './categorical-tests.js';
 import { categoryCounts } from '../shared/category-counts.js';
 import { requireClonedRecord } from '../../../utils/exact-record.js';
+import { formatPValue } from '../../../utils/format-units.js';
 
 /**
  * @typedef {Object} StatisticalResult
@@ -54,15 +56,6 @@ function getSignificance(pValue) {
   return 'ns';
 }
 
-/**
- * Format p-value for display
- */
-function formatPValue(p) {
-  requireProbability(p, 'Displayed p-value');
-  if (p < 0.0001) return '< 0.0001';
-  if (p < 0.001) return p.toExponential(2);
-  return p.toFixed(4);
-}
 
 function requireProbability(value, label) {
   if (!Number.isFinite(value) || value < 0 || value > 1) {
@@ -493,6 +486,28 @@ export function tTest(group1, group2) {
 }
 
 /**
+ * Student's t of paired differences `a[i] - b[i]` (`scipy.stats.ttest_rel`):
+ * `mean(d) / (sd(d) / √n)` on n - 1 degrees of freedom. Fewer than two pairs,
+ * or differences all equal, give no test (NaN).
+ *
+ * @param {ArrayLike<number>} a
+ * @param {ArrayLike<number>} b
+ * @returns {{statistic: number, pValue: number, n: number}}
+ */
+export function pairedTTest(a, b) {
+  const d = [];
+  for (let i = 0; i < a.length; i++) if (Number.isFinite(a[i]) && Number.isFinite(b[i])) d.push(a[i] - b[i]);
+  const n = d.length;
+  if (n < 2) return { statistic: NaN, pValue: NaN, n };
+  const mean = d.reduce((sum, value) => sum + value, 0) / n;
+  const squares = d.reduce((sum, value) => sum + (value - mean) ** 2, 0);
+  const standardError = Math.sqrt(squares / (n - 1) / n);
+  if (!(standardError > 0)) return { statistic: NaN, pValue: NaN, n };
+  const statistic = mean / standardError;
+  return { statistic, pValue: tTwoSidedPValue(statistic, n - 1), n };
+}
+
+/**
  * Mann-Whitney U test (non-parametric alternative to t-test)
  * @param {number[]} group1 - First group values
  * @param {number[]} group2 - Second group values
@@ -599,7 +614,7 @@ export function oneWayANOVA(groups) {
     };
   }
 
-  // Group means less one pivot (the first value) and centred sums of
+  // Group means less one pivot (the first value) and centered sums of
   // squares, as SciPy's f_oneway shifts the data: a large common offset
   // keeps its digits. And sizes.
   const pivot = validGroups[0][0];
@@ -984,7 +999,7 @@ export function formatStatisticalResult(result) {
   return {
     test: result.testName,
     statistic,
-    pValue: !isFiniteNumber(result.pValue) ? 'N/A' : formatPValue(result.pValue),
+    pValue: !isFiniteNumber(result.pValue) ? 'N/A' : formatPValue(requireProbability(result.pValue, 'Displayed p-value')),
     significance: result.significance,
     effectSize,
     method: Object.hasOwn(result, 'pValueMethod')

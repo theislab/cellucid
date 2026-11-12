@@ -923,6 +923,13 @@ const INDEX_REVISIONS = [
   { revision: 8, digest: '8560778575098ff604f63c6564bbfb1d23c5ccf4b32bd8605fb77ab0567ac4ab' },
   // The rates a plan weighs are read through `utils/machine.js` (the kept-read rate, the index pass rates, the cores); nothing an index holds changed.
   { revision: 9, digest: 'cec9f65e01ec9f5d74e721e8267e00b9c0ef60256190787e3592e0d99646b927' },
+  // A Zarr store on a web host remembers the objects its host answered as absent, in the store and in the page
+  // (`formats/zarr/stores/http.js`, `formats/io/range-cache.js`); nothing an index holds changed.
+  { revision: 10, digest: '216eae648134ad37c4e72c9b91590becca1e6d9e9271ca11c51df41b6c6058c5' },
+  // Round 8–9 (2026-11-11; one raise for the day): AnnData layout refusals (`AnnDataFormatError`), 64-bit integer obs
+  // columns past 2^53 read as their exact text, messages in US spelling, one formatter and one listener set per
+  // concept; what an index holds is unchanged.
+  { revision: 11, digest: 'aa1322276b1c712f5bd68c4dbee5228e25db1dc32493a8dd6d936eecf2093d60' },
 ];
 
 test('the kept-index revision is raised whenever the code that decides what an index holds changes', () => {

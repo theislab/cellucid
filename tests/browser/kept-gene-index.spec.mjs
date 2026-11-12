@@ -2,7 +2,7 @@
  * The gene index of a file stored cell by cell, kept in this browser across
  * visits (`anndata/kept-column-index.js`), in the app: opened again later
  * (a reload: a new page and reader worker, the same browser storage) with the
- * same cells, a gene shows at once — whole from its first colours, with
+ * same cells, a gene shows at once — whole from its first colors, with
  * nothing of the index read (the link's version, its ETag, is the one the
  * runs were kept under), only each gene's values not read before — and the
  * Session panel's Stored line names the index, refreshed as the runs are

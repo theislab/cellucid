@@ -4,7 +4,7 @@
  * without anyone's Claude or ChatGPT account: this script is the MCP client
  * and a Chromium page (Playwright) is the person's Cellucid tab.
  *
- *   node scripts/relay-live-check.mjs [--relay https://<relay>] [--idle 90] [--asking] [--out <file.json>]
+ *   node scripts/relay-live-check.mjs [--relay https://<relay>] [--idle 90] [--asking] [--port 8000] [--out <file.json>]
  *
  * What it checks, in order, each a line PASS or FAIL with what it saw:
  *
@@ -12,17 +12,19 @@
  *    401 with `resource_metadata`; `/health` and a GET of the root (405);
  *    the protected-resource and authorization-server metadata (S256, `none`,
  *    CIMD and DCR advertised: what makes Claude choose CIMD).
- * 2. Dynamic Client Registration, PKCE S256, the authorize page (who asks, the
- *    connect code), the approval link opened in the tab (`#cellucid_connect=`),
- *    Allow, the page's wait handing back the redirect with `code`, `state` and
- *    `iss`, the token exchange.
+ * 2. Dynamic Client Registration, PKCE S256, the authorize page shown in the
+ *    tab's browser (who asks, the connect code, the approver cookie it sets),
+ *    the approval link opened in the tab (`#cellucid_connect=`), Allow, the
+ *    page's wait handing back the redirect with `code`, `state` and `iss`, the
+ *    token exchange. A link whose page another browser shows is refused in
+ *    the tab (`other-browser`): nothing to allow.
  * 3. MCP, both eras: `initialize` (2025-06-18), `server/discover` and
- *    `tools/list` (2026-07-28 headers); the tools are the tab's catalogue,
+ *    `tools/list` (2026-07-28 headers); the tools are the tab's catalog,
  *    the view card's tools name `ui://cellucid/view`; `resources/read` gives
  *    the card's HTML.
  * 4. Tool calls reaching the tab and back: the datasets to open, a dataset
- *    opened by name (the tab shows it), a colouring (a step of the tab's
- *    history labelled as the agent's), a picture as image content within a
+ *    opened by name (the tab shows it), a coloring (a step of the tab's
+ *    history labeled as the agent's), a picture as image content within a
  *    chat's limits, one too large left out with a sentence, `cellucid_status`.
  *    The history through the tools: the agent's steps, undo, a jump.
  *    With `--asking`: a large download the person is asked about and does
@@ -40,10 +42,17 @@
  *    the tab shows ChatGPT and Claude by the host that vouches for them.
  * 8. Forget in the tab ends every connection: calls answer 401.
  *
- * The tab is a local Cellucid page on http://127.0.0.1:8000, an origin the
- * deployed relay allows (`ALLOWED_ORIGINS`), opened on the browser tests'
- * small demo catalog. Nothing secret is printed: tokens and codes stay in
- * memory. It is not part of CI (it needs the network and the deployed relay).
+ * The tab is this checkout's Cellucid page, opened on the browser tests' small
+ * demo catalog, in the same site as the relay, since a claim carries the
+ * relay's `SameSite=Strict` approver cookie: for the deployed relay the page
+ * is served as https://www.cellucid.com (Playwright answers that origin from
+ * the local server; the relay allows it), for a local relay (`--relay
+ * http://127.0.0.1:8787`, `wrangler dev`) it is http://127.0.0.1:8000,
+ * pointed at it with `__CELLUCID_RELAY_ORIGIN__`. Each waiting page is opened
+ * in the tab's browser (another tab of its context), as Claude opens it in
+ * the person's browser, then closed: its code and secret are read from it.
+ * Nothing secret is printed: tokens and codes stay in memory. It is not part
+ * of CI (it needs the network and the deployed relay).
  */
 
 import { spawn } from 'node:child_process';
@@ -53,6 +62,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from '@playwright/test';
 import { browserLaunchOptions } from './lib/browser-launch.mjs';
+import { plainText, resultDataOf } from '../assets/js/app/agent/bridge/mcp-content.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -65,9 +75,12 @@ const RELAY = new URL(option('relay', 'https://mcp.cellucid.com')).origin;
 const IDLE_SECONDS = Number(option('idle', '90'));
 const OUT = option('out', null);
 const ASKING = args.includes('--asking');
-const PORT = 8000;
-const SAMPLE_PORT = 8001;
-const APP = `http://127.0.0.1:${PORT}`;
+const PORT = Number(option('port', '8000'));
+const SAMPLE_PORT = PORT + 1;
+const LOCAL = `http://127.0.0.1:${PORT}`;
+// The page and the relay are one site: the deployed site's address, or the local relay's host.
+const LOCAL_RELAY = new URL(RELAY).protocol === 'http:';
+const APP = LOCAL_RELAY ? LOCAL : 'https://www.cellucid.com';
 const PAGE_URL = `${APP}/?sampleCatalog=${encodeURIComponent(`${APP}/tests/browser/fixtures/demo-catalog/`)}&dataset=synthetic-cell-types-2d`;
 const MCP = RELAY;
 
@@ -106,22 +119,36 @@ async function json(response) {
   }
 }
 
-/** Start authorizing at the relay: the page a person sees, its code and the page's own secret. */
-async function authorize({ clientId, redirectUri, challenge, state }) {
+/**
+ * Start authorizing at the relay in `context`'s browser, as Claude opens the
+ * page in the person's: the page a person sees (its approver cookie kept by
+ * that browser), its code and the page's own secret. The page is closed once
+ * read, so it never follows the answer to the client's address.
+ */
+async function authorize(context, { clientId, redirectUri, challenge, state }) {
   const url = new URL(`${RELAY}/oauth/authorize`);
   for (const [key, value] of Object.entries({
     response_type: 'code', client_id: clientId, redirect_uri: redirectUri, code_challenge: challenge,
     code_challenge_method: 'S256', state, scope: 'cellucid', resource: MCP,
   })) url.searchParams.set(key, value);
-  const response = await fetch(url, { redirect: 'manual' });
-  const html = await response.text();
-  must(response.status === 200, `authorize answered ${response.status}: ${html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, 200)}`);
-  const code = /data-code="([^"]+)"/.exec(html)?.[1];
-  const request = /data-request="([^"]+)"/.exec(html)?.[1];
-  const heading = /<h1>([^<]+)<\/h1>/.exec(html)?.[1];
-  must(code && request, 'the authorize page carries no connect code');
-  must(response.headers.get('content-security-policy')?.includes("frame-ancestors 'none'"), 'the authorize page can be framed');
-  return { code, request, heading, display: `${code.slice(0, 4)}-${code.slice(4)}` };
+  const page = await context.newPage();
+  try {
+    const response = await page.goto(url.href, { waitUntil: 'domcontentloaded' });
+    const html = await response.text();
+    must(response.status() === 200, `authorize answered ${response.status()}: ${html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, 200)}`);
+    const main = page.locator('main[data-code]');
+    const code = await main.getAttribute('data-code');
+    const request = await main.getAttribute('data-request');
+    const heading = await page.locator('h1').textContent();
+    must(code && request, 'the authorize page carries no connect code');
+    const headers = await response.allHeaders();
+    must(headers['content-security-policy']?.includes("frame-ancestors 'none'"), 'the authorize page can be framed');
+    must(/^__Host-cellucid-approver=[^;]+;.*Secure.*HttpOnly.*SameSite=Strict/.test(headers['set-cookie'] ?? ''), 'the authorize page sets no approver cookie');
+    must((await context.cookies(RELAY)).some(cookie => cookie.name === '__Host-cellucid-approver'), 'the browser did not keep the approver cookie');
+    return { code, request, heading, display: `${code.slice(0, 4)}-${code.slice(4)}` };
+  } finally {
+    await page.close();
+  }
 }
 
 /** The authorize page's long poll, until the person answered in the tab. */
@@ -175,6 +202,8 @@ async function call(accessToken, name, toolArgs = {}) {
 }
 
 const textOf = result => result.content.find(item => item.type === 'text')?.text ?? '';
+/** A result's data: the text between its data marks (`mcp-content.js`), as JSON. */
+const dataOf = result => JSON.parse(resultDataOf(textOf(result)) ?? textOf(result));
 
 function startServer() {
   const server = spawn(process.execPath, ['scripts/serve-browser-tests.mjs'], {
@@ -194,8 +223,22 @@ function startServer() {
   });
 }
 
-async function openTab(browser) {
+/** A browser (a context) whose www.cellucid.com is this checkout's page, served by the local server. */
+async function newBrowser(browser) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 860 }, serviceWorkers: 'block' });
+  if (!LOCAL_RELAY) {
+    await context.route(`${APP}/**`, async route => {
+      const local = route.request().url().replace(APP, LOCAL);
+      await route.fulfill({ response: await route.fetch({ url: local }) });
+    });
+  } else {
+    await context.addInitScript(origin => { window.__CELLUCID_RELAY_ORIGIN__ = origin; }, RELAY);
+  }
+  return context;
+}
+
+async function openTab(browser) {
+  const context = await newBrowser(browser);
   const page = await context.newPage();
   page.on('pageerror', error => console.log(`  page error: ${error.message}`));
   await page.goto(PAGE_URL, { waitUntil: 'domcontentloaded' });
@@ -238,7 +281,7 @@ async function approveInTab(page, display, { via, expectWho }) {
 async function connectClient(page, { clientId, redirectUri, via, expectWho, extraToken = {} }) {
   const { verifier, challenge } = pkce();
   const state = base64Url(randomBytes(12));
-  const asked = await authorize({ clientId, redirectUri, challenge, state });
+  const asked = await authorize(page.context(), { clientId, redirectUri, challenge, state });
   const waiting = decision(asked);
   const who = await approveInTab(page, asked.display, { via, expectWho });
   const answer = await waiting;
@@ -256,7 +299,7 @@ async function connectClient(page, { clientId, redirectUri, via, expectWho, extr
   // A code works once.
   const again = await token({ grant_type: 'authorization_code', code, code_verifier: verifier, client_id: clientId, redirect_uri: redirectUri });
   must(again.status === 400 && again.body.error === 'invalid_grant', 'the authorization code worked twice');
-  return { tokens: exchanged.body, heading: asked.heading, who };
+  return { tokens: exchanged.body, heading: asked.heading, who, clientId };
 }
 
 async function main() {
@@ -296,11 +339,32 @@ async function main() {
       });
       const client = await json(registered);
       must(registered.status === 201 && client.client_id.startsWith('cd1.'), `register: ${registered.status}`);
-      dcr = await connectClient(page, { clientId: client.client_id, redirectUri, via: 'link', expectWho: 'Cellucid live check asks' });
+      // Registered with a loopback redirect and no client document: no site vouches for it, so it is
+      // an app on this computer, its own name only quoted (R9Z-2).
+      dcr = await connectClient(page, {
+        clientId: client.client_id, redirectUri, via: 'link', expectWho: 'An app on this computer, which calls itself “Cellucid live check”, asks',
+      });
       return `client registered (${client.client_id.length} chars); the page asks "${dcr.heading}"; the tab shows "${dcr.who.slice(0, 60)}…"`;
     });
     if (dcr === null) throw new Error('No connection: the rest cannot run.');
     let access = dcr.tokens.access_token;
+
+    await check('a link whose waiting page another browser shows is refused in the tab: nothing to allow', async () => {
+      const other = await newBrowser(browser);
+      try {
+        const { challenge } = pkce();
+        const asked = await authorize(other, { clientId: dcr.clientId, redirectUri, challenge, state: base64Url(randomBytes(12)) });
+        await page.goto('about:blank');
+        await page.goto(`${PAGE_URL}#cellucid_connect=${asked.display}`, { waitUntil: 'domcontentloaded' });
+        const notice = page.locator('#notification-center').filter({ hasText: 'started in another browser' });
+        await notice.waitFor({ timeout: 30_000 });
+        must(!(await page.locator('#agent-approval-dialog').isVisible()), 'the tab asks to allow it');
+        await dismissWelcome(page);
+        return 'refused: "This connect code was started in another browser…"';
+      } finally {
+        await other.close();
+      }
+    });
 
     await check('the tab lists the connection', async () => {
       await page.locator('#agent-connect-status').filter({ hasText: 'connected' }).waitFor({ timeout: 15_000 });
@@ -316,7 +380,7 @@ async function main() {
     });
 
     let toolNames = [];
-    await check('tools/list (handshake): the tab\'s catalogue, the view card on its tools', async () => {
+    await check('tools/list (handshake): the tab\'s catalog, the view card on its tools', async () => {
       const { answer, ms } = await mcp(access, 'tools/list');
       toolNames = answer.result.tools.map(tool => tool.name);
       for (const name of ['dataset_open', 'datasets_list', 'view_picture', 'cellucid_status', 'color_by', 'history_get']) {
@@ -345,7 +409,7 @@ async function main() {
 
     await check('tools/call datasets_list reaches the tab', async () => {
       const { result, ms } = await call(access, 'datasets_list');
-      const list = JSON.parse(textOf(result));
+      const list = dataOf((result));
       must(list.samples.length === 3, `${list.samples.length} samples`);
       return `${list.samples.length} samples, open: ${list.open?.name}; round trip ${Math.round(ms)} ms`;
     });
@@ -353,7 +417,7 @@ async function main() {
     await check('tools/call dataset_open by a word of its name: the tab shows it', async () => {
       const { result, ms } = await call(access, 'dataset_open', { name: 'trajectory' });
       must(!result.isError, textOf(result));
-      const opened = JSON.parse(textOf(result));
+      const opened = dataOf((result));
       await page.locator('#dataset-name', { hasText: opened.name }).waitFor({ timeout: 30_000 });
       must(result._meta?.['cellucid/view']?.dataset === opened.name, 'no card metadata');
       return `${opened.name}, ${opened.cells} cells, ${Math.round(ms)} ms`;
@@ -361,30 +425,35 @@ async function main() {
 
     await check('a refusal names what exists', async () => {
       const { result } = await call(access, 'dataset_open', { name: 'zebrafish' });
-      must(result.isError && /^There is no dataset "zebrafish": the samples are /.test(textOf(result)), textOf(result).slice(0, 120));
-      return textOf(result).slice(0, 110);
+      must(result.isError && /^There is no dataset "zebrafish": the samples are /.test(plainText(textOf(result))), textOf(result).slice(0, 120));
+      return plainText(textOf(result)).slice(0, 110);
     });
 
-    await check('a colouring is a step of the tab\'s history, labelled as the agent\'s', async () => {
-      const fields = JSON.parse(textOf((await call(access, 'fields_list', { kind: 'categorical' })).result));
-      const field = fields.fields[0];
-      const { result } = await call(access, 'color_by', { field: { source: 'obs', key: field.key } });
-      const body = JSON.parse(textOf(result));
-      must(body.step !== null, 'no step');
-      const history = JSON.parse(textOf((await call(access, 'history_get')).result));
+    await check('a coloring is a step of the tab\'s history, labeled as the agent\'s', async () => {
+      const fields = dataOf(((await call(access, 'fields_list', { kind: 'categorical' })).result));
+      // A field other than the one shown, so the coloring is a change (one already shown makes no step).
+      let body = null;
+      for (const field of fields.fields) {
+        body = dataOf((await call(access, 'color_by', { field: { source: 'obs', key: field.key } })).result);
+        if (body.step !== null) break;
+      }
+      must(body?.step != null, 'no step');
+      const history = dataOf(((await call(access, 'history_get')).result));
       const step = history.steps.find(each => each.id === body.step.id);
-      must(step.origin === 'agent' && step.agent === 'Cellucid live check', `origin ${step.origin} ${step.agent}`);
+      // No site vouches for this registered app: its steps carry the name Manage… gives it (R9Z-5).
+      const named = 'An app on this computer (calls itself “Cellucid live check”)';
+      must(step.origin === 'agent' && step.agent === named, `origin ${step.origin} ${step.agent}`);
       return `"${body.step.label}" by ${step.agent}`;
     });
 
     await check('the history is the agent\'s too: undo and a jump through the tools', async () => {
-      const history = JSON.parse(textOf((await call(access, 'history_get')).result));
+      const history = dataOf(((await call(access, 'history_get')).result));
       const mine = history.steps.filter(step => step.origin === 'agent');
       must(mine.length > 0, 'no step of the agent');
       const last = mine.at(-1);
-      const undone = JSON.parse(textOf((await call(access, 'history_undo')).result));
+      const undone = dataOf(((await call(access, 'history_undo')).result));
       must(undone.moved === true && undone.head !== last.id, `undo: ${JSON.stringify(undone)}`);
-      const shown = JSON.parse(textOf((await call(access, 'history_jump', { step: last.id })).result));
+      const shown = dataOf(((await call(access, 'history_jump', { step: last.id })).result));
       must(shown.head === last.id, `jump: ${JSON.stringify(shown)}`);
       return `${mine.length} step(s) by ${last.agent} in turn ${last.turn.slice(0, 12)}…; undone and shown again`;
     });
@@ -394,22 +463,25 @@ async function main() {
       const { result, ms } = await call(access, 'view_picture', { width: 640, height: 480 });
       const image = result.content.find(item => item.type === 'image');
       must(image && image.mimeType === 'image/png', 'no image');
-      const body = JSON.parse(textOf(result));
-      must(body.png?.image === 1 && !textOf(result).includes(image.data.slice(0, 64)), 'the picture travelled as text');
+      const body = dataOf((result));
+      must(body.png?.image === 1 && !textOf(result).includes(image.data.slice(0, 64)), 'the picture traveled as text');
       pictureBytes = image.data.length;
       must(pictureBytes < 10 * 1024 * 1024, 'over 10 MiB');
       return `${body.width} × ${body.height} px, ${pictureBytes} base64 characters, text ${textOf(result).length} characters, ${Math.round(ms)} ms`;
     });
 
     await check('a picture larger than a chat takes is left out with a sentence', async () => {
-      const { result } = await call(access, 'view_picture', { width: 8200, height: 300, legend: false });
+      // The picture fits the pane inside the box asked for and keeps its shape (`reads/views.js`), so
+      // the box must be large on both sides for the picture to pass 8,000 px on its longer side
+      // (8,200 by 300 drew a picture about 500 px wide, rightly sent).
+      const { result } = await call(access, 'view_picture', { width: 8200, height: 8200, legend: false });
       must(!result.content.some(item => item.type === 'image'), 'sent anyway');
-      must(/more than a chat takes \(8,000 a side\)/.test(textOf(result)), textOf(result).slice(-200));
+      must(/more than a chat takes \(/.test(textOf(result)), textOf(result).slice(-200));
       return textOf(result).split('\n').at(-1);
     });
 
     await check('cellucid_status (answered by the relay)', async () => {
-      const status = JSON.parse(textOf((await call(access, 'cellucid_status')).result));
+      const status = dataOf(((await call(access, 'cellucid_status')).result));
       must(status.connected === true && status.tabs.length >= 1, JSON.stringify(status));
       return `connected; dataset "${status.tabs[0].dataset}"`;
     });
@@ -485,7 +557,7 @@ async function main() {
         expectWho: 'Claude (claude.ai) asks',
       });
       const { result } = await call(claudeCode.tokens.access_token, 'cellucid_status');
-      must(JSON.parse(textOf(result)).agent === 'Claude', textOf(result));
+      must(dataOf((result)).agent === 'Claude', textOf(result));
       return `the page asks "${claudeCode.heading}"; the connection is Claude's`;
     });
 

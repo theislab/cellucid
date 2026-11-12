@@ -99,7 +99,7 @@ function scale(properties, label) {
 
 function assertOrder(sizes, label) {
   // One size for the bulk of the interface: headings, body, labels, the text
-  // inside controls and on buttons. Hierarchy above it is weight and colour.
+  // inside controls and on buttons. Hierarchy above it is weight and color.
   for (const role of ['heading', 'body', 'label', 'control', 'button']) {
     assert.equal(sizes[role], sizes.body, `${label}: ${role} is the base size`);
   }

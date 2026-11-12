@@ -1,6 +1,6 @@
 {
   "name": "cellucid",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "config": { "cellucid-version-marker": "CELLUCID_VERSION" },
   "description": "Name reservation for Cellucid — a browser-first, GPU-accelerated workspace for exploring large single-cell datasets, released with each Cellucid version. The application runs at https://www.cellucid.com",
   "keywords": [

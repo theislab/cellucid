@@ -1,5 +1,5 @@
 /**
- * The refusals of the transcoders: a file Cellucid recognises and does not
+ * The refusals of the transcoders: a file Cellucid recognizes and does not
  * show, each saying what to do in Python and in R. They are layout
  * refusals (`views/refusal.js`), which `open.js` shows as they are.
  *
@@ -8,7 +8,7 @@
 
 import { LayoutRefusal, noEmbeddingRefusal as embeddingRefusal } from '../views/refusal.js';
 
-/** A recognised object or file Cellucid does not open; the message says what to do. */
+/** A recognized object or file Cellucid does not open; the message says what to do. */
 export class RObjectRefusal extends LayoutRefusal {
   /**
    * @param {string} message

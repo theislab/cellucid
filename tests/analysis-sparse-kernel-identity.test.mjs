@@ -355,7 +355,7 @@ test('markers against the rest over non-zero entries keep every group\'s exact s
         } else if (Number.isNaN(reference[g].pValue)) {
           assert.ok(Number.isNaN(dense.pValues[g]), `${label} untested`);
         } else {
-          // Welch from centred moments of the group and of all grouped cells:
+          // Welch from centered moments of the group and of all grouped cells:
           // the same statistic, summed in another order.
           const relative = Math.abs(dense.pValues[g] - reference[g].pValue) / Math.max(reference[g].pValue, 1e-300);
           assert.ok(relative < 1e-9, `${label} p ${dense.pValues[g]} vs ${reference[g].pValue}`);
@@ -441,7 +441,7 @@ test('a frame throttle delivers the latest update at most once per interval', as
   throttle.push(() => 53);
   throttle.flush();
   assert.deepEqual(delivered, [1, 50, 51, 53]);
-  // A cancelled update is never delivered.
+  // A canceled update is never delivered.
   throttle.push(() => 54);
   throttle.cancel();
   await time.sleep(40);

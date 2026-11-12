@@ -157,7 +157,11 @@ test('an offline dataset switch explains itself and stays on screen', async ({
   await expect(page.locator('#dataset-name')).toHaveText(GOOD_DATASET.name);
   // The first opening is over before the link goes (`goOffline`): a read of
   // it still under way (its gene list, a tree its frames asked for) would
-  // fail offline on its own and say so beside the switch's failure.
+  // fail offline on its own and say so beside the switch's failure. So is
+  // the samples' listing, which reads their files once the first view has
+  // settled (`holdListingUntil`): the other sample is listed with its cells.
+  await expect(page.locator(`#dataset-select option[value="${optionValue(OTHER_DATASET.id)}"]`))
+    .toHaveText(new RegExp(`${OTHER_DATASET.cells} cells`));
   await goOffline(context);
   await page.locator('#dataset-select').selectOption(
     optionValue(OTHER_DATASET.id),
@@ -248,6 +252,13 @@ test('a damaged dataset leads with the dataset, not the file', async ({
   });
   await dismissWelcome(page);
   await expect(page.locator('#dataset-name')).toHaveText(OTHER_DATASET.name);
+  // The samples' listing reads their files once the first view has settled
+  // (`holdListingUntil`); until it has, the picker (and so the failure) can
+  // name the damaged sample only by its file. A switch made while the listing
+  // still reads keeps its notice when the listing settles: the contract test
+  // "a listing that settles after a failed switch keeps the switch's notice".
+  await expect(page.locator(`#dataset-select option[value="${optionValue(GOOD_DATASET.id)}"]`))
+    .toHaveText(new RegExp(`${GOOD_DATASET.cells} cells`));
 
   await page.locator('#dataset-select').selectOption(
     optionValue(GOOD_DATASET.id),

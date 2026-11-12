@@ -9,7 +9,7 @@
  * purpose, so the app is reachable at `http://<lan-address>:<port>` — and there
  * the integrity check on a published default state threw "undefined is not an
  * object (evaluating 'globalThis.crypto.subtle.digest')" and the dataset opened
- * with none of its published colouring applied.
+ * with none of its published coloring applied.
  *
  * Sibling of `opaque-id-secure-context-contract.test.mjs`.
  */
@@ -21,7 +21,7 @@ import test from 'node:test';
 import {
   sha256Hex,
   sha256HexWithoutWebCrypto,
-} from '../assets/js/app/utils/sha256.js';
+} from '../assets/js/utils/sha256.js';
 
 function withCrypto(replacement, run) {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto');

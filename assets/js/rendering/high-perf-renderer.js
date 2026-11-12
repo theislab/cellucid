@@ -42,10 +42,8 @@ import {
   requireSnapshotPointData,
   requireViewId,
 } from './high-perf/renderer-contracts.js';
-import {
-  describeError,
-  settleCalculationNotification,
-} from './high-perf/calculation-notifications.js';
+import { settleCalculationNotification } from './high-perf/calculation-notifications.js';
+import { InternalError, failureDetails, failureText, joinFailure, sayFailure } from '../utils/errors.js';
 import {
   CONTEXT_LOST_ERROR_NAME,
   cancelDeferredWebGLErrorChecks,
@@ -93,7 +91,9 @@ import {
   readPositionBounds,
   requirePositionArray,
 } from './position-layout.js';
-import { formatCountOf, formatCount } from '../utils/format-units.js';
+import { formatBytes, formatCountOf, formatCount } from '../utils/format-units.js';
+import { realmHosts } from '../formats/io/hosts.js';
+import { upperFirst } from '../utils/text-case.js';
 
 // ============================================================================
 // CONSTANTS
@@ -140,10 +140,10 @@ const OPAQUE_POINT_PROGRAMS = Object.freeze(new Set(['sculpted']));
  * buffer (dimension level <= DEPTH_TEST_DIMENSION_THRESHOLD). A quality whose
  * fragment shader discards has one: the no-depth variant replaces each discard
  * with a zero-alpha fragment that blends to an identical pixel without
- * serialising the blend (see HP_FS_LIGHT_NO_DEPTH). `full` gained nothing from
+ * serializing the blend (see HP_FS_LIGHT_NO_DEPTH). `full` gained nothing from
  * this while it evaluated fog per fragment, because that was what bound its
  * dense 2-D frame; with fog evaluated per point it is bound by the same
- * serialisation as `light`. `ultralight` never discards.
+ * serialization as `light`. `ultralight` never discards.
  */
 const NO_DEPTH_POINT_PROGRAMS = Object.freeze({
   full: 'fullNoDepth',
@@ -231,7 +231,7 @@ function collectAlphaUploadRegions(dirtyRows, height, regions) {
  *
  * A store in source order is the published Float32 position array
  * (`dimension` components a point, never padded to three) and the published
- * RGBA8 colour array, each handed to `bufferData` / `bufferSubData` as-is (a
+ * RGBA8 color array, each handed to `bufferData` / `bufferSubData` as-is (a
  * range of it a store segment), so the renderer never holds a client-side
  * copy of either. A store in a tree's
  * draw order -- slot `k` holds point `indices[k]` -- is gathered on the GPU
@@ -289,7 +289,7 @@ const MAX_CULLED_DRAW_RANGES = 256;
 const STORE_ORDER_POINTS_PER_FRAME = 2 ** 21;
 
 /**
- * What a colour store holds after its store's order was given up mid-way
+ * What a color store holds after its store's order was given up mid-way
  * (`_storeOrderWriteFailed`): no order at all, so it is written again when
  * next drawn.
  */
@@ -302,9 +302,9 @@ const MAX_CULLED_DRAW_RANGES_MULTI_DRAW = 1024;
 /** The live geometry's store, as `_ensureStoreDrawOrder` names a store. */
 const LIVE_STORE = Object.freeze({ kind: 'live' });
 /**
- * The passes of a view by the layers of its colours (`u_drawPass`,
- * `colorLayersOf`): every cell at once when all are on top; else the grey
- * beneath (1), then the coloured cells (2); with cells not read, those first
+ * The passes of a view by the layers of its colors (`u_drawPass`,
+ * `colorLayersOf`): every cell at once when all are on top; else the gray
+ * beneath (1), then the colored cells (2); with cells not read, those first
  * (3), each pass a draw of its own.
  */
 const SINGLE_DRAW_PASS = Object.freeze([0]);
@@ -371,10 +371,6 @@ function projectLodBuildHeapBytes(pointCount, inWorker = false) {
   return Math.ceil(pointCount * perPoint + LOD_BUILD_HEAP_FIXED_BYTES);
 }
 
-function describeHeapMebibytes(bytes) {
-  return `${formatCount(Math.round(bytes / (1024 * 1024)))} MiB`;
-}
-
 /**
  * Refuse a level-of-detail build this tab's heap cannot finish.
  *
@@ -439,14 +435,14 @@ function requireLodBuildHeapHeadroom(pointCount, buildLOD, label, { inWorker = f
     )
   );
   throw new RangeError(
-    `${label} cannot build a level-of-detail index for ` +
-    `${formatCountOf(pointCount, 'point')} on this device: the build peaks at ` +
-    `about ${describeHeapMebibytes(projectedBytes)} of JavaScript heap on top ` +
-    `of the ${describeHeapMebibytes(usedBytes)} already in use, and this ` +
-    `browser caps the tab at ${describeHeapMebibytes(limitBytes)}. Turn off ` +
-    'adaptive level of detail and frustum culling to render this dataset at ' +
-    `full detail, or subset it to at most ` +
-    `${formatCountOf(affordablePoints, 'point')}.`
+    `${upperFirst(label)} cannot build a level-of-detail index for ` +
+    `${formatCountOf(pointCount, 'cell')} on this device: the build peaks at ` +
+    `about ${formatBytes(projectedBytes)} of JavaScript heap on top ` +
+    `of the ${formatBytes(usedBytes)} already in use, and this ` +
+    `browser caps the tab at ${formatBytes(limitBytes)}. Turn off ` +
+    'Level of detail (LOD) and Frustum culling to draw this dataset at ' +
+    `full detail, or open at most ` +
+    `${formatCountOf(affordablePoints, 'cell')}.`
   );
 }
 
@@ -469,8 +465,8 @@ function requireWordAlignedColors(colors) {
 }
 
 /**
- * A colour store is written in a store order only when that order places
- * every point: one slot a colour.
+ * A color store is written in a store order only when that order places
+ * every point: one slot a color.
  *
  * @param {StoreOrder|null} order
  * @param {Uint8Array} colors
@@ -481,7 +477,7 @@ function requireOrderCoversColors(order, colors, owner) {
   const slots = order.pointCount;
   const count = colors.length >>> 2;
   if (slots !== count) {
-    throw new RangeError(`${owner} has a draw order of ${slots} slots for ${formatCountOf(count, 'colour')}.`);
+    throw new RangeError(`${owner} has a draw order of ${slots} slots for ${formatCountOf(count, 'color')}.`);
   }
 }
 
@@ -597,7 +593,7 @@ export function earlierSlotsOf(base, baseEnd, indices, first, end) {
 
 /**
  * Whether two store orders are steps of one store taking one order (they
- * share a slot map): a colour store a step behind is rewritten in place, not
+ * share a slot map): a color store a step behind is rewritten in place, not
  * swapped for another.
  *
  * @param {StoreOrder|null} a
@@ -685,7 +681,7 @@ export class HighPerfRendererContextLostError extends Error {
       `HighPerfRenderer cannot ${operation} after its WebGL context was lost.`
     );
     // The shared marker from `gl-errors.js`, so this fence and every GL-error
-    // preflight raise one recognisable condition; `isContextLostError()` there
+    // preflight raise one recognizable condition; `isContextLostError()` there
     // is what the frame loop tests against.
     this.name = CONTEXT_LOST_ERROR_NAME;
   }
@@ -747,14 +743,14 @@ export class HighPerfRenderer {
     // The order the live position store holds (see "STORE ORDERS"): null
     // while it holds source order, else a `StoreOrder`
     // (`high-perf/store-order.js`), whose texture maps a stored slot back to
-    // its source index. `_liveColorOrder` is the store order the live colour
+    // its source index. `_liveColorOrder` is the store order the live color
     // store holds; it follows `_liveOrder` at the next render.
     this._liveOrder = null;
     this._liveColorOrder = null;
-    // Live colour stores kept per draw order (see "COLOUR STORES KEPT PER
+    // Live color stores kept per draw order (see "COLOR STORES KEPT PER
     // DRAW ORDER").
     this._liveColorCache = new Map();
-    // The colours the lower layers are drawn in: the grey of the cells with
+    // The colors the lower layers are drawn in: the gray of the cells with
     // no value and the fade of the cells not read (`setLayerBackground`).
     this._zeroColor = zeroCellColor([1, 1, 1]);
     this._unreadColor = unreadCellColor([1, 1, 1]);
@@ -791,7 +787,7 @@ export class HighPerfRenderer {
     this.vao = null;
 
     // Snapshot buffers for multi-view rendering (avoids re-uploading per frame).
-    // Each snapshot owns one RGBA8 colour VBO plus one R8 alpha texture while its
+    // Each snapshot owns one RGBA8 color VBO plus one R8 alpha texture while its
     // geometry generation owns the immutable position VBO shared by every
     // same-generation VAO. `buffer` remains a compatibility alias for the
     // snapshot color owner's buffer.
@@ -805,9 +801,9 @@ export class HighPerfRenderer {
     this._snapshotAlphaUploadRegions = null;
     // The views the viewer presents this frame (`setPresentedViews`); null
     // until it says, which keeps every view resident. A kept view that is not
-    // presented gives up its colour store and R8 texture when an allocation
+    // presented gives up its color store and R8 texture when an allocation
     // is refused (`_releaseDormantSnapshotStores`) and gets them back from
-    // its published colours and transparency when it is next drawn or edited.
+    // its published colors and transparency when it is next drawn or edited.
     this._presentedViewIds = null;
     // The kept view a public operation is working on: never released under it.
     this._snapshotInOperation = null;
@@ -898,7 +894,7 @@ export class HighPerfRenderer {
       throw new HighPerfRendererContextLostError(operation);
     }
     if (this._disposed === true) {
-      const error = new Error(
+      const error = new InternalError(
         `HighPerfRenderer cannot ${operation} after disposal.`
       );
       error.name = 'HighPerfRendererDisposedError';
@@ -1343,7 +1339,7 @@ export class HighPerfRenderer {
         );
     const candidateTexture = gl.createTexture();
     if (!candidateTexture) {
-      throw new Error('HighPerfRenderer could not allocate the required LOD index texture.');
+      throw new InternalError('HighPerfRenderer could not allocate the required LOD index texture.');
     }
     let candidateByteLength = 0;
     try {
@@ -1426,7 +1422,7 @@ export class HighPerfRenderer {
       if (shader !== undefined) return shader;
       shader = gl.createShader(type);
       if (!shader) {
-        throw new Error(`HighPerfRenderer could not allocate the ${label} shader.`);
+        throw new InternalError(`HighPerfRenderer could not allocate the ${label} shader.`);
       }
       shaders.set(key, shader);
       gl.shaderSource(shader, source);
@@ -1449,7 +1445,7 @@ export class HighPerfRenderer {
         const fragmentShader = compile(gl.FRAGMENT_SHADER, fsSource, `"${name}" fragment`);
         const program = gl.createProgram();
         if (!program) {
-          throw new Error(`HighPerfRenderer could not allocate the "${name}" shader program.`);
+          throw new InternalError(`HighPerfRenderer could not allocate the "${name}" shader program.`);
         }
         programs[name] = program;
         gl.attachShader(program, vertexShader);
@@ -1497,9 +1493,11 @@ export class HighPerfRenderer {
     const uniformNames = [
       'u_mvpMatrix', 'u_modelViewMatrix', 'u_projectionMatrix',
       'u_pointSize', 'u_sizeAttenuation', 'u_pointScale',
+      // The sprite cap (rendering/point-sprite.js)
+      'u_pointSizeMax',
       'u_lightingStrength', 'u_fogNear', 'u_fogScale',
       'u_fogColor', 'u_lightDir', 'u_halfDir',
-      // Sculpted lighting normalisation and coverage floor
+      // Sculpted lighting normalization and coverage floor
       'u_invCenterShade', 'u_coverageFloor',
       // Alpha texture uniforms for efficient alpha-only updates
       'u_alphaTex', 'u_alphaLayout', 'u_useAlphaTex',
@@ -1511,7 +1509,7 @@ export class HighPerfRenderer {
       // Which cells a pass draws, and whether they yield in depth
       // (`BENEATH_DRAW_PASSES`)
       'u_drawPass', 'u_yieldDepth',
-      // The colours of cells not read and of the grey beneath
+      // The colors of cells not read and of the gray beneath
       // (`unreadCellColor`, `zeroCellColor`)
       'u_unreadColor', 'u_zeroColor'
     ];
@@ -1547,7 +1545,7 @@ export class HighPerfRenderer {
     const exactQuality = requireShaderQuality(quality);
     const program = this.programs[exactQuality];
     if (!program) {
-      throw new Error(`HighPerfRenderer "${exactQuality}" shader program is unavailable.`);
+      throw new InternalError(`HighPerfRenderer "${exactQuality}" shader program is unavailable.`);
     }
     this.activeQuality = exactQuality;
     this.activeProgram = program;
@@ -1871,7 +1869,7 @@ export class HighPerfRenderer {
   /**
    * Allocate, ahead of `loadData`, the GPU stores a dataset of `pointCount`
    * points of `dimension` components will be published into: its position
-   * and colour vertex stores and its R8 alpha texture.
+   * and color vertex stores and its R8 alpha texture.
    *
    * WebGL reports a refused allocation only through `getError`, a round trip
    * that waits until the GPU has done the allocation and everything queued
@@ -1932,7 +1930,7 @@ export class HighPerfRenderer {
       );
       const texture = gl.createTexture();
       if (!texture) {
-        throw new Error('HighPerfRenderer could not allocate the required alpha texture.');
+        throw new InternalError('HighPerfRenderer could not allocate the required alpha texture.');
       }
       prepared.alphaTexture = texture;
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, texture);
@@ -2514,7 +2512,7 @@ export class HighPerfRenderer {
 
   _ensureSnapshotGeometryGpuOwner(geometry) {
     if (!geometry || !(geometry.positions instanceof Float32Array)) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer snapshot geometry has no exact Float32 position owner.'
       );
     }
@@ -2539,7 +2537,7 @@ export class HighPerfRenderer {
             geometry.positions.byteLength
         )
     ) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot geometry generation ${geometry.generation} has invalid position-buffer ownership.`
       );
     }
@@ -2606,7 +2604,7 @@ export class HighPerfRenderer {
       expectedPositions = this._positions;
       sourceDimension = this.currentDimensionLevel;
       if (!Number.isSafeInteger(generation) || generation <= 0) {
-        throw new Error(
+        throw new InternalError(
           'HighPerfRenderer live geometry has no published generation.'
         );
       }
@@ -2623,12 +2621,12 @@ export class HighPerfRenderer {
       sourceDimension = sourceSnapshot.dimensionLevel;
     }
     if (!Number.isSafeInteger(generation) || generation <= 0) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot source "${exactSourceViewId}" has no exact geometry generation.`
       );
     }
     if (sourcePositions !== expectedPositions) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot source "${exactSourceViewId}" positions do not match its published geometry owner.`
       );
     }
@@ -2636,7 +2634,7 @@ export class HighPerfRenderer {
     let geometry = this._snapshotGeometryPools.get(generation);
     if (geometry === undefined) {
       if (!sourceIsLive) {
-        throw new Error(
+        throw new InternalError(
           `HighPerfRenderer snapshot source "${exactSourceViewId}" has no owned frozen geometry.`
         );
       }
@@ -2644,7 +2642,7 @@ export class HighPerfRenderer {
         !this.buffers.positions ||
         this._positionGpuByteLength !== sourcePositions.byteLength
       ) {
-        throw new Error(
+        throw new InternalError(
           'HighPerfRenderer live geometry has no exact position VBO to share.'
         );
       }
@@ -2676,7 +2674,7 @@ export class HighPerfRenderer {
       !Number.isSafeInteger(geometry.refCount) ||
       geometry.refCount < 0
     ) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot geometry generation ${generation} is inconsistent.`
       );
     }
@@ -2820,7 +2818,7 @@ export class HighPerfRenderer {
     const budget = evictAll
       ? 0
       : Math.max(0, this._geometryRetentionBudget() - headroomBytes);
-    // Kept colour stores share the budget and go first: they are the
+    // Kept color stores share the budget and go first: they are the
     // cheaper to rebuild.
     let held = this.getRetainedGeometryBytes() + this.getKeptColorBytes();
     let freed = 0;
@@ -2901,7 +2899,7 @@ export class HighPerfRenderer {
       !Number.isSafeInteger(geometry.refCount) ||
       geometry.refCount <= 0
     ) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot geometry generation ${geometryGeneration} has invalid spatial ownership.`
       );
     }
@@ -2947,7 +2945,7 @@ export class HighPerfRenderer {
         spatialIndex.dimensionLevel !== dimensionLevel
       )
     ) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot geometry generation ${geometryGeneration} has an inconsistent ${dimensionLevel}D spatial owner.`
       );
     }
@@ -2967,7 +2965,7 @@ export class HighPerfRenderer {
       spatialIndex.positions !== positions ||
       spatialIndex.dimensionLevel !== dimensionLevel
     ) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer cannot publish an inconsistent snapshot spatial owner.'
       );
     }
@@ -2979,7 +2977,7 @@ export class HighPerfRenderer {
       this._snapshotSpatialIndexKey(dimensionLevel, needsLOD);
     const existing = geometry.spatialIndices.get(key);
     if (existing !== undefined && existing !== spatialIndex && !replace) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot geometry generation ${geometryGeneration} already owns a different ${dimensionLevel}D spatial index.`
       );
     }
@@ -3000,7 +2998,7 @@ export class HighPerfRenderer {
       snapshot.geometryGeneration
     );
     if (geometry === undefined) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot geometry generation ${snapshot.geometryGeneration} is not owned.`
       );
     }
@@ -3009,7 +3007,7 @@ export class HighPerfRenderer {
       !Number.isSafeInteger(geometry.refCount) ||
       geometry.refCount <= 0
     ) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot geometry generation ${snapshot.geometryGeneration} has invalid ownership.`
       );
     }
@@ -3020,7 +3018,7 @@ export class HighPerfRenderer {
       existingPositionBuffer !== null &&
       geometry.positionBuffer !== existingPositionBuffer
     ) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot geometry generation ${snapshot.geometryGeneration} cannot merge distinct retired position owners.`
       );
     }
@@ -3055,7 +3053,7 @@ export class HighPerfRenderer {
         !Number.isSafeInteger(snapshot.bufferByteLength) ||
         snapshot.bufferByteLength < 0
       ) {
-        throw new Error(
+        throw new InternalError(
           `HighPerfRenderer snapshot "${snapshot.id ?? 'unknown'}" has no exact color-buffer owner.`
         );
       }
@@ -3080,7 +3078,7 @@ export class HighPerfRenderer {
       snapshot.buffer !== owner.buffer ||
       snapshot.bufferByteLength !== owner.byteLength
     ) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot "${snapshot.id ?? 'unknown'}" has inconsistent color-buffer ownership.`
       );
     }
@@ -3109,7 +3107,7 @@ export class HighPerfRenderer {
       !Number.isSafeInteger(byteLength) ||
       byteLength !== this.pointCount * 4
     ) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer cannot publish an invalid snapshot color-buffer owner.'
       );
     }
@@ -3118,7 +3116,7 @@ export class HighPerfRenderer {
       byteLength,
       pointCount: this.pointCount,
       refCount: 1,
-      // The store order the colours are in (null: source order).
+      // The store order the colors are in (null: source order).
       order,
     };
   }
@@ -3135,7 +3133,7 @@ export class HighPerfRenderer {
       owner.refCount <= 0 ||
       owner.refCount >= Number.MAX_SAFE_INTEGER
     ) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer cannot retain an invalid snapshot color-buffer owner.'
       );
     }
@@ -3155,7 +3153,7 @@ export class HighPerfRenderer {
       !Number.isSafeInteger(owner.refCount) ||
       owner.refCount <= 0
     ) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer cannot release an invalid snapshot color-buffer owner.'
       );
     }
@@ -3164,7 +3162,7 @@ export class HighPerfRenderer {
       existingBuffer !== null &&
       owner.buffer !== existingBuffer
     ) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer cannot merge distinct retired snapshot color buffers.'
       );
     }
@@ -3335,7 +3333,7 @@ export class HighPerfRenderer {
     const colorOwner = releaseColor
       ? snapshot?.colorOwner ?? null
       : null;
-    // A retiring view takes the colour stores it kept with it.
+    // A retiring view takes the color stores it kept with it.
     if (releaseColor && releaseVao && snapshot?.colorCache instanceof Map) {
       this._clearKeptColorStores(snapshot.colorCache);
     }
@@ -3589,7 +3587,7 @@ export class HighPerfRenderer {
         const cleanupGlError = gl.getError();
         if (cleanupGlError !== gl.NO_ERROR) {
           cleanupErrors.push(
-            new Error(
+            new InternalError(
               `HighPerfRenderer rollback encountered WebGL error 0x${cleanupGlError.toString(16)}.`
             )
           );
@@ -3626,7 +3624,7 @@ export class HighPerfRenderer {
    * (`app/open-cells-resize.js`): the first `min(n, n')` cells are the cells
    * shown now, at the same positions, so their bytes on the GPU are kept.
    *
-   * - Added cells (`n' > n`) are appended to the position and colour stores
+   * - Added cells (`n' > n`) are appended to the position and color stores
    *   (`PointStore#resize`, then `write` of the new slots only), in rank
    *   order behind whatever order the stores hold (`StoreOrder#resized`).
    * - Removed cells (`n' < n`) are cut from the end. Where the stores hold a
@@ -3639,9 +3637,9 @@ export class HighPerfRenderer {
    * Nothing else is uploaded or reordered: the levels of detail of a store in
    * rank order are the ladder's counts over `n'` at once (`RankLevels`), and
    * the tree of the new positions is built in the worker and adopted band by
-   * band like any other (`_ensureStoreDrawOrder`). Colours are compared with
+   * band like any other (`_ensureStoreDrawOrder`). Colors are compared with
    * the published ones over the kept cells, and re-published whole only if
-   * they differ (a colour scale over every open cell can change); the R8
+   * they differ (a color scale over every open cell can change); the R8
    * alpha texture (one byte a cell) keeps its storage when it holds `n'`
    * cells and sends only the rows that change (`_resizeAlphaTexture`). A
    * growth whose target is known (`capacity`: the open cells a progressive
@@ -3683,7 +3681,7 @@ export class HighPerfRenderer {
     const previousCount = this.pointCount;
     const pointCount = requirePositionArray(positions, dimension, 'HighPerfRenderer positions');
     if (previousCount === 0 || !this.buffers.positions || !this.buffers.colors) {
-      throw new Error('HighPerfRenderer resizes published cells; publish a dataset first (loadData).');
+      throw new InternalError('HighPerfRenderer resizes published cells; publish a dataset first (loadData).');
     }
     if (colors.length !== pointCount * 4) {
       throw new RangeError(`HighPerfRenderer colors must contain exactly ${pointCount * 4} RGBA bytes for ${formatCountOf(pointCount, 'point')}; received ${colors.length}.`);
@@ -3702,7 +3700,7 @@ export class HighPerfRenderer {
     }
     planLinearTextureFor(gl, capacity);
     this._flushPendingPositionUpload();
-    // Geometry retained for other representations and colour stores kept
+    // Geometry retained for other representations and color stores kept
     // for other orders hold the previous cells.
     this._clearKeptColorStores(this._liveColorCache);
     this.evictRetainedGeometry(Infinity);
@@ -3730,7 +3728,7 @@ export class HighPerfRenderer {
       pointCount, gl.STATIC_DRAW, allocate, `${label}: positions`, capacity
     );
     this._colorGpuByteLength = this.buffers.colors.resize(
-      pointCount, gl.DYNAMIC_DRAW, allocate, `${label}: colours`, capacity
+      pointCount, gl.DYNAMIC_DRAW, allocate, `${label}: colors`, capacity
     );
     if (rewriteFrom < pointCount) {
       this.buffers.positions.write(positionsForGpu(positions.subarray(rewriteFrom * dimension), dimension), rewriteFrom);
@@ -3745,7 +3743,7 @@ export class HighPerfRenderer {
     this._retireStoreOrder(order, nextOrder);
     this._liveOrder = nextOrder;
     this._liveColorOrder = keptColors ? nextOrder : this._liveColorOrder;
-    // Colours that changed over the kept cells go up whole at the next frame.
+    // Colors that changed over the kept cells go up whole at the next frame.
     this._colorsDirty = !keptColors;
     this.pointCount = pointCount;
     this._positions = positions;
@@ -3802,7 +3800,7 @@ export class HighPerfRenderer {
     // The live positions hold exactly the live dimension's components, so
     // only that dimension's tree can be built over them.
     if (dim !== this.currentDimensionLevel) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer live positions are ${this.currentDimensionLevel}D; ` +
         `a ${dim}D spatial index cannot be built over them.`
       );
@@ -3840,7 +3838,7 @@ export class HighPerfRenderer {
       requireLodBuildHeapHeadroom(
         this.pointCount,
         needsLOD,
-        `HighPerfRenderer ${dim}D live view`
+        `the live view (${dim}D)`
       );
     }
     // Build a complete CPU candidate off-state. The prior exact CPU/GPU
@@ -3894,7 +3892,8 @@ export class HighPerfRenderer {
           notifications,
           notifId,
           'failCalculation',
-          `Cellucid could not prepare drawing and cell lookup: ${describeError(error)}`
+          `${joinFailure(`Cellucid could not prepare drawing and cell lookup`, sayFailure(error))}`,
+          failureDetails(error)
         );
       }
       throw error;
@@ -3903,7 +3902,7 @@ export class HighPerfRenderer {
 
   /**
    * Show another representation in the live view: replace only its
-   * positions, keeping the published colours, transparency and alpha texture
+   * positions, keeping the published colors, transparency and alpha texture
    * (they are per cell, not per representation). The live dimension is the
    * dimension of the published positions, so this is the only way the live
    * view changes dimension.
@@ -3936,7 +3935,7 @@ export class HighPerfRenderer {
     }
 
     if (!(this._colors instanceof Uint8Array) || !this.buffers?.colors) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer cannot update positions before exact color data is published.'
       );
     }
@@ -3974,7 +3973,7 @@ export class HighPerfRenderer {
 
       const donorTree = donor?.spatialIndices?.get(newDimLevel) ?? null;
       if (donorTree !== null && donorTree.positions === positions) {
-        // The tree follows the renderer's colour generation, as on recolour.
+        // The tree follows the renderer's color generation, as on recolor.
         donorTree.colors = this._colors;
         const fullDetailLevel = donorTree.lodLevels?.at(-1);
         if (fullDetailLevel?.isFullDetail === true) fullDetailLevel.colors = this._colors;
@@ -4004,7 +4003,7 @@ export class HighPerfRenderer {
           ? donor.generation
           : this._allocateGeometryGeneration();
       }
-      // The moved colour store keeps the order it holds; the next render
+      // The moved color store keeps the order it holds; the next render
       // regathers it into the new geometry's order when they differ.
       this._liveColorOrder = previous.liveColorOrder ?? null;
       this.vao.setStores(this.buffers.positions, this.buffers.colors, newDimLevel);
@@ -4025,7 +4024,7 @@ export class HighPerfRenderer {
       if (candidateInstalled) {
         const rejected = this._captureDataPublication();
         this._restoreDataPublication(previous);
-        // Only what the candidate created is retired: the moved colour and
+        // Only what the candidate created is retired: the moved color and
         // alpha owners and a donor's buffer belong to their owners.
         cleanupErrors.push(...this._retireDataPublication({
           ...rejected,
@@ -4092,7 +4091,7 @@ export class HighPerfRenderer {
    * The geometry the live view leaves stays available: a pool record that
    * borrows its buffer takes it over (with the live tree); otherwise a new
    * retained record owns buffer and tree. Returns the publication to retire
-   * without the moved colour/alpha owners and without that buffer.
+   * without the moved color/alpha owners and without that buffer.
    *
    * @param {Object} previous - The captured previous publication.
    * @returns {Object}
@@ -4290,7 +4289,7 @@ export class HighPerfRenderer {
 
   /**
    * Say which views are presented this frame. A kept view that is not
-   * presented is dormant: its colour store and R8 texture are the first
+   * presented is dormant: its color store and R8 texture are the first
    * thing released when an allocation is refused, and come back when it is
    * next drawn or edited.
    *
@@ -4315,7 +4314,7 @@ export class HighPerfRenderer {
    * With culling or level of detail on, a view's spatial tree (with levels
    * when LOD needs them) is built off the main thread and lands in a later
    * frame, and the store it serves then adopts the tree's draw order: a GPU
-   * re-order of positions and colours, with the error reads a publication
+   * re-order of positions and colors, with the error reads a publication
    * owes. A benchmark window that contains that landing measures the
    * landing, not the configuration, so the benchmark starts a window only
    * once this holds. Reads the state and asks for nothing: no tree is
@@ -4407,7 +4406,7 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Bytes the dormant kept views' colour stores and R8 textures hold.
+   * Bytes the dormant kept views' color stores and R8 textures hold.
    * @returns {number}
    * @private
    */
@@ -4422,9 +4421,9 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Release the colour store, kept colour stores and R8 texture of every
+   * Release the color store, kept color stores and R8 texture of every
    * dormant kept view (not presented, not being worked on, its store its
-   * own). The view keeps its published colours and transparency, its geometry and its
+   * own). The view keeps its published colors and transparency, its geometry and its
    * vertex array, so `_restoreSnapshotStores` rebuilds exactly what it drew.
    * @returns {number} Bytes released.
    * @private
@@ -4455,7 +4454,7 @@ export class HighPerfRenderer {
     }
     if (released > 0) {
       console.log(
-        `[HighPerfRenderer] Released ${(released / 1024 / 1024).toFixed(1)} MB of colour and alpha stores of views not shown; they are rebuilt when shown.`
+        `[HighPerfRenderer] Released ${(released / 1024 / 1024).toFixed(1)} MB of color and alpha stores of views not shown; they are rebuilt when shown.`
       );
       this._refreshGpuMemoryStats();
     }
@@ -4463,8 +4462,8 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Rebuild a released kept view's colour store (in its geometry's current
-   * order) and R8 texture from its published colours and transparency, and point
+   * Rebuild a released kept view's color store (in its geometry's current
+   * order) and R8 texture from its published colors and transparency, and point
    * its vertex array at the new store. A failure leaves it released.
    * @private
    */
@@ -4509,7 +4508,7 @@ export class HighPerfRenderer {
   /**
    * Run one GPU allocation on the target its caller bound (`allocate` may
    * run twice; the binding is restored before the second run). Memory kept only for speed -- geometry of representations no
-   * view shows, colour stores kept for switching back -- never costs an
+   * view shows, color stores kept for switching back -- never costs an
    * allocation: when the driver refuses one while any is kept, all of it is
    * released and the allocation runs once more. Nothing is evicted while an
    * allocation fits, so a switch back stays free whenever memory allows.
@@ -4533,7 +4532,7 @@ export class HighPerfRenderer {
       deferWebGLErrorCheck(gl, {
         label: refusal,
         owner: this,
-        onError: error => onError(new RangeError(`${refusal} (${describeError(error)}).`)),
+        onError: error => onError(new RangeError(`${refusal} (${failureText(error)}).`)),
       });
       return;
     }
@@ -4636,7 +4635,7 @@ export class HighPerfRenderer {
     if (prepared !== null) prepared.alphaTexture = null;
     const candidateTexture = adoptedTexture ?? gl.createTexture();
     if (!candidateTexture) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer could not allocate the required alpha texture.'
       );
     }
@@ -4789,7 +4788,7 @@ export class HighPerfRenderer {
       regionCount <= 0 ||
       regions.length < regionCount * 2
     ) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer alpha texture upload received incomplete exact state.'
       );
     }
@@ -4802,7 +4801,7 @@ export class HighPerfRenderer {
         rowStart < previousRowEnd ||
         rowStart + rowCount > height
       ) {
-        throw new Error(
+        throw new InternalError(
           'HighPerfRenderer alpha texture upload received an invalid row region.'
         );
       }
@@ -4862,7 +4861,7 @@ export class HighPerfRenderer {
       height <= 0 ||
       plan?.rows !== height
     ) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer alpha texture update received incomplete exact state.'
       );
     }
@@ -4962,7 +4961,7 @@ export class HighPerfRenderer {
     }
     requireWordAlignedColors(colors);
 
-    // The same colours in another array (a field made again after cells
+    // The same colors in another array (a field made again after cells
     // were added or removed in place, `resizeLiveCells`): nothing to send.
     // The same array is always sent again: its owner may have rewritten it.
     const unchanged = colors !== this._colors && this._colors instanceof Uint8Array
@@ -4982,7 +4981,7 @@ export class HighPerfRenderer {
 
     if (unchanged) return;
     // Publication is deferred to the next render, so back-to-back recolors
-    // upload once. Stores kept for other orders hold the old colours.
+    // upload once. Stores kept for other orders hold the old colors.
     this._colorsDirty = true;
     this._clearKeptColorStores(this._liveColorCache);
   }
@@ -5091,7 +5090,7 @@ export class HighPerfRenderer {
       colors.byteLength !== this.pointCount * 4 ||
       this._colorGpuByteLength !== colors.byteLength
     ) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer full-detail color publication has no exact accepted color store.'
       );
     }
@@ -5152,7 +5151,7 @@ export class HighPerfRenderer {
     } else {
       const sphere = this._boundingSphere;
       if (!sphere) {
-        throw new Error(
+        throw new InternalError(
           'HighPerfRenderer fog range requires published live point bounds.'
         );
       }
@@ -5207,7 +5206,7 @@ export class HighPerfRenderer {
         !Array.isArray(sphere.center) ||
         sphere.center.length !== 3
       ) {
-        throw new Error(
+        throw new InternalError(
           'HighPerfRenderer fog range requires published live point bounds.'
         );
       }
@@ -5251,7 +5250,7 @@ export class HighPerfRenderer {
       typeof snapshot.bounds !== 'object' ||
       Array.isArray(snapshot.bounds)
     ) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot "${exactViewId}" has no exact fog bounds.`
       );
     }
@@ -5459,11 +5458,11 @@ export class HighPerfRenderer {
     }
 
     if (!this.activeProgram) {
-      throw new Error('HighPerfRenderer active shader program is unavailable.');
+      throw new InternalError('HighPerfRenderer active shader program is unavailable.');
     }
 
     if (!this.buffers.positions || !this.buffers.colors) {
-      throw new Error('HighPerfRenderer point buffers are unavailable.');
+      throw new InternalError('HighPerfRenderer point buffers are unavailable.');
     }
     this._flushPendingPositionUpload();
 
@@ -5823,7 +5822,7 @@ export class HighPerfRenderer {
       const plane = scratchPlanes[planeIndex];
       for (let valueIndex = 0; valueIndex < 4; valueIndex++) {
         if (!Number.isFinite(plane[valueIndex])) {
-          throw new Error(
+          throw new InternalError(
             `HighPerfRenderer frustum extraction produced a non-finite plane value at ${planeIndex}:${valueIndex}.`
           );
         }
@@ -5915,7 +5914,8 @@ export class HighPerfRenderer {
     lightingStrength,
     fogDensity,
     fogColor,
-    lightDir
+    lightDir,
+    pointSizeMax
   ) {
     const frame = this._pointShaderFrame ??= {
       modelView: new Float32Array(16),
@@ -5936,6 +5936,7 @@ export class HighPerfRenderer {
     if (uniforms.u_pointSize !== null) gl.uniform1f(uniforms.u_pointSize, pointSize);
     if (uniforms.u_sizeAttenuation !== null) gl.uniform1f(uniforms.u_sizeAttenuation, sizeAttenuation);
     if (uniforms.u_pointScale !== null) gl.uniform1f(uniforms.u_pointScale, pointScale);
+    if (uniforms.u_pointSizeMax !== null) gl.uniform1f(uniforms.u_pointSizeMax, pointSizeMax);
     if (uniforms.u_lightingStrength !== null) gl.uniform1f(uniforms.u_lightingStrength, lightingStrength);
     writeFogUniforms(
       gl,
@@ -5983,13 +5984,13 @@ export class HighPerfRenderer {
   // source index. Every level of detail is a prefix of that order and every
   // run of tree leaves is one contiguous range per band, so a reduced level
   // is one `drawArrays` prefix and frustum culling draws node ranges -- no
-  // per-point index ever leaves the CPU after the order is built. Neighbouring
-  // points are also neighbours in memory and on screen, which is what makes
+  // per-point index ever leaves the CPU after the order is built. Neighboring
+  // points are also neighbors in memory and on screen, which is what makes
   // the stored order faster to draw at full detail than source order (10M
   // points: 18 ms against 68 ms on Chromium, 15 against 57 on WebKit, 14
   // against 57 on Firefox).
   //
-  // Positions are per geometry, so each geometry carries its order; colours
+  // Positions are per geometry, so each geometry carries its order; colors
   // are per view and are gathered into the order of the geometry the view
   // draws. Alpha stays in source order, read through the order's R32UI slot
   // map (`u_orderedSlots`). What a store holds is a `StoreOrder`
@@ -6112,7 +6113,7 @@ export class HighPerfRenderer {
 
   /**
    * A store's order moved from `previous` to `next`: retire `previous`'s
-   * slot map unless `next` reads the same one, and the colour stores kept
+   * slot map unless `next` reads the same one, and the color stores kept
    * for any order of that map (no store holds one any more).
    *
    * @param {StoreOrder|null} previous
@@ -6130,7 +6131,7 @@ export class HighPerfRenderer {
     this._dropKeptColorStoresOf(map);
   }
 
-  /** Retire the colour stores kept for any order of slot map `map` (no store will hold one again). @private */
+  /** Retire the color stores kept for any order of slot map `map` (no store will hold one again). @private */
   _dropKeptColorStoresOf(map) {
     for (const [cache, order, entry] of this._keptColorStores()) {
       if (order?.map !== map) continue;
@@ -6150,10 +6151,10 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Rewrite an RGBA8 colour store (already sized) with one view's colours in
+   * Rewrite an RGBA8 color store (already sized) with one view's colors in
    * store order `order`, or in source order when `order` is null. A store
    * order is gathered on the GPU through its slot map (`GpuPermuter`): the
-   * CPU uploads the source-order colours once, as a source-order store
+   * CPU uploads the source-order colors once, as a source-order store
    * would, and never reads them at random.
    *
    * @param {PointStore} buffer
@@ -6186,7 +6187,7 @@ export class HighPerfRenderer {
   /**
    * Bring one position store toward `tree`'s draw order: the bands this
    * frame's budget allows when the store holds its cells by rank (see
-   * "STORE ORDERS"), else the whole order at once. The colours of every view
+   * "STORE ORDERS"), else the whole order at once. The colors of every view
    * presented on the store follow it at each step. The CPU only uploads the
    * source-order words; it never reads them at random. While bands remain,
    * a frame is asked for (`onAsyncTreeReady`), so the store keeps moving
@@ -6229,10 +6230,12 @@ export class HighPerfRenderer {
       this._adoptionFailures ??= new WeakSet();
       this._adoptionFailures.add(drawOrder);
       const byRank = this._rankLevelsOf(store) !== null;
+      // Levels of detail by rank (`byRank`) still thin the picture; culling (cells off screen skipped) is off.
       getNotificationCenter().error(
-        `${byRank ? 'Culling is' : 'Levels of detail and culling are'} off for the ${store.kind === 'live' ? 'live view' : 'kept views of a representation'}: `
-          + `its ${formatCountOf(drawOrder.pointCount, 'point')} could not be put in draw order on the GPU (${describeError(error)}). `
-          + (byRank ? 'Its levels of detail are drawn in rank order, without culling.' : 'It is drawn at full detail.')
+        `Drawing the ${store.kind === 'live' ? 'live view' : 'kept views of an embedding'} may be slower: `
+          + `the graphics card could not sort its ${formatCountOf(drawOrder.pointCount, 'cell')}, so `
+          + (byRank ? 'cells off screen are drawn too.' : 'every cell is drawn at full detail.'),
+        { category: 'render', details: failureText(error) }
       );
       return this._storeOrder(store);
     }
@@ -6353,10 +6356,10 @@ export class HighPerfRenderer {
         }
         throw error;
       }
-      // Colour stores kept for the earlier orders of a map taken over hold
+      // Color stores kept for the earlier orders of a map taken over hold
       // orders no store will take again.
       if (reuse) this._dropKeptColorStoresOf(map);
-      // The slots hold what they held: the colour stores in step with the
+      // The slots hold what they held: the color stores in step with the
       // store are in step with the new description too.
       for (const target of this._colorTargetsOf(store)) {
         if (target.order === current) target.follow(started);
@@ -6445,7 +6448,7 @@ export class HighPerfRenderer {
    * more after it was written (`writeWordsRange`'s deferred check). If the
    * store is still the one written, its slots may hold anything there: the
    * store is written again in source order from page memory (its positions;
-   * the colours follow at the next frame), the order is given up (said
+   * the colors follow at the next frame), the order is given up (said
    * once, not tried again until LOD or culling is toggled) and the view draws
    * as a store in source order does.
    * @private
@@ -6471,9 +6474,9 @@ export class HighPerfRenderer {
     this._permuter?.releaseRangeSource();
     this._drainDataRetirements();
     getNotificationCenter().error(
-      `Culling and the tree's draw order are off for the ${store.kind === 'live' ? 'live view' : 'kept views of a representation'}: `
-        + `putting its ${formatCountOf(drawOrder.pointCount, 'point')} in draw order failed on the GPU (${describeError(error)}). `
-        + 'It is drawn in source order.'
+      `Drawing the ${store.kind === 'live' ? 'live view' : 'kept views of an embedding'} may be slower: `
+        + `the graphics card could not sort its ${formatCountOf(drawOrder.pointCount, 'cell')}, so cells off screen are drawn too.`,
+      { category: 'render', details: failureText(error) }
     );
     this.onAsyncTreeReady?.();
   }
@@ -6488,7 +6491,7 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Write one colour target's colours into `buffer` in `order`.
+   * Write one color target's colors into `buffer` in `order`.
    * @private
    */
   _writeTargetColors(target, buffer, order, label) {
@@ -6501,10 +6504,10 @@ export class HighPerfRenderer {
   }
 
   /**
-   * The colour streams that must follow a store's order: the live colours
+   * The color streams that must follow a store's order: the live colors
    * and every kept view of the live geometry for the live store; every kept
    * view of a pooled geometry for that geometry. Each names the order its
-   * store holds now (`order`; undefined for live colours waiting to be
+   * store holds now (`order`; undefined for live colors waiting to be
    * published, which are written whole in the store's order then) and
    * records a new one (`follow`).
    *
@@ -6553,11 +6556,11 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Put a store and every colour stream of its views in `drawOrder` whole,
+   * Put a store and every color stream of its views in `drawOrder` whole,
    * now: a store whose slots do not hold its cells by rank (see "STORE
    * ORDERS"). Each stream records its own order as it is written, so a
    * failure part way leaves every stream consistent with the order it says
-   * it holds (a colour store left behind is regathered by the next frame).
+   * it holds (a color store left behind is regathered by the next frame).
    * @returns {StoreOrder}
    * @private
    */
@@ -6590,14 +6593,14 @@ export class HighPerfRenderer {
     this._retireStoreOrder(previous, record);
     for (const target of targets) {
       if (target.key === this && target.order === null) {
-        // The live colours, written in source order: copied on the GPU.
+        // The live colors, written in source order: copied on the GPU.
         this._getPermuter().writeWords(
           target.buffer,
           { buffer: target.buffer, words: target.source.length / 4, page: colorWordsOf(target.source) },
           record,
           1
         );
-        requireLiveContext(this.gl, `${label} colours`);
+        requireLiveContext(this.gl, `${label} colors`);
       } else {
         this._writeTargetColors(target, target.buffer, record, label);
       }
@@ -6610,15 +6613,15 @@ export class HighPerfRenderer {
   }
 
   // ==========================================================================
-  // COLOUR STORES KEPT PER DRAW ORDER
+  // COLOR STORES KEPT PER DRAW ORDER
   //
-  // A view's colours are stored in the draw order of the geometry it shows.
+  // A view's colors are stored in the draw order of the geometry it shows.
   // When a view switches to another representation, the store it leaves is
   // kept (keyed by that order) instead of being regathered, so switching
-  // back costs no upload while the colours are unchanged. Kept stores count
+  // back costs no upload while the colors are unchanged. Kept stores count
   // against the retention budget with retained geometry
   // (`evictRetainedGeometry`) and are evicted first, least recently used
-  // first; a recolour drops every store kept for the old colours.
+  // first; a recolor drops every store kept for the old colors.
   // ==========================================================================
 
   /**
@@ -6635,7 +6638,7 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Every kept colour store: `[cache, drawOrder, entry]` triples.
+   * Every kept color store: `[cache, drawOrder, entry]` triples.
    * @private
    */
   _keptColorStores() {
@@ -6652,7 +6655,7 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Bytes of kept colour stores.
+   * Bytes of kept color stores.
    * @returns {number}
    */
   getKeptColorBytes() {
@@ -6662,7 +6665,7 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Drop kept colour stores, least recently used first, until `bytes` are
+   * Drop kept color stores, least recently used first, until `bytes` are
    * freed (`Infinity`: all of them).
    * @returns {number} Bytes freed.
    * @private
@@ -6681,7 +6684,7 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Drop every store a cache keeps (the colours they hold were replaced).
+   * Drop every store a cache keeps (the colors they hold were replaced).
    * @private
    */
   _clearKeptColorStores(cache) {
@@ -6692,7 +6695,7 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Swap a view's colour store for the one holding `source` in `drawOrder`:
+   * Swap a view's color store for the one holding `source` in `drawOrder`:
    * a kept store when there is one, else a new store gathered now. The store
    * left is kept under its own order.
    *
@@ -6743,7 +6746,7 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Make the live colour store follow the live position order.
+   * Make the live color store follow the live position order.
    * @private
    */
   _ensureLiveColorsInOrder() {
@@ -6762,7 +6765,7 @@ export class HighPerfRenderer {
           source: this._colors,
         },
         this._liveOrder,
-        'HighPerfRenderer live colour store'
+        'HighPerfRenderer live color store'
       );
       this.buffers = { ...this.buffers, colors: buffer };
       this.vao.setColors(buffer);
@@ -6795,7 +6798,7 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Make one snapshot's colour store follow the order of its geometry.
+   * Make one snapshot's color store follow the order of its geometry.
    * @param {object} snapshot
    * @param {StoreOrder|null} order - The order the geometry's store holds.
    * @private
@@ -6805,7 +6808,7 @@ export class HighPerfRenderer {
     if ((owner.order ?? null) === (order ?? null)) return;
     if (sameStoreOrders(owner.order ?? null, order ?? null)) {
       // An earlier step of the same store's order: rewritten in place.
-      this._writeOrderedColors(owner.buffer, snapshot.colors, order, `HighPerfRenderer view "${snapshot.id}" colour store`);
+      this._writeOrderedColors(owner.buffer, snapshot.colors, order, `HighPerfRenderer view "${snapshot.id}" color store`);
       owner.order = order;
       return;
     }
@@ -6822,7 +6825,7 @@ export class HighPerfRenderer {
         source: snapshot.colors,
       },
       order,
-      `HighPerfRenderer view "${snapshot.id}" colour store`
+      `HighPerfRenderer view "${snapshot.id}" color store`
     );
     owner.buffer = buffer;
     owner.order = order ?? null;
@@ -7064,20 +7067,21 @@ export class HighPerfRenderer {
     const program = this.programs[programName];
     const uniforms = this.uniformLocations.get(programName);
     if (!program || !uniforms) {
-      throw new Error(`HighPerfRenderer "${this.activeQuality}" point shader state is unavailable.`);
+      throw new InternalError(`HighPerfRenderer "${this.activeQuality}" point shader state is unavailable.`);
     }
     gl.useProgram(program);
     this._applyPointUniforms(
       gl, uniforms,
       params.mvpMatrix, params.viewMatrix, params.modelMatrix, params.projectionMatrix,
       params.pointSize * sizeMultiplier, params.sizeAttenuation, params.viewportHeight, params.fov,
-      params.lightingStrength, params.fogDensity, params.fogColor, params.lightDir
+      params.lightingStrength, params.fogDensity, params.fogColor, params.lightDir,
+      params.pointSizeMax
     );
 
-    // The layers of the view's colours (`colorLayersOf`): every cell at
+    // The layers of the view's colors (`colorLayersOf`): every cell at
     // once, or a layer a pass, bottom first. While some cells are not read
     // (`rendering/read-cell-layer.js`), those are drawn first, flat, in the
-    // colour faded from the background and without depth writes, so every
+    // color faded from the background and without depth writes, so every
     // cell read shows over them; the cells read are drawn larger
     // (`readCellSizeMultiplier`), and from their own slot list
     // (`ReadCellIndex`) whenever there are no more of them than the level
@@ -7098,6 +7102,7 @@ export class HighPerfRenderer {
         pointSize: params.pointSize,
         sizeAttenuation: params.sizeAttenuation,
         fov: params.fov,
+        pointSizeMax: params.pointSizeMax,
         readShare: readByIndex ? 1 : drawn / draw.pointCount,
       }));
     }
@@ -7221,10 +7226,10 @@ export class HighPerfRenderer {
   }
 
   /**
-   * The layers of a view's colours (`colorLayersOf`), read once per
-   * published colours array: a published array is never rewritten but the
+   * The layers of a view's colors (`colorLayersOf`), read once per
+   * published colors array: a published array is never rewritten but the
    * live one through `updateColors`, which forgets its answer. A new record
-   * is a new generation of the colours' layers (`ReadCellIndex` keys on it).
+   * is a new generation of the colors' layers (`ReadCellIndex` keys on it).
    * @private
    */
   _layersOf(colors) {
@@ -7267,9 +7272,9 @@ export class HighPerfRenderer {
   }
 
   /**
-   * The background the lower layers' colours are made from: the grey of the
+   * The background the lower layers' colors are made from: the gray of the
    * cells with no value (`zeroCellColor`) and the fade of the cells not read
-   * (`unreadCellColor`), from the colour the views are drawn on (sRGB, 0..1).
+   * (`unreadCellColor`), from the color the views are drawn on (sRGB, 0..1).
    *
    * @param {ArrayLike<number>} background
    */
@@ -7280,7 +7285,7 @@ export class HighPerfRenderer {
 
   /**
    * The layers a view was last drawn with, as picking needs them: the
-   * colours (their alpha byte the layer), whether the cells read were drawn
+   * colors (their alpha byte the layer), whether the cells read were drawn
    * at every level of detail, and the size multiplier of the cells read and
    * of the others; null before the view's first frame.
    *
@@ -7516,7 +7521,7 @@ export class HighPerfRenderer {
     if (viewId !== 'live') {
       const snapshot = this.snapshotBuffers.get(viewId);
       if (!snapshot) {
-        throw new Error(`HighPerfRenderer snapshot "${viewId}" does not exist.`);
+        throw new InternalError(`HighPerfRenderer snapshot "${viewId}" does not exist.`);
       }
       if (!this._snapshotUsesLiveGeometry(snapshot)) {
         if (snapshot.spatialIndex && snapshot.spatialIndex.positions === snapshot.positions) return null;
@@ -7642,13 +7647,13 @@ export class HighPerfRenderer {
       failed !== undefined &&
       (failed.needsLOD || !needsLOD) &&
       failed.epoch === (this._releaseEpoch ?? 0) &&
-      !(failed.offline && globalThis.navigator?.onLine !== false)
+      !(failed.offline && realmHosts.online())
     ) {
       settled?.(false, null);
       return;
     }
     const pointCount = target.kind === 'live' ? this.pointCount : snapshot.pointCount;
-    const label = target.kind === 'live' ? 'live view' : 'a kept view';
+    const label = `${target.kind === 'live' ? 'the live' : 'a kept'} view`;
     const notifications = getNotificationCenter();
     // `needsLOD` may be raised while the build waits (above); `job` is its
     // place in the worker's queue (null for a build made here).
@@ -7661,12 +7666,12 @@ export class HighPerfRenderer {
     try {
       // The build runs in the tree worker wherever there is one
       // (`_buildSpatialTreeJob`): this thread then only receives its result.
-      requireLodBuildHeapHeadroom(pointCount, needsLOD, `HighPerfRenderer ${dimensionLevel}D ${label}`, {
+      requireLodBuildHeapHeadroom(pointCount, needsLOD, `${label} (${dimensionLevel}D)`, {
         inWorker: typeof Worker === 'function',
       });
     } catch (error) {
       this._treeBuildFailures.set(positions, { needsLOD, epoch: this._releaseEpoch ?? 0 });
-      notifications.error(describeError(error));
+      notifications.error(`${joinFailure(`Cellucid could not prepare drawing and cell lookup`, sayFailure(error))}`, { category: 'spatial', ...failureDetails(error) });
       finish(false, error);
       return;
     }
@@ -7679,10 +7684,10 @@ export class HighPerfRenderer {
       this._treeBuildFailures.set(positions, {
         needsLOD: build.needsLOD,
         epoch: this._releaseEpoch ?? 0,
-        offline: globalThis.navigator?.onLine === false,
+        offline: !realmHosts.online(),
       });
       settleCalculationNotification(notifications, notifId, 'failCalculation',
-        `Cellucid could not prepare drawing and cell lookup: ${describeError(error)}`);
+        `${joinFailure(`Cellucid could not prepare drawing and cell lookup`, sayFailure(error))}`, failureDetails(error));
       finish(false, error);
     };
     // The build was dropped because its positions are no longer drawn (a
@@ -7929,7 +7934,7 @@ export class HighPerfRenderer {
     if (!this._spatialTreeWorker) return;
     this._spatialTreeWorker.terminate();
     this._spatialTreeWorker = null;
-    const error = new Error('HighPerfRenderer was disposed before the background spatial index finished.');
+    const error = new InternalError('HighPerfRenderer was disposed before the background spatial index finished.');
     const pending = [...this._spatialTreeRequests.values()];
     this._spatialTreeRequests.clear();
     this._spatialTreeQueue = [];
@@ -7941,7 +7946,7 @@ export class HighPerfRenderer {
     const vid = requireViewId(viewId, 'HighPerfRenderer stats viewId');
     const viewState = this._perViewState.get(vid);
     if (!viewState?.stats || viewState.statsPublished !== true) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer has no published render statistics for view "${vid}".`
       );
     }
@@ -7976,7 +7981,7 @@ export class HighPerfRenderer {
     cullPercent
   ) {
     if (!viewState?.stats) {
-      throw new Error('HighPerfRenderer statistics require an exact per-view state.');
+      throw new InternalError('HighPerfRenderer statistics require an exact per-view state.');
     }
     this.stats.visiblePoints = visiblePoints;
     this.stats.lodLevel = lodLevel;
@@ -8002,7 +8007,7 @@ export class HighPerfRenderer {
    */
   _publishFrameTiming(viewState, frameStart) {
     if (!viewState?.stats) {
-      throw new Error('HighPerfRenderer frame timing requires an exact per-view state.');
+      throw new InternalError('HighPerfRenderer frame timing requires an exact per-view state.');
     }
     const lastFrameTime = performance.now() - frameStart;
     const fps = lastFrameTime > 0
@@ -8121,7 +8126,7 @@ export class HighPerfRenderer {
     }
     const geometry = this._snapshotGeometryPools.get(snapshot.geometryGeneration);
     if (geometry === undefined) {
-      throw new Error(`HighPerfRenderer view "${exactViewId}" has no geometry owner.`);
+      throw new InternalError(`HighPerfRenderer view "${exactViewId}" has no geometry owner.`);
     }
     return this._geometryOrderRecord(geometry)?.slotSources() ?? null;
   }
@@ -8196,7 +8201,7 @@ export class HighPerfRenderer {
       }
       generation = snapshot.geometryGeneration;
       if (!Number.isSafeInteger(generation) || generation <= 0) {
-        throw new Error(
+        throw new InternalError(
           `HighPerfRenderer snapshot "${exactViewId}" has no exact geometry generation.`
         );
       }
@@ -8294,7 +8299,7 @@ export class HighPerfRenderer {
       return this.spatialIndices.get(dim) || null;
     }
     if (snapshot.dimensionLevel !== dim) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot "${exactViewId}" owns ${snapshot.dimensionLevel}D data but received a ${dim}D spatial-owner request.`
       );
     }
@@ -8357,17 +8362,17 @@ export class HighPerfRenderer {
         snapshot !== undefined &&
         !this._snapshotUsesLiveGeometry(snapshot)
       ) {
-        throw new Error(
+        throw new InternalError(
           `HighPerfRenderer snapshot "${exactViewId}" has no current ${dim}D spatial index or rank levels for active LOD level ${lodLevel}.`
         );
       }
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer has no ${dim}D spatial index or rank levels for active LOD level ${lodLevel}.`
       );
     }
     const level = levels.lodLevels?.[lodLevel];
     if (!level) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer LOD ${lodLevel} is not one of the levels ${dim}D view "${exactViewId}" draws.`
       );
     }
@@ -8379,7 +8384,7 @@ export class HighPerfRenderer {
       owner: `HighPerfRenderer LOD ${lodLevel} membership of ${dim}D view "${exactViewId}"`,
     });
     if (membership === null || membership.lodLevel !== lodLevel || membership.count !== level.pointCount) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer LOD ${lodLevel} membership does not describe the level ${dim}D view "${exactViewId}" draws.`
       );
     }
@@ -8410,7 +8415,7 @@ export class HighPerfRenderer {
     const spatialIndex = this._lodLevelsForView(exactViewId, dim);
     const level = spatialIndex?.lodLevels?.[lodLevel];
     if (!level) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer LOD ${lodLevel} spatial owner is unavailable for ${dim}D view "${exactViewId}".`
       );
     }
@@ -8490,7 +8495,7 @@ export class HighPerfRenderer {
     const viewState = this._perViewState.get(exactViewId);
     if (viewState === undefined) return -1;
     if (!Number.isInteger(viewState.lastLodLevel) || viewState.lastLodLevel < -1) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer LOD state is invalid for view "${exactViewId}".`
       );
     }
@@ -8517,7 +8522,7 @@ export class HighPerfRenderer {
     const spatialIndex = this._lodLevelsForView(exactViewId, dim);
     const level = spatialIndex?.lodLevels?.[lodLevel];
     if (!level) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer LOD ${lodLevel} spatial owner is unavailable for ${dim}D view "${exactViewId}".`
       );
     }
@@ -8557,7 +8562,7 @@ export class HighPerfRenderer {
 
 
   /**
-   * Size the bound `ARRAY_BUFFER` as one snapshot's RGBA8 colour store, 4
+   * Size the bound `ARRAY_BUFFER` as one snapshot's RGBA8 color store, 4
    * bytes a point like the live store, and fill it from the snapshot's
    * colors (gathered on the GPU for a draw order, `_writeOrderedColors`).
    * Four bytes a vertex keep the attribute on the 4-byte stride Metal needs:
@@ -8581,7 +8586,7 @@ export class HighPerfRenderer {
       colors,
       owner
     );
-    const byteLength = this._allocatePointStore(buffer, 4, this.pointCount, gl.STATIC_DRAW, `${owner} colour store`);
+    const byteLength = this._allocatePointStore(buffer, 4, this.pointCount, gl.STATIC_DRAW, `${owner} color store`);
     this._writeOrderedColors(
       buffer,
       exactColors,
@@ -8665,7 +8670,7 @@ export class HighPerfRenderer {
 
   /**
    * Create a GPU buffer for a snapshot view. Call this once when snapshot is created.
-   * The snapshot owns one RGBA8 colour VBO plus one R8 alpha texture and references its
+   * The snapshot owns one RGBA8 color VBO plus one R8 alpha texture and references its
    * geometry generation's shared immutable position VBO through its VAO.
    * @param {string} id - Unique snapshot identifier
    * @param {Uint8Array} colors - Exact RGBA colors.
@@ -8691,10 +8696,10 @@ export class HighPerfRenderer {
       'HighPerfRenderer snapshot dimensionLevel'
     );
     if (!this._positions || this.pointCount === 0) {
-      throw new Error('HighPerfRenderer cannot create a snapshot before point data is loaded.');
+      throw new InternalError('HighPerfRenderer cannot create a snapshot before point data is loaded.');
     }
     if (this.snapshotBuffers.has(exactId)) {
-      throw new Error(`HighPerfRenderer snapshot "${exactId}" already exists.`);
+      throw new InternalError(`HighPerfRenderer snapshot "${exactId}" already exists.`);
     }
 
     const gl = this.gl;
@@ -8847,7 +8852,7 @@ export class HighPerfRenderer {
     this.snapshotBuffers.set(exactId, {
       // The published RGBA array, kept by reference: a published color array
       // is never written (a recolor publishes a new one), and it is what the
-      // colour store is gathered from when its geometry's draw order changes.
+      // color store is gathered from when its geometry's draw order changes.
       colors: pointData.colors,
       // The published transparency, kept by reference for the same reason
       // (null: every cell shown). It is what the R8 texture holds, so the
@@ -8885,7 +8890,7 @@ export class HighPerfRenderer {
     console.log(
       `[HighPerfRenderer] Created snapshot buffer "${exactId}" ` +
       `(${formatCountOf(n, 'point')}, ` +
-      `${(colorBufferByteLength / 1024 / 1024).toFixed(1)} MB colour, ` +
+      `${(colorBufferByteLength / 1024 / 1024).toFixed(1)} MB color, ` +
       `${(alphaStaging.alphaTextureByteLength / 1024 / 1024).toFixed(1)} MB R8 alpha, ` +
       `${(positions.byteLength / 1024 / 1024).toFixed(1)} MB shared positions` +
       `${spatialIndex ? ', with spatial index' : ''})`
@@ -8894,7 +8899,7 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Transactionally replace any requested snapshot colour, R8, and geometry
+   * Transactionally replace any requested snapshot color, R8, and geometry
    * owners while retaining unchanged publications by exact reference count.
    * @param {string} id - Snapshot identifier
    * @param {Uint8Array} colors - Exact RGBA colors.
@@ -8923,7 +8928,7 @@ export class HighPerfRenderer {
     );
     const snapshot = this.snapshotBuffers.get(exactId);
     if (!snapshot) {
-      throw new Error(`HighPerfRenderer snapshot "${exactId}" does not exist.`);
+      throw new InternalError(`HighPerfRenderer snapshot "${exactId}" does not exist.`);
     }
     if (typeof forceGeometryPublication !== 'boolean') {
       throw new TypeError(
@@ -8939,7 +8944,7 @@ export class HighPerfRenderer {
       );
     }
     if (!replaceColor && replaceAlpha) {
-      throw new Error(
+      throw new InternalError(
         'HighPerfRenderer isolated alpha replacement must use updateSnapshotAlphas().'
       );
     }
@@ -9148,7 +9153,7 @@ export class HighPerfRenderer {
     };
     if (replaceColor) {
       snapshot.colors = colors;
-      // Stores kept for other orders hold the old colours.
+      // Stores kept for other orders hold the old colors.
       this._clearKeptColorStores(snapshot.colorCache);
     }
     snapshot.buffer = candidateBuffer;
@@ -9207,12 +9212,12 @@ export class HighPerfRenderer {
   }
 
   /**
-   * Replace only one snapshot's colour publication. The colours' alpha byte is
+   * Replace only one snapshot's color publication. The colors' alpha byte is
    * never read: the accepted R8 texture is the snapshot's alpha.
    *
    * A store this snapshot alone owns, already in the order it draws with, is
    * rewritten in place (one gather, as an adoption rewrites it): no new
-   * buffer or vertex array per recolour. A shared store, or one in another
+   * buffer or vertex array per recolor. A shared store, or one in another
    * order, is replaced.
    */
   updateSnapshotColors(id, colors) {
@@ -9223,14 +9228,14 @@ export class HighPerfRenderer {
     );
     const snapshot = this.snapshotBuffers.get(exactId);
     if (!snapshot) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot "${exactId}" does not exist.`
       );
     }
     if (snapshot.storesReleased === true) {
       // Nothing on the GPU to rewrite: the view is rebuilt from these
-      // colours when it is next drawn.
-      requireSnapshotColors(this.pointCount, colors, `HighPerfRenderer snapshot "${exactId}" recolour`);
+      // colors when it is next drawn.
+      requireSnapshotColors(this.pointCount, colors, `HighPerfRenderer snapshot "${exactId}" recolor`);
       snapshot.colors = colors;
       return true;
     }
@@ -9245,11 +9250,11 @@ export class HighPerfRenderer {
       owner.refCount === 1 &&
       (owner.order ?? null) === (orderRecord ?? null)
     ) {
-      const label = `HighPerfRenderer snapshot "${exactId}" recolour`;
+      const label = `HighPerfRenderer snapshot "${exactId}" recolor`;
       requireSnapshotColors(this.pointCount, colors, label);
       this._writeOrderedColors(owner.buffer, colors, orderRecord, label);
       snapshot.colors = colors;
-      // Stores kept for other orders hold the old colours.
+      // Stores kept for other orders hold the old colors.
       this._clearKeptColorStores(snapshot.colorCache);
       return true;
     }
@@ -9286,7 +9291,7 @@ export class HighPerfRenderer {
     );
     const snapshot = this.snapshotBuffers.get(exactId);
     if (!snapshot) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot "${exactId}" does not exist.`
       );
     }
@@ -9478,7 +9483,7 @@ export class HighPerfRenderer {
     const exactId = requireViewId(id, 'HighPerfRenderer snapshot id');
     const snapshot = this.snapshotBuffers.get(exactId);
     if (!snapshot) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot "${exactId}" does not exist.`
       );
     }
@@ -9495,7 +9500,7 @@ export class HighPerfRenderer {
 
   /**
    * Update only the positions for a snapshot buffer (for dimension switching).
-   * The existing colour VBO and R8 texture remain independent accepted owners.
+   * The existing color VBO and R8 texture remain independent accepted owners.
    * @param {string} id - Snapshot identifier
    * @param {Float32Array} viewPositions - New positions for the view
    * @param {number} dimensionLevel - Exact published view dimension.
@@ -9510,7 +9515,7 @@ export class HighPerfRenderer {
     );
     const snapshot = this.snapshotBuffers.get(exactId);
     if (!snapshot) {
-      throw new Error(`HighPerfRenderer snapshot "${exactId}" does not exist.`);
+      throw new InternalError(`HighPerfRenderer snapshot "${exactId}" does not exist.`);
     }
 
     if (
@@ -9658,10 +9663,10 @@ export class HighPerfRenderer {
     }
     const snapshot = this.snapshotBuffers.get(exactId);
     if (!snapshot) {
-      throw new Error(`HighPerfRenderer snapshot "${exactId}" does not exist.`);
+      throw new InternalError(`HighPerfRenderer snapshot "${exactId}" does not exist.`);
     }
     if (snapshot.dimensionLevel !== exactDimensionLevel) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot "${exactId}" owns ${snapshot.dimensionLevel}D positions; a ${exactDimensionLevel}D spatial index cannot be built over them.`
       );
     }
@@ -9730,7 +9735,7 @@ export class HighPerfRenderer {
         requireLodBuildHeapHeadroom(
           snapshot.pointCount,
           needsLOD,
-          `HighPerfRenderer ${exactDimensionLevel}D view "${exactId}"`
+          `a kept view (${exactDimensionLevel}D)`
         );
       }
       const notifications = getNotificationCenter();
@@ -9770,7 +9775,8 @@ export class HighPerfRenderer {
           notifications,
           notifId,
           'failCalculation',
-          `Cellucid could not prepare drawing and cell lookup for a kept view: ${describeError(error)}`
+          `${joinFailure(`Cellucid could not prepare drawing and cell lookup for a kept view`, sayFailure(error))}`,
+          failureDetails(error)
         );
         throw error;
       }
@@ -9802,7 +9808,7 @@ export class HighPerfRenderer {
     const exactId = requireViewId(id, 'HighPerfRenderer snapshot id');
     const exactParams = requireRenderContract(params, exactId);
     if (exactParams.viewId !== exactId) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot id "${exactId}" must match render viewId "${exactParams.viewId}".`
       );
     }
@@ -9810,7 +9816,7 @@ export class HighPerfRenderer {
     this._flushPendingPositionUpload();
     const snapshot = this.snapshotBuffers.get(exactId);
     if (!snapshot) {
-      throw new Error(`HighPerfRenderer snapshot "${exactId}" does not exist.`);
+      throw new InternalError(`HighPerfRenderer snapshot "${exactId}" does not exist.`);
     }
     // Drawing a view makes it the one being worked on: nothing it draws
     // with is released under it, and a released view is rebuilt first.
@@ -9850,7 +9856,7 @@ export class HighPerfRenderer {
     const needsSpatialIndex = this._needsSpatialIndex(forceLOD);
     const needsLOD = this._needsLodResources(forceLOD);
     if (useAlphaTexture && !this.isAlphaTextureActive()) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot "${exactId}" requested the alpha texture before exact alpha state was published.`
       );
     }
@@ -9858,19 +9864,19 @@ export class HighPerfRenderer {
       !useAlphaTexture &&
       !this.isAlphaTextureActiveForView(exactId)
     ) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot "${exactId}" has no accepted R8 alpha texture.`
       );
     }
 
     // Ensure bounds for custom-position snapshots (fog + LOD/frustum calculations).
     if (snapshot.dimensionLevel !== dimensionLevel) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot "${exactId}" owns ${snapshot.dimensionLevel}D data but received a ${dimensionLevel}D render contract.`
       );
     }
     if (hasCustomPositions && !snapshot.bounds) {
-      throw new Error(
+      throw new InternalError(
         `HighPerfRenderer snapshot "${exactId}" is missing its exact position bounds.`
       );
     }
@@ -9902,7 +9908,7 @@ export class HighPerfRenderer {
     const lodSpatialIndex = hasCustomPositions ? customSpatialIndex : mainSpatialIndex;
 
     // The geometry is stored in the draw order of its tree whenever one
-    // exists, and the view's colours follow it; until the store holds that
+    // exists, and the view's colors follow it; until the store holds that
     // order whole, it draws levels by rank (or full detail) as it is.
     const orderTree = lodSpatialIndex ?? (
       hasCustomPositions
@@ -10145,7 +10151,7 @@ export class HighPerfRenderer {
     this._alphaUploadRegions = null;
     this._useAlphaTexture = false;
     this._currentAlphas = null;
-    // Kept colour stores are deleted with the rest (queued, drained below).
+    // Kept color stores are deleted with the rest (queued, drained below).
     this._evictKeptColorStores(Infinity);
     this._liveOrder = null;
     this._liveColorOrder = null;

@@ -42,6 +42,8 @@ test('each kind of step alone adds its bytes to the session file and the autosav
   assert.deepEqual(Object.keys(result), STEP_KINDS.map(([kind]) => kind));
   for (const [kind, measured] of Object.entries(result)) {
     assert.ok(measured.steps > 0, `${kind} made steps`);
+    // Each change is a step of its own (a cell of its own): none merged into the step before it.
+    assert.equal(measured.merged, 0, `${kind}: no change merged into the step before it`);
     assert.ok(measured.stepsChunkBytesPerStep > 0, `${kind} adds step records`);
     assert.ok(measured.recording.recorder.n === measured.steps, `${kind} recording was timed`);
   }

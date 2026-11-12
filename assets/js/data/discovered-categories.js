@@ -9,14 +9,14 @@
  *
  * - **Order**: the labels in code-point order (`compareCategoryLabels`;
  *   `false` before `true`), whatever cells hold them.
- * - **Colour**: derived from the label (`categoryNameSlots`): a stable hash
- *   of it picks a colour of Cellucid's category sequence (`getCategoryColor`),
- *   a label whose colour an earlier label (in code-point order) took moving
+ * - **Color**: derived from the label (`categoryNameSlots`): a stable hash
+ *   of it picks a color of Cellucid's category sequence (`getCategoryColor`),
+ *   a label whose color an earlier label (in code-point order) took moving
  *   to the next free one. Opening more cells adds categories without moving
- *   any: the labels already shown keep their colours, and each new one takes
- *   its own the same way among the colours left.
+ *   any: the labels already shown keep their colors, and each new one takes
+ *   its own the same way among the colors left.
  *
- * A categorical the file stores keeps its own dictionary and the colours its
+ * A categorical the file stores keeps its own dictionary and the colors its
  * file stores (`uns['<column>_colors']`); none of this applies to it.
  *
  * @module data/discovered-categories
@@ -155,11 +155,11 @@ function labelHash(label) {
 }
 
 /**
- * The colour each category of a column whose categories were found takes,
- * as its place in Cellucid's category colour sequence (`getCategoryColor`):
+ * The color each category of a column whose categories were found takes,
+ * as its place in Cellucid's category color sequence (`getCategoryColor`):
  * labels already given one (`previous`, label to place) keep it; every other
  * label, in label order, takes the place its hash names among
- * `max(the sequence's designed colours, twice the categories)`, or the next
+ * `max(the sequence's designed colors, twice the categories)`, or the next
  * place no label took.
  *
  * @param {ReadonlyArray<string|boolean>} categories - In label order
@@ -168,7 +168,7 @@ function labelHash(label) {
  */
 export function categoryNameSlots(categories, previous = new Map()) {
   const places = Math.max(getCategoryColorSeedCount(), 2 * categories.length);
-  const slots = allocateTypedArray(Int32Array, categories.length, 'Category colour places').fill(-1);
+  const slots = allocateTypedArray(Int32Array, categories.length, 'Category color places').fill(-1);
   const taken = new Set();
   categories.forEach((category, i) => {
     const kept = previous.get(category);
@@ -188,7 +188,7 @@ export function categoryNameSlots(categories, previous = new Map()) {
 }
 
 /**
- * The colours of `categoryNameSlots`, one RGB triplet (0 to 1) a category:
+ * The colors of `categoryNameSlots`, one RGB triplet (0 to 1) a category:
  * what a field's `palette` holds (`defaultCategoryColor`).
  *
  * @param {Int32Array} slots

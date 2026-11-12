@@ -5,6 +5,7 @@
  */
 
 import { createIntentPrefetcher } from '../../utils/intent-prefetch.js';
+import { setControlAvailability } from '../core/control-availability.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { isCancellation, cancelled, cancellationKind } from '../../../utils/abort.js';
 import {
@@ -26,6 +27,7 @@ import { isReported } from '../../../utils/errors.js';
 import { useOpenCells } from '../../../data/open-cells-work.js';
 import { PLACES, placePath } from '../place-names.js';
 import { describeUnshownField, unshownChoiceReason } from './field-interaction-owner.js';
+import { quoteName } from '../../actions/targets/names.js';
 import { getActions } from '../../actions/index.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
 import { isQuietFailure } from '../../actions/control-dispatch.js';
@@ -431,7 +433,7 @@ export function initGeneExpressionSelector(options) {
    * worth writing out. `Failed to load gene: X` names the symptom and nothing
    * else — not whether the payload never arrived or arrived unusable, not what
    * was wrong with it, and not what to do. `explainContinuousPayloadFailure`
-   * knows all three, and the notification centre renders the newlines it uses.
+   * knows all three, and the notification center renders the newlines it uses.
    *
    * A refusal (the action's own sentence: a gene no longer on the list)
    * is said as information. The task is the dispatch (`chooseGene`): the
@@ -518,7 +520,9 @@ export function initGeneExpressionSelector(options) {
     const failure = hasGeneExpressionFields ? null : state.getGeneListFailure();
     geneContainer.hidden = !hasGeneExpressionFields && !pending && failure === null;
     geneContainer.setAttribute('aria-busy', String(pending));
-    geneSearch.disabled = pending || failure !== null;
+    setControlAvailability(geneSearch, pending
+      ? 'the gene names are being read; search once they are'
+      : failure !== null ? 'the gene names could not be read; open the dataset again to retry' : null);
     geneSearch.placeholder = pending
       ? 'Reading gene names…'
       : failure !== null ? 'Gene names could not be read' : 'Search genes…';
@@ -628,6 +632,22 @@ export function initGeneExpressionSelector(options) {
     geneList.setActive(-1);
   }
 
+  /**
+   * The gene at `originalIdx` of the gene list in use, as the field object of
+   * the view in focus.
+   *
+   * Every view holds its own copies of the field objects (`_cloneVarData`;
+   * `setActiveView` swaps them in), so the entries listed for the search name
+   * a gene by position and key, never as the field to read: the field is
+   * taken from the inventory in use when the gene is chosen. (Found
+   * 2026-11-11, F95: the entries' fields were the objects of the view the
+   * list was built in, so after `view.keep` a gene chosen on the kept view
+   * was "no longer on the gene list" (`locateVarField` found no such
+   * object), was not shown, and `color.by` answered null.)
+   *
+   * @param {number} originalIdx
+   * @returns {{field: object, originalIdx: number}}
+   */
   function findGeneEntry(originalIdx) {
     const index = requireIndex(originalIdx, 'Gene field index');
     const entry = geneFieldList.find(
@@ -638,7 +658,13 @@ export function initGeneExpressionSelector(options) {
         'Gene field index is absent from the visible gene inventory'
       );
     }
-    return entry;
+    const field = readVarInventory()[index];
+    if (field === undefined || field._isDeleted === true) {
+      throw new RangeError(
+        'Gene field index is absent from the gene list in use'
+      );
+    }
+    return { field, originalIdx: index };
   }
 
   function syncFromState() {
@@ -717,7 +743,7 @@ export function initGeneExpressionSelector(options) {
   }
 
   /**
-   * Colour the cells by the gene at `originalIdx` of the gene list.
+   * Color the cells by the gene at `originalIdx` of the gene list.
    *
    * The choice is work on the open cells (`data/open-cells-work.js`): one
    * made while a progressive opening's step or Apply changes them starts on
@@ -731,14 +757,24 @@ export function initGeneExpressionSelector(options) {
    * field selector provides it): the controls dispatch the action.
    *
    * @param {number} originalIdx
-   * @param {{signal?: AbortSignal|null}} [options] - The action's signal
+   * @param {{signal?: AbortSignal|null, onUnshown?: ((message: string) => void)|null}} [options] -
+   *   The action's signal; `onUnshown` hears the sentence said when the gene
+   *   is not shown, its name marked as data (`quoteName`), so the action can
+   *   refuse with it
    * @returns {Promise<Object|null>} The activation, or null when not shown
    */
-  function selectGene(originalIdx, { signal = null } = {}) {
+  function selectGene(originalIdx, { signal = null, onUnshown = null } = {}) {
     assertAlive();
     const chosen = findGeneEntry(originalIdx);
+    // `sentence(name)`: told the person with the gene's name, handed to the
+    // action with it marked as data.
+    const unshown = (key, sentence) => {
+      sayUnshown(sentence(key));
+      onUnshown?.(sentence(quoteName(key)));
+    };
     if (interactionOwner.isSuspended()) {
-      sayUnshown(describeUnshownField(chosen.field.key, interactionOwner.suspensionReason()));
+      const reason = interactionOwner.suspensionReason();
+      unshown(chosen.field.key, name => describeUnshownField(name, reason));
       return Promise.resolve(null);
     }
     return interactionOwner.run(async token => {
@@ -763,7 +799,7 @@ export function initGeneExpressionSelector(options) {
       let gone = false;
       const chosenKey = field.key;
       // A gene of a subsample's cell-major matrix shows on more cells as
-      // they are read (`showPartialVarField`); the colours of the field
+      // they are read (`showPartialVarField`); the colors of the field
       // shown come back if it is not shown in the end.
       let partial = false;
       try {
@@ -843,9 +879,9 @@ export function initGeneExpressionSelector(options) {
             syncFromState();
           }
           if (gone && interactionOwner.isCurrent(token)) {
-            sayUnshown(`${chosenKey} is not shown: the gene list changed while it was read (${placePath(PLACES.session, PLACES.dataMapping)}) and no longer has it.`);
+            unshown(chosenKey, name => `${name} is not shown: the gene list changed while it was read (${placePath(PLACES.session, PLACES.dataMapping)}) and no longer has it.`);
           } else if (reason !== null) {
-            sayUnshown(describeUnshownField(chosenKey, reason));
+            unshown(chosenKey, name => describeUnshownField(name, reason));
           }
           return null;
         }
@@ -875,7 +911,7 @@ export function initGeneExpressionSelector(options) {
   }
 
   /**
-   * Colour by the gene named `geneKey`, as a step (the action `color.by`):
+   * Color by the gene named `geneKey`, as a step (the action `color.by`):
    * resolves with what was shown, or null when another choice replaced it.
    *
    * @param {string} geneKey
@@ -915,7 +951,7 @@ export function initGeneExpressionSelector(options) {
   }
 
   /**
-   * Colour the cells by the gene named `geneKey`, exactly as choosing it in
+   * Color the cells by the gene named `geneKey`, exactly as choosing it in
    * this list does: how a gene picked elsewhere (an analysis result) is
    * shown, so the search box always names the gene the cells show. A name
    * the list cannot choose (still being read, or not a gene of it) rejects
@@ -927,7 +963,7 @@ export function initGeneExpressionSelector(options) {
   function colorByGene(geneKey) {
     assertAlive();
     if (typeof geneKey !== 'string' || geneKey.length === 0) {
-      throw new TypeError('Gene to colour by must be its exact key');
+      throw new TypeError('Gene to color by must be its exact key');
     }
     const list = geneListForLookup();
     const outcome = resolveExactGene(geneKey, {
@@ -1026,7 +1062,11 @@ export function initGeneExpressionSelector(options) {
   }, { signal: lifecycle.signal });
   geneSearch.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
+      // Given up: the box names the gene shown again (or the choice under
+      // way), and what was said of the name typed goes with it.
       hideGeneDropdown();
+      geneSearchStatus.textContent = '';
+      syncFromState();
       geneSearch.blur();
       return;
     }
@@ -1060,9 +1100,11 @@ export function initGeneExpressionSelector(options) {
     const entry = geneFieldList[outcome.position];
     reportGeneSelectionFailure(chooseGene(entry.field.key), entry.field.key);
   }, { signal: lifecycle.signal });
+  // Left (a click elsewhere, Tab), the box names what is shown -- the gene,
+  // the choice under way, or nothing -- never text that chose no gene; a
+  // choice is made only by Enter or the list (whose click follows this).
   geneSearch.addEventListener('blur', () => {
-    if (selectedGeneOriginalIdx < 0 || geneSearch.value.length > 0) return;
-    geneSearch.value = findGeneEntry(selectedGeneOriginalIdx).field.key;
+    syncFromState();
   }, { signal: lifecycle.signal });
 
   ownerDocument.addEventListener('click', (event) => {

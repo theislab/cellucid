@@ -12,7 +12,7 @@ import test from 'node:test';
 
 import {
   STARTING_VIEW_CONTENT_DOMAINS, STARTING_VIEW_OMITTED_DOMAINS, assertPublishedDefaultProfile, assertPublishedDefaultRoot,
-  rebindPublishedDefaultFingerprint, trimToPublishedDefault,
+  STARTING_VIEW_SHOWN_CONTROL_IDS, keepShownControls, rebindPublishedDefaultFingerprint, trimToPublishedDefault,
 } from '../assets/js/app/session/published-default.js';
 import { openHistoryFile, readHistoryFileManifest, writeHistoryFile } from '../assets/js/app/session/history-file.js';
 import { SAVE_DEFAULTS, writeSharedHistory } from '../assets/js/app/session/share-scope.js';
@@ -127,4 +127,33 @@ test('publishing rebinds a capture to the identity it ships under, never restati
   }
   assert.throws(() => rebindPublishedDefaultFingerprint(captured, { ...PUBLISHED, datasetId: null }), /must name the dataset it ships beside/);
   assert.throws(() => rebindPublishedDefaultFingerprint({ ...captured, cellOrder: { dimension: 2, digest: 'x' } }, PUBLISHED), /must contain exactly/);
+});
+
+test('a starting view leaves the viewer background as shown, the person\'s own look like the theme', () => {
+  const values = {
+    settings: {
+      controls: {
+        'background-select': { type: 'select', value: 'studio' },
+        'point-size': { type: 'range', value: '4' },
+      },
+      figureExport: null,
+    },
+    colors: { by: 'cell_type' },
+  };
+  const shown = {
+    settings: {
+      controls: {
+        'background-select': { type: 'select', value: 'studio-dark' },
+        'point-size': { type: 'range', value: '2' },
+      },
+      figureExport: null,
+    },
+  };
+  const applied = keepShownControls(values, id => shown[id]);
+  assert.deepEqual(STARTING_VIEW_SHOWN_CONTROL_IDS, ['background-select']);
+  assert.deepEqual(applied.settings.controls['background-select'], { type: 'select', value: 'studio-dark' });
+  assert.deepEqual(applied.settings.controls['point-size'], { type: 'range', value: '4' }, 'every other setting is the view\'s');
+  assert.equal(applied.colors, values.colors);
+  assert.equal(values.settings.controls['background-select'].value, 'studio', 'the file\'s values are not changed');
+  assert.equal(keepShownControls({ colors: values.colors }, () => assert.fail('no settings, nothing read')).colors, values.colors);
 });

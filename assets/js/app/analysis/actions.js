@@ -26,6 +26,16 @@ import { analysisViewSizes } from './shared/analysis-view-sizes.js';
 import { listNames, quoteName } from '../actions/targets/names.js';
 import { describeProvenance } from './shared/result-provenance.js';
 import { expandPagesWithDerived } from './shared/page-derivation-utils.js';
+import { downloadBlob } from '../utils/download.js';
+
+/**
+ * The plot options a view change sets, as the step names them (the options column's labels:
+ * `plotOptionWords`), for an analysis that shows a plot; nothing otherwise.
+ */
+function plotWords(ui, view) {
+  if (!Array.isArray(view?.plot) || typeof ui?.plotOptionWords !== 'function') return {};
+  return { plot: ui.plotOptionWords(view.plot) };
+}
 
 /**
  * @param {{
@@ -112,6 +122,30 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
     return ids.map(id => pages.find(page => page.id === id)?.name ?? id);
   }
 
+  /** A cell scope's value naming a highlight page: `page:<id>` held, `page:<name>` named. */
+  const PAGE_SCOPE = 'page:';
+
+  /** An analysis's options whose choices are pages (`pages: true`), by key. */
+  function pageOptionKeys(mode) {
+    return (mode.options?.entries ?? []).filter(entry => entry.pages === true).map(entry => entry.key);
+  }
+
+  /**
+   * Options as the actions give them: a page named by its name, as every
+   * action names pages (the record holds its id, which no read gives an
+   * agent: "restof__page_1"); `toIds` the other way. An empty value stays.
+   */
+  function optionsWithPages(mode, options, { toIds }) {
+    const keys = pageOptionKeys(mode).filter(key => typeof options?.[key] === 'string' && options[key] !== '');
+    // A cell scope (Cells, Within) names a page as `page:<page>` (`CELL_SCOPE_MEANS`).
+    const scopes = Object.keys(options ?? {}).filter(key => !keys.includes(key) && typeof options[key] === 'string' && options[key].startsWith(PAGE_SCOPE));
+    if (keys.length === 0 && scopes.length === 0) return options;
+    const out = { ...options };
+    for (const key of keys) out[key] = (toIds ? pageIdsOf : pageNamesOf)([options[key]])[0];
+    for (const key of scopes) out[key] = PAGE_SCOPE + (toIds ? pageIdsOf : pageNamesOf)([options[key].slice(PAGE_SCOPE.length)])[0];
+    return out;
+  }
+
   /** A UI's result state as the reads give it. */
   /**
    * What a read says of an analysis's result, taken now (synchronously, so a
@@ -163,13 +197,48 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
     { code: 'not-shown', type });
   }
 
+  /**
+   * The panel shows one analysis at a time: an action that draws on an
+   * analysis of the panel shows it when the panel shows another, as a
+   * person opens an analysis to use it (an agent that set up two analyses
+   * was refused "not shown" running, setting the options and choosing the
+   * pages of the first after the second was shown: lane-analyst L3-6,
+   * lane-scientist L5-4), and is refused (`requireShown`) when it still
+   * cannot draw (the section or the sidebar closed), the shown one put back.
+   * Returns what puts it back, for a refusal that comes later.
+   */
+  function showToDraw(type, mode, ui, where) {
+    const before = comparisonModule.getOpenMode();
+    const putBack = () => {
+      if (comparisonModule.getOpenMode() === before) return;
+      if (before === null) comparisonModule.closeOpenMode();
+      else comparisonModule.openMode(before);
+    };
+    if (where === 'panel' && before !== mode.id && !ui.isShown()) {
+      comparisonModule.openMode(mode.id);
+      if (!ui.isShown()) putBack();
+    }
+    requireShown(type, mode, ui, where);
+    return putBack;
+  }
+
+  /** `fn()`, putting the shown analysis back (`showToDraw`) when it throws. */
+  function orPutBack(putBack, fn) {
+    try {
+      return fn();
+    } catch (error) {
+      putBack();
+      throw error;
+    }
+  }
+
   const removers = [
-    actions.provide('analysis.open', async ({ analysis, window }) => {
+    actions.provide('analysis.open', async ({ analysis, window }, { signal }) => {
       const mode = modeNamed(analysis);
       if (window) {
         const id = await windows.copyFromEmbedded(mode.id);
-        // The step holds what the new window's first update changes.
-        await windows.whenWindowSettled(id);
+        // The step holds what the new window's first update changes (stopped, that update stops).
+        await windows.whenWindowSettled(id, { signal });
         return { window: windows.windowNumberOf(id) };
       }
       if (section !== null) section.open = true;
@@ -182,16 +251,16 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
       comparisonModule.closeOpenMode();
       return { title: analysisModeOfId(open)?.title ?? open };
     }),
-    actions.provide('analysis.pages.set', async ({ analysis, in: where, pages }) => {
+    actions.provide('analysis.pages.set', async ({ analysis, in: where, pages }, { signal }) => {
       const { mode, ui } = analysisAt(analysis, where);
       const ids = pageIdsOf(pages);
-      requireShown('analysis.pages.set', mode, ui, where);
-      refusing('analysis.pages.set', () => ui.onPageSelectionChange(ids));
-      // What the change set off (a redraw) is part of the step.
-      await ui.whenSettled();
+      const putBack = showToDraw('analysis.pages.set', mode, ui, where);
+      orPutBack(putBack, () => refusing('analysis.pages.set', () => ui.onPageSelectionChange(ids)));
+      // What the change set off (a redraw) is part of the step; stopped, it stops.
+      await ui.whenSettled({ signal });
       return { pages: pages.length };
     }),
-    actions.provide('analysis.quick.set', async ({ in: where, categorical, continuous }) => {
+    actions.provide('analysis.quick.set', async ({ in: where, categorical, continuous }, { signal }) => {
       const { mode, ui } = analysisAt('quick', where);
       for (const [kind, keys, words] of [['categorical_obs', categorical, 'categorical'], ['continuous_obs', continuous, 'continuous']]) {
         if (keys === undefined) continue;
@@ -203,20 +272,20 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
           });
         }
       }
-      requireShown('analysis.quick.set', mode, ui, where);
-      const changed = refusing('analysis.quick.set', () => ui.setFields({ categorical, continuous }));
-      await ui.whenSettled();
+      const putBack = showToDraw('analysis.quick.set', mode, ui, where);
+      const changed = orPutBack(putBack, () => refusing('analysis.quick.set', () => ui.setFields({ categorical, continuous })));
+      await ui.whenSettled({ signal });
       return changed ? { changed: ['categorical', 'continuous'].filter(key => (key === 'categorical' ? categorical : continuous) !== undefined).join(', ') } : null;
     }),
-    actions.provide('analysis.detailed.set', async ({ in: where, variable, plot, plot_options: plotOptions }) => {
+    actions.provide('analysis.detailed.set', async ({ in: where, variable, plot, plot_options: plotOptions }, { signal }) => {
       const { mode, ui } = analysisAt('detailed', where);
-      requireShown('analysis.detailed.set', mode, ui, where);
-      const changed = refusing('analysis.detailed.set', () => ui.setPlot({ variable, plot, plotOptions }));
-      await ui.whenSettled();
+      const putBack = showToDraw('analysis.detailed.set', mode, ui, where);
+      const changed = orPutBack(putBack, () => refusing('analysis.detailed.set', () => ui.setPlot({ variable, plot, plotOptions })));
+      await ui.whenSettled({ signal });
       const given = [['variable', variable], ['plot', plot], ['plot_options', plotOptions]].filter(([, value]) => value !== undefined);
       return changed ? { changed: given.map(([key]) => key).join(', ') } : null;
     }),
-    actions.provide('analysis.view.set', async ({ analysis, in: where, view }) => {
+    actions.provide('analysis.view.set', async ({ analysis, in: where, view }, { signal }) => {
       const { mode, ui } = analysisAt(analysis, where);
       const keys = viewKeysOf(mode);
       const unknown = Object.keys(view).filter(key => !keys.includes(key));
@@ -228,22 +297,22 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
       }
       // Checked whole first (a wrong name is said as such), then refused when not shown.
       const apply = refusing('analysis.view.set', () => ui.prepareView(view));
-      requireShown('analysis.view.set', mode, ui, where);
-      const changed = apply();
-      await ui.whenSettled();
-      return changed ? { changed: Object.keys(view).join(', ') } : null;
+      const putBack = showToDraw('analysis.view.set', mode, ui, where);
+      const changed = orPutBack(putBack, apply);
+      await ui.whenSettled({ signal });
+      return changed ? { changed: Object.keys(view).join(', '), ...plotWords(ui, view) } : null;
     }),
     actions.provide('analysis.run', async ({ analysis, in: where }, { signal }) => {
       const { mode, ui } = analysisAt(analysis, where);
-      requireShown('analysis.run', mode, ui, where);
-      let ran;
+      // Run shows the analysis it runs, as a person opens it to press its Run.
+      showToDraw('analysis.run', mode, ui, where);
       try {
-        ran = await ui.runNow({ signal });
+        // A new result, or a throw: refused, failed, or stopped (said as such).
+        await ui.runNow({ signal });
       } catch (error) {
         if (error instanceof RangeError) throw new ActionRefused(error.marked ?? error.message, { code: 'refused', type: 'analysis.run' });
         throw error;
       }
-      if (!ran) return null;
       return { rows: ui.describeResult(1)?.total ?? 0 };
     }),
     // What a run would take, for the agent presence's heavy work (measured runs of this analysis).
@@ -257,10 +326,10 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
     actions.provide('analysis.cancel', ({ analysis, in: where }) => (
       readAnalysisAt(analysis, where, ({ ui }) => ({ stopped: ui.cancelRun() }))
     )),
-    actions.provide('analysis.window.copy', async ({ window }) => {
+    actions.provide('analysis.window.copy', async ({ window }, { signal }) => {
       const entry = windowNumbered(window);
       const id = await windows.copyFromWindow(entry.id);
-      await windows.whenWindowSettled(id);
+      await windows.whenWindowSettled(id, { signal });
       return { window: windows.windowNumberOf(id) };
     }),
     actions.provide('analysis.window.close', async ({ window }) => {
@@ -316,29 +385,64 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
         columns: table.columns,
         rows: table.rows,
         total_rows: table.total,
+        about: table.about ?? null,
         stale: state.stale,
         stale_reasons: state.stale_reasons,
         computed_on: state.computed_on,
       };
     }),
+    actions.provide('analysis.export', async ({ analysis, in: where, all = false }) => {
+      // Taken now (a read of a mode the panel never made unmakes it after;
+      // such a mode has no result, so nothing of it is used later).
+      const { mode, ui, facts } = readAnalysisAt(analysis, where, ({ mode: read, ui: shown }) => ({
+        mode: read, ui: shown, facts: resultFacts(shown),
+      }));
+      if (all && mode.name !== 'markers') {
+        throw new ActionRefused(`"all" exports every gene of marker genes; ${mode.title} has one table.`, { code: 'refused', type: 'analysis.export' });
+      }
+      if (!facts.has_result) {
+        throw new ActionRefused(`${mode.title} has no result yet; run it first (analysis.run).`, { code: 'no-result', type: 'analysis.export' });
+      }
+      const reasons = (await facts.reasons) ?? [];
+      if (reasons.length > 0) {
+        throw new ActionRefused(`${mode.title}'s result is out of date: ${reasons.join(' ')} Run it again to export it.`, { code: 'refused', type: 'analysis.export' });
+      }
+      const file = await ui.tableFile(all ? { all: true } : undefined);
+      if (file === null) {
+        throw new ActionRefused(`${mode.title} has no result table to export.`, { code: 'no-result', type: 'analysis.export' });
+      }
+      const blob = file.csv instanceof Blob ? file.csv : new Blob([file.csv], { type: 'text/csv' });
+      const name = `${file.name}.csv`;
+      downloadBlob(blob, name);
+      return { analysis: mode.name, file: name, bytes: blob.size };
+    }),
     ...ANALYSIS_MODES.filter(mode => mode.options !== null).flatMap(mode => [
-      actions.provide(`analysis.${mode.name}.set`, async ({ in: where, options, show }) => {
+      actions.provide(`analysis.${mode.name}.set`, async ({ in: where, options, show }, { signal }) => {
         if (show && where !== 'panel') {
           throw new ActionRefused(`"show" opens ${mode.title} in the panel (in "panel"); analysis window ${where} shows its own.`, {
             code: 'refused', type: `analysis.${mode.name}.set`,
           });
         }
         const { ui } = analysisAt(mode.name, where);
-        // Options alone draw nothing; with a result shown, a display option redraws it.
-        if (ui.describeResult(1) !== null) requireShown(`analysis.${mode.name}.set`, mode, ui, where);
+        // Options alone draw nothing; with a result shown, a display option
+        // redraws it. The panel shows one analysis at a time: changing the
+        // options of one with a result shows it, as a person opens it to
+        // change them (an agent that had run DE, then markers, was refused
+        // "not shown" twice for DE's options, `show: true` or not), and puts
+        // the shown one back when it still cannot draw.
+        const shownBefore = comparisonModule.getOpenMode();
+        const putBack = ui.describeResult(1) !== null ? showToDraw(`analysis.${mode.name}.set`, mode, ui, where) : () => {};
         const before = ui.getOptions();
-        refusing(`analysis.${mode.name}.set`, () => ui.setOptions(options));
+        orPutBack(putBack, () => {
+          const given = optionsWithPages(mode, options, { toIds: true });
+          refusing(`analysis.${mode.name}.set`, () => ui.setOptions(given));
+        });
         // A display option redraws the shown result: the step holds the redrawn one.
-        await ui.whenSettled();
+        await ui.whenSettled({ signal });
         const after = ui.getOptions();
         const changed = Object.keys(options).filter(key => JSON.stringify(before[key]) !== JSON.stringify(after[key]));
-        const opened = show === true && comparisonModule.getOpenMode() !== mode.id;
-        if (opened) comparisonModule.openMode(mode.id);
+        if (show === true && comparisonModule.getOpenMode() !== mode.id) comparisonModule.openMode(mode.id);
+        const opened = where === 'panel' && shownBefore !== mode.id && comparisonModule.getOpenMode() === mode.id;
         return changed.length === 0 && !opened ? null : { changed: changed.join(', '), ...(opened ? { opened: true } : {}) };
       }),
       actions.provide(`analysis.${mode.name}.get`, async ({ in: where }) => {
@@ -346,7 +450,7 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
         const { facts, ...read } = readAnalysisAt(mode.name, where, ({ ui }) => ({
           analysis: mode.name,
           in: where,
-          options: ui.getOptions(),
+          options: optionsWithPages(mode, ui.getOptions(), { toIds: false }),
           pages: pageNamesOf(ui.getSelectedPages()),
           facts: resultFacts(ui),
         }));
@@ -356,7 +460,8 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
   ];
 
   function record(type, params, outcome = null, after = null) {
-    actions.recordObserved(type, params, {}, outcome, { after })
+    // Every change recorded here is the person's own (a press, a drag): never the work of an action.
+    actions.recordObserved(type, params, {}, outcome, { after, person: true })
       .catch(error => console.error(`[Analysis] ${type} could not be recorded:`, error));
   }
 
@@ -389,10 +494,12 @@ export function installAnalysisActions({ actions, comparisonModule, dockable, se
           record('analysis.pages.set', { analysis: mode.name, in: located.where, pages: pageNamesOf(detail.pageIds) }, null, after);
         } else if (kind === 'set' && mode.options !== null) {
           record(`analysis.${mode.name}.set`, {
-            in: located.where, options: detail.options, ...(detail.show === true ? { show: true } : {}),
-          }, null, after);
+            in: located.where, options: optionsWithPages(mode, detail.options, { toIds: false }), ...(detail.show === true ? { show: true } : {}),
+          // The options it changed name the step, as the action's own outcome does.
+          }, detail.changed === undefined ? null : { changed: detail.changed.join(', ') }, after);
         } else if (kind === 'view' && viewKeysOf(mode).length > 0) {
-          record('analysis.view.set', { analysis: mode.name, in: located.where, view: detail.view }, null, after);
+          const words = plotWords(ui, detail.view);
+          record('analysis.view.set', { analysis: mode.name, in: located.where, view: detail.view }, Object.keys(words).length === 0 ? null : words, after);
         } else if (kind === 'fields' && mode.name === 'quick') {
           record('analysis.quick.set', { in: located.where, ...detail }, null, after);
         } else if (kind === 'detailed' && mode.name === 'detailed') {

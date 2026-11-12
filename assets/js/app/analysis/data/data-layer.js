@@ -37,7 +37,7 @@
 import { isContinuousValues } from '../../../data/continuous-values.js';
 import { LRUCache } from '../shared/lru-cache.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { abortReason, throwIfAborted, SharedWork, cancel, onAbort } from '../../../utils/abort.js';
+import { abortReason, throwIfAborted, SharedWork, cancel, onAbort, requireSignalOrNull } from '../../../utils/abort.js';
 import {
   isRestOfPageId,
   isDerivedPageId,
@@ -57,12 +57,18 @@ import {
   createSlicedYield,
   waitForAvailableSlot
 } from '../shared/concurrency-utils.js';
-import { formatDuration, formatCountOf } from '../../../utils/format-units.js';
+import { formatDuration, formatCountOf, formatPercent } from '../../../utils/format-units.js';
 import { cellsSteady } from '../../../data/open-cells-work.js';
 import { isCellList } from '../../utils/cell-set.js';
 import { registerResidentHolder, residencyBudgetBytes } from '../../../data/memory-budget.js';
-import { failureText } from '../../../utils/errors.js';
+import { failureDetails, joinFailure, sayFailure } from '../../../utils/errors.js';
 import { dispatchFromControl } from '../../actions/control-dispatch.js';
+import { cellLibrarySizes, totalsOfObsField } from '../../../data/library-sizes.js';
+import { expressionMatrixName } from '../../../data/data-mapping.js';
+import {
+  RAW_VALUES, effectiveTransform, factorsOfCells, isRawValues, transformBlock, transformColumn, transformKey, valuesRecord,
+} from '../../../data/expression-transform.js';
+import { librarySizeFields } from '../../utils/field-roles.js';
 
 // =============================================================================
 // PARALLEL LOADING
@@ -77,16 +83,35 @@ import { dispatchFromControl } from '../../actions/control-dispatch.js';
 // here could know.
 
 
-/** An expression matrix (`X`, `raw`, `layer:<key>`) as results name it. */
 /**
- * A matrix as an analysis names it: `X`, `raw`, `layers['counts']`, with
- * `· counts, not normalised` when it holds counts (Data mapping's
- * `expressionHoldsCounts`): a fold change on counts is not normalised by
- * each cell's depth.
+ * A matrix as an analysis names it: `X`, `raw.X`, `layers['counts']`, with
+ * `· counts` when it holds counts (Data mapping's `expressionHoldsCounts`):
+ * a result says beside it the values it computed from (the expression
+ * transform, `data/expression-transform.js`).
  */
 function matrixName(matrix, counts = false) {
-  const name = matrix.startsWith('layer:') ? `layers['${matrix.slice('layer:'.length)}']` : matrix;
-  return counts ? `${name} · counts, not normalised` : name;
+  const name = expressionMatrixName(matrix);
+  return counts ? `${name} · counts` : name;
+}
+
+/**
+ * The values a run computes from (`DataLayer.runValues`): the expression
+ * transform, the cells' totals when it normalizes (null otherwise), its
+ * `key` (`transformKey`) and what a result keeps of them (`record`, null for
+ * the values as stored).
+ *
+ * @typedef {Readonly<{transform: import('../../../data/expression-transform.js').ExpressionTransform,
+ *   sizes: import('../../../data/library-sizes.js').LibrarySizes|null, key: string,
+ *   record: {normalize: boolean, log1p: boolean, totals: string|null}|null}>} RunValues
+ */
+
+/** The values as stored, as a run's values. */
+export const RAW_RUN_VALUES = Object.freeze({ transform: RAW_VALUES, sizes: null, key: transformKey(RAW_VALUES), record: null });
+
+/** A gene read from the source in a run's values (null: as stored). */
+function transformedBy(column, values) {
+  if (values === null || isRawValues(values.transform)) return column;
+  return transformColumn(column, values.sizes?.factors ?? null, values.transform.log1p);
 }
 
 /** Whether the expression menu says `matrix` holds counts. */
@@ -533,7 +558,7 @@ function sortedUnionOf(lists, pointCount) {
  *
  * Grouped analyses — marker discovery is the one that caches — are addressed by
  * observation-field key, but a field's codes can be rewritten in place while the
- * key stays the same: merging two categories and moving one to "unassigned" both
+ * key stays the same: merging two categories and moving one to "Unassigned" both
  * do exactly that to a user-defined field. The key therefore does not identify
  * the grouping, and a cache keyed on it alone would serve results computed for a
  * different partition of the same cells — a plausible answer to a question
@@ -612,12 +637,10 @@ export function computeCategoryGroupingDigest(codes) {
 /**
  * @typedef {Object} DataLayerOptions
  * @property {boolean} [enableCache=true] - Enable LRU caching
- * @property {number} [cacheSize=100] - Maximum page-data cache entries
  * @property {number|(() => number)} [cacheMaxBytes] - Page-data cache budget for
- *   the bytes of cached per-cell values and page cell lists; by default the
- *   `analysisPages` share of the memory model (`residencyBudgetBytes`), read
- *   whenever the cache is trimmed
- * @property {number} [cacheMaxAge=0] - Cache entry max age in ms (0 = no expiration)
+ *   the bytes of cached per-cell values and page cell lists, its one bound
+ *   (no entry count, no age); by default the `analysisPages` share of the
+ *   memory model (`residencyBudgetBytes`), read whenever the cache is trimmed
  * @property {boolean} [enableDedup=true] - Enable request deduplication
  * @property {boolean} [enablePrefetch=false] - Enable prefetching
  * @property {boolean} [enableVersionTracking=true] - Track page versions for cache correctness
@@ -674,7 +697,6 @@ export function computeCategoryGroupingDigest(codes) {
  * // With custom options
  * const dataLayer = new DataLayer(state, {
  *   enableCache: true,
- *   cacheSize: 200,
  *   enablePrefetch: true
  * });
  */
@@ -766,9 +788,7 @@ export class DataLayer {
   constructor(state, options = {}) {
     const {
       enableCache = true,
-      cacheSize = 100,
       cacheMaxBytes = pageDataCacheBytes,
-      cacheMaxAge = 0,
       enableDedup = true,
       enablePrefetch = false,
       enableVersionTracking = true,
@@ -781,17 +801,12 @@ export class DataLayer {
     /** @type {DataLayerOptions} Configuration options */
     this._options = {
       enableCache,
-      cacheSize,
       cacheMaxBytes,
-      cacheMaxAge,
       enableDedup,
       enablePrefetch,
       enableVersionTracking,
       enableNotifications
     };
-
-    // Simple variable cache (for variable info lookups)
-    this._variableCache = new Map();
 
     // Fast key->fieldIndex lookups (critical for streaming loaders).
     // Built lazily and treated as immutable for the lifetime of this DataLayer
@@ -801,13 +816,10 @@ export class DataLayer {
     /** @type {Map<string, number>|null} */
     this._obsFieldIndexByKey = null;
 
-    // LRU cache for page data (if enabled), bounded by entries and by the
-    // bytes of the per-cell values it holds and the page cell lists made for
-    // them.
+    // LRU cache for page data (if enabled), bounded by the bytes of the
+    // per-cell values it holds and the page cell lists made for them alone.
     this._dataCache = enableCache
       ? new LRUCache({
-        maxSize: cacheSize,
-        maxAge: cacheMaxAge,
         maxBytes: cacheMaxBytes,
         sizeOf: pageDataValueBytes,
         heldBytes: () => this._heldPageCellBytes()
@@ -986,6 +998,21 @@ export class DataLayer {
   // ===========================================================================
 
   /**
+   * The key of the categorical obs field the cells are colored by, or null:
+   * the default field of the analyses that group the cells
+   * (`options/composition-options.js` `defaultCellTypeField`).
+   *
+   * @returns {string|null}
+   */
+  getColoringCategoricalField() {
+    const state = this.state;
+    const active = state?.activeFieldSource === 'obs' && state.activeFieldIndex >= 0
+      ? state.obsData?.fields?.[state.activeFieldIndex]
+      : null;
+    return active?.kind === 'category' ? active.key : null;
+  }
+
+  /**
    * Get list of available variables by type
    *
    * @param {DataType} type - Type of variables to list
@@ -1131,7 +1158,7 @@ export class DataLayer {
     if (typeof this.state?.getHighlightPageColor !== 'function') {
       throw new TypeError('DataLayer state.getHighlightPageColor is required');
     }
-    // A sample of a page is drawn in its page's colour.
+    // A sample of a page is drawn in its page's color.
     const sample = parseSamplePageId(pageId);
     if (sample !== null) return this.getPageColor(sample.baseId);
     const color = this.state.getHighlightPageColor(pageId);
@@ -1143,7 +1170,7 @@ export class DataLayer {
 
   /**
    * Set the persistent color for a highlight page (a sample of a page
-   * recolours its page): a highlight action, named by the page's name.
+   * recolors its page): a highlight action, named by the page's name.
    * @param {string} pageId
    * @param {string} color
    * @returns {Promise<object|null>} The action's result, or null when it was
@@ -1160,7 +1187,7 @@ export class DataLayer {
     return dispatchFromControl(
       'highlight.page.recolor',
       { page: page.name, color },
-      { failure: 'Recolouring the highlight page failed', category: 'highlight' }
+      { failure: 'Recoloring the highlight page failed', category: 'highlight' }
     );
   }
 
@@ -1472,11 +1499,11 @@ export class DataLayer {
     }
     this._requireCurrentDatasetGeneration(datasetGeneration);
     if (lifecycle.signal.aborted) {
-      throw lifecycle.signal.reason;
+      throw abortReason(lifecycle.signal);
     }
 
     if (field.loaded) return;
-    // A caller's own signal (a prefetch that may be cancelled) ends this
+    // A caller's own signal (a prefetch that may be canceled) ends this
     // caller's lease as well as the analysis lifecycle does.
     const loadSignal = callerSignal === null
       ? lifecycle.signal
@@ -1553,9 +1580,7 @@ export class DataLayer {
     const steady = cellsSteady();
     if (steady !== null) await steady;
     const { silent = true, signal = null, priority = 'normal' } = options;
-    if (signal !== null && !(signal instanceof AbortSignal)) {
-      throw new TypeError('Gene load signal must be an AbortSignal or null');
-    }
+    requireSignalOrNull(signal, 'Gene load signal');
     const datasetGeneration = this._datasetGeneration;
     this._requireCurrentDatasetGeneration(datasetGeneration);
 
@@ -1604,8 +1629,16 @@ export class DataLayer {
    * named on its own axis (`getGeneKeys`) and always read from the source; a
    * gene that matrix lacks is refused by name (`GENE_NOT_IN_MATRIX`).
    *
+   * `values` are the values read (`runValues`): a run's, so every gene of the
+   * run is in one transform whatever changes meanwhile; null for the values
+   * as stored (pseudobulk sums raw counts); omitted, the matrix's values now
+   * (the mapped one's as shown). A loaded field's array is given when it is
+   * in them (every field of the mapped matrix is in the transform shown);
+   * otherwise the gene is read from the source and transformed here. A gene
+   * field made in the app (a copy) is given as it is.
+   *
    * @param {string} geneKey
-   * @param {{signal?: AbortSignal|null, priority?: 'high'|'normal'|'bulk'|'low', owner?: string|null, matrix?: string}} [options]
+   * @param {{signal?: AbortSignal|null, priority?: 'high'|'normal'|'bulk'|'low', owner?: string|null, matrix?: string, values?: RunValues|null}} [options]
    * @returns {Promise<{fieldIndex: number, values: Float32Array|{length: number, indices: Uint32Array, values: Float32Array}, owned: boolean}>}
    */
   async readGeneColumn(geneKey, options = {}) {
@@ -1614,10 +1647,10 @@ export class DataLayer {
     const steady = cellsSteady();
     if (steady !== null) await steady;
     const { signal = null, priority = 'normal', owner = null, matrix = 'mapped' } = options;
-    if (signal !== null && !(signal instanceof AbortSignal)) {
-      throw new TypeError('Gene read signal must be an AbortSignal or null');
-    }
+    requireSignalOrNull(signal, 'Gene read signal');
     const datasetGeneration = this._datasetGeneration;
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    const values = options.values === undefined ? await this.runValues(matrix, { signal, owner }) : options.values;
     this._requireCurrentDatasetGeneration(datasetGeneration);
     const expression = matrix === 'mapped' ? null : this.resolveExpressionMatrix(matrix).read;
     if (expression !== null) {
@@ -1633,7 +1666,7 @@ export class DataLayer {
           : AbortSignal.any([this._fieldLoadLifecycle.signal, signal])
       });
       this._requireCurrentDatasetGeneration(datasetGeneration);
-      return { fieldIndex: gene, values: sample, owned: true };
+      return { fieldIndex: gene, values: transformedBy(sample, values), owned: true };
     }
     const fields = this.state.varData?.fields;
     if (!fields) {
@@ -1647,7 +1680,9 @@ export class DataLayer {
     if (!field) {
       throw new Error(`[DataLayer] Var field not found for gene: ${geneKey}`);
     }
-    if (field.loaded && field.values) {
+    // A loaded gene is in the transform shown; a copy made in the app is
+    // given as it is.
+    if (field.loaded && field.values && (field._isUserDefined === true || this._showsValues(values))) {
       return { fieldIndex, values: field.values, owned: false };
     }
     const sample = typeof this.state.readVarSparseColumn === 'function'
@@ -1660,7 +1695,7 @@ export class DataLayer {
       })
       : null;
     this._requireCurrentDatasetGeneration(datasetGeneration);
-    if (sample !== null) return { fieldIndex, values: sample, owned: true };
+    if (sample !== null) return { fieldIndex, values: transformedBy(sample, values), owned: true };
     // No source to read entries from (a field with no payload of its own):
     // its values are loaded into field state, and let go of again unless
     // something else had them loaded, so the caller then owns them.
@@ -1683,7 +1718,13 @@ export class DataLayer {
     const mapping = this.state.getDataMapping?.() ?? null;
     const mapped = mapping?.expression ?? null;
     const menu = mapped === null ? null : (this.state.getMappingGroupChoices?.('expression') ?? null);
-    const choices = [{ value: 'mapped', label: mapped === null ? 'Mapped' : `Mapped (${matrixName(mapped, countsIn(menu, mapped))})` }];
+    // The mapped matrix is also named as the dataset names it (`X`,
+    // `raw`, `layer:<name>`): either names the same choice.
+    const choices = [{
+      value: 'mapped',
+      label: mapped === null ? 'Mapped' : `Mapped (${matrixName(mapped, countsIn(menu, mapped))})`,
+      ...(mapped === null ? {} : { aliases: [mapped] }),
+    }];
     if (menu === null) {
       return {
         choices,
@@ -1718,6 +1759,148 @@ export class DataLayer {
       throw new RangeError(`This dataset has no expression matrix ${String(matrix)} to read`);
     }
     return { matrix, read: matrix, label: matrixName(matrix, choice.counts === true) };
+  }
+
+  /**
+   * Whether an "Expression matrix" value holds counts, as its label says
+   * ("· counts": the Data mapping's `counts`, from the stored
+   * values, `data/anndata/reader.js` `storedValueFacts`): the matrices the
+   * expression transform applies to (`runValues`).
+   *
+   * @param {string} [matrix='mapped']
+   * @returns {boolean}
+   */
+  matrixHoldsCounts(matrix = 'mapped') {
+    const mapped = this.state.getDataMapping?.()?.expression ?? null;
+    const name = matrix === 'mapped' ? mapped : matrix;
+    if (name === null) return false;
+    return countsIn(this.state.getMappingGroupChoices?.('expression') ?? null, name);
+  }
+
+  /**
+   * The expression transform the values of one "Expression matrix" are in
+   * (Data mapping › Expression values, `data/expression-transform.js`): the
+   * mapped matrix's as shown; another matrix's, the transform asked when
+   * that matrix holds counts and its values are not `log1p` already, else
+   * its values as stored.
+   *
+   * @param {string} [matrix='mapped']
+   * @returns {import('../../../data/expression-transform.js').ExpressionTransform}
+   */
+  expressionTransformOf(matrix = 'mapped') {
+    const resolved = this.resolveExpressionMatrix(matrix);
+    if (resolved.read === null) return this.state.getShownExpressionTransform?.() ?? RAW_VALUES;
+    const mapping = this.state.getDataMapping?.() ?? null;
+    const takes = this.matrixHoldsCounts(matrix) && mapping?.log1p?.[resolved.read] === undefined;
+    return effectiveTransform(this.state.getExpressionTransform?.() ?? RAW_VALUES, takes);
+  }
+
+  /**
+   * The values a run of one "Expression matrix" computes from, fixed for the
+   * run: its transform (`expressionTransformOf`), the cells' totals when it
+   * normalizes (read before any gene: an obs total, else one pass over the
+   * matrix's genes, kept and shared by every run and by the coloring), and
+   * what its result keeps of them (`record`, `valuesRecord`).
+   *
+   * @param {string} [matrix='mapped']
+   * @param {{readTo?: number|null, signal?: AbortSignal|null, owner?: string|null}} [options] -
+   *   `readTo`: the open cells genes are read for, as the run read them
+   *   (`geneCellsOf`); the gene sample's when null
+   * @returns {Promise<RunValues>}
+   */
+  async runValues(matrix = 'mapped', { readTo = null, signal = null, owner = null } = {}) {
+    const transform = this.expressionTransformOf(matrix);
+    if (isRawValues(transform)) return RAW_RUN_VALUES;
+    const sizes = transform.normalize ? await this.librarySizes(matrix, { readTo, signal, owner }) : null;
+    return Object.freeze({ transform, sizes, key: transformKey(transform), record: valuesRecord(transform, sizes) });
+  }
+
+  /** Whether `values` are those a loaded gene of the mapped matrix holds (the transform shown). @private */
+  _showsValues(values) {
+    const shown = this.state.getShownExpressionTransform?.() ?? RAW_VALUES;
+    return transformKey(values?.transform ?? RAW_VALUES) === transformKey(shown);
+  }
+
+  /**
+   * Each open cell's library size of one "Expression matrix"
+   * (`data/library-sizes.js`): an obs total when the file records one (the
+   * field `uns['cellucid']['totalCounts']` names first), else one pass over
+   * the matrix's genes; computed once per matrix and the cells read, shared
+   * by every run that asks (the mapped matrix's with its shown values,
+   * `DataState.mappedLibrarySizes`).
+   *
+   * @param {string} [matrix='mapped']
+   * @param {{readTo?: number|null, signal?: AbortSignal|null, owner?: string|null}} [options] -
+   *   `readTo`: the open cells genes are read for; the gene sample's when null
+   * @returns {Promise<import('../../../data/library-sizes.js').LibrarySizes>}
+   */
+  async librarySizes(matrix = 'mapped', { readTo = null, signal = null, owner = null } = {}) {
+    const datasetGeneration = this._datasetGeneration;
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    const read = signal === null ? this._fieldLoadLifecycle.signal : AbortSignal.any([this._fieldLoadLifecycle.signal, signal]);
+    const expression = this.resolveExpressionMatrix(matrix).read;
+    let sizes;
+    if (expression === null) {
+      sizes = await this.state.mappedLibrarySizes({ ...(readTo === null ? {} : { readTo }), signal: read, owner });
+    } else {
+      const { handle } = await this._openMatrix(expression);
+      this._requireCurrentDatasetGeneration(datasetGeneration);
+      const cells = readTo ?? (await this.geneCellsOf(matrix))?.cells ?? this.state.pointCount;
+      const obs = this._continuousObs();
+      sizes = await cellLibrarySizes({
+        holder: handle,
+        pointCount: this.state.pointCount,
+        readTo: cells,
+        matrixLabel: expressionMatrixName(expression),
+        stored: null,
+        candidates: librarySizeFields([...obs.keys()].map(key => ({ key }))),
+        readObs: (key, readSignal) => this._readObsValues(obs, key, readSignal),
+        geneCount: handle.fields.length,
+        readGene: (gene, readSignal) => this.state.readMatrixSparseColumn(handle, gene, { signal: readSignal, priority: 'bulk', owner }),
+        readGenesInCells: typeof this.state.readMatrixCellSubset === 'function'
+          ? (genes, cellList, readSignal) => this.state.readMatrixCellSubset(handle, genes, cellList, { signal: readSignal, owner })
+          : null,
+        signal: read,
+      });
+    }
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    return sizes;
+  }
+
+  /**
+   * Each open cell's stored total count, from the obs field the file names
+   * (`uns['cellucid']['totalCounts']`) or one named like a total, never from
+   * the genes: what pseudobulk takes its samples' library sizes from
+   * (`stats/pseudobulk.js`, `cellTotals`). Null when the file stores none.
+   *
+   * @param {{signal?: AbortSignal|null}} [options]
+   * @returns {Promise<{field: string, totals: Float64Array}|null>}
+   */
+  async storedCellTotals({ signal = null } = {}) {
+    const obs = this._continuousObs();
+    const stored = this.state.storedCellTotals?.() ?? null;
+    const fields = [...(stored === null ? [] : [stored.field]), ...librarySizeFields([...obs.keys()].map(key => ({ key })))];
+    for (const field of new Set(fields)) {
+      const totals = totalsOfObsField(await this._readObsValues(obs, field, signal), this.state.pointCount);
+      if (totals !== null) return { field, totals };
+    }
+    return null;
+  }
+
+  /** The continuous obs fields by the key the file gives them, to their position. @private */
+  _continuousObs() {
+    const keys = new Map();
+    (this.state.obsData?.fields ?? []).forEach((field, index) => {
+      if (field?.kind === 'continuous' && field._isUserDefined !== true) keys.set(field._originalKey ?? field.key, index);
+    });
+    return keys;
+  }
+
+  /** One continuous obs field's values on every open cell, or null when it is not one. @private */
+  async _readObsValues(obs, key, signal) {
+    const index = obs.get(key);
+    if (index === undefined) return null;
+    return (await this.state.ensureFieldLoaded(index, { silent: true, signal }))?.values ?? null;
   }
 
   /**
@@ -1841,13 +2024,25 @@ export class DataLayer {
    *
    * @param {string[]} geneKeys - Distinct gene keys (of `matrix`)
    * @param {ArrayLike<number>} cellIndices - Distinct cell positions
-   * @param {{signal?: AbortSignal|null, owner?: string|null, matrix?: string, runGenes?: number|null}} [options] -
-   *   `owner`: the job the read is for; `matrix` as `readGeneColumn`;
+   * @param {{signal?: AbortSignal|null, owner?: string|null, matrix?: string, runGenes?: number|null, values?: RunValues|null}} [options] -
+   *   `owner`: the job the read is for; `matrix` and `values` as
+   *   `readGeneColumn` (the block is read from the source, then transformed
+   *   here by its cells' factors);
    *   `runGenes`: the genes the read's run has still to read of these cells,
    *   this read's included (the source prices its routes over the run)
    * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}|null>}
    */
   async readGeneCellSubset(geneKeys, cellIndices, options = {}) {
+    const values = options.values === undefined
+      ? await this.runValues(options.matrix ?? 'mapped', { signal: options.signal ?? null, owner: options.owner ?? null })
+      : options.values;
+    const block = await this._readGeneCellSubset(geneKeys, cellIndices, options);
+    if (block === null || values === null || isRawValues(values.transform)) return block;
+    return transformBlock(block, values.sizes === null ? null : factorsOfCells(values.sizes.factors, cellIndices), values.transform.log1p);
+  }
+
+  /** `readGeneCellSubset` as stored. @private */
+  async _readGeneCellSubset(geneKeys, cellIndices, options) {
     // The open cells being changed in place: read on the cells after it
     // (`data/open-cells-work.js`).
     const steady = cellsSteady();
@@ -1982,9 +2177,7 @@ export class DataLayer {
     const steady = cellsSteady();
     if (steady !== null) await steady;
     const { signal = null, priority = 'normal', owner = null, matrix = 'mapped' } = options;
-    if (signal !== null && !(signal instanceof AbortSignal)) {
-      throw new TypeError('Gene delivery signal must be an AbortSignal or null');
-    }
+    requireSignalOrNull(signal, 'Gene delivery signal');
     const datasetGeneration = this._datasetGeneration;
     this._requireCurrentDatasetGeneration(datasetGeneration);
     const readSignal = signal === null
@@ -2072,7 +2265,8 @@ export class DataLayer {
    * invalidated.
    *
    * @param {string[]} geneKeys
-   * @param {{isCurrent?: () => boolean, registerInvalidationCleanup?: (cleanup: () => void) => void, priority?: 'high'|'normal'|'bulk'|'low', signal?: AbortSignal|null, owner?: string|null, matrix?: string}} [options]
+   * @param {{isCurrent?: () => boolean, registerInvalidationCleanup?: (cleanup: () => void) => void, priority?: 'high'|'normal'|'bulk'|'low', signal?: AbortSignal|null, owner?: string|null, matrix?: string, values?: RunValues|null}} [options] -
+   *   `values` as `readGeneColumn` (the matrix's now when omitted, one for every gene)
    * @returns {Promise<Array<ArrayLike<number>|{length: number, indices: Uint32Array, values: Float32Array}>>}
    */
   async readGeneColumns(geneKeys, options = {}) {
@@ -2091,9 +2285,7 @@ export class DataLayer {
       owner: readOwner = null,
       matrix = 'mapped'
     } = options;
-    if (signal !== null && !(signal instanceof AbortSignal)) {
-      throw new TypeError('Gene column signal must be an AbortSignal or null');
-    }
+    requireSignalOrNull(signal, 'Gene column signal');
     if (isCurrent !== undefined && typeof isCurrent !== 'function') {
       throw new TypeError('Gene column isCurrent must be a function when provided');
     }
@@ -2117,6 +2309,8 @@ export class DataLayer {
         }
       };
       requireCurrent();
+      const values = options.values === undefined ? await this.runValues(matrix, { signal: owner.signal, owner: readOwner }) : options.values;
+      requireCurrent();
       const columns = new Array(geneKeys.length);
       const inFlight = new Set();
       const tasks = [];
@@ -2124,7 +2318,7 @@ export class DataLayer {
       for (let index = 0; index < geneKeys.length; index++) {
         await waitForAvailableSlot(inFlight, maxInFlight);
         requireCurrent();
-        const task = this.readGeneColumn(geneKeys[index], { signal: owner.signal, priority, owner: readOwner, matrix })
+        const task = this.readGeneColumn(geneKeys[index], { signal: owner.signal, priority, owner: readOwner, matrix, values })
           .then(({ values }) => {
             columns[index] = values;
           });
@@ -2320,9 +2514,7 @@ export class DataLayer {
       noCache = false,
       signal = null
     } = options;
-    if (signal !== null && !(signal instanceof AbortSignal)) {
-      throw new TypeError('Page-data fetch signal must be an AbortSignal or null');
-    }
+    requireSignalOrNull(signal, 'Page-data fetch signal');
     throwIfAborted(signal);
     const pageIds = Array.isArray(requestedPageIds)
       ? [...requestedPageIds]
@@ -2445,8 +2637,8 @@ export class DataLayer {
     this._requireCurrentDatasetGeneration(datasetGeneration);
 
     // Get the variable info and field
-    const variableInfo = this.getVariableInfo(type, variableKey);
-    if (!variableInfo) {
+    const listedInfo = this.getVariableInfo(type, variableKey);
+    if (!listedInfo) {
       throw new Error(
         `Variable not found: ${String(variableKey)} (type: ${String(type)})`
       );
@@ -2462,12 +2654,23 @@ export class DataLayer {
       throw new Error(`No ${source} fields are available`);
     }
 
-    const fieldIndex = variableInfo._fieldIndex;
+    const fieldIndex = listedInfo._fieldIndex;
     const field = fields[fieldIndex];
 
     if (!field) {
       throw new Error(`Field not found at index ${String(fieldIndex)}`);
     }
+
+    // What a gene's pages hold: the values shown (Data mapping › Expression
+    // values), fixed for this read and named with the pages
+    // (`variableInfo.values`, `valuesRecord`), so a plot, a table and a CSV
+    // name its units (`geneValueLabel`) as they were when read. A gene made
+    // in the app keeps its own values (null), as an obs field has none.
+    const geneValues = source === 'var' && field._isUserDefined !== true
+      ? await this.runValues('mapped', { signal, owner: options.owner ?? null })
+      : null;
+    this._requireCurrentDatasetGeneration(datasetGeneration);
+    const variableInfo = source === 'var' ? { ...listedInfo, values: geneValues?.record ?? null } : listedInfo;
 
     // Ensure field is loaded - show notification if not already loaded (unless silent)
     let loadingNotificationId = null;
@@ -2480,7 +2683,7 @@ export class DataLayer {
       loadingNotificationId = notifications.show({
         type: 'loading',
         category: 'data',
-        message: `Loading ${variableKey}...`
+        message: `Loading ${variableKey}…`
       });
     }
 
@@ -2490,7 +2693,7 @@ export class DataLayer {
     let sparseGene = null;
     try {
       if (source === 'var' && !(field.loaded && field.values) && typeof this.state.readVarSparseColumn === 'function') {
-        const read = await this.readGeneColumn(variableKey, { signal, owner: options.owner ?? null });
+        const read = await this.readGeneColumn(variableKey, { signal, owner: options.owner ?? null, ...(geneValues === null ? {} : { values: geneValues }) });
         if (ArrayBuffer.isView(read.values)) {
           // Loaded meanwhile: the field's own array.
         } else {
@@ -2794,8 +2997,12 @@ export class DataLayer {
    * @private
    */
   _getCacheKey(options) {
-    const { type, variableKey, pageIds } = options;
+    const { type, variableKey: asked, pageIds } = options;
     const sortedPageIds = [...pageIds].sort();
+    // A gene's values are those of the transform shown (Expression values).
+    const variableKey = type === 'gene_expression'
+      ? `${asked}@${transformKey(this.state.getShownExpressionTransform?.() ?? RAW_VALUES)}`
+      : asked;
 
     // Include page version digests for cache correctness
     if (this._pageVersions) {
@@ -3048,7 +3255,6 @@ export class DataLayer {
     if (this._pendingRequests !== null) {
       this._pendingRequests.clear();
     }
-    this._variableCache.clear();
     if (this._dataCache) {
       this._dataCache.clear();
     }
@@ -3064,7 +3270,6 @@ export class DataLayer {
     if (this._pendingRequests !== null) {
       this._pendingRequests.clear();
     }
-    this._variableCache.clear();
     if (this._dataCache) {
       this._dataCache.clear();
     }
@@ -3348,7 +3553,7 @@ export class DataLayer {
       notificationId = this._notifications.show({
         type: 'progress',
         category: 'data',
-        message: `Loading ${obsFields.length} observation fields...`,
+        message: `Loading ${formatCountOf(obsFields.length, 'field')}…`,
         progress: 0
       });
     }
@@ -3357,7 +3562,7 @@ export class DataLayer {
     const handleProgress = (progress) => {
       if (notificationId && this._notifications) {
         this._notifications.updateProgress(notificationId, progress, {
-          message: `Loading observation fields... ${progress}%`
+          message: `Loading fields… ${formatPercent(progress)}`
         });
       }
       if (onProgress) {
@@ -3377,13 +3582,13 @@ export class DataLayer {
       const duration = performance.now() - startTime;
       if (notificationId && this._notifications) {
         this._notifications.complete(notificationId,
-          `Loaded ${result.stats.fieldsLoaded} fields (${formatDuration(duration)})`
+          `Loaded ${formatCountOf(result.stats.fieldsLoaded, 'field')} (${formatDuration(duration)})`
         );
       }
     } catch (error) {
       // Fail notification on error
       if (notificationId && this._notifications) {
-        this._notifications.fail(notificationId, `Failed to load observation fields: ${failureText(error)}`);
+        this._notifications.fail(notificationId, `${joinFailure(`The fields could not be loaded`, sayFailure(error))}`, failureDetails(error));
       }
       throw error;
     }
@@ -3468,7 +3673,6 @@ export class DataLayer {
     return {
       dataCache: {
         size: this._dataCache ? this._dataCache.size() : 0,
-        maxSize: this._options.cacheSize,
         stats: this._dataCache ? this._dataCache.getStats() : null
       },
       pendingRequests: this._pendingRequests ? this._pendingRequests.size : 0,
@@ -3507,27 +3711,6 @@ export class DataLayer {
   }
 
   /**
-   * Perform periodic cleanup of expired cache entries
-   * @returns {{cleaned: number, remaining: number}}
-   */
-  performCacheCleanup() {
-    let cleaned = 0;
-
-    // Prune data cache if it supports it
-    if (this._dataCache && this._dataCache.prune) {
-      cleaned += this._dataCache.prune();
-    }
-
-    const remaining = this._dataCache ? this._dataCache.size() : 0;
-
-    if (cleaned > 0) {
-      console.debug(`[DataLayer] Cache cleanup removed ${formatCountOf(cleaned, 'entry', 'entries')}`);
-    }
-
-    return { cleaned, remaining };
-  }
-
-  /**
    * Destroy the DataLayer instance and release all resources
    *
    * Call this when the DataLayer is no longer needed to:
@@ -3560,8 +3743,7 @@ export class DataLayer {
       if (this._dataCache) {
         this._dataCache.clear();
       }
-      this._variableCache.clear();
-
+  
       if (this._pendingRequests) {
         this._pendingRequests.clear();
       }
@@ -3592,7 +3774,6 @@ export class DataLayer {
  * @example
  * const dataLayer = createDataLayer(state, {
  *   enableCache: true,
- *   cacheSize: 200,
  *   enablePrefetch: true
  * });
  */

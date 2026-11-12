@@ -17,7 +17,8 @@
  *   (it is captured on every cell and applies to any subsample of its
  *   dataset, `verifySessionFingerprint`);
  * - its root holds no `cells` (the cells open are the person's choice) and
- *   no `layout`: the person's own panels, sidebar and theme stay theirs.
+ *   no `layout`: the person's own panels, sidebar and theme stay theirs; its
+ *   viewer background is not applied either ({@link keepShownControls}).
  *
  * Publishing ({@link trimToPublishedDefault}) turns a Save of the dataset
  * into that file: the active tracker's head becomes the one root, every step
@@ -51,9 +52,38 @@ export const STARTING_VIEW_CONTENT_DOMAINS = Object.freeze([
 /**
  * The domains a starting view does not hold: which cells are open (the
  * person's or the link's choice; a starting view applies to any subsample of
- * its dataset) and the person's own workspace.
+ * its dataset), the Expression values the genes are shown in (the person's
+ * setting, as stored until they choose: `app/state/domains/expression.js`)
+ * and the person's own workspace.
  */
-export const STARTING_VIEW_OMITTED_DOMAINS = Object.freeze(['cells', 'layout']);
+export const STARTING_VIEW_OMITTED_DOMAINS = Object.freeze(['cells', 'expression', 'layout']);
+
+/**
+ * The settings a starting view holds but leaves as shown: the viewer's
+ * background, the person's own look as the theme is (a background never
+ * chosen follows the theme, `rendering/viewer-backgrounds.js`
+ * `backgroundForTheme`; owner, 2026-11-10). The settings value lists every
+ * control, so the file still holds one; it is not applied.
+ */
+export const STARTING_VIEW_SHOWN_CONTROL_IDS = Object.freeze(['background-select']);
+
+/**
+ * The starting view's values with {@link STARTING_VIEW_SHOWN_CONTROL_IDS} as
+ * shown now: the `keepShown` of `history.showValues`.
+ *
+ * @param {Record<string, unknown>} values the root's values, by domain
+ * @param {(domainId: string) => any} shownOf a domain's value as shown now
+ * @returns {Record<string, unknown>}
+ */
+export function keepShownControls(values, shownOf) {
+  if (!Object.hasOwn(values, 'settings')) return values;
+  const shown = shownOf('settings').controls;
+  const controls = { ...values.settings.controls };
+  for (const id of STARTING_VIEW_SHOWN_CONTROL_IDS) {
+    if (Object.hasOwn(controls, id)) controls[id] = shown[id];
+  }
+  return { ...values, settings: { ...values.settings, controls } };
+}
 
 /** The name of a starting view's one tracker. */
 export const STARTING_VIEW_TRACKER_NAME = 'Starting view';

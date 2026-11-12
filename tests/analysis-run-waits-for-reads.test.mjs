@@ -114,3 +114,26 @@ test('differential expression run right after its options waits for the categori
   assert.equal(await run, true);
   assert.deepEqual(ran, ['ran']);
 });
+
+test('a run that ends without a result is said as stopped or cancelled, never as one that changed nothing', async () => {
+  // Stopped by its caller (an agent's Stop) while it ran: the caller's reason.
+  const stopped = markers(deferred());
+  stopped._requireOptions = () => MARKERS;
+  stopped._ensureController = () => ({ scopeOf: () => null, describeGroups: async () => ({ groups: [] }), plan: () => ({ blocker: null, testedCount: 2 }) });
+  const stop = new AbortController();
+  stopped._lastResult = null;
+  stopped._runAnalysis = async () => { stop.abort(new DOMException('The person stopped Claude.', 'AbortError')); };
+  stopped.cancelRun = () => {};
+  await assert.rejects(stopped.runNow({ signal: stop.signal }), /The person stopped Claude\./);
+  // Canceled by a person (Cancel in the panel): nothing kept, said so (lane-analyst L3-14).
+  const cancelledRun = markers(deferred());
+  cancelledRun._requireOptions = () => MARKERS;
+  cancelledRun._ensureController = stopped._ensureController;
+  cancelledRun._lastResult = null;
+  cancelledRun._runAnalysis = async () => {};
+  await assert.rejects(cancelledRun.runNow(), error => {
+    assert.equal(error.name, 'AbortError');
+    assert.equal(error.message, 'Marker genes was canceled before it finished; nothing was kept.');
+    return true;
+  });
+});

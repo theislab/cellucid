@@ -49,7 +49,7 @@ async function readyAnnouncements(page, cells) {
   const { notifications } = await readRecord(page);
   return new Set(
     notifications
-      .filter(entry => entry.type === 'success' && entry.text.includes(`User data ready: ${cells} cells`))
+      .filter(entry => entry.type === 'success' && entry.text.includes(`: ${cells} cells`) && entry.text.startsWith('Opened '))
       .map(entry => entry.id),
   ).size;
 }

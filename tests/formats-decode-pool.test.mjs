@@ -8,7 +8,7 @@
  * - small chunks, a missing `Worker` constructor and a worker that fails to
  *   start all decode in this thread;
  * - a damaged chunk fails with the same error class and message either way;
- * - a cancelled decode stops waiting at once (a waiting task is never sent),
+ * - a canceled decode stops waiting at once (a waiting task is never sent),
  *   and the pool keeps working; idle workers are terminated;
  * - the decoder probe: a read goes with the engine's prior or the decision,
  *   never an untested decoder; decoders are measured while the pool is
@@ -403,7 +403,7 @@ test('a damaged chunk fails with the same error class and message on a worker as
 // Cancellation and lifetime.
 
 test('a cancelled decode stops waiting at once; a waiting one is never sent; the pool keeps working', async () => {
-  // The worker's answers are held until released: the cancelled read must
+  // The worker's answers are held until released: the canceled read must
   // have stopped waiting before the worker has answered anything.
   const { counts, createWorker, answers } = countingWorkers({ holdAnswers: true });
   // One worker, one task at a time in it: the second task waits in the pool.

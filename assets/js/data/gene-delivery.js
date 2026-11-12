@@ -12,7 +12,7 @@
  * values (`compute/data-worker.js` takes it from the worker's inbox).
  *
  * Every port of a route has a generation. A worker the pool replaced (a
- * cancelled task outlived its grace, `worker-pool.js`) gets a new port, one
+ * canceled task outlived its grace, `worker-pool.js`) gets a new port, one
  * generation on; a delivery made for an older generation is dropped, and the
  * task naming it answers `lost`, so the run reads those genes again.
  *

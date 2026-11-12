@@ -149,10 +149,10 @@ int cubeFaceOf(vec3 d, out vec2 uv) {
 /**
  * Star field on a cube-face cell grid. A cell holds at most one star, kept
  * inside the middle half of the cell, so a fragment only tests its own cell.
- * The bake evaluates the same stars (with neighbours) for their halos.
+ * The bake evaluates the same stars (with neighbors) for their halos.
  */
 const STARS_GLSL = `
-// x: present (0/1), y: magnitude 0..1, z: colour temperature 0..1; dir out.
+// x: present (0/1), y: magnitude 0..1, z: color temperature 0..1; dir out.
 vec3 starInCell(int face, vec2 cell, float cells, float probability, float seed, out vec3 dir) {
   vec3 key = vec3(cell, float(face) * 131.0 + seed);
   float h = hash13(key);
@@ -429,7 +429,7 @@ uniform float u_pixelRatio;   // device px per CSS px
 uniform vec2 u_viewport;      // pane size, device px
 uniform float u_glowCenterX;  // NDC x of the presented area's centre
 uniform float u_opacity;      // fade-in 0..1
-uniform vec3 u_surface;       // clear colour (sRGB)
+uniform vec3 u_surface;       // clear color (sRGB)
 uniform float u_planar;       // 1: planar pane (virtual sky camera + near tile)
 uniform vec3 u_stageCenter;
 uniform vec3 u_stageExtent;
@@ -550,7 +550,7 @@ const vec3 DEEP = vec3(0.0011, 0.0013, 0.0034);
 const vec3 BAND_LIFT = vec3(0.0042, 0.0040, 0.0062);
 
 // Data tints graded toward the classic emission palette (H-alpha rose,
-// O-III teal), so a field of warm colours never turns the sky to mud.
+// O-III teal), so a field of warm colors never turns the sky to mud.
 vec3 grade(vec3 tint, vec3 cosmic) {
   vec3 t = mix(tint, cosmic, 0.5);
   return t / max(luma(t), 1e-3);
@@ -558,7 +558,7 @@ vec3 grade(vec3 tint, vec3 cosmic) {
 
 // detail: fine fBm evaluated per fragment, finer than the cube's texels, so
 // the clouds stay crisp at 4K and DPR 2 (-1..1, faded out where it would alias).
-vec3 nebulaColour(vec4 s, float band, float detail) {
+vec3 nebulaColor(vec4 s, float band, float detail) {
   float a = s.r * (1.0 + 0.45 * detail);
   float b = s.g * 2.0 * (1.0 + 0.6 * detail);
   float dust = clamp(s.b * (1.0 - 0.35 * detail), 0.0, 1.0);
@@ -602,7 +602,7 @@ void main() {
     vec3 d = ray;
     vec4 s = texture(u_sky, d);
     float band = exp(-pow(dot(d, BAND_NORMAL) / 0.34, 2.0));
-    col = nebulaColour(s, band, nebulaDetail(d, pixelAngle));
+    col = nebulaColor(s, band, nebulaDetail(d, pixelAngle));
     // Near layer: a dust shell around the stage, which slides against the
     // sky as the camera moves.
     vec3 oc = u_eye - u_stageCenter;
@@ -627,7 +627,7 @@ void main() {
     float skyPixel = max(length(fwidth(d)), 1e-6);
     vec4 s = texture(u_sky, d);
     float band = exp(-pow(dot(d, BAND_NORMAL) / 0.34, 2.0));
-    col = nebulaColour(s, band, nebulaDetail(d, skyPixel));
+    col = nebulaColor(s, band, nebulaDetail(d, skyPixel));
     float glow = s.a / max(1.0 - s.a, 1e-3);
     col += kneeLuminance(vec3(0.85, 0.90, 1.0) * glow * 0.020, 0.045) * behind;
     col += (starCores(d, 40.0, 0.05 + 0.16 * band, 3.0, 1.0, skyPixel, twinkle)
@@ -698,7 +698,7 @@ void main() {
   float reach = max(max(u_stageExtent.x, u_stageExtent.z), 0.6) * 2.4;
   if (u_planar < 0.5) {
     // An infinite cyclorama: the floor sweeps up into the wall at the
-    // horizon with no edge; both meet the same horizon colour.
+    // horizon with no edge; both meet the same horizon color.
     float height = u_eye.y - u_floorY;
     float rise = clamp(ray.y, -1.0, 1.0);
     vec2 keyDir = normalize(u_keyLight.xz + 1e-5);
@@ -725,14 +725,14 @@ void main() {
       float pool = exp(-dot(offset, offset) / (reach * reach));
       float wide = exp(-dot(offset, offset) / (reach * reach * 9.0));
       float side = dot(normalize(offset + 1e-5), keyDir) * smoothstep(0.0, reach, length(offset));
-      vec3 lightColour = mix(FILL, KEY, 0.55 + 0.45 * side);
-      vec3 floorColour = PAPER * lightColour * (0.86 + 0.08 * wide + 0.12 * pool);
-      floorColour = applyShadow(floorColour, shadowAt(uv));
-      floorColour *= 1.0 + 0.010 * grain;
-      // The cove: the floor blends into the horizon colour as it nears
+      vec3 lightColor = mix(FILL, KEY, 0.55 + 0.45 * side);
+      vec3 floorColor = PAPER * lightColor * (0.86 + 0.08 * wide + 0.12 * pool);
+      floorColor = applyShadow(floorColor, shadowAt(uv));
+      floorColor *= 1.0 + 0.010 * grain;
+      // The cove: the floor blends into the horizon color as it nears
       // grazing, so floor and wall meet without an edge.
       float cove = 1.0 - smoothstep(0.0, 0.30, -rise);
-      col = mix(floorColour, horizon, cove);
+      col = mix(floorColor, horizon, cove);
     } else if (rise > 0.0 && height < 0.0) {
       // Below the stage, looking up: the floor is a sheet of paper lit from
       // above, glowing through, with the data's shadow showing through it as
@@ -780,19 +780,19 @@ const float DIP = 0.55;
 
 vec3 water(vec3 d, vec4 s, float planarMurk) {
   float rise = d.y;
-  vec3 top, horizon, depth, shaftColour, causticColour;
+  vec3 top, horizon, depth, shaftColor, causticColor;
   if (u_dark > 0.5) {
     top = vec3(0.012, 0.050, 0.068);
     horizon = vec3(0.0035, 0.0160, 0.0250);
     depth = vec3(0.0005, 0.0018, 0.0036);
-    shaftColour = vec3(0.020, 0.080, 0.085);
-    causticColour = vec3(0.012, 0.050, 0.050);
+    shaftColor = vec3(0.020, 0.080, 0.085);
+    causticColor = vec3(0.012, 0.050, 0.050);
   } else {
     top = vec3(0.90, 0.98, 0.96);
     horizon = vec3(0.56, 0.81, 0.83);
     depth = vec3(0.40, 0.69, 0.74);
-    shaftColour = vec3(0.36, 0.28, 0.18);
-    causticColour = vec3(0.20, 0.17, 0.12);
+    shaftColor = vec3(0.36, 0.28, 0.18);
+    causticColor = vec3(0.20, 0.17, 0.12);
   }
   vec3 col = rise > 0.0
     ? mix(horizon, top, pow(smoothstep(0.0, 1.0, rise), 0.7))
@@ -804,13 +804,13 @@ vec3 water(vec3 d, vec4 s, float planarMurk) {
   float sunAngle = acos(clamp(dot(d, SUN), -1.0, 1.0));
   float sunGlow = exp(-sunAngle * sunAngle / 0.20);
   if (u_dark > 0.5) {
-    col += shaftColour * shafts;
-    col += causticColour * s.g;
-    col += shaftColour * 0.7 * sunGlow;
+    col += shaftColor * shafts;
+    col += causticColor * s.g;
+    col += shaftColor * 0.7 * sunGlow;
     col = kneeLuminance(col, 0.046);
   } else {
-    col += shaftColour * shafts * 0.40;
-    col += causticColour * s.g * 0.8;
+    col += shaftColor * shafts * 0.40;
+    col += causticColor * s.g * 0.8;
     // The sunlit surface overhead, rippled: darker troughs between the
     // bright caustic crests.
     col = mix(col, col * vec3(0.84, 0.93, 0.96), (1.0 - s.g) * smoothstep(0.25, 0.8, rise) * 0.55);
@@ -822,7 +822,7 @@ vec3 water(vec3 d, vec4 s, float planarMurk) {
 
 // Sunlit shallows only: a sandy floor below the stage under a caustic web,
 // sliding with true parallax and fading into turquoise water.
-vec3 sandFloor(vec2 uv, float distance, vec3 waterColour) {
+vec3 sandFloor(vec2 uv, float distance, vec3 waterColor) {
   // Two baked web layers (tile .g and .b) drifting against each other.
   float drift = u_time * 0.02;
   float caustic = texture(u_tile, uv * 1.3 / 8.0 + vec2(drift, 0.3 * drift)).g * 0.65
@@ -833,17 +833,17 @@ vec3 sandFloor(vec2 uv, float distance, vec3 waterColour) {
   // Shallow water over the sand: a light turquoise cast, deepening with distance.
   lit *= vec3(0.90, 0.98, 0.97);
   float fog = 1.0 - exp(-distance / 11.0);
-  return mix(lit, waterColour, clamp(fog, 0.0, 1.0));
+  return mix(lit, waterColor, clamp(fog, 0.0, 1.0));
 }
 
-vec3 seaFloor(vec3 ray, vec3 waterColour) {
+vec3 seaFloor(vec3 ray, vec3 waterColor) {
   // The sand lies under the stage, and sinks under a camera that dives
   // below the data, so there is always a sea floor beneath the viewer.
   float floorY = min(u_floorY - 1.2, u_eye.y - 1.2);
-  if (u_dark > 0.5 || ray.y >= -0.01) return waterColour;
+  if (u_dark > 0.5 || ray.y >= -0.01) return waterColor;
   float t = (floorY - u_eye.y) / ray.y;
   vec2 uv = (u_eye + ray * t).xz;
-  return sandFloor(uv, t, waterColour);
+  return sandFloor(uv, t, waterColor);
 }
 
 void main() {
@@ -934,9 +934,9 @@ vec3 sky(vec3 d, vec4 s, float pixelAngle, float behind) {
     col += vec3(0.30, 0.24, 0.14) * exp(-sunAngle * sunAngle / 0.004);
     // Clouds lit pink-gold on the sun side, lavender in their shade.
     float sunSide = 0.5 + 0.5 * dot(normalize(d.xz + 1e-5), normalize(SUN.xz));
-    vec3 litColour = mix(vec3(1.0, 0.96, 0.97), vec3(1.0, 0.85, 0.70), sunSide * sunSide);
-    vec3 shadeColour = vec3(0.62, 0.62, 0.80);
-    vec3 cloud = mix(shadeColour, litColour, smoothstep(0.15, 0.85, s.g));
+    vec3 litColor = mix(vec3(1.0, 0.96, 0.97), vec3(1.0, 0.85, 0.70), sunSide * sunSide);
+    vec3 shadeColor = vec3(0.62, 0.62, 0.80);
+    vec3 cloud = mix(shadeColor, litColor, smoothstep(0.15, 0.85, s.g));
     col = mix(col, cloud, clamp(s.r * 1.25, 0.0, 0.95));
     col = floorLuminance(col, 0.62);
   }
@@ -979,9 +979,9 @@ void main() {
     vec3 d = dipped(ray, DIP);
     float pixelAngle = max(length(fwidth(d)), 1e-6);
     vec4 s = texture(u_sky, d);
-    vec3 skyColour = sky(d, s, pixelAngle, behind);
+    vec3 skyColor = sky(d, s, pixelAngle, behind);
     if (d.y >= 0.0) {
-      col = skyColour;
+      col = skyColor;
     } else {
       vec3 horizonDir = normalize(vec3(d.x, 0.004, d.z));
       vec3 haze = sky(horizonDir, texture(u_sky, horizonDir), pixelAngle, 0.0);

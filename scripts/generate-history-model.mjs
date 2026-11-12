@@ -21,7 +21,7 @@
  * The sibling repositories are found next to this one, or where
  * `CELLUCID_PYTHON_ROOT` and `CELLUCID_R_ROOT` say; one that is not there is
  * named and skipped. After writing, put the printed digest in the three
- * tests. Canonical as the action catalogue is: object keys sorted, two-space
+ * tests. Canonical as the action catalog is: object keys sorted, two-space
  * indent, one trailing newline.
  */
 

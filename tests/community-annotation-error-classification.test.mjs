@@ -60,3 +60,25 @@ test('codes decide: Worker versions, layout, contract, unreachable, cut answers'
   assert.equal(isTransientRoleResolutionFailure(withProps('x', { status: 503 })), true);
   assert.equal(isTransientRoleResolutionFailure(withProps('x', { status: 422 })), false);
 });
+
+test('a programming TypeError is the code\'s own failure, never an unreachable Worker asked again', async () => {
+  // Round 9: any TypeError read as "GitHub unreachable", so a broken contract was retried and said as GitHub's.
+  const programming = new TypeError("Cannot read properties of undefined (reading 'login')");
+  assert.equal(isWorkerUnreachable(programming), false);
+  assert.equal(isTransientRoleResolutionFailure(programming), false);
+  assert.equal(isWorkerUnreachable(new TypeError('Failed to fetch')), false, 'a raw rejection never reaches here');
+  // fetch's own rejection, as the one transport names it: unanswered, and asked again.
+  const { fetchOnce } = await import('../assets/js/formats/io/byte-source.js');
+  const { createHostBook } = await import('../assets/js/formats/io/hosts.js');
+  let failure = null;
+  try {
+    await fetchOnce('https://worker.example/me', {}, {
+      fetchImpl: async () => { throw new TypeError('Failed to fetch'); },
+      hosts: createHostBook(),
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.equal(isWorkerUnreachable(failure), true);
+  assert.equal(isTransientRoleResolutionFailure(failure), true);
+});

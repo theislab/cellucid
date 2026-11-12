@@ -139,8 +139,8 @@ test('the Stored row sums up what is kept, and its dialog lists it by dataset an
   await rememberHosts(page);
   await keepItems(page);
   await expect(page.locator('#kept-stores-line')).toBeVisible();
-  // One line beside Manage…; the whole of it in its title.
-  await expect(page.locator('#kept-stores-text')).toHaveText('2 datasets · 11 MB · 2 more');
+  // One line beside Manage… naming the datasets; every kind in its title.
+  await expect(page.locator('#kept-stores-text')).toHaveText('2 datasets · 11 MB kept');
   await expect(page.locator('#kept-stores-text')).toHaveAttribute('title', '2 datasets · 11 MB · 2 connection speeds');
   expect(await page.locator('#kept-stores-text').evaluate(text => text.getClientRects().length)).toBe(1);
 
@@ -223,7 +223,9 @@ test('a saved state is listed under its dataset\'s name, and removed when chosen
   await expect(saved.locator('.kept-dataset-name')).toHaveText('Saved states');
   const row = saved.locator('[data-item-id^="saved:"]');
   await expect(row.locator('.select-item-name')).toHaveText('Current UI fixture');
-  await expect(row.locator('.select-item-meta')).toHaveText('Saved as "Probe" · 0 steps · saved today');
+  // What it is in the words of every list of saved states (`savedStateWords`), and when, as every
+  // list of the app says it (`formatAgo`): saved a moment ago.
+  await expect(row.locator('.select-item-meta')).toHaveText('"Probe" · 0 steps · saved just now');
   await expect(page.locator('#kept-stores-where dt:text-is("Holds") + dd')).toHaveText('files, saved states, My datasets, connection speeds');
   await row.locator('input').check();
   await page.locator('#kept-stores-remove-selected').click();

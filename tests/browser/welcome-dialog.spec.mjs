@@ -16,6 +16,7 @@
  */
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
+import { tabKey } from './helpers/dialog-keys.mjs';
 import { expectWelcomeShown } from './helpers/welcome.mjs';
 
 const PLAIN_START_URL =
@@ -81,10 +82,11 @@ test('Start exploring closes the dialog and opens nothing else', async ({
 
 test('Start exploring from the keyboard closes the dialog and leaves the dropdown inactive', async ({
   page,
+  browserName,
 }) => {
   const errors = observeProductErrors(page);
   await openPlainStart(page);
-  await page.keyboard.press('Tab');
+  await page.keyboard.press(tabKey(browserName));
   await expect(page.locator('#welcome-start-btn')).toBeFocused();
   await page.keyboard.press('Enter');
   await expect(page.locator('#welcome-modal')).toBeHidden();
@@ -113,7 +115,9 @@ test('the backdrop closes onboarding without activating the dropdown', async ({
 }) => {
   const errors = observeProductErrors(page);
   await openPlainStart(page);
-  await page.locator('#welcome-modal .welcome-backdrop').click({
+  // The dialog is a layer over the whole screen; its corner, outside the
+  // card, is the backdrop.
+  await page.locator('#welcome-modal').click({
     position: { x: 8, y: 8 },
   });
   await expect(page.locator('#welcome-modal')).toBeHidden();

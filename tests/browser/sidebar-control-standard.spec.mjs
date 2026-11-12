@@ -86,7 +86,8 @@ test('equivalent controls compute one look wherever they are built', async ({
     },
     {
       name: 'secondary buttons',
-      selector: '#sidebar .btn:not(.btn-compact):not(.btn-primary):not([aria-pressed="true"]):not(:disabled)',
+      // A quiet button (an action nested in a row) speaks at the size of the text around it.
+      selector: '#sidebar .btn:not(.btn-compact):not(.btn-primary):not(.btn-quiet):not([aria-pressed="true"]):not(:disabled)',
       properties: ['font-family', 'font-size', 'letter-spacing', 'text-transform', 'border-radius', 'padding-top', 'padding-left', 'background-color'],
       minimum: 8,
     },
@@ -181,7 +182,7 @@ test('disclosures and switches work from the keyboard and publish their state', 
   await logSwitch.focus();
   await page.keyboard.press('Space');
   await expect(logSwitch).toHaveAttribute('aria-checked', 'true');
-  // The range sliders are labelled fields with live readouts.
+  // The range sliders are labeled fields with live readouts.
   await expect(page.getByRole('slider', { name: 'Minimum' })).toBeVisible();
   await expect(page.getByRole('slider', { name: 'Maximum' })).toBeVisible();
 });

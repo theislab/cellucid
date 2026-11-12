@@ -2,14 +2,14 @@
  * The page's own work between the reader's answer and the pixels, held to
  * the bytes it must produce and to what it costs at 10M cells.
  *
- * - The continuous colour kernels (`state/managers/continuous-colors.js`)
+ * - The continuous color kernels (`state/managers/continuous-colors.js`)
  *   are the per-cell rule, byte for byte, on columns made of what fields
  *   are made of at scale: runs of one value (a gene's zeros), a gene
  *   sample's unread NaN tail, the neutral floor, -0, infinities (scanned,
  *   with their cells named).
  * - A gene reaches the page with its sparse form (`data/column-forms.js`):
  *   the reader worker makes it where the column is made, the page notes it
- *   beside the column, and colours and statistics are read from it (a word
+ *   beside the column, and colors and statistics are read from it (a word
  *   fill and its entries, not two passes over every cell: ~50 ms of the
  *   main thread at 10M). A gene shown while its index is built crosses as
  *   that form alone, not as a whole column a partial answer.
@@ -29,7 +29,7 @@ import { resizedCellArray } from '../assets/js/app/state/managers/open-cells.js'
 import { annData, dataFrame, dense, mapping, sparse, strings, zarrEntries } from './helpers/anndata-store.mjs';
 
 /**
- * The per-cell rule: grey beneath for NaN, a non-positive value on a log
+ * The per-cell rule: gray beneath for NaN, a non-positive value on a log
  * scale, or a value at or below the floor; the bottom layer (not read) for
  * the cells from `readRows` on.
  */
@@ -96,7 +96,7 @@ function runsColumn(Values, n, seed, { negative = false, infinities = false } = 
   return values;
 }
 
-test('the colour kernels are the per-cell rule on runs, NaN tails, the floor and -0, at every scale and colormap', () => {
+test('the color kernels are the per-cell rule on runs, NaN tails, the floor and -0, at every scale and colormap', () => {
   for (const Values of [Float32Array, Float64Array]) {
     for (const [seed, negative] of [[1, false], [2, true]]) {
       const values = runsColumn(Values, 6000, seed, { negative });
@@ -136,7 +136,7 @@ test('the scan is the range and tally by definition, infinities named by their c
 
 test('the linear dense kernel samples the colormap only for the table\'s inexact buckets', () => {
   // Every value distinct (a continuous obs column): the colormap's sampler
-  // runs for about 1 % of the cells, the table answers the rest.
+  // runs for about 1% of the cells, the table answers the rest.
   const colormap = CONTINUOUS_COLORMAPS[0];
   let sampled = 0;
   const counting = { ...colormap, sampleInto: (t, out) => { sampled++; return colormap.sampleInto(t, out); } };
@@ -187,14 +187,14 @@ test('a sparse form gives back its column bit for bit, and is made only when sma
   assert.deepEqual(Array.from(sparseFormOf(wide).values), [0.1]);
 });
 
-test('a column whose form was noted is coloured and scanned from the form', () => {
+test('a column whose form was noted is colored and scanned from the form', () => {
   const n = 5000;
   const truth = new Float32Array(n);
   for (let i = 0; i < n; i += 41) truth[i] = 1 + (i % 7);
   truth.fill(Number.NaN, 4000);
   const form = sparseFormOf(truth);
   // A column whose cells say otherwise: only the form can give the truth's
-  // colours, so the kernels read it and no cell of the column.
+  // colors, so the kernels read it and no cell of the column.
   const column = new Float32Array(n).fill(9);
   noteColumnForm(column, form);
   assert.strictEqual(columnFormOf(column), form);
@@ -297,7 +297,7 @@ test('a gene reaches the page with its form noted, and while its index builds it
   sameBits(denseOfForm(columnFormOf(second)), first, 'the copy\'s form');
 });
 
-/** A DataState of `n` cells with one gene field, its viewer recording the colours it is handed. */
+/** A DataState of `n` cells with one gene field, its viewer recording the colors it is handed. */
 async function geneScene(n) {
   const { createDataState } = await import('../assets/js/app/state/core/data-state.js');
   const { createDimensionManager } = await import('../assets/js/data/dimension-manager.js');
@@ -324,7 +324,7 @@ async function geneScene(n) {
   return { state, pushed };
 }
 
-test('a gene shown on the cells read so far is coloured from its form exactly as from its column', async () => {
+test('a gene shown on the cells read so far is colored from its form exactly as from its column', async () => {
   const n = 3000;
   const truth = new Float32Array(n);
   for (let i = 0; i < n; i += 13) truth[i] = 0.5 + (i % 11);
@@ -335,7 +335,7 @@ test('a gene shown on the cells read so far is coloured from its form exactly as
   assert.equal(state.showPartialVarField(0, sparseFormOf(truth, 1200)), true);
   assert.deepEqual(pushed.at(-1), fromColumn, 'the same bytes from the form');
   // The cells not read are the bottom layer (not read), not the no-value
-  // grey; a form of another length is refused.
+  // gray; a form of another length is refused.
   assert.deepEqual(Array.from(fromColumn.subarray(2000 * 4, 2000 * 4 + 4)), [NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, UNREAD_ALPHA_BYTE]);
   assert.throws(() => state.showPartialVarField(0, sparseFormOf(truth.subarray(0, 2000), 1000)), /sparse form/);
 });

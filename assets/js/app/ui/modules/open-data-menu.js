@@ -10,8 +10,9 @@
  * dropped anywhere on the page opens the same way (`dataset-drop.js`).
  *
  * Keyboard: Enter, Space or Down opens the menu on its first item, Up on its
- * last; Up, Down, Home and End move; Escape closes it and returns to the
- * button; Tab closes it.
+ * last; in the menu, the keys of every menu (`menuKeyDown` in
+ * `ui/components/menu.js`: Up, Down, Home and End move; Escape closes it and
+ * returns to the button; Tab closes it and moves on from the button).
  *
  * The History panel's ⋯ menu and My datasets open the same way. Open, a
  * menu is shown above the page (moved to the body, or to the open dialog
@@ -27,6 +28,7 @@
  */
 
 import { onAbort } from '../../../utils/abort.js';
+import { menuKeyDown } from '../components/menu.js';
 import { StyleManager } from '../../../utils/style-manager.js';
 
 /**
@@ -113,22 +115,7 @@ export function initOpenDataMenu({ button, menu, items, onChoose, signal }) {
   }, options);
 
   menu.addEventListener('keydown', event => {
-    const index = items.indexOf(ownerDocument.activeElement);
-    const move = {
-      ArrowDown: (index + 1) % items.length,
-      ArrowUp: (index - 1 + items.length) % items.length,
-      Home: 0,
-      End: items.length - 1,
-    }[event.key];
-    if (move !== undefined) {
-      event.preventDefault();
-      items[move].focus();
-    } else if (event.key === 'Escape') {
-      event.preventDefault();
-      close({ restoreFocus: true });
-    } else if (event.key === 'Tab') {
-      close();
-    }
+    menuKeyDown(event, items, refocus => close({ restoreFocus: refocus }));
   }, options);
 
   for (const item of items) {

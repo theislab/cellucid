@@ -5,18 +5,12 @@
  */
 
 import { formatCells } from '../../../utils/format-units.js';
+import { parseIntersectionKey } from '../../utils/page-membership.js';
 
-/**
- * Produce a default label for an intersection bitmask, e.g. "A & B".
- * @param {number} mask
- * @param {string[]} labels
- * @returns {string}
- */
 function requirePageLabels(labels) {
   if (
     !Array.isArray(labels)
     || labels.length === 0
-    || labels.length > 31
     || labels.some(
       label => (
         typeof label !== 'string'
@@ -32,38 +26,27 @@ function requirePageLabels(labels) {
   return labels;
 }
 
-export function formatIntersectionLabel(mask, labels) {
-  if (!Number.isSafeInteger(mask) || mask < 1) {
-    throw new TypeError(
-      'Intersection mask must be a positive safe integer'
-    );
-  }
+/**
+ * Produce a default label for a combination of pages, e.g. "A & B".
+ * @param {string} key - The combination's key (`intersectionKey`)
+ * @param {string[]} labels - The pages' labels, by position
+ * @returns {string}
+ */
+export function formatIntersectionLabel(key, labels) {
   requirePageLabels(labels);
-  if (mask >= 2 ** labels.length) {
-    throw new RangeError(
-      'Intersection mask references a page outside the label inventory'
-    );
-  }
-  const parts = [];
-  for (let i = 0; i < labels.length; i++) {
-    if (mask & (1 << i)) parts.push(labels[i]);
-  }
-  if (parts.length < 2) {
-    throw new RangeError(
-      'Intersection mask must identify at least two pages'
-    );
-  }
-  return parts.join(' & ');
+  return parseIntersectionKey(key, labels.length)
+    .map(position => labels[position])
+    .join(' & ');
 }
 
 /**
- * Render editable labels for intersection rows and keep `labelsByMask` in sync.
+ * Render editable labels for intersection rows and keep `labelsByKey` in sync.
  *
  * @param {object} options
  * @param {HTMLElement} options.listEl
- * @param {Array<{mask: number, count: number}>} options.rows
+ * @param {Array<{key: string, count: number}>} options.rows
  * @param {string[]} options.pageLabels
- * @param {Record<string, string>} options.labelsByMask
+ * @param {Record<string, string>} options.labelsByKey
  * @param {() => void} options.onLabelsChanged
  * @param {AbortSignal} options.signal
  */
@@ -73,7 +56,7 @@ export function renderIntersectionLabelInputs(options) {
     || typeof options !== 'object'
     || Array.isArray(options)
     || Object.keys(options).sort().join(',') !==
-      'labelsByMask,listEl,onLabelsChanged,pageLabels,rows,signal'
+      'labelsByKey,listEl,onLabelsChanged,pageLabels,rows,signal'
   ) {
     throw new TypeError(
       'Intersection input options must use the exact current schema'
@@ -83,7 +66,7 @@ export function renderIntersectionLabelInputs(options) {
     listEl,
     rows,
     pageLabels,
-    labelsByMask,
+    labelsByKey,
     onLabelsChanged,
     signal
   } = options;
@@ -113,13 +96,13 @@ export function renderIntersectionLabelInputs(options) {
   }
   requirePageLabels(pageLabels);
   if (
-    labelsByMask === null
-    || typeof labelsByMask !== 'object'
-    || Array.isArray(labelsByMask)
-    || Object.getPrototypeOf(labelsByMask) !== Object.prototype
+    labelsByKey === null
+    || typeof labelsByKey !== 'object'
+    || Array.isArray(labelsByKey)
+    || Object.getPrototypeOf(labelsByKey) !== Object.prototype
   ) {
     throw new TypeError(
-      'Intersection labelsByMask must be a plain object'
+      'Intersection labelsByKey must be a plain object'
     );
   }
   if (typeof onLabelsChanged !== 'function') {
@@ -143,9 +126,8 @@ export function renderIntersectionLabelInputs(options) {
       row === null
       || typeof row !== 'object'
       || Array.isArray(row)
-      || Object.keys(row).sort().join(',') !== 'count,mask'
-      || !Number.isSafeInteger(row.mask)
-      || row.mask < 1
+      || Object.keys(row).sort().join(',') !== 'count,key'
+      || typeof row.key !== 'string'
       || !Number.isSafeInteger(row.count)
       || row.count < 1
     ) {
@@ -153,31 +135,27 @@ export function renderIntersectionLabelInputs(options) {
         `Intersection input row ${index} is malformed`
       );
     }
-    formatIntersectionLabel(row.mask, pageLabels);
-    const maskKey = String(row.mask);
-    if (active.has(maskKey)) {
+    formatIntersectionLabel(row.key, pageLabels);
+    if (active.has(row.key)) {
       throw new Error(
-        `Intersection input mask ${maskKey} is duplicated`
+        `Intersection input ${row.key} is duplicated`
       );
     }
-    active.add(maskKey);
+    active.add(row.key);
   }
-  for (const key of Object.keys(labelsByMask)) {
-    if (!active.has(key)) delete labelsByMask[key];
+  for (const key of Object.keys(labelsByKey)) {
+    if (!active.has(key)) delete labelsByKey[key];
   }
 
   const fragment = ownerDocument.createDocumentFragment();
 
   rows.forEach((row) => {
-    const maskKey = String(row.mask);
-    if (!Object.hasOwn(labelsByMask, maskKey)) {
-      labelsByMask[maskKey] = formatIntersectionLabel(
-        row.mask,
-        pageLabels
-      );
-    } else if (typeof labelsByMask[maskKey] !== 'string') {
+    const key = row.key;
+    if (!Object.hasOwn(labelsByKey, key)) {
+      labelsByKey[key] = formatIntersectionLabel(key, pageLabels);
+    } else if (typeof labelsByKey[key] !== 'string') {
       throw new TypeError(
-        `Intersection label ${maskKey} must be a string`
+        `Intersection label ${key} must be a string`
       );
     }
 
@@ -191,10 +169,10 @@ export function renderIntersectionLabelInputs(options) {
     const input = ownerDocument.createElement('input');
     input.type = 'text';
     input.className = 'obs-select cat-builder-intersection-input';
-    input.value = labelsByMask[maskKey];
-    input.dataset.mask = maskKey;
+    input.value = labelsByKey[key];
+    input.dataset.pages = key;
     input.addEventListener('input', () => {
-      labelsByMask[maskKey] = input.value;
+      labelsByKey[key] = input.value;
       onLabelsChanged();
     }, { signal });
 

@@ -25,17 +25,28 @@ import {
 } from '../schema-contract.js';
 import { requireExactKeys, requireKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 import { formatCountOf } from '../../../utils/format-units.js';
-import { throwIfAborted, cancelled } from '../../../utils/abort.js';
+import { throwIfAborted, cancelled, requireSignalOrNull } from '../../../utils/abort.js';
+import { markDamaged } from '../../../utils/errors.js';
 
 /**
  * The byte stream ended before a read it was asked for. Kept distinct so the
  * header check can tell "too short to be a session file" from a real failure.
  */
+/** A file that ends before what it declares: damaged (`utils/errors.js` `markDamaged`). */
 class UnexpectedEndOfFileError extends Error {
   constructor(message) {
     super(message);
     this.name = 'UnexpectedEndOfFileError';
+    markDamaged(this);
   }
+}
+
+/**
+ * A file whose framing breaks the format: its words (offsets, lengths, ids)
+ * go under Details; the person reads that the file is damaged.
+ */
+function damaged(message, options) {
+  return markDamaged(new Error(message, options));
 }
 
 class StreamByteReader {
@@ -154,13 +165,13 @@ class StreamByteReader {
   async assertEnd() {
     await this._fill();
     if (this._queue.length !== 0) {
-      throw new Error(`Invalid ${this._file}: trailing bytes after declared chunks.`);
+      throw damaged(`Invalid ${this._file}: trailing bytes after declared chunks.`);
     }
     if (!this._streamDone) {
-      throw new Error(`Invalid ${this._file}: byte stream did not reach its exact end.`);
+      throw damaged(`Invalid ${this._file}: byte stream did not reach its exact end.`);
     }
     if (this._totalBytes !== null && this._position !== this._totalBytes) {
-      throw new Error(`Invalid ${this._file}: consumed byte count does not match file size.`);
+      throw damaged(`Invalid ${this._file}: consumed byte count does not match file size.`);
     }
   }
 }
@@ -218,15 +229,7 @@ export async function readBundle(source, options) {
   ) {
     throw new TypeError('readBundle: expected a Blob/File or ReadableStream<Uint8Array>.');
   }
-  if (
-    signal !== null
-    && (
-      typeof signal !== 'object'
-      || typeof signal.aborted !== 'boolean'
-    )
-  ) {
-    throw new TypeError('readBundle: signal must be an AbortSignal or null.');
-  }
+  requireSignalOrNull(signal, 'readBundle: signal');
   const onProgress = options.onProgress;
   if (onProgress !== null && typeof onProgress !== 'function') {
     throw new TypeError('readBundle: onProgress must be a function or null.');
@@ -260,9 +263,8 @@ export async function readBundle(source, options) {
     try {
       magic = await byteReader.readExactly(signature.bytes.byteLength);
     } catch (error) {
-      if (error instanceof UnexpectedEndOfFileError) {
-        throw new Error(signature.refusal(new Uint8Array(0)), { cause: error });
-      }
+      // Not a damaged file of this kind: not one at all (the end-of-file error is not its cause).
+      if (error instanceof UnexpectedEndOfFileError) throw new Error(signature.refusal(new Uint8Array(0)));
       throw error;
     }
     if (!signature.bytes.every((byte, i) => magic[i] === byte)) {
@@ -276,13 +278,13 @@ export async function readBundle(source, options) {
     // 2) Manifest length
     const manifestByteLength = await byteReader.readU32LE();
     if (manifestByteLength <= 0) {
-      throw new Error(`Invalid manifest length: ${formatCountOf(manifestByteLength, 'byte')}.`);
+      throw damaged(`Invalid manifest length: ${formatCountOf(manifestByteLength, 'byte')}.`);
     }
     if (
       byteReader.totalBytes != null
       && manifestByteLength > byteReader.totalBytes - byteReader.position
     ) {
-      throw new Error(
+      throw damaged(
         `Invalid manifest length: ${formatCountOf(manifestByteLength, 'byte')} is more than the ${file} holds (${file} truncated?).`
       );
     }
@@ -301,16 +303,16 @@ export async function readBundle(source, options) {
           { cause: error },
         );
       }
-      throw new Error(`Invalid ${file} (manifest JSON parse failed).`, {
+      throw damaged(`Invalid ${file} (manifest JSON parse failed).`, {
         cause: error,
       });
     }
 
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
-      throw new Error(`Invalid ${file} (manifest must be a JSON object).`);
+      throw damaged(`Invalid ${file} (manifest must be a JSON object).`);
     }
     if (!Array.isArray(manifest.chunks)) {
-      throw new Error(`Invalid ${file} (manifest.chunks must be an array).`);
+      throw damaged(`Invalid ${file} (manifest.chunks must be an array).`);
     }
   } catch (error) {
     await cancel(error);
@@ -322,27 +324,31 @@ export async function readBundle(source, options) {
       for (let i = 0; i < manifest.chunks.length; i++) {
         throwIfAborted(signal);
         const meta = manifest.chunks[i];
-        requirePlainRecord(meta, `${label} manifest chunk ${i}`);
-        const metaId = assertNonEmptyString(
-          meta.id,
-          `${label} manifest chunk ${i} id`,
-        );
+        // A chunk the manifest describes out of the format: the file is damaged.
+        let metaId;
+        let storedBytes;
+        try {
+          requirePlainRecord(meta, `${label} manifest chunk ${i}`);
+          metaId = assertNonEmptyString(meta.id, `${label} manifest chunk ${i} id`);
+          storedBytes = assertSafeInteger(
+            meta.storedBytes,
+            `${label} manifest chunk "${metaId}" storedBytes`,
+            { maximum: MAX_FRAME_BYTES },
+          );
+        } catch (error) {
+          throw markDamaged(error);
+        }
         const chunkByteLength = await byteReader.readU32LE();
 
-        const storedBytes = assertSafeInteger(
-          meta.storedBytes,
-          `${label} manifest chunk "${metaId}" storedBytes`,
-          { maximum: MAX_FRAME_BYTES },
-        );
         if (storedBytes !== chunkByteLength) {
-          throw new Error(`Chunk length mismatch for ${metaId}: header=${chunkByteLength}, manifest=${storedBytes}`);
+          throw damaged(`Chunk length mismatch for ${metaId}: header=${chunkByteLength}, manifest=${storedBytes}`);
         }
 
         // Bounds check against total file size (prevents "length says 2GB" on short files).
         if (byteReader.totalBytes != null) {
           const remaining = byteReader.totalBytes - byteReader.position;
           if (chunkByteLength > remaining) {
-            throw new Error(
+            throw damaged(
               `Invalid chunk length for ${metaId}: ${chunkByteLength} > remaining ${remaining} (${file} truncated?)`
             );
           }

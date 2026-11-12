@@ -5,10 +5,17 @@
 
    .btn               secondary pill: every ordinary action
    .btn.btn-primary   filled: the one action that commits a panel's work
-   .btn.btn-compact   the same pill, one size down, for actions inside a
-                      list, a box or a row of several
+   .btn.btn-compact   the same pill, one size down, for a panel's, a
+                      dialog's or a card's own actions where room is short
    .btn[aria-pressed] a toggle or a tool choice; pressed is filled
    .btn.btn-danger    filled red: the confirmation that destroys something
+   .btn.btn-quiet     no border, no fill, secondary text: an action nested
+                      inside something smaller than a panel (a list item's
+                      row or details, a chat turn; the deeper a control
+                      sits, the quieter it is); a soft fill on hover
+   .btn.btn-quiet.btn-quiet-primary
+                      the one main action of such a nested area: accent
+                      text, never a filled button
    .icon-btn          square icon-only action, named by aria-label and title
    .icon-btn-danger   an icon action that deletes
    ===================================================================== */
@@ -87,6 +94,41 @@
 .btn-primary:active:not(:disabled),
 .btn[aria-pressed="true"]:active:not(:disabled) {
   background-color: var(--color-interactive-primary-active);
+}
+
+/* Quiet: an action inside a nested area (a list item's details, a row).
+   Controls get quieter the deeper they sit (found 2026-11-11: a history
+   step's details carried full pills and a filled "Show", louder than the
+   panel around them). One line always: a quiet action never wraps. */
+.btn.btn-quiet {
+  min-height: max(var(--control-compact-height), var(--control-target-min));
+  padding: var(--control-button-compact-padding-y) var(--space-1-5);
+  border-color: transparent;
+  background-color: transparent;
+  color: var(--color-text-secondary);
+  /* A quiet action speaks at the size of the text around it. */
+  font-size: inherit;
+  font-weight: var(--font-weight-regular);
+  white-space: nowrap;
+}
+
+.btn.btn-quiet:hover:not(:disabled) {
+  border-color: transparent;
+  background-color: var(--color-interactive-secondary-hover);
+  color: var(--color-text-primary);
+}
+
+.btn.btn-quiet:active:not(:disabled) {
+  background-color: var(--color-interactive-secondary-active);
+}
+
+.btn.btn-quiet.btn-quiet-primary {
+  color: var(--color-accent-text);
+  font-weight: var(--font-weight-medium);
+}
+
+.btn.btn-quiet.btn-quiet-primary:hover:not(:disabled) {
+  color: var(--color-accent-text);
 }
 
 /* A confirmation that destroys something. */
@@ -205,6 +247,26 @@
   overflow: auto;
   box-sizing: border-box;
   color: var(--color-text-secondary);
+}
+
+/* The whole text of a row cut to one line, on a click or a tap
+   (ui/components/full-text-reveal.js): the info tooltip's surface, one short
+   paragraph. */
+.full-text-popover {
+  position: fixed;
+  z-index: calc(var(--z-notification) + 1);
+  background: var(--color-surface-elevated);
+  border: var(--border-default);
+  box-shadow: var(--shadow-lg);
+  max-width: min(300px, calc(100vw - var(--space-4)));
+  max-height: calc(100vh - var(--space-4));
+  overflow: auto;
+  box-sizing: border-box;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--type-body);
+  line-height: var(--leading-relaxed);
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
 }
 
 /* A tip: a title row with its close button, short paragraphs or a list, and

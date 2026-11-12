@@ -306,7 +306,7 @@ async function exportFigure(page, format) {
   const bytes = await readFile(await download.path());
   // The SVG is compared as bytes; the PNG as pixels, so a raster that
   // differs only by the rasterizer's last bit is told apart from one whose
-  // points, colours or visibility changed (helpers/pixel-parity.mjs).
+  // points, colors or visibility changed (helpers/pixel-parity.mjs).
   return format === 'png' ? decodePng(bytes) : exportFingerprint(bytes, format);
 }
 
@@ -349,8 +349,9 @@ test('a kept view shares per-cell memory until it writes, and its writes never r
 
   await page.locator('#figure-export-section > summary').click();
   await page.getByRole('button', { name: /^Framing\b/ }).click();
-  await page.getByLabel('Export width (px)').fill('400');
-  await page.getByLabel('Export height (px)').fill('300');
+  // A small figure: the single-column width (89 mm), its height from the plot's shape.
+  await page.getByLabel('Figure width preset').selectOption('single-column');
+  await expect(page.getByLabel('Figure width (mm)')).toHaveValue('89');
   await page.getByRole('button', { name: /^Download\b/ }).click();
 
   const liveBefore = await readViewPublication(page);
@@ -374,7 +375,7 @@ test('a kept view shares per-cell memory until it writes, and its writes never r
       transparencyShared: kept.categoryTransparency === live.categoryTransparency,
       maskShared: kept.cellVisibilityMask === live.cellVisibilityMask,
       // The kept view's colors are the live array until either view is
-      // recoloured: a filter writes visibility only, never colours.
+      // recolored: a filter writes visibility only, never colors.
       colorsShared: kept.colorsArray === live.colorsArray,
       types: [
         kept.categoryTransparency.constructor.name,

@@ -75,8 +75,10 @@
  * @module data/host-link-memory
  */
 
+import { isLoopbackUrl } from '../utils/loopback.js';
 import { LOCAL_POLICY } from '../formats/io/byte-source.js';
 import { isHeld } from '../utils/machine.js';
+import { webStorage } from '../utils/web-storage.js';
 
 /** Where the records are kept. */
 export const HOST_LINK_STORAGE_KEY = 'cellucid:host-link:v1';
@@ -141,14 +143,7 @@ export function hostOf(source) {
  * @returns {boolean}
  */
 export function onThisMachine(origin) {
-  if (typeof origin !== 'string') return false;
-  let hostname;
-  try {
-    hostname = new URL(origin).hostname;
-  } catch {
-    return false;
-  }
-  return hostname === 'localhost' || hostname.endsWith('.localhost') || /^127\.\d+\.\d+\.\d+$/.test(hostname) || hostname === '[::1]';
+  return typeof origin === 'string' && isLoopbackUrl(origin);
 }
 
 /**
@@ -194,11 +189,7 @@ function readAll(storage) {
 
 /** The page's storage, when it has one it may use. */
 function pageStorage() {
-  try {
-    return globalThis.localStorage ?? null;
-  } catch {
-    return null;
-  }
+  return webStorage('localStorage');
 }
 
 /**
@@ -301,13 +292,14 @@ function readPaces(storage) {
 /** Keep `all` (origin -> record), the most recently changed `HOST_LINK_RECORDS`. Never throws. */
 function writePaces(all, storage) {
   const kept = Object.entries(all)
-    .filter(([key, value]) => /^https?:\/\/[^/?#\s]+$/.test(key) && value?.paceMs > 0 && Number.isFinite(value.paceMs))
+    // A host on this machine never keeps a pace (`rememberedHostPace`).
+    .filter(([key, value]) => /^https?:\/\/[^/?#\s]+$/.test(key) && !onThisMachine(key) && value?.paceMs > 0 && Number.isFinite(value.paceMs))
     .sort((a, b) => (b[1].at ?? 0) - (a[1].at ?? 0))
     .slice(0, HOST_LINK_RECORDS);
   try {
     storage.setItem(HOST_PACE_STORAGE_KEY, JSON.stringify(Object.fromEntries(kept)));
   } catch {
-    // Storage refused: the pace is learnt again on the next block.
+    // Storage refused: the pace is learned again on the next block.
   }
 }
 
@@ -347,19 +339,22 @@ function visitPace(origin, storage, now) {
  * @returns {number}
  */
 export function rememberedHostPace(origin, storage = pageStorage()) {
-  if (typeof origin !== 'string') return 0;
+  // A host on this machine blocks no network: silence from it is a server restarting or down,
+  // and a pace learned from it would slow every later visit for a day (found 2026-11-10: Suo from
+  // a local server read at 5-60 KB/s for 95 s after one episode of lost answers).
+  if (typeof origin !== 'string' || onThisMachine(origin)) return 0;
   const paceMs = readPaces(storage)[origin]?.paceMs;
   return paceMs > 0 && Number.isFinite(paceMs) ? paceMs : 0;
 }
 
 /**
  * Keep the pace `origin` was found to bear (`hosts.js` `watchPace`, a block
- * met in this visit): an origin and a number, the most recently learnt
+ * met in this visit): an origin and a number, the most recently learned
  * `HOST_LINK_RECORDS` kept. The pace kept is never faster than the one the
  * host's last block taught (`learntMs`): a block met at a pace loosened
  * since (`visitPace`) snaps it back, and counts as the host's second (it
  * stays paced from then on), as does a block that teaches a slower pace
- * still. The same pace heard again (learnt in one realm, told to another)
+ * still. The same pace heard again (learned in one realm, told to another)
  * is not another block. Never throws.
  *
  * @param {string|null} origin

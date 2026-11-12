@@ -27,7 +27,7 @@ import { embeddingOrigin, isLocalOrigin, pageOrigin } from './page-context.js';
 import { finalSignInFailure, getSignInSteps } from './sign-in.js';
 import { readSignInRecord, removeSignIn, setSignInExpiry, writeSignInRecord } from './token-store.js';
 import { whileWaitingOnPerson } from '../../../utils/person-wait.js';
-import { onAbort, throwIfAborted } from '../../../utils/abort.js';
+import { abortReason, onAbort, throwIfAborted } from '../../../utils/abort.js';
 
 export const DRIVE_FILE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 export const GIS_SCRIPT_URL = 'https://accounts.google.com/gsi/client';
@@ -112,7 +112,7 @@ export function describeGoogleError(error) {
     case 'popup_closed':
       return signInFailure(
         'Google\'s sign-in window was closed before it finished. If Google said "Access blocked", your ' +
-        'organisation\'s administrator does not allow Cellucid: sign in with a personal Google account, or ask ' +
+        'organization\'s administrator does not allow Cellucid: sign in with a personal Google account, or ask ' +
         'them (the Cellucid documentation, "Google Workspace accounts: administrator approval", says how).',
         'POPUP_CLOSED',
         { help: GOOGLE_ADMIN_HELP }
@@ -327,7 +327,7 @@ export function createGoogleAuth({
       let picker = null;
       const stopWaiting = onAbort(signal, () => {
         picker?.setVisible(false);
-        reject(signal.reason);
+        reject(abortReason(signal));
       });
       picker = new pickerApi.PickerBuilder()
         .addView(view)
@@ -375,6 +375,7 @@ export function createGoogleAuth({
     // within its hour, which the caller says.
     return (async () => {
       try {
+        // Raw fetch: a keepalive revocation that outlives the page, never ended as stalled.
         const response = await fetchImpl(REVOKE_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },

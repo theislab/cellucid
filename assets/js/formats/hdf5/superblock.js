@@ -137,7 +137,7 @@ export async function readSuperblock(reader, signal = null, activity = null) {
   // The end-of-file address is absolute (it counts the user block).
   if (endOfFile !== null && endOfFile > size) {
     throw new Hdf5FormatError(
-      `${reader.name} is truncated: the superblock says it is ${formatCountOf(endOfFile, 'byte')} long, but it is ${size}.`
+      `${reader.name} is truncated: the superblock says it is ${formatCountOf(endOfFile, 'byte')} long, but it is ${formatCountOf(size, 'byte')}.`
     );
   }
   return { version, offset, offsetSize, lengthSize, rootAddress, rootSymbolTable, extensionAddress, endOfFile, btreeK };

@@ -3,7 +3,7 @@
  * @module ui/onboarding
  */
 
-export { initKeyboardShortcuts } from './keyboard-shortcuts.js';
+export { initKeyboardShortcuts, provideShortcut } from './keyboard-shortcuts.js';
 export {
   hideWelcomeModal,
   initWelcomeModal,

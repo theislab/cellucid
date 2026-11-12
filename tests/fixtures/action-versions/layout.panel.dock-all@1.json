@@ -1,0 +1,12 @@
+{
+  "examples": [
+    {}
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {},
+    "type": "object"
+  },
+  "type": "layout.panel.dock-all",
+  "version": 1
+}

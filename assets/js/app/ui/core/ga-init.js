@@ -11,8 +11,8 @@
  * a change in the Google Analytics property cannot widen it:
  *
  * - consent defaults deny advertising storage, advertising use of user data
- *   and ad personalisation (only `analytics_storage` is granted), and Google
- *   signals and ad-personalisation signals are off;
+ *   and ad personalization (only `analytics_storage` is granted), and Google
+ *   signals and ad-personalization signals are off;
  * - the page location and referrer are origin and path only, set for every
  *   hit: the query string names what the page opens (`dataset`, `remote`,
  *   `data`, `sampleCatalog`, a subsample) and can carry a private server

@@ -11,8 +11,8 @@
  *   added and what was already there; Continue opens an imported history.
  * - A file that is not a library file is refused in the status line, and
  *   nothing is added.
- * - Dropped on the page, a library file is imported in All… the same way; a
- *   session file is refused saying what it is and where it goes.
+ * - Dropped on the page, a library file is imported in All… the same way (a
+ *   session file dropped loads as Load…'s: `history-session-file.spec.mjs`).
  */
 import { closeContextWithApplicationRetirement, expect, test } from './helpers/test.mjs';
 import { expectDownloadNamed } from './helpers/downloads.mjs';
@@ -54,7 +54,7 @@ async function openAll(page) {
   await expect(dialog(page)).toBeVisible();
 }
 
-/** Colour by a categorical field not shown now, and wait until the step is kept in this browser. */
+/** Color by a categorical field not shown now, and wait until the step is kept in this browser. */
 async function takeAStep(page, datasetId) {
   const field = await page.evaluate(() => {
     const select = document.getElementById('categorical-field');
@@ -107,7 +107,7 @@ test('Export… writes the datasets and saved states ticked; Import… in anothe
   await exportPanel(page).locator('[data-export-action="confirm"]').click();
   const file = await download;
   expect(await file.failure()).toBeNull();
-  await expectDownloadNamed(file, /^cellucid-library-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d\.cellucid-library$/);
+  await expectDownloadNamed(file, /^cellucid-library-\d{8}_\d{6}\.cellucid-library$/);
   const path = testInfo.outputPath('my.cellucid-library');
   await file.saveAs(path);
   await expect(status(page)).toHaveText(`Exported 2 datasets and ${plural(kept)}.`);
@@ -153,7 +153,7 @@ test('Export… writes the datasets and saved states ticked; Import… in anothe
     'named:Figure 2 (imported)', 'named:Figure 2 (imported)',
   ]);
 
-  // Continue opens the dataset with an imported history: the field the step coloured by is back.
+  // Continue opens the dataset with an imported history: the field the step colored by is back.
   const resume = row(other, TRAJECTORY.name).locator('[data-library-action="continue"]');
   await expect(resume).toBeEnabled();
   await resume.click();
@@ -163,13 +163,5 @@ test('Export… writes the datasets and saved states ticked; Import… in anothe
   await expectNoFailureAnnounced(other);
   expect(otherErrors).toEqual([]);
 
-  // A session file dropped is no dataset: refused, saying what it is and where it goes.
-  const sessionSaid = await other.evaluate(async () => {
-    const { cellucidFileOfName } = await import('/assets/js/data/input-formats.js');
-    return cellucidFileOfName('x.cellucid-session').said;
-  });
-  await dragAndDrop(other, await createDrag(other, { files: [{ name: 'work.cellucid-session', base64: Buffer.from('CELLUCID_SESSION/4\n').toString('base64') }] }));
-  await expectAnnouncedOnce(other, new RegExp(sessionSaid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  await expect(dialog(other)).toBeHidden();
   await closeContextWithApplicationRetirement(context);
 });

@@ -6,8 +6,8 @@
  *
  * Each task is judged on the app, never on the model's words: the steps the
  * turn made exist and are the agent's (origin, name, turn), the state they
- * reach is what the task asks (a new annotation field coloured by; a
- * differential expression run and a gene coloured by; a first colouring; a
+ * reach is what the task asks (a new annotation field colored by; a
+ * differential expression run and a gene colored by; a first coloring; a
  * history read with nothing changed), the model wrote an answer, and one
  * click of Undo turn puts every state domain back.
  *
@@ -51,17 +51,19 @@ for (const run of RUNS) {
     async function task(page, text) {
       const turn = await liveTurn(page, text);
       for (const usage of turn.usage) ledger.add(usage.model, usage);
-      expect(turn.notes.filter(note => note.kind === 'error' || note.kind === 'refusal')).toEqual([]);
+      ledger.addProgress(test.info().title.split(':')[0], turn.progress, turn.usage);
+      expect(turn.notes.filter(note => ['error', 'refusal', 'empty', 'limit'].includes(note.kind))).toEqual([]);
       expect(turn.replied).toBe(true);
       return turn;
     }
 
-    test('annotate clusters: markers read, labels written as a new annotation field, coloured by it, one click undoes it', async ({ page }) => {
+    test('annotate clusters: markers read, labels written as a new annotation field, colored by it, one click undoes it', async ({ page }) => {
       test.setTimeout(15 * 60_000);
       await openLiveChat(page, run);
       const before = await fingerprint(page);
       const fieldsBefore = await obsFields(page);
-      const turn = await task(page, 'Annotate the clusters of cell_type: read their marker genes, propose a cell-type label for each cluster, write the labels as a new annotation field (keep cell_type as it is), colour by it, and explain each label.');
+      // The fixture's genes barely tell its clusters apart: a careful model asks or declines unless told to label anyway.
+      const turn = await task(page, 'Annotate the clusters of cell_type: read their marker genes, propose a cell-type label for each cluster, write the labels as a new annotation field (keep cell_type as it is), color by it, and explain each label. This is a small test dataset: where the markers are weak, still give each cluster your best label and say how unsure it is.');
       const steps = await stepsOfTurn(page, turn.turn);
       expect(steps.length).toBeGreaterThan(0);
       expect(steps.every(step => step.origin === 'agent' && step.agent === run.agent)).toBe(true);
@@ -71,35 +73,40 @@ for (const run of RUNS) {
       expect(fieldsAfter.find(field => field.key === 'cell_type').categories).toEqual(fieldsBefore.find(field => field.key === 'cell_type').categories);
       const shown = await shownField(page);
       const shownNew = added.find(field => (shown?.user === undefined ? field.key === shown?.key : field.user === shown.user));
-      expect(shownNew, 'coloured by the new field').toBeDefined();
+      expect(shownNew, 'colored by the new field').toBeDefined();
       await undoTurnByClick(page, turn.turn);
       expect(await fingerprint(page)).toEqual(before);
     });
 
-    test('compare populations: two groups, differential expression run, a telling gene coloured by, one click undoes it', async ({ page }) => {
+    test('compare populations: two groups, differential expression run, a telling gene colored by, one click undoes it', async ({ page }) => {
       test.setTimeout(15 * 60_000);
       await openLiveChat(page, run);
       const before = await fingerprint(page);
-      const turn = await task(page, 'Compare the alpha cells with the beta cells of cell_type: run differential expression between them, explain the top genes in each direction, and colour by the most telling gene.');
+      const turn = await task(page, 'Compare the alpha cells with the beta cells of cell_type: run differential expression between them, explain the top genes in each direction, and color by the most telling gene.');
       const steps = await stepsOfTurn(page, turn.turn);
       expect(steps.every(step => step.origin === 'agent' && step.agent === run.agent)).toBe(true);
       expect(turn.calls.some(call => /^analysis_/.test(call.name) && call.isError === false), 'an analysis ran').toBe(true);
       expect(steps.some(step => step.type.startsWith('analysis.'))).toBe(true);
       const shown = await shownField(page);
-      expect(shown?.source, 'coloured by a gene').toBe('var');
+      expect(shown?.source, 'colored by a gene').toBe('var');
       await undoTurnByClick(page, turn.turn);
       expect(await fingerprint(page)).toEqual(before);
     });
 
-    test('a guided first look: the dataset read, a sensible first colouring, one click undoes it', async ({ page }) => {
+    test('a guided first look: the dataset read, a sensible first coloring, one click undoes it', async ({ page }) => {
       test.setTimeout(15 * 60_000);
       await openLiveChat(page, run);
+      // The dataset opens colored by its cell types (F21): the person cleared that, so a first coloring is the agent's to choose.
+      await page.evaluate(async () => {
+        const { getActions } = await import('/assets/js/app/actions/index.js');
+        await getActions().dispatch('color.by', { field: null });
+      });
       const before = await fingerprint(page);
       const turn = await task(page, 'Give me a guided first look at this dataset.');
       const reads = turn.calls.filter(call => ['dataset_summary', 'fields_list', 'field_summary', 'field_categories'].includes(call.name));
       expect(reads.length, 'the dataset was read').toBeGreaterThan(0);
       const steps = await stepsOfTurn(page, turn.turn);
-      expect(steps.some(step => step.type === 'color.by'), 'a first colouring').toBe(true);
+      expect(steps.some(step => step.type === 'color.by'), 'a first coloring').toBe(true);
       expect(steps.every(step => step.origin === 'agent' && step.agent === run.agent)).toBe(true);
       await undoTurnByClick(page, turn.turn);
       expect(await fingerprint(page)).toEqual(before);

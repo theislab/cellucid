@@ -1,5 +1,5 @@
 /**
- * The page's whole action catalogue (`assets/js/app/actions/definitions/`):
+ * The page's whole action catalog (`assets/js/app/actions/definitions/`):
  * every action, whatever area defines it, has parameters whose own example
  * is valid (what an agent's tool description and the docs show), a one-line
  * past-tense label and pseudocode for that example, known domains, and a
@@ -62,7 +62,7 @@ const PERSON_FEATURES = Object.freeze({
   'Stored › Manage…: the list and its removals': { 'stored.list': null, 'stored.remove': 'deletes-saved' },
   'Figure export: its settings and Download': { 'figure-export.set': null, 'figure.export': 'writes-file' },
   'the highlighted cells and a field as a file': { 'cells.export': 'writes-file', 'field.export': 'writes-file' },
-  'community annotation: the suggestions, a vote and Publish': { 'annotation.suggestions': null, 'annotation.vote': 'publishes' },
+  'community annotation: the suggestions, votes, suggestions and Publish': { 'annotation.suggestions': null, 'annotation.publish': 'publishes' },
   'Share (Open data): the link, the badge, the embed': { 'dataset.share-link': 'publishes' },
   'Share and Save of the history': { 'history.share': 'writes-file', 'history.save': null, 'history.saved.delete': 'deletes-saved' },
 });
@@ -85,5 +85,34 @@ test('every permission kind governs real tools: each confirmation kind is asked 
   const used = new Set(catalog.list().map(definition => definition.confirm).filter(confirm => confirm !== null));
   assert.deepEqual([...ACTION_CONFIRMS].filter(kind => !used.has(kind)), [], 'a kind no action asks is a setting that governs nothing');
   const publishes = catalog.list().filter(definition => definition.confirm === 'publishes').map(definition => definition.type).sort();
-  assert.deepEqual(publishes, ['annotation.suggest', 'annotation.vote', 'dataset.share-link']);
+  assert.deepEqual(publishes, ['annotation.publish', 'dataset.share-link']);
+});
+
+// Bug hunt L21-3 (agent-loop lane): "Pause recording" told the agent "Ask the person first.": a
+// chat model asked in its own words (`ask_person`), its turn ended on the question, and the action was
+// never called, while Cellucid asks the person itself as their settings say (`confirm`).
+test('no description tells an agent to ask the person itself: an action Cellucid asks about says so by its confirm', () => {
+  const told = getActionCatalog().list()
+    .filter(definition => /\b(ask|confirm with|check with)\b[^.]*\b(the person|them)\b[^.]*\bfirst\b/i.test(definition.summary))
+    .map(definition => `${definition.type}: ${definition.summary}`);
+  assert.deepEqual(told, []);
+});
+
+// Bug hunt L21-5 (agent-loop lane): "Merge two categories" was exemplified as merging "T cells" into
+// "T cells" (both parameters took the label's one example): a model given it merged a category into
+// itself and was refused; the reference docs showed it too. A rename's example renamed to the same name.
+test('no action\'s example names one value for two of its parameters (a merge into itself, a rename to its own name)', () => {
+  const doubled = [];
+  for (const definition of getActionCatalog().list()) {
+    const example = exampleOf(definition.params);
+    if (example === null || typeof example !== 'object') continue;
+    const seen = new Map();
+    for (const [key, value] of Object.entries(example)) {
+      // A placeholder ("x", a schema's bare string) is not a value an example chose.
+      if (typeof value !== 'string' || /^x+$/.test(value)) continue;
+      if (seen.has(value)) doubled.push(`${definition.type}: ${seen.get(value)} and ${key} are both ${JSON.stringify(value)}`);
+      else seen.set(value, key);
+    }
+  }
+  assert.deepEqual(doubled, []);
 });

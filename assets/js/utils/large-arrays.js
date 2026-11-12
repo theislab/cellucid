@@ -30,6 +30,7 @@
  */
 
 import { formatCountOf } from './format-units.js';
+import { setOwnDataProperty } from './exact-record.js';
 
 /** Bytes of one WebAssembly page. */
 const MEMORY_PAGE_BYTES = 65536;
@@ -308,7 +309,8 @@ export function assembledArrays(value, assemblies, depth = 0) {
     const resolved = assembledArrays(value[key], assemblies, depth + 1);
     if (resolved !== value[key]) {
       copy ??= { ...value };
-      copy[key] = resolved;
+      // A key can be the data's own (`__proto__` too): an own property, never the prototype.
+      setOwnDataProperty(copy, key, resolved);
     }
   }
   return copy ?? value;

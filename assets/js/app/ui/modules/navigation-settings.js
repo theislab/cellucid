@@ -9,6 +9,7 @@
 
 import { parseRangeInput } from '../core/numeric-input-contract.js';
 import { formatMultiplier, formatWithUnit } from '../components/display-format.js';
+import { defineControlReadout } from '../core/control-readout.js';
 
 /** Slider position → viewer value and readout, for each speed slider. */
 const SLIDERS = Object.freeze({
@@ -113,11 +114,15 @@ export function wireNavigationSettings({ viewer, dom, listen, isDestroyed, owner
     dom.freeflyControls.hidden = mode !== 'free';
   }
 
-  const sliderUpdater = (kind, input, display, apply) => () => {
-    if (isDestroyed()) return;
-    const { value, text } = readNavigationSlider(kind, input.value, owner);
-    display.textContent = text;
-    apply(value);
+  const sliderUpdater = (kind, input, display, apply) => {
+    // Its readout of any position, for the history as for the row (`core/control-readout.js`).
+    const readout = defineControlReadout(input, raw => readNavigationSlider(kind, raw, owner).text);
+    return () => {
+      if (isDestroyed()) return;
+      const { value } = readNavigationSlider(kind, input.value, owner);
+      display.textContent = readout(input.value);
+      apply(value);
+    };
   };
 
   const updateOrbitKeySpeed = sliderUpdater(
@@ -164,9 +169,9 @@ export function wireNavigationSettings({ viewer, dom, listen, isDestroyed, owner
   ]) {
     apply(checkbox.checked);
     listen(checkbox, 'change', () => {
+      // A checkbox leaves the letters to the page (`utils/key-ownership.js`):
+      // W A S D move at once with it focused, and focus stays on it.
       apply(checkbox.checked);
-      // Hand the keyboard back to the plot, so WASD moves at once.
-      checkbox.blur();
     });
   }
 

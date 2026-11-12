@@ -95,7 +95,7 @@ function publishSelectBarNotice(mirror, notice) {
 /**
  * Say on the selection bar what a tap or drag will do now. The owner of the
  * panel's idle copy calls this beside it: mode-ui.js when the tool changes,
- * and the annotation tool when its precondition (a coloured field) changes.
+ * and the annotation tool when its precondition (a colored field) changes.
  *
  * @param {Document} documentOwner
  * @param {string} hint

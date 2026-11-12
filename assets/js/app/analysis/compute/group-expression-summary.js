@@ -48,7 +48,7 @@ export function createGroupSummaryContext(cellGroup, groupCount) {
 }
 
 /**
- * Summarise genes over the groups of a context.
+ * Summarize genes over the groups of a context.
  *
  * @param {ReturnType<typeof createGroupSummaryContext>} context
  * @param {Array<Float32Array|{length: number, indices: Uint32Array, values: Float32Array|Float64Array}>} genes
@@ -196,7 +196,7 @@ export function groupSummaryValues(summary) {
 }
 
 /**
- * The colour value of each dot, scaled as asked (scanpy `standard_scale`):
+ * The color value of each dot, scaled as asked (scanpy `standard_scale`):
  * 'none' as is; 'var' each gene to 0–1 over the groups (min-max, a flat
  * gene 0, as scanpy); 'z' each gene to z over the groups (population SD, as
  * `scipy.stats.zscore`; a flat gene 0). NaN stays NaN.

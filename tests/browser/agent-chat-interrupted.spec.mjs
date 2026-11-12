@@ -8,9 +8,9 @@
  * one that has not). From the agents bug hunt of 2026-11-04.
  */
 import { closePageWithApplicationRetirement, expect, test } from './helpers/test.mjs';
-import { dismissWelcome } from './helpers/welcome.mjs';
+import { continueWhereLeftOff, dismissWelcome } from './helpers/welcome.mjs';
 import {
-  AGENT_DATASET_URL, COLOR_BY_CELL_TYPE, agentRequests, installScriptedModel, observeProductErrors, openAgentDataset, openChat,
+  AGENT_DATASET_URL, COLOR_BY_SCORE, agentRequests, installScriptedModel, observeProductErrors, openAgentDataset, openChat,
   queueReplies, say, stepFacts,
 } from './helpers/agent-chat.mjs';
 
@@ -39,8 +39,9 @@ for (const how of ['reload', 'close-tab']) {
     await say(page, 'Highlight three cells');
     // The person's settings ask before every change: the next call waits on a card.
     await page.evaluate(() => window._cellucidUi.agents.presence.permissions.set({ kinds: { change: 'ask' } }));
-    await queueReplies(page, [{ text: 'Colouring.', calls: [COLOR_BY_CELL_TYPE] }, { text: 'Done.' }]);
-    await page.locator('#agent-chat-input').fill('Colour by cell type');
+    // A change (the dataset opens colored by cell_type): were it run, it would be a step.
+    await queueReplies(page, [{ text: 'Coloring.', calls: [COLOR_BY_SCORE] }, { text: 'Done.' }]);
+    await page.locator('#agent-chat-input').fill('Color by score');
     await page.locator('#agent-chat-input').press('Enter');
     await expect(page.locator('#agent-presence .agent-confirm')).toHaveCount(1);
     // What the autosave keeps now: the call, and no result yet.
@@ -49,14 +50,14 @@ for (const how of ['reload', 'close-tab']) {
 
     const next = await reopen(context, page, how);
     const errorsAfter = observeProductErrors(next);
-    await next.locator('.notification').filter({ hasText: 'Continue where you left off?' }).getByRole('button', { name: 'Continue' }).click();
+    await continueWhereLeftOff(next);
     const log = next.locator('#agent-chat-log');
-    await expect(log.locator('.agent-msg-user .agent-msg-text').last()).toHaveText('Colour by cell type');
+    await expect(log.locator('.agent-msg-user .agent-msg-text').last()).toHaveText('Color by score');
     const row = log.locator('.agent-tool[data-tool="color_by"]');
     if (how === 'reload') {
       // The page went at once: the kept conversation has the call and no result; it is answered on the way back.
       await expect(row).toHaveAttribute('data-state', 'interrupted');
-      await expect(row.locator('.agent-tool-label')).toHaveText('Colour the cells by a field or gene · interrupted');
+      await expect(row.locator('.agent-tool-label')).toHaveText('Color the cells by a field or gene: score · interrupted');
       await row.locator('.agent-tool-head').click();
       await expect(row.locator('.agent-tool-result')).toContainText('The page closed before this call finished; nothing was applied.');
     } else {

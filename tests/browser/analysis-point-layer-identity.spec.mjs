@@ -170,7 +170,7 @@ test('the point layer draws every point where Plotly puts it, with the same hove
   expect(report.counts.points).toBeGreaterThan(100000);
 });
 
-test('the volcano draws every gene where and in the colour Plotly would, before and after a threshold change', async ({ page }) => {
+test('the volcano draws every gene where and in the color Plotly would, before and after a threshold change', async ({ page }) => {
   test.setTimeout(120_000);
   await openPlotHarness(page);
   const report = await page.evaluate(async () => {
@@ -243,14 +243,14 @@ test('the volcano draws every gene where and in the colour Plotly would, before 
     const reference = () => mine.data.map(({ _cellucidPointLayer, ...trace }) => trace);
     await Plotly.newPlot(theirs, reference(), structuredClone(mine.layout), getPlotlyConfig());
     const before = compare('render');
-    // A threshold change recolours the genes (a style-only update).
+    // A threshold change recolors the genes (a style-only update).
     const changed = { ...options, pValueThreshold: 0.001, foldChangeThreshold: 2 };
     // Resolves once the point image is redrawn: Plotly's style step waits
     // for the layer's raster (`gd._promises`).
     await volcano.update(mine, { results }, changed);
     await Plotly.react(theirs, reference(), structuredClone(mine.layout), getPlotlyConfig());
     const after = compare('threshold change');
-    if (after === before) failures.push('the point image was not redrawn after the colours changed');
+    if (after === before) failures.push('the point image was not redrawn after the colors changed');
     for (const div of divs) { Plotly.purge(div); div.remove(); }
     return { failures };
   });

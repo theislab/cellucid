@@ -5,12 +5,16 @@
  *
  * - a sample by a word of its name; one open already is not opened again;
  *   a name nothing matches is refused naming the samples and My datasets;
- * - a link, as the address bar opens it; then, from My datasets, by the name
- *   it was listed under, after another dataset was shown;
+ * - a link the person has not seen in this tab is asked about on the card
+ *   before anything of it is requested (F121): declined, its host hears
+ *   nothing; allowed once, it opens as the address bar opens it; then, from
+ *   My datasets, by the name it was listed under, it opens without asking;
+ *   one the person typed into the address bar is not asked about;
  * - a whole-file download (a host that serves no parts of a file) is asked
  *   about first on the agent presence's card (the dispatcher's confirmer),
  *   with its size and why: declined, the dataset shown stays and the agent
  *   is told; allowed once, it downloads and opens;
+ * - a fraction or a count of the cells opens that subsample at once (F90);
  * - opening is no step of either dataset's history.
  */
 import { expect, test } from './helpers/test.mjs';
@@ -62,9 +66,48 @@ test('a sample by a word of its name; one open already is not opened again; an u
   expect(errors).toEqual([]);
 });
 
-test('a link opens as the address bar opens it, and again from My datasets by its listed name', async ({ page }) => {
+test('a fraction or a count opens that subsample at once, as cells_open takes it; datasets opened next open as before (F90)', async ({ page }) => {
   const errors = await start(page);
-  const linked = await openDatasetAsAgent(page, { name: LINK.url });
+  const opened = await openDatasetAsAgent(page, { name: 'development', fraction: 0.25, seed: 3 });
+  expect(opened.outcome).toMatchObject({ name: DEVELOPMENT.name, kind: 'sample', cells: 24, total_cells: DEVELOPMENT.cells, already_open: false });
+  await expect.poll(() => page.evaluate(() => window._cellucidViewer.getPointCount())).toBe(24);
+  // One reading, at the asked share: no step reads the cells again.
+  const steps = await page.evaluate(async () => {
+    const { getActions } = await import('/assets/js/app/actions/index.js');
+    return (await getActions().dispatch('history.get', {})).outcome.steps.map(step => step.type);
+  });
+  expect(steps).not.toContain('cells.open');
+  // Asked for other cells, the dataset open already names the action that reads them.
+  const again = await openDatasetAsAgent(page, { name: 'development', count: 10 });
+  expect(again.refused).toMatchObject({ code: 'already-open', message: `"${DEVELOPMENT.name}" is open already: cells_open reads it again with other cells.` });
+  const tooFew = await openDatasetAsAgent(page, { name: 'trajectory', count: 1 });
+  expect(tooFew.refused).toMatchObject({ code: 'bad-params', message: 'Open at least 2 cells: one cell has no coordinate variation to draw.' });
+  // The tab's choice for openings is the person's: the next dataset opens with every cell.
+  await openDatasetAsAgent(page, { name: 'trajectory' });
+  await expectSettledOn(page, TRAJECTORY);
+  const counted = await openDatasetAsAgent(page, { name: 'development', count: 40, method: 'uniform' });
+  expect(counted.outcome).toMatchObject({ cells: 40, total_cells: DEVELOPMENT.cells });
+  expect(errors).toEqual([]);
+});
+
+test('a link not seen in this tab is asked first (F121): declined, its host hears nothing; allowed, it opens; from My datasets, it is not asked', async ({ page }) => {
+  const errors = await start(page);
+  let requests = 0;
+  await page.route(`${LINK.url}*`, route => { requests += 1; return route.fallback(); });
+  const card = page.locator('#agent-presence .agent-confirm');
+  const declining = openDatasetAsAgent(page, { name: LINK.url });
+  await expect(card).toHaveAttribute('data-asking', 'unseen-link');
+  await expect(card).toHaveAttribute('data-action', 'dataset.open');
+  await expect(card.locator('.agent-confirm-why')).toHaveText(`It opens "${LINK.url}", an address not typed, pasted or opened in this tab before.`);
+  await card.locator('.agent-confirm-deny').click();
+  expect((await declining).refused).toMatchObject({ code: 'declined' });
+  expect(requests).toBe(0);
+  await expectSettledOn(page, START);
+
+  const allowing = openDatasetAsAgent(page, { name: LINK.url });
+  await expect(card).toHaveAttribute('data-asking', 'unseen-link');
+  await card.locator('.agent-confirm-allow').click();
+  const linked = await allowing;
   expect(linked.outcome).toMatchObject({ name: LINK.name, kind: 'link', cells: LINK.cells, already_open: false });
   await expectSettledOn(page, LINK);
   await expect(page.locator('#data-address')).toHaveValue(LINK.url);
@@ -79,6 +122,26 @@ test('a link opens as the address bar opens it, and again from My datasets by it
   const mine = await openDatasetAsAgent(page, { name: LINK.name, kind: 'my-datasets' });
   expect(mine.outcome).toMatchObject({ name: LINK.name, kind: 'link', already_open: false });
   await expectSettledOn(page, LINK);
+  // Listed in My datasets now: its address opens without a card too.
+  await openDatasetAsAgent(page, { name: 'development', kind: 'sample' });
+  await expectSettledOn(page, DEVELOPMENT);
+  const listed = await openDatasetAsAgent(page, { name: LINK.url });
+  expect(listed).toMatchObject({ outcome: { name: LINK.name, kind: 'link' } });
+  await expect(card).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test('a link the person typed into the address bar is one they have seen: an agent opens it without asking (F121)', async ({ page }) => {
+  const errors = await start(page);
+  await page.locator('#data-address').fill(LINK.url);
+  await page.locator('#data-address-open-btn').click();
+  await expectSettledOn(page, LINK);
+  await openDatasetAsAgent(page, { name: 'development', kind: 'sample' });
+  await expectSettledOn(page, DEVELOPMENT);
+  const card = page.locator('#agent-presence .agent-confirm');
+  const opened = await openDatasetAsAgent(page, { name: LINK.url });
+  expect(opened).toMatchObject({ outcome: { name: LINK.name, kind: 'link' } });
+  await expect(card).toHaveCount(0);
   expect(errors).toEqual([]);
 });
 
@@ -100,9 +163,12 @@ test('a whole-file download is asked about first: declined, the dataset shown st
   // opening itself is a change the default settings allow; the download is asked.
   const card = page.locator('#agent-presence .agent-confirm');
   const declining = openDatasetAsAgent(page, { name: WHOLE.url });
+  // First the address itself, not seen in this tab (F121), allowed once; then the download.
+  await expect(card).toHaveAttribute('data-asking', 'unseen-link');
+  await card.locator('.agent-confirm-allow').click();
   await expect(card).toHaveAttribute('data-asking', 'large-download');
   await expect(card).toHaveAttribute('data-action', 'dataset.open');
-  await expect(card.locator('.agent-confirm-title')).toHaveText(/^Claude asks to open a dataset: “Opened .+”\.$/);
+  await expect(card.locator('.agent-confirm-title')).toHaveText(/^Claude asks to open a dataset: [^“”]+\.$/);
   await expect(card.locator('.agent-confirm-why')).toHaveText(/^It downloads the whole file current-ui\.h5ad \(\d+ KB\) into this browser: 127\.0\.0\.1:\d+ does not serve parts of files\.$/);
   await card.locator('.agent-confirm-deny').click();
   const declined = await declining;
@@ -111,6 +177,8 @@ test('a whole-file download is asked about first: declined, the dataset shown st
   await expectSettledOn(page, START);
 
   const allowing = openDatasetAsAgent(page, { name: WHOLE.url });
+  await expect(card).toHaveAttribute('data-asking', 'unseen-link');
+  await card.locator('.agent-confirm-allow').click();
   await expect(card).toHaveAttribute('data-asking', 'large-download');
   await card.locator('.agent-confirm-allow').click();
   const allowed = await allowing;

@@ -259,6 +259,7 @@ function createRestoreOwners() {
     getLiveViewHidden() {
       return layout.liveViewHidden;
     },
+    getViewName: () => null,
     setViewCameraState(viewId, camera) {
       viewCameras.set(viewId, structuredClone(camera));
     },

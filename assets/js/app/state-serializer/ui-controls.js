@@ -10,9 +10,11 @@
  */
 
 import { isStableId } from '../utils/stable-id.js';
+import { unavailableReasonOf } from '../ui/core/control-availability.js';
 import { isGeneratedDomId } from '../ui/components/dom-id.js';
 import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
-import { throwIfAborted } from '../../utils/abort.js';
+import { requireSignalOrNull, throwIfAborted } from '../../utils/abort.js';
+import { HEX_COLOR, isHexColor } from '../../utils/hex-color.js';
 
 const SERIALIZABLE_INPUT_TYPES = new Set([
   'checkbox',
@@ -77,7 +79,8 @@ function queryAll(sidebar, selector) {
 /**
  * Whether a control stays out of the session's control inventory: anything
  * inside a `data-state-serializer-skip` subtree, and any control whose id was
- * minted on this page (`createDomId`). A minted id names nothing on another
+ * minted on this page (`createDomId`), or made from such an id (it holds the
+ * minted separator, `isGeneratedDomId`). A minted id names nothing on another
  * page, so a session that recorded one could not be loaded there; what such
  * a control shows (a legend's range sliders, for one) is saved by the state
  * that renders it.
@@ -470,7 +473,7 @@ function validateControlRecord(id, record, inventoryEntry, valueAgainstCurrent =
     }
   } else if (type === 'range' || type === 'number') {
     assertFiniteNumericControlValue(element, record.value, id);
-  } else if (type === 'color' && !/^#[0-9a-f]{6}$/.test(record.value)) {
+  } else if (type === 'color' && !HEX_COLOR.test(record.value)) {
     throw new TypeError(
       `Session UI control "${id}" color must be an exact lowercase six-digit hex value.`,
     );
@@ -599,11 +602,17 @@ function restoreValidatedControl(id, entry, data) {
   }
   if (element.value === data.value) return;
   element.value = data.value;
-  dispatchControlEvent(
-    id,
-    element,
-    type === 'select' ? 'change' : 'input',
-  );
+  if (type === 'select') {
+    dispatchControlEvent(id, element, 'change');
+  } else {
+    // As a person's change ends: the thumb let go, the field committed. An
+    // owner may follow `input` on the next frame and apply only on `change`
+    // (the vector field's sliders: Particle density restarts the particles
+    // on release only), so `input` alone left its readout one frame behind
+    // what `setting.set` read back and the value never applied.
+    dispatchControlEvent(id, element, 'input');
+    dispatchControlEvent(id, element, 'change');
+  }
   if (element.value !== data.value) {
     throw new Error(
       `Session UI control "${id}" rejected restored value "${data.value}".`,
@@ -626,13 +635,7 @@ function assertRestoreOptions(options) {
     expectedKeys,
     'Session UI restore options',
   );
-  if (
-    Object.hasOwn(options, 'abortSignal')
-    && options.abortSignal !== null
-    && typeof options.abortSignal?.aborted !== 'boolean'
-  ) {
-    throw new TypeError('Session UI abortSignal must expose a boolean aborted state.');
-  }
+  if (Object.hasOwn(options, 'abortSignal')) requireSignalOrNull(options.abortSignal, 'Session UI abortSignal');
   for (const [key, label] of [
     ['deferControlIds', 'deferred'],
     ['withholdControlIds', 'withheld'],
@@ -657,6 +660,17 @@ function assertRestoreOptions(options) {
 /** The order controls are restored in. */
 const RESTORE_ORDER = Object.freeze([
   'details', 'checkbox', 'select', 'range', 'number', 'color', 'text',
+]);
+
+/**
+ * The order of the controls whose choices follow the embedding
+ * (`AFTER_EMBEDDING_SELECTOR`): the choice (a select: which vector field)
+ * before the switch that shows it (`Show overlay`), so the switch shows the
+ * restored choice at once. Switched on first, it began showing the choice
+ * the page had, and the restored choice had to supersede it (R9V-1).
+ */
+const AFTER_EMBEDDING_RESTORE_ORDER = Object.freeze([
+  'details', 'select', 'checkbox', 'range', 'number', 'color', 'text',
 ]);
 
 /**
@@ -752,7 +766,7 @@ export function createUiControlSerializer({ sidebar, domains = null }) {
     }
 
     function restoreMatchingControls(restoreDeferred) {
-      for (const type of RESTORE_ORDER) {
+      for (const type of restoreDeferred ? AFTER_EMBEDDING_RESTORE_ORDER : RESTORE_ORDER) {
         for (const [id, staged] of stagedControls) {
           if (staged.entry.type !== type) continue;
           if (deferredIds.has(id) !== restoreDeferred) continue;
@@ -767,12 +781,64 @@ export function createUiControlSerializer({ sidebar, domains = null }) {
     return () => {
       // The embedding-dependent values are checked against the controls as
       // they are now, after the embeddings and the active view came back,
-      // before any of the deferred controls is touched.
+      // before any of the deferred controls is touched. A value the
+      // controls no longer offer (a choice of an embedding the data now
+      // lacks) keeps the control as it is and is returned, said by the
+      // caller: it never stops the others (`readSavedControls`).
+      const unread = [];
       for (const id of laterValueIds) {
-        validateControlRecord(id, controls[id], stagedControls.get(id).entry);
+        const staged = stagedControls.get(id);
+        try {
+          validateControlRecord(id, controls[id], staged.entry);
+        } catch (error) {
+          unread.push({ id, label: labelOf(staged.entry.element), reason: String(error?.message ?? error) });
+          withheldIds.add(id);
+        }
       }
       restoreMatchingControls(true);
+      return unread;
     };
+  }
+
+  /**
+   * A saved record of the controls (a session's, a dataset's starting
+   * view's, a history step's) read against the interface now, one control at
+   * a time: a control the record holds a valid value for takes it; one the
+   * record lacks (added since it was saved) and one whose value the control
+   * refuses keep their value now; one the interface no longer has is left
+   * out. `unread` names each refused or left-out value, so the restore says
+   * it, and the record returned is complete and valid for
+   * `restoreUIControls`. One control never fails the others (found
+   * 2026-11-11: a value one version of Cellucid could not read failed every
+   * setting of a session).
+   *
+   * @param {unknown} saved
+   * @returns {{controls: object, unread: Array<{id: string, label: string, reason: string}>}}
+   */
+  function readSavedControls(saved) {
+    const inventory = buildCurrentInventory(sidebar, domains);
+    const laterValueIds = new Set(afterEmbeddingControlIds(inventory));
+    const current = collectUIControls();
+    const record = saved !== null && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    const controls = {};
+    const unread = [];
+    for (const [id, entry] of inventory) {
+      if (!Object.hasOwn(record, id)) {
+        controls[id] = current[id];
+        continue;
+      }
+      try {
+        validateControlRecord(id, record[id], entry, !laterValueIds.has(id));
+        controls[id] = record[id];
+      } catch (error) {
+        controls[id] = current[id];
+        unread.push({ id, label: labelOf(entry.element), reason: String(error?.message ?? error) });
+      }
+    }
+    for (const id of Object.keys(record)) {
+      if (!inventory.has(id)) unread.push({ id, label: id, reason: 'this version of Cellucid has no such control' });
+    }
+    return { controls, unread };
   }
 
   /**
@@ -832,6 +898,7 @@ export function createUiControlSerializer({ sidebar, domains = null }) {
     embeddingDependentControlIds,
     listSettings,
     readSetting,
+    readSavedControls,
     restoreUIControls,
     setSetting,
     settingKeyOf,
@@ -930,7 +997,7 @@ function describeSetting(key, { element, type }) {
       out.min = 1;
     }
   } else if (type === 'color') {
-    Object.assign(out, { kind: 'colour', value: element.value });
+    Object.assign(out, { kind: 'color', value: element.value });
   } else {
     Object.assign(out, { kind: 'text', value: element.value });
   }
@@ -945,7 +1012,12 @@ function describeSetting(key, { element, type }) {
 function settingRecordOf({ element, type }, value) {
   const label = labelOf(element);
   if (element.disabled === true) {
-    throw new RangeError(`"${label}" cannot be changed now: it is switched off by another setting`);
+    // The owner that turned the control off said why
+    // (`ui/core/control-availability.js`): a missing dataset feature, a load
+    // under way, another setting. Only the markup's own `disabled` (a control
+    // no owner has started yet) has none.
+    const reason = unavailableReasonOf(element) ?? 'it is not ready yet';
+    throw new RangeError(`"${label}" cannot be changed now: ${reason}`);
   }
   if (type === 'checkbox') {
     if (typeof value !== 'boolean') throw new TypeError(`"${label}" is a switch: give true or false`);
@@ -956,6 +1028,13 @@ function settingRecordOf({ element, type }, value) {
     if (typeof value !== 'string' || !options.some(option => option.value === value)) {
       throw new RangeError(`"${label}" has no choice ${JSON.stringify(value)}; its choices are ${
         options.map(option => option.value).join(', ') || 'none now'}`);
+    }
+    // A choice its owner turned off says why (`setControlAvailability` on the
+    // option: smoke while views are kept), as a control turned off does.
+    const chosen = options.find(option => option.value === value);
+    if (chosen.disabled === true && element.value !== value) {
+      const reason = unavailableReasonOf(chosen) ?? 'it is not ready yet';
+      throw new RangeError(`"${label}" cannot be ${textOf(chosen) || value} now: ${reason}`);
     }
     return { type, value };
   }
@@ -983,8 +1062,8 @@ function settingRecordOf({ element, type }, value) {
     return { type, value: String(value) };
   }
   if (type === 'color') {
-    if (typeof value !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(value)) {
-      throw new TypeError(`"${label}" takes a colour as #rrggbb`);
+    if (!isHexColor(value)) {
+      throw new TypeError(`"${label}" takes a color as #rrggbb`);
     }
     return { type, value: value.toLowerCase() };
   }

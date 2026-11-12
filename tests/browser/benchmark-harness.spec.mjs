@@ -220,7 +220,7 @@ test('the harness observes LOD, culling and uploads under scripted motion', PROC
   }
 
   // The ladder itself is untouched by the floor — a forced level is an explicit
-  // request and is still honoured — so the harness can still tell one level from
+  // request and is still honored — so the harness can still tell one level from
   // another, which is what it exists to measure. Level 0 is below the adaptive
   // floor and only a forced request reaches it.
   expect(outcome.forced.map(entry => entry.observed)).toEqual([

@@ -27,7 +27,7 @@ const T0 = '2026-07-25T01:02:03.456Z';
 const USER_PATH = 'annotations/users/ghid_42.json';
 const FORK_ONLY = { pull: true, triage: false, push: false, maintain: false, admin: false };
 
-/** The dataset view the session builds for ghid_42, with one suggestion labelled `label`. */
+/** The dataset view the session builds for ghid_42, with one suggestion labeled `label`. */
 function view(label) {
   const id = `ghid_42_${label.replace(/\W/g, '')}`;
   return {

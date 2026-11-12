@@ -8,8 +8,9 @@
  */
 
 import { getNotificationCenter } from '../../notification-center.js';
-import { isCancellation, cancelled } from '../../../utils/abort.js';
+import { cancelled, isCancellation, throwIfAborted } from '../../../utils/abort.js';
 import { InlineEditor } from '../components/inline-editor.js';
+import { setControlAvailability } from '../core/control-availability.js';
 import { showConfirmDialog } from '../components/confirm-dialog.js';
 import { CategoryBuilder } from '../category-builder.js';
 import { FieldKind, FieldSource } from '../../utils/field-constants.js';
@@ -33,15 +34,18 @@ import {
 import { useOpenCells } from '../../../data/open-cells-work.js';
 import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 import { getActions } from '../../actions/index.js';
+import { ActionRefused } from '../../actions/dispatcher.js';
+import { markReported } from '../../../utils/errors.js';
 import { requireNewName, resolveField } from '../../actions/targets/fields.js';
 import { dispatchFromControl, isQuietFailure, reportActionFailure } from '../../actions/control-dispatch.js';
 
 const NONE_FIELD_VALUE = '-1';
 const INIT_KEYS = new Set(['state', 'dom', 'dataSourceManager', 'callbacks']);
-const CALLBACK_KEYS = new Set(['onActiveFieldChanged', 'onChooseGeneNames']);
+const CALLBACK_KEYS = new Set(['onActiveFieldChanged', 'onChooseGeneNames', 'onGroupCategories']);
 const DOM_TYPES = new Map([
   ['categoricalSelect', 'HTMLSelectElement'],
   ['categoricalCopyBtn', 'HTMLButtonElement'],
+  ['categoricalGroupBtn', 'HTMLButtonElement'],
   ['categoricalRenameBtn', 'HTMLButtonElement'],
   ['categoricalDeleteBtn', 'HTMLButtonElement'],
   ['categoricalClearBtn', 'HTMLButtonElement'],
@@ -301,6 +305,7 @@ export function initFieldSelector(options) {
   const {
     categoricalSelect,
     categoricalCopyBtn,
+    categoricalGroupBtn,
     categoricalRenameBtn,
     categoricalDeleteBtn,
     categoricalClearBtn,
@@ -346,7 +351,7 @@ export function initFieldSelector(options) {
   const interactionOwner = createFieldInteractionOwner();
   let destroyed = false;
   let destroyPromise = null;
-  // The obs choice under way -- `field` null for no colouring -- from the
+  // The obs choice under way -- `field` null for no coloring -- from the
   // person's pick in a menu (`token` null while its action waits its turn:
   // `pickObsField`) or an action's start (`activateField`, with its choice's
   // token) until it ends. While it is the latest choice the menus name it and
@@ -596,6 +601,7 @@ export function initFieldSelector(options) {
     }
 
     categoricalCopyBtn.disabled = catDisabled;
+    categoricalGroupBtn.disabled = catDisabled;
     categoricalRenameBtn.disabled = catDisabled || catVotingLocked;
     categoricalDeleteBtn.disabled = catDisabled || catVotingLocked;
     categoricalClearBtn.disabled = catDisabled;
@@ -638,8 +644,11 @@ export function initFieldSelector(options) {
   function updateFieldSelectDisabledStates() {
     assertAlive();
     const held = menusHeld();
-    categoricalSelect.disabled = held || !hasCategoricalFields;
-    continuousSelect.disabled = held || !hasContinuousFields;
+    const heldReason = 'a field, a gene or a session is being opened; try again once it has';
+    setControlAvailability(categoricalSelect, held ? heldReason
+      : !hasCategoricalFields ? 'this dataset has no categorical field' : null);
+    setControlAvailability(continuousSelect, held ? heldReason
+      : !hasContinuousFields ? 'this dataset has no continuous field' : null);
     updateFieldActionButtons();
     geneSelector.updateGeneActionButtons(held);
   }
@@ -696,7 +705,7 @@ export function initFieldSelector(options) {
         void dispatchFromControl(
           'field.rename',
           { field: { source, key: field.key }, name: newName },
-          { failure: 'Failed to rename field', category: 'filter' }
+          { failure: 'Could not rename the field', category: 'filter' }
         ).then(done => {
           if (done?.outcome == null) return;
           getNotificationCenter().success(
@@ -770,7 +779,7 @@ export function initFieldSelector(options) {
         void dispatchFromControl(
           'field.delete',
           { field: { source, key: field.key } },
-          { failure: 'Failed to delete field', category: 'filter' }
+          { failure: 'Could not delete the field', category: 'filter' }
         ).then(done => {
           if (done === null) return;
           getNotificationCenter().success(
@@ -953,7 +962,7 @@ export function initFieldSelector(options) {
   }
 
   /**
-   * Show obs field `idx` (-1 clears the colouring). A choice is work on the
+   * Show obs field `idx` (-1 clears the coloring). A choice is work on the
    * open cells (`data/open-cells-work.js`): one made while a progressive
    * opening's step or Apply changes them starts on the cells after it, and
    * no change commits under it. Whatever keeps it from being shown is said
@@ -964,21 +973,23 @@ export function initFieldSelector(options) {
    * the controls dispatch the action, and `signal` is the action's.
    *
    * @param {number} idx
-   * @param {{signal?: AbortSignal|null}} [options]
+   * @param {{signal?: AbortSignal|null, onUnshown?: ((message: string) => void)|null}} [options] -
+   *   `onUnshown` hears the sentence said when the field is not shown, its
+   *   name marked as data (`quoteName`), so the action can refuse with it
    */
-  function activateField(idx, { signal = null } = {}) {
+  function activateField(idx, { signal = null, onUnshown = null } = {}) {
     assertAlive();
     const index = requireSelectableIndex(idx, 'Field activation index');
     if (interactionOwner.isSuspended()) {
       // The selects are put back to what is shown when the suspension ends
       // (`acquireSessionOperation`'s release).
       const reason = interactionOwner.suspensionReason();
-      getNotificationCenter().info(
-        index === -1
-          ? `The colouring is not cleared: ${reason}. Clear it again when that has ended.`
-          : describeUnshownField(getFieldForSource(FieldSource.OBS, index).field.key, reason),
-        { category: 'data' }
-      );
+      const sentence = name => (index === -1
+        ? `The coloring is not cleared: ${reason}. Clear it again when that has ended.`
+        : describeUnshownField(name, reason));
+      const key = index === -1 ? null : getFieldForSource(FieldSource.OBS, index).field.key;
+      getNotificationCenter().info(sentence(key), { category: 'data' });
+      onUnshown?.(sentence(key === null ? null : quoteName(key)));
       return Promise.resolve(null);
     }
     synchronizeDatasetGeneration();
@@ -992,7 +1003,7 @@ export function initFieldSelector(options) {
       renderChoices();
       try {
         return await useOpenCells(
-          () => activateFieldOnOpenCells(index, token),
+          () => activateFieldOnOpenCells(index, token, onUnshown),
           token.signal
         );
       } finally {
@@ -1004,7 +1015,7 @@ export function initFieldSelector(options) {
     }, { signal });
   }
 
-  async function activateFieldOnOpenCells(index, token) {
+  async function activateFieldOnOpenCells(index, token, onUnshown) {
     const datasetGeneration = adoptDatasetGeneration();
     syncCommunityAnnotationCacheContext({ dataSourceManager });
 
@@ -1071,6 +1082,7 @@ export function initFieldSelector(options) {
         if (interactionOwner.isCurrent(token)) syncFromState();
         if (reason !== null) {
           getNotificationCenter().info(describeUnshownField(field.key, reason), { category: 'data' });
+          onUnshown?.(describeUnshownField(quoteName(field.key), reason));
         }
         return null;
       }
@@ -1092,7 +1104,7 @@ export function initFieldSelector(options) {
   }
 
   /**
-   * Duplicate a field and colour by the copy (the toolbars' copy button),
+   * Duplicate a field and color by the copy (the toolbars' copy button),
    * as a step: the action `field.duplicate`, said while it runs.
    *
    * @param {'obs'|'var'} source
@@ -1116,13 +1128,13 @@ export function initFieldSelector(options) {
           return;
         }
         notifications.dismiss(notificationId);
-        reportActionFailure(error, { failure: 'Duplicate failed', category: 'filter' });
+        reportActionFailure(error, { failure: 'Could not duplicate the field', category: 'filter' });
       }
     );
   }
 
   /**
-   * Colour the view in focus by the obs field `field` (null: by nothing) as the person picked
+   * Color the view in focus by the obs field `field` (null: by nothing) as the person picked
    * it in a menu or cleared it: the pick is the choice under way the menus
    * name and hold from now on, while its action waits its turn (a change of
    * the open cells under way first: `cells.open`) and runs.
@@ -1137,8 +1149,8 @@ export function initFieldSelector(options) {
       'color.by',
       { field: field === null ? null : { source: FieldSource.OBS, key: field.key } },
       field === null
-        ? { failure: 'Failed to clear field', category: 'filter' }
-        : { failure: 'Failed to load field', category: 'data' }
+        ? { failure: 'Could not clear the field', category: 'filter' }
+        : { failure: 'Could not load the field', category: 'data' }
     ).finally(() => {
       if (obsChoice === pick) obsChoice = null;
       if (!destroyed) renderChoices();
@@ -1146,26 +1158,43 @@ export function initFieldSelector(options) {
   }
 
   /**
-   * The action `color.by`: colour by a field of the cells or a gene (named),
+   * The action `color.by`: color by a field of the cells or a gene (named),
    * or by nothing (null), through this selector's own choice, so the selects
    * and the gene search name what is shown whoever chose it.
    */
   async function colorByAction({ field }, { signal }) {
     assertAlive();
+    // A choice that ends unshown is refused with the sentence the person is
+    // told, never answered with a bare null an agent takes for done (F95).
+    // The person has heard all they need (that sentence, or nothing after
+    // their own newer choice or Cancel), so the refusal is marked reported
+    // and no control says it again.
+    let unshown = null;
+    const onUnshown = message => { unshown = message; };
+    const refuseUnshown = name => {
+      throwIfAborted(signal);
+      throw markReported(new ActionRefused(
+        unshown ?? (name === null
+          ? 'The coloring is not cleared: another choice or Cancel ended it first.'
+          : `${name} is not shown: another choice or Cancel ended it before it was shown.`),
+        { code: 'not-shown', type: 'color.by' }
+      ));
+    };
     if (field === null) {
-      const cleared = await activateField(-1, { signal });
-      return cleared === null ? null : { field: null };
+      const cleared = await activateField(-1, { signal, onUnshown });
+      if (cleared === null) refuseUnshown(null);
+      return { field: null };
     }
     const target = resolveField(state, field);
     const info = target.source === FieldSource.OBS
-      ? await activateField(target.index, { signal })
-      : await geneSelector.selectGene(target.index, { signal });
-    if (info === null) return null;
+      ? await activateField(target.index, { signal, onUnshown })
+      : await geneSelector.selectGene(target.index, { signal, onUnshown });
+    if (info === null) refuseUnshown(quoteName(target.field.key));
     return { field: target.field.key, source: target.source, kind: target.field.kind };
   }
 
   /**
-   * The action `field.duplicate`: copy a field (named) and colour by the
+   * The action `field.duplicate`: copy a field (named) and color by the
    * copy; a categorical copy starts without community annotation voting.
    */
   async function duplicateAction({ field: ref, name }, { signal }) {
@@ -1176,7 +1205,8 @@ export function initFieldSelector(options) {
     // another dataset taking over meanwhile leaves the copy unshown.
     const intent = interactionOwner.beginIntent();
     const result = requireDuplicateResult(
-      await state.duplicateField(target.source, target.index, name === undefined ? {} : { newKey: name }),
+      // Stopped while the field is read, nothing is made.
+      await state.duplicateField(target.source, target.index, name === undefined ? { signal } : { newKey: name, signal }),
       target.source,
       state
     );
@@ -1386,6 +1416,11 @@ export function initFieldSelector(options) {
     const index = parseSelectorIndex(categoricalSelect.value, 'Categorical duplicate selection');
     if (index >= 0) duplicateFieldAt(FieldSource.OBS, index);
   }, { signal: lifecycle.signal });
+  // Group categories: a new field of groups of its categories (`group-categories-dialog.js`, `field.group`).
+  categoricalGroupBtn.addEventListener('click', () => {
+    const index = parseSelectorIndex(categoricalSelect.value, 'Categorical group selection');
+    if (index >= 0) callbacks.onGroupCategories(index, categoricalGroupBtn);
+  }, { signal: lifecycle.signal });
   categoricalRenameBtn.addEventListener('click', () => {
     const index = parseSelectorIndex(
       categoricalSelect.value,
@@ -1473,7 +1508,7 @@ export function initFieldSelector(options) {
   }
   categoryBuilderContainer.dataset.catBuilderInitialized = 'true';
 
-  // The orchestration above is the implementation of colouring and
+  // The orchestration above is the implementation of coloring and
   // duplicating, whoever asks: a control here, an agent, a notebook, a replay.
   const unprovideActions = [
     getActions().provide('color.by', colorByAction),

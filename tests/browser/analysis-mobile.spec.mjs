@@ -146,7 +146,7 @@ test('a window is a bottom sheet with snap heights, a grip, a collapsing header 
   expect(errors).toEqual([]);
 });
 
-/** Whether a tap at the centre of the panel's bar lands on the bar. */
+/** Whether a tap at the center of the panel's bar lands on the bar. */
 function barTakesTap(page) {
   return page.evaluate(() => {
     const bar = document.getElementById('phone-sheet-bar');

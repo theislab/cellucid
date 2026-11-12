@@ -2,7 +2,7 @@
  * The relay stays in step with the web app it serves.
  *
  * `relay/generated/bundle.js` is what the deployed relay knows of the web
- * app: the wire protocol shared with the tab, the action catalogue as MCP
+ * app: the wire protocol shared with the tab, the action catalog as MCP
  * tools (its answer while no tab is connected), the agent instructions, the
  * Cellucid version. It is generated (`scripts/generate-relay-bundle.mjs`) and
  * must equal what the sources make now: an action added or changed, an

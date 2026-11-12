@@ -67,7 +67,7 @@ for (const run of RUNS) {
     test('Stop in the middle of a turn, and the provider still accepts the conversation afterwards', async ({ page }) => {
       test.setTimeout(10 * 60_000);
       await openLiveChat(page, run);
-      await page.locator('#agent-chat-input').fill('List every field, then read the categories of each categorical field one call at a time, then colour by each field in turn, one after the other.');
+      await page.locator('#agent-chat-input').fill('List every field, then read the categories of each categorical field one call at a time, then color by each field in turn, one after the other.');
       await page.locator('#agent-chat-input').press('Enter');
       await expect(page.locator('#agent-chat-log .agent-tool').first()).toBeVisible({ timeout: 120_000 });
       await page.locator('#agent-chat-stop').click();

@@ -51,41 +51,16 @@ import { listSavedStates, onSavedStatesChange, removeSavedStates } from '../../h
 import { listLocalFiles, localHandlesAvailable, onLocalFilesChange } from '../../library/local-file-handles.js';
 import { forgetMyDatasets, listMyDatasets, onMyDatasetsChange } from '../../library/my-datasets.js';
 import { PLACES } from '../place-names.js';
+import { formatAgo, savedStateWords } from './state/model.js';
 import { describeSubsampleMethod } from '../../../data/subsample.js';
 import { formatBytes, formatCountOf, formatDuration } from '../../../utils/format-units.js';
-import { createSelectItem, renderFactList } from '../components/controls.js';
+import { createButton, createSelectItem, renderFactList } from '../components/controls.js';
 import { wireAppDialog } from '../components/app-dialog.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
 import { listNames, quoteName } from '../../actions/targets/names.js';
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
 /** The order a dataset's rows are listed in, by kind; a kind not named here comes last. */
 const KIND_ORDER = ['parts', 'gene-index', 'converted', 'download'];
-
-/**
- * When something was last used or saved, in words: today, yesterday, some
- * days ago, or its date, after `verb` ("used today", "saved 3 days ago");
- * '' when not known.
- *
- * @param {string} verb
- * @param {number} time - ms since the epoch (0: not known)
- * @param {number} [now]
- * @param {string|undefined} [locale]
- * @returns {string}
- */
-export function describeWhen(verb, time, now = Date.now(), locale = undefined) {
-  if (!(time > 0)) return '';
-  const day = time => {
-    const date = new Date(time);
-    return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
-  };
-  const days = Math.round((day(now) - day(time)) / DAY_MS);
-  if (days <= 0) return `${verb} today`;
-  if (days === 1) return `${verb} yesterday`;
-  if (days < 7) return `${verb} ${days} days ago`;
-  return `${verb} ${new Intl.DateTimeFormat(locale, { day: 'numeric', month: 'short', year: 'numeric' }).format(new Date(time))}`;
-}
 
 /**
  * What a kept item is, in a few words.
@@ -125,7 +100,8 @@ export function describeKeptItem(item, now = Date.now()) {
   return {
     name: describeKeptKind(item),
     size: formatBytes(item.bytes),
-    meta: [describeWhen('used', item.used, now), held, saves].filter(Boolean).join(' · ') || 'not used yet',
+    // How long ago, in the words every list of the app uses (`state/model.js` `formatAgo`).
+    meta: [item.used > 0 ? `used ${formatAgo(item.used, now).long}` : '', held, saves].filter(Boolean).join(' · ') || 'not used yet',
     removable: item.held === 'none',
   };
 }
@@ -138,7 +114,7 @@ const SAVED_ID = 'saved:';
  * history this browser kept, or a save under its name), how many steps it
  * holds and when it was last written.
  *
- * @param {{kind: 'autosave'|'named', name: string|null, dataset: {name: string|null}, steps: number,
+ * @param {{kind: 'autosave'|'named', name: string|null, lastStep?: string|null, dataset: {name: string|null}, steps: number,
  *   bytes: number, updatedAt: number, openable: boolean}} saved - `listSavedStates`
  * @param {number} [now]
  * @returns {{name: string, size: string, meta: string}}
@@ -148,9 +124,9 @@ export function describeSavedState(saved, now = Date.now()) {
     name: saved.dataset.name ?? 'Unnamed dataset',
     size: formatBytes(saved.bytes),
     meta: [
-      saved.kind === 'named' ? `Saved as "${saved.name}"` : 'History kept in this browser',
+      savedStateWords(saved),
       formatCountOf(saved.steps, 'step'),
-      describeWhen('saved', saved.updatedAt, now),
+      saved.updatedAt > 0 ? `${saved.kind === 'named' ? 'saved' : 'changed'} ${formatAgo(saved.updatedAt, now).long}` : '',
       saved.openable ? '' : 'kept by another version',
     ].filter(Boolean).join(' · '),
   };
@@ -410,6 +386,11 @@ export function initKeptStoresDialog(dom, {
     for (const button of dom.list.querySelectorAll('[data-hosts-remove], [data-decoders-remove], [data-saved-remove], [data-library-remove], [data-library-show]')) button.disabled = busy;
   }
 
+  /** A section's Remove: quiet, as every action in a row of the list (`createButton`). */
+  function removeAction() {
+    return createButton({ label: 'Remove', variant: 'quiet' });
+  }
+
   /** A dataset's or the hosts' head: its name, the facts under it, and Remove. */
   function sectionHead(titleId, nameText, factsText, removeButton) {
     const head = doc.createElement('div');
@@ -425,9 +406,6 @@ export function initKeptStoresDialog(dom, {
     facts.className = 'kept-dataset-facts';
     facts.textContent = factsText;
     text.append(name, facts);
-    removeButton.type = 'button';
-    removeButton.className = 'btn btn-compact';
-    removeButton.textContent = 'Remove';
     head.append(text, removeButton);
     return { head, facts };
   }
@@ -440,7 +418,7 @@ export function initKeptStoresDialog(dom, {
     const titleId = `kept-dataset-${index}`;
     section.setAttribute('aria-labelledby', titleId);
     const removable = removableIds(group.items);
-    const removeButton = doc.createElement('button');
+    const removeButton = removeAction();
     removeButton.dataset.datasetRemove = group.file;
     removeButton.dataset.removable = String(removable.length > 0);
     removeButton.setAttribute('aria-label', `Remove what is kept of ${group.name}`);
@@ -448,7 +426,12 @@ export function initKeptStoresDialog(dom, {
     section.appendChild(sectionHead(titleId, group.name, `${group.host} · ${formatBytes(group.bytes)}`, removeButton).head);
     for (const item of group.items) {
       const words = describeKeptItem(item, now());
-      const { root, checkbox } = createSelectItem({ name: words.name, size: words.size, meta: words.meta, disabled: !words.removable });
+      const { root, checkbox } = createSelectItem({
+        name: words.name,
+        size: words.size,
+        meta: words.meta,
+        unavailable: words.removable ? null : 'in use by an open tab: it can be removed once that tab closes',
+      });
       root.dataset.itemId = item.id;
       checkbox.checked = words.removable && chosen.has(item.id);
       checkbox.setAttribute('aria-label', `${words.name} of ${group.name}, ${words.size}, ${words.meta}`);
@@ -464,7 +447,7 @@ export function initKeptStoresDialog(dom, {
     section.className = 'kept-dataset kept-saved-states';
     section.setAttribute('role', 'group');
     section.setAttribute('aria-labelledby', 'kept-saved-title');
-    const removeButton = doc.createElement('button');
+    const removeButton = removeAction();
     removeButton.dataset.savedRemove = 'true';
     removeButton.setAttribute('aria-label', `Remove ${formatCountOf(savedList.length, 'saved state')}`);
     const total = savedList.reduce((sum, saved) => sum + saved.bytes, 0);
@@ -491,17 +474,13 @@ export function initKeptStoresDialog(dom, {
     section.className = 'kept-dataset kept-library';
     section.setAttribute('role', 'group');
     section.setAttribute('aria-labelledby', 'kept-library-title');
-    const removeButton = doc.createElement('button');
+    const removeButton = removeAction();
     removeButton.dataset.libraryRemove = 'true';
     removeButton.setAttribute('aria-label', `Forget every dataset of ${words.name}`);
     const { head } = sectionHead('kept-library-title', words.name, words.facts, removeButton);
     if (onShowLibrary !== null) {
-      const show = doc.createElement('button');
-      show.type = 'button';
-      show.className = 'btn btn-compact';
+      const show = createButton({ label: 'Show…', variant: 'quiet', ariaLabel: `Show ${words.name}` });
       show.dataset.libraryShow = 'true';
-      show.textContent = 'Show…';
-      show.setAttribute('aria-label', `Show ${words.name}`);
       show.setAttribute('aria-haspopup', 'dialog');
       head.insertBefore(show, removeButton);
     }
@@ -515,7 +494,7 @@ export function initKeptStoresDialog(dom, {
     section.className = 'kept-dataset kept-hosts';
     section.setAttribute('role', 'group');
     section.setAttribute('aria-labelledby', 'kept-hosts-title');
-    const removeButton = doc.createElement('button');
+    const removeButton = removeAction();
     removeButton.dataset.hostsRemove = 'true';
     removeButton.setAttribute('aria-label', `Forget the connection speeds of ${formatCountOf(remembered.length, 'host')}`);
     const { head, facts } = sectionHead('kept-hosts-title', words.name, words.facts, removeButton);
@@ -530,7 +509,7 @@ export function initKeptStoresDialog(dom, {
     section.className = 'kept-dataset kept-decoders';
     section.setAttribute('role', 'group');
     section.setAttribute('aria-labelledby', 'kept-decoders-title');
-    const removeButton = doc.createElement('button');
+    const removeButton = removeAction();
     removeButton.dataset.decodersRemove = 'true';
     removeButton.setAttribute('aria-label', 'Forget the decoder choices');
     const { head, facts } = sectionHead('kept-decoders-title', words.name, words.facts, removeButton);

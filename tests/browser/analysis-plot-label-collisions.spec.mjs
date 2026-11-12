@@ -21,7 +21,7 @@
  *    pairs genuinely overlapped at 224×180 and none at 720×380, so the axis is
  *    thinned to what the drawn box can hold rather than to a fixed count.
  *
- * 3. The dot plot's size legend title ran into its colour bar in the sidebar
+ * 3. The dot plot's size legend title ran into its color bar in the sidebar
  *    preview, its dots into each other in the expanded view, and its gene names
  *    into each other where the panel was narrow: the legends were placed in
  *    fractions of a plot area whose height the preview does not fix.
@@ -238,7 +238,7 @@ test.describe('analysis plot label collisions', () => {
         height: surface.height,
       });
 
-      // The axis title is not optional: an unlabelled axis cannot be read at
+      // The axis title is not optional: an unlabeled axis cannot be read at
       // any size, so it is drawn on every surface.
       expect(measured.axisTitle, 'the volcano must draw its x-axis title')
         .not.toBeNull();
@@ -492,7 +492,7 @@ function dotplotData() {
   };
 }
 
-/** Two pages of a correlation coloured by cell type. */
+/** Two pages of a correlation colored by cell type. */
 function correlationData() {
   const types = ['Ngn3 low EP', 'Alpha', 'Beta', 'Delta', 'Ductal', 'Epsilon', 'Ngn3 high EP', 'Pre-endocrine'];
   return [0, 1].map(pageIndex => {
@@ -519,6 +519,8 @@ function correlationData() {
       intercept: -0.1,
       xVariable: 'S_score',
       yVariable: 'G2M_score',
+      xLabel: 'S_score',
+      yLabel: 'G2M_score',
       colorValues,
       colorVariable: 'cell_type',
     };
@@ -528,7 +530,7 @@ function correlationData() {
 /**
  * Draw one plot into a host of an exact size (a dot plot no narrower than it
  * names every gene and group, as its preview is) and measure every label it
- * drew: annotations, the legend's box, the colour bar's bar, ticks and title,
+ * drew: annotations, the legend's box, the color bar's bar, ticks and title,
  * the size legend's dots and the tick labels. Returns the labels, every pair
  * that overlaps and every label past the host's edge.
  */

@@ -12,7 +12,7 @@
  *   its field by name, it takes the newly open cells in its category or
  *   range that are visible (`takeInNewCells`), as growing in place does;
  * - a user-defined categorical field keeps each open cell's category; a
- *   newly open cell is labelled as growing in place labels it: from the
+ *   newly open cell is labeled as growing in place labels it: from the
  *   file's column the field was made from (a copy, an edit, a consensus;
  *   `DataState.takeInNewlyOpenCells`), else missing (the codes' missing
  *   marker, `categorical-storage-contract.js`);
@@ -74,7 +74,7 @@ export function captureCarried(state) {
   for (const field of state.obsData?.fields ?? []) {
     if (field?._isUserDefined !== true || field._isDeleted === true) continue;
     if (field.kind === 'category' && ArrayBuffer.isView(field.codes) && field.codes.length === state.pointCount) {
-      // What it was made from goes with it: newly open cells are labelled
+      // What it was made from goes with it: newly open cells are labeled
       // from that column (`takeInNewCells`).
       const meta = {};
       if (field._sourceField != null) meta._sourceField = field._sourceField;

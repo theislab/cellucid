@@ -17,7 +17,7 @@ import { isChangedOnHost, isExplainedFailure } from '../../../../data/data-sourc
 import { getReadActivityLog } from '../../../../data/read-activity-log.js';
 import { factsText, geneReadPlanFacts } from '../../../../data/gene-read-plan.js';
 import { formatCount, formatCountOf, formatRemaining } from '../../../../utils/format-units.js';
-import { abortReason, awaitWithSignal, cancel, cancelled, cancellationKind, isCancellation, onAbort } from '../../../../utils/abort.js';
+import { abortReason, awaitWithSignal, cancel, cancelled, cancellationKind, isCancellation, onAbort, requireSignalOrNull } from '../../../../utils/abort.js';
 import { cellsSteady, trackCellWork } from '../../../../data/open-cells-work.js';
 import { isColumnForm, requireColumnForm, unreadTailOf } from '../../../../data/column-forms.js';
 import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
@@ -35,6 +35,7 @@ import {
   touchFieldResidency,
 } from './residency.js';
 import { markReported } from '../../../../utils/errors.js';
+import { createListenerSet } from '../../../../utils/listener-set.js';
 
 /**
  * Say that a field or gene could not be read: why, in one sentence (a
@@ -116,14 +117,6 @@ function readDatasetGeneration(state) {
   return generation;
 }
 
-function requireAbortSignal(signal) {
-  if (signal === null || signal === undefined) return null;
-  if (!(signal instanceof AbortSignal)) {
-    throw new TypeError('Field loading signal must be an AbortSignal or null.');
-  }
-  return signal;
-}
-
 /** Each shared load's key: its reads carry it, so a job joining the load adopts them. */
 let nextSharedLoadKey = 1;
 
@@ -134,7 +127,7 @@ function createSharedLoadOwner() {
     task: null,
     waiters: new Set(),
     // Who hears a gene on more cells as they are read (`onPartial`).
-    partials: new Set(),
+    partials: createListenerSet('a gene read on more cells'),
     readKey: `field-load-${nextSharedLoadKey++}`
   };
 }
@@ -272,7 +265,7 @@ function validateLoadedLength(values, pointCount, message) {
  * column publishes none until it is read: a string or boolean column's are
  * its labels among the open cells, a categorical's its stored dictionary,
  * or, when that has more categories than there are open cells, the ones its
- * open cells hold, `storedCategoryCount` of them stored), with their colours
+ * open cells hold, `storedCategoryCount` of them stored), with their colors
  * (the file's for a categorical, the ones its labels name for a text
  * column), shown under their display names. A field whose categories are
  * known keeps them: the dataset codes a column one way for its whole life,
@@ -303,15 +296,66 @@ function adoptFoundCategories(state, field, categories, palette = null, storedCa
   state._applyCategoryOverlay(field, owner.source, owner.originalKey, owner.label);
 }
 
+/**
+ * The obs field at `fieldIndex`, listed as numbers, made the text column
+ * `descriptor` describes (an integer column whose first load found
+ * identifiers past 2^53, `readExactIntegers`): its descriptor replaced, and
+ * each view's copy of the field given the kind, the categories to be found
+ * and the codes of a text column, its numbers dropped. The selectors list
+ * it with the categorical fields from now on (`field:changed`, sent by the
+ * load once the field holds its codes).
+ */
+function adoptTextColumn(state, fieldIndex, descriptor, asText) {
+  const descriptors = [...(state._obsFieldDescriptors ?? [])];
+  descriptors[fieldIndex] = descriptor;
+  state._obsFieldDescriptors = Object.freeze(descriptors);
+  const lists = [state.obsData?.fields, ...[...(state.viewContexts?.values() ?? [])].map(context => context?.obsData?.fields)];
+  // A categorical field's centroids, cached per layout: one Map every view's
+  // copy shares, as a field listed categorical has (`view-context-viewer-sync.js`).
+  const centroidsByLayout = new Map();
+  for (const fields of new Set(lists.filter(Array.isArray))) {
+    const copy = fields[fieldIndex];
+    if (!copy || copy.kind === FieldKind.CATEGORY) continue;
+    copy.kind = FieldKind.CATEGORY;
+    copy.centroidsByLayout = centroidsByLayout;
+    for (const key of ['categories', 'codesDtype', 'codesMissingValue', 'palette', 'discovered', 'outlierQuantilesPath']) copy[key] = descriptor[key];
+    delete copy.values;
+    delete copy.outlierQuantiles;
+    copy.asText = asText;
+    copy.loaded = false;
+  }
+}
+
 export class FieldLoadingMethods {
   setFieldLoader(loaderFn) {
     this.fieldLoader = loaderFn;
   }
 
+  /**
+   * The gene loader of the mapped matrix: one that shows the expression
+   * transform (`expression-values.js` `shownVarLoader`), taken as it is, or
+   * the matrix's own loader (a dataset just published: its values as
+   * stored, the transform off).
+   *
+   * @param {Function|null} loaderFn
+   */
   setVarFieldLoader(loaderFn) {
     this.varFieldLoader = loaderFn;
     // The open cells its genes are read for (`gene-sample.js`).
     void this.refreshGeneSample();
+  }
+
+  /**
+   * Run one read through the state's download scheduler
+   * (`data/fetch-scheduler.js`), as the state's own reads are: what a read
+   * of a loader that is not installed yet (a transform's cells' totals,
+   * `expression-values.js`) waits on.
+   *
+   * @param {{priority?: string, signal?: AbortSignal|null, start: (signal: AbortSignal, priority: string) => Promise<*>}} read
+   * @returns {Promise<*>}
+   */
+  scheduleLoaderRead({ priority = 'bulk', signal = null, start }) {
+    return fetchSchedulerOf(this).run({ key: {}, priority, signal: requireSignalOrNull(signal ?? null, 'Field loading signal'), start });
   }
 
   getDatasetGeneration() {
@@ -329,6 +373,9 @@ export class FieldLoadingMethods {
       _loadingSignal: null
     }));
     this.varData = { ...geneList, fields: normalizedFields };
+    // The list as read: the expression transform shows it again under
+    // another loader (`expression-values.js`).
+    this._varGeneList = geneList;
     this._varFieldDataCache.clear();
     // The genes listed: the open cells they are read for (`gene-sample.js`).
     void this.refreshGeneSample();
@@ -346,7 +393,7 @@ export class FieldLoadingMethods {
       signal: rawSignal = null,
       silent = false
     } = options;
-    const signal = requireAbortSignal(rawSignal);
+    const signal = requireSignalOrNull(rawSignal ?? null, 'Field loading signal');
     if (signal?.aborted) throw abortReason(signal);
     // The open cells being changed in place: loaded on the cells after it
     // (`data/open-cells-work.js`).
@@ -469,7 +516,7 @@ export class FieldLoadingMethods {
     const notifications = getNotificationCenter();
     const notifId = silent ? null : notifications.loading(`Loading field: ${field.key}`, {
       category: 'data',
-      onCancel: () => cancel(sharedOwner.controller, 'user', `Loading "${field.key}" was cancelled.`)
+      onCancel: () => cancel(sharedOwner.controller, 'user', `Loading "${field.key}" was canceled.`)
     });
     let task;
     task = Promise.resolve()
@@ -515,6 +562,12 @@ export class FieldLoadingMethods {
         if (sharedSignal.aborted) throw abortReason(sharedSignal);
         requireCurrentSharedLoad(field, task);
         assertCurrentLoadOwner(this, owner);
+        // A column listed as numbers that its first load found to hold
+        // identifiers past 2^53 is a text column from now on, in every view
+        // (data-loaders.js `textColumnDescriptor`); a text column says why.
+        const becameText = loadedData?.descriptor !== undefined;
+        if (becameText) adoptTextColumn(this, fieldIndex, loadedData.descriptor, loadedData.asText);
+        if (typeof loadedData?.asText === 'string') field.asText = loadedData.asText;
         // The categories a column has are found by its first load when its
         // field list could not state them (data-loaders.js).
         const foundCategories = loadedData?.categories;
@@ -525,6 +578,10 @@ export class FieldLoadingMethods {
           field.outlierQuantiles = nextOutlierQuantiles;
         }
         field.loaded = true;
+        if (becameText) {
+          getFieldRegistry().invalidate();
+          this._notifyFieldChange?.(FieldSource.OBS, fieldIndex, 'kind');
+        }
         if (field._loadingPromise === task) {
           field._loadingPromise = null;
           field._loadingSignal = null;
@@ -604,7 +661,7 @@ export class FieldLoadingMethods {
       onPartial = null
     } = options;
     requirePriority(priority);
-    const signal = requireAbortSignal(rawSignal);
+    const signal = requireSignalOrNull(rawSignal ?? null, 'Field loading signal');
     if (signal?.aborted) throw abortReason(signal);
     const steady = cellsSteady();
     if (steady !== null) await awaitWithSignal(steady, signal);
@@ -728,8 +785,11 @@ export class FieldLoadingMethods {
     const notifications = getNotificationCenter();
     const notifId = silent ? null : notifications.loading(`Loading gene: ${field.key}`, {
       category: 'data',
-      onCancel: () => sharedOwner.controller.abort(cancelled('user', `Loading \"${field.key}\" was cancelled.`))
+      onCancel: () => sharedOwner.controller.abort(cancelled('user', `Loading \"${field.key}\" was canceled.`))
     });
+    // This notification shows the gene's reads (and their waits, below): the read
+    // notifications leave them out (`read-progress-notifications.js`), so a wait is said once.
+    if (notifId !== null) getReadActivityLog().adopt(sharedOwner.readKey, `gene-notification-${notifId}`);
     // What the read costs is said before it runs, when it is the whole matrix.
     if (notifId !== null && typeof loader.readPlan === 'function') {
       Promise.resolve()
@@ -783,8 +843,8 @@ export class FieldLoadingMethods {
               onPartial: (column, cells) => {
                 if (sharedOwner.settled || sharedSignal.aborted || column.length !== owner.pointCount) return;
                 if (notifId !== null && notifications.hasNotification(notifId)) {
-                  // The whole gene's time left, from the cells coloured since
-                  // the first colours (every open cell's rows are read: the
+                  // The whole gene's time left, from the cells colored since
+                  // the first colors (every open cell's rows are read: the
                   // time goes with the cells, `geneLayoutReason`). A gene read
                   // for a sample of the open cells (`gene-sample.js`) is read
                   // for those only: they are its whole.
@@ -795,11 +855,11 @@ export class FieldLoadingMethods {
                   const left = rate === null ? '' : ` · ${formatRemaining(Math.max(0, readFor - cells) / rate)} left`;
                   // A sample of the cells; the others show as missing until read (said in the details).
                   notifications.loading(
-                    `Reading gene ${field.key}: ${formatCount(cells)} of ${formatCountOf(readFor, 'cell')} coloured${left}`,
+                    `Reading gene ${field.key}: ${formatCount(cells)} of ${formatCountOf(readFor, 'cell')} colored${left}`,
                     { id: notifId, category: 'data' }
                   );
                 }
-                for (const listener of sharedOwner.partials) listener(column, cells);
+                sharedOwner.partials.notify(column, cells);
               }
             })
           }),
@@ -843,7 +903,7 @@ export class FieldLoadingMethods {
           field._loadingPromise = null;
           field._loadingSignal = null;
         }
-        // Cancelled by the person: every waiter learns it was, whatever the
+        // Canceled by the person: every waiter learns it was, whatever the
         // read stopped with.
         const personsReason = sharedSignal.aborted && cancellationKind(sharedSignal.reason) === 'user'
           ? sharedSignal.reason
@@ -893,7 +953,7 @@ export class FieldLoadingMethods {
    * @returns {Promise<{length: number, indices: Uint32Array, values: Float32Array}|null>}
    */
   async readVarSparseColumn(fieldIndex, options = {}) {
-    const signal = requireAbortSignal(options.signal ?? null);
+    const signal = requireSignalOrNull(options.signal ?? null, 'Field loading signal');
     if (signal?.aborted) throw abortReason(signal);
     const loader = this.varFieldLoader;
     const descriptor = this._varFieldDescriptors?.[fieldIndex];
@@ -926,7 +986,7 @@ export class FieldLoadingMethods {
    * @returns {Promise<{length: number, indices: Uint32Array, values: Float32Array}>}
    */
   async readMatrixSparseColumn(matrix, gene, options = {}) {
-    const signal = requireAbortSignal(options.signal ?? null);
+    const signal = requireSignalOrNull(options.signal ?? null, 'Field loading signal');
     if (signal?.aborted) throw abortReason(signal);
     const descriptor = requireOpenMatrix(this, matrix).fields[gene];
     if (descriptor === undefined) throw new RangeError(`${matrix.expression} has no gene ${gene}.`);
@@ -952,7 +1012,7 @@ export class FieldLoadingMethods {
    * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}>}
    */
   async readMatrixCellSubset(matrix, genes, cells, options = {}) {
-    const signal = requireAbortSignal(options.signal ?? null);
+    const signal = requireSignalOrNull(options.signal ?? null, 'Field loading signal');
     if (signal?.aborted) throw abortReason(signal);
     const { fields } = requireOpenMatrix(this, matrix);
     const descriptors = genes.map(gene => {
@@ -986,7 +1046,7 @@ export class FieldLoadingMethods {
    * @returns {Promise<{pointers: Float64Array, cellIndex: Int32Array, values: Float32Array}|null>}
    */
   async readVarCellSubset(fieldIndices, cells, options = {}) {
-    const signal = requireAbortSignal(options.signal ?? null);
+    const signal = requireSignalOrNull(options.signal ?? null, 'Field loading signal');
     if (signal?.aborted) throw abortReason(signal);
     const loader = this.varFieldLoader;
     if (typeof loader?.readCellSubset !== 'function') return null;
@@ -1078,7 +1138,7 @@ export class FieldLoadingMethods {
    * @returns {Promise<{bytes: number[]}>}
    */
   async deliverVarSparseColumns(fieldIndices, delivery, options = {}) {
-    const signal = requireAbortSignal(options.signal ?? null);
+    const signal = requireSignalOrNull(options.signal ?? null, 'Field loading signal');
     if (signal?.aborted) throw abortReason(signal);
     return this._deliverWith(this.varFieldLoader, this._deliverableDescriptors(fieldIndices), options, signal,
       (loader, descriptors, downloadSignal, owner) => loader.deliverSparseColumns(descriptors, delivery, { signal: downloadSignal, owner }));
@@ -1095,7 +1155,7 @@ export class FieldLoadingMethods {
    * @returns {Promise<{bytes: number[]}>}
    */
   async deliverMatrixSparseColumns(matrix, genes, delivery, options = {}) {
-    const signal = requireAbortSignal(options.signal ?? null);
+    const signal = requireSignalOrNull(options.signal ?? null, 'Field loading signal');
     if (signal?.aborted) throw abortReason(signal);
     return this._deliverWith(requireOpenMatrix(this, matrix).loader, matrixDescriptors(matrix, genes), options, signal,
       (loader, descriptors, downloadSignal, owner) => loader.deliverSparseColumns(descriptors, delivery, { signal: downloadSignal, owner }));
@@ -1112,7 +1172,7 @@ export class FieldLoadingMethods {
    * @returns {Promise<{bytes: number}>}
    */
   async deliverVarCellSubset(fieldIndices, cells, delivery, options = {}) {
-    const signal = requireAbortSignal(options.signal ?? null);
+    const signal = requireSignalOrNull(options.signal ?? null, 'Field loading signal');
     if (signal?.aborted) throw abortReason(signal);
     return this._deliverWith(this.varFieldLoader, this._deliverableDescriptors(fieldIndices), { ...options, priority: 'bulk' }, signal,
       (loader, descriptors, downloadSignal, owner) => loader.deliverCellSubset(descriptors, cells, delivery, { signal: downloadSignal, owner, runGenes: options.runGenes ?? null }));
@@ -1124,7 +1184,7 @@ export class FieldLoadingMethods {
    * @returns {Promise<{bytes: number}>}
    */
   async deliverMatrixCellSubset(matrix, genes, cells, delivery, options = {}) {
-    const signal = requireAbortSignal(options.signal ?? null);
+    const signal = requireSignalOrNull(options.signal ?? null, 'Field loading signal');
     if (signal?.aborted) throw abortReason(signal);
     return this._deliverWith(requireOpenMatrix(this, matrix).loader, matrixDescriptors(matrix, genes), { ...options, priority: 'bulk' }, signal,
       (loader, descriptors, downloadSignal, owner) => loader.deliverCellSubset(descriptors, cells, delivery, { signal: downloadSignal, owner, runGenes: options.runGenes ?? null }));
@@ -1251,8 +1311,8 @@ export class FieldLoadingMethods {
       this.clearCentroids();
     } else {
       this.updateColorsCategorical(field);
-      // Its colours are now written whole; a recolour this batch still owes
-      // it (restored filter colours) is already in them.
+      // Its colors are now written whole; a recolor this batch still owes
+      // it (restored filter colors) is already in them.
       if (this._batchMode === true) this._batchDirty.affectedFields.delete(field);
       this.buildCentroidsForField(field, {
         viewId: this.activeViewId,
@@ -1320,19 +1380,19 @@ export class FieldLoadingMethods {
   }
 
   /**
-   * Colour the view by a gene's values on the cells read so far, while its
+   * Color the view by a gene's values on the cells read so far, while its
    * gene index is built (`ensureVarFieldLoaded`'s `onPartial`): the cells
    * not read yet are NaN and are drawn as not read (`UNREAD_ALPHA_BYTE`,
-   * faded beneath the cells read). Only the colours change -- the
+   * faded beneath the cells read). Only the colors change -- the
    * gene is not loaded, so nothing else (filters, analysis, sessions) ever
    * sees partial values -- and once it is loaded whole, showing it
-   * (`setActiveVarField`) writes every colour again.
+   * (`setActiveVarField`) writes every color again.
    *
    * @param {number} fieldIndex
    * @param {Float32Array|import('../../../../data/column-forms.js').ColumnForm} column -
    *   The cells read so far: their sparse form (`readRows` the cells read),
    *   or one value an open cell (NaN on the cells not read)
-   * @returns {boolean} Whether the colours were written
+   * @returns {boolean} Whether the colors were written
    */
   showPartialVarField(fieldIndex, column) {
     const field = this.varData?.fields?.[fieldIndex];
@@ -1347,7 +1407,7 @@ export class FieldLoadingMethods {
   }
 
   /**
-   * Write the colours of the field shown again: a gene's partial colours
+   * Write the colors of the field shown again: a gene's partial colors
    * (`showPartialVarField`) were drawn and its load stopped or failed.
    */
   restoreActiveFieldColors() {

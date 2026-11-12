@@ -4,7 +4,7 @@
  * CELLxGENE, 2.3M cells): every stored byte is fetched at most once across
  * the opening, its growth in place to the cells asked for, and three genes,
  * the first given up for the second while its index pass runs (a person
- * picks another gene before the first has coloured).
+ * picks another gene before the first has colored).
  *
  * - The gene index pass a withdrawn gene started is kept: the next gene goes
  *   on from the slab it reached (`RowMajorColumnIndex` `_pass1`), and over a
@@ -406,7 +406,7 @@ test('an auto opening over a slow link opens every cell and reads genes for the 
   const [genes, sized, stored] = geneSampleFacts(subset.genes);
   assert.deepEqual([genes.label, genes.value], ['Genes read', `${subset.genes.cells.toLocaleString('en-US')} of 6,000 open cells`]);
   assert.equal(sized.label, 'Sized to');
-  assert.match(sized.value, /^a gene in about 20 s here$/);
+  assert.match(sized.value, /^a gene in ~20 s here$/);
   assert.match(sized.title, /^Every open cell would take ~\d/);
   assert.deepEqual([stored.label, stored.value], ['Stored', 'cell by cell (sparse, CSR)']);
 });

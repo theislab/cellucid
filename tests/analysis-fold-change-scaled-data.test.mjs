@@ -173,7 +173,7 @@ test('log1p fold change below overflow keeps scanpy\'s formula exactly, and the 
 
 test('markers and pseudobulk take the same finite log1p fold change past overflow', async () => {
   const { createGroupingContext, geneSampleOf, groupMarkers } = await import('../assets/js/app/analysis/compute/gene-statistics.js');
-  const { pseudobulkGeneTest } = await import('../assets/js/app/analysis/stats/pseudobulk.js');
+  const { pseudobulkLimma } = await import('../assets/js/app/analysis/stats/pseudobulk.js');
   const a = perMillion(30, 760, 1118, 0);
   const b = perMillion(30, 252, 450, 2);
   const c = perMillion(30, 900, 1000, 0);
@@ -187,14 +187,17 @@ test('markers and pseudobulk take the same finite log1p fold change past overflo
     }
   }
   // Two units a side, per-million unit means on both sides of the overflow.
-  const pseudo = pseudobulkGeneTest(
-    Float64Array.of(800 * 10, 900 * 10, 300 * 10, 350 * 10),
-    Float64Array.of(10, 10, 10, 10),
-    Float64Array.of(10, 10, 10, 10),
-    Uint8Array.of(1, 1, 2, 2),
-    LOG1P,
-    1,
-  );
-  assert.ok(Number.isFinite(pseudo.log2FoldChange), String(pseudo.log2FoldChange));
-  assert.ok(Math.abs(pseudo.log2FoldChange - (850 - Math.log(Math.expm1(325) + 1e-9)) / Math.LN2) < 1e-9);
+  const { genes } = pseudobulkLimma({
+    sums: Float64Array.of(800 * 10, 900 * 10, 300 * 10, 350 * 10),
+    expressing: Float64Array.of(10, 10, 10, 10),
+    measured: Float64Array.of(10, 10, 10, 10),
+    geneCount: 1,
+    units: { unitCount: 4, unitSide: Uint8Array.of(1, 1, 2, 2), unitSample: Int32Array.of(0, 1, 2, 3) },
+    counts: false,
+    minCellsPerSample: 1,
+    foldChange: LOG1P
+  });
+  const log2FoldChange = genes.log2FoldChange[0];
+  assert.ok(Number.isFinite(log2FoldChange), String(log2FoldChange));
+  assert.ok(Math.abs(log2FoldChange - (850 - Math.log(Math.expm1(325) + 1e-9)) / Math.LN2) < 1e-9);
 });

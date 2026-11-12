@@ -20,7 +20,12 @@ export function resultJson(text) {
 
 export const AGENT_DATASET_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=agent-chat-ci`;
 export const CELL_TYPE = Object.freeze({ source: 'obs', key: 'cell_type' });
-export const COLOR_BY_CELL_TYPE = Object.freeze({ name: 'color_by', args: { field: CELL_TYPE } });
+export const SCORE = Object.freeze({ source: 'obs', key: 'score' });
+/**
+ * The agent's call that is a change: the fixture opens colored by cell_type
+ * (its first coloring, part of the opening), so coloring by score is a step.
+ */
+export const COLOR_BY_SCORE = Object.freeze({ name: 'color_by', args: { field: SCORE } });
 
 /** Console errors and uncaught errors of the page, as lines. */
 export function observeProductErrors(page) {
@@ -120,12 +125,20 @@ export async function stepFacts(page) {
   });
 }
 
-/** The key of the first categorical field of the dataset shown (what a scripted turn colours by). */
-export async function firstCategoricalField(page) {
+/**
+ * The key of the first field of the cells of the dataset shown that they are
+ * not colored by now (what a scripted turn colors by): a dataset opens
+ * colored by its first coloring (`app/first-coloring.js`), and coloring by
+ * that field again would change nothing and be no step.
+ */
+export async function fieldNotShown(page) {
   return page.evaluate(async () => {
     const { getActions } = await import('/assets/js/app/actions/index.js');
-    const { outcome } = await getActions().dispatch('fields.list', { kind: 'categorical' });
-    return outcome.fields[0].key;
+    const { outcome } = await getActions().dispatch('fields.list', {});
+    const shown = window._cellucidState.getActiveField()?.key ?? null;
+    const other = outcome.fields.find(field => field.key !== shown);
+    if (other === undefined) throw new Error(`No field other than the one shown (${shown})`);
+    return other.key;
   });
 }
 

@@ -50,11 +50,22 @@
  * callers wait for stops only once every one of them has withdrawn, and a
  * caller whose own signal did not fire never sees another's cancellation.
  *
+ * **Work nobody waits for** (`settleInBackground`): a task started and not
+ * awaited (a UI refresh resetting a control) ends quietly when it is
+ * cancelled and reports any other failure; and since a cancellation is never
+ * a failure, one that still reaches no handler is not a page error either
+ * (`quietUnhandledCancellations`, installed once by the page: a choice
+ * superseded by a newer one, found 2026-11-11 when a link was opened right
+ * after the start page, showed as `pageerror: Field interaction was
+ * superseded by a newer intent.`).
+ *
  * Crossing a thread or a process, a cancellation keeps its kind through
  * `utils/error-wire.js`.
  *
  * @module utils/abort
  */
+
+import { reportListenerFailure } from './listener-set.js';
 
 /** The kinds of cancellation (module overview). */
 export const CANCEL_KINDS = Object.freeze(['user', 'superseded', 'closed', 'released', 'page-left']);
@@ -101,6 +112,38 @@ export function isCancellation(error) {
 }
 
 /**
+ * Let `task` run with nobody waiting for it: a cancellation ends it quietly,
+ * any other failure goes to `report` (never an unhandled rejection).
+ *
+ * @param {Promise<unknown>} task
+ * @param {(error: unknown) => void} report
+ */
+export function settleInBackground(task, report) {
+  if (task === null || typeof task?.then !== 'function') throw new TypeError('Background work is a promise.');
+  if (typeof report !== 'function') throw new TypeError('Background work says where its failures go.');
+  task.then(undefined, (error) => {
+    if (!isCancellation(error)) report(error);
+  });
+}
+
+/**
+ * Make a cancellation that reached no handler quiet on `target` (the page's
+ * window, or a worker's global): it is never a failure, so never a page
+ * error or an "Uncaught (in promise)". Any other unhandled rejection is left
+ * as it is. Returns the listener's removal.
+ *
+ * @param {{addEventListener: Function, removeEventListener: Function}} target
+ * @returns {() => void}
+ */
+export function quietUnhandledCancellations(target) {
+  const listener = (event) => {
+    if (isCancellation(event.reason)) event.preventDefault();
+  };
+  target.addEventListener('unhandledrejection', listener);
+  return () => target.removeEventListener('unhandledrejection', listener);
+}
+
+/**
  * What kind of cancellation `error` is (module overview): its kind, `user`
  * for an `AbortError` without one (the platform's own), or null when it is
  * not a cancellation.
@@ -134,12 +177,65 @@ export function isTransientCancellation(error) {
 export function abortReason(signal) {
   const reason = signal?.reason;
   if (reason instanceof Error || (typeof reason?.name === 'string' && typeof reason?.message === 'string')) return reason;
-  return cancelled('user', 'The work was cancelled.', reason);
+  return cancelled('user', 'The work was canceled.', reason);
 }
 
 /** Throw why `signal` aborted, when it has (`abortReason`). */
 export function throwIfAborted(signal) {
   if (signal?.aborted) throw abortReason(signal);
+}
+
+/** The platform's own `aborted` getter: it answers only for a real signal. */
+const SIGNAL_ABORTED = typeof AbortSignal === 'function'
+  ? Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted')?.get ?? null
+  : null;
+
+/**
+ * Whether `value` is an `AbortSignal`: the platform's brand check (its
+ * `aborted` getter throws for anything else), so a signal made in another
+ * window of this site (a panel moved out) is one too, where `instanceof`
+ * would say no. An object that only has its members (`aborted`,
+ * `addEventListener`) is not one: work handed it would wait on a signal that
+ * never aborts the way a real one does (`onAbort`, `reason`, `any`).
+ *
+ * @param {unknown} value
+ * @returns {value is AbortSignal}
+ */
+export function isAbortSignal(value) {
+  if (SIGNAL_ABORTED === null || value === null || typeof value !== 'object') return false;
+  try {
+    SIGNAL_ABORTED.call(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `value` when it is an `AbortSignal` (`isAbortSignal`), else a `TypeError`
+ * naming `what` (a programming error: whoever passed it broke its contract).
+ *
+ * @param {unknown} value
+ * @param {string} what - e.g. "Gene load signal"
+ * @returns {AbortSignal}
+ */
+export function requireSignal(value, what) {
+  if (!isAbortSignal(value)) throw new TypeError(`${what} must be an AbortSignal.`);
+  return value;
+}
+
+/**
+ * `value` when it is an `AbortSignal` or exactly null (no way to stop the
+ * work), else a `TypeError` naming `what`. `undefined` is not null: a caller
+ * that means "none" says so (`signal ?? null` where an option may be left out).
+ *
+ * @param {unknown} value
+ * @param {string} what
+ * @returns {AbortSignal|null}
+ */
+export function requireSignalOrNull(value, what) {
+  if (value !== null && !isAbortSignal(value)) throw new TypeError(`${what} must be an AbortSignal or null.`);
+  return value;
 }
 
 /** @type {WeakMap<AbortSignal, {entries: Set<{callback: () => void}>, fire: () => void}>} */
@@ -178,10 +274,8 @@ export function onAbort(signal, callback) {
         try {
           entry.callback();
         } catch (error) {
-          // As for an event listener: reported, and the others still run.
-          queueMicrotask(() => {
-            throw error;
-          });
+          // As for every listener: reported, and the others still run.
+          reportListenerFailure('a signal aborting', error);
         }
       }
       entries.clear();
@@ -293,7 +387,7 @@ export function withinLifetime(lifetime, signal, work) {
  * reads, a chunk index leaf, a heap collection, a modality's cell map, a
  * field or gene load several views wait for): the work runs with a signal
  * of its own, which aborts once every waiter has withdrawn (its own signal
- * aborted) and never before, so cancelling one read never fails another; a
+ * aborted) and never before, so canceling one read never fails another; a
  * waiter whose signal aborts is answered at once, with its own signal's
  * reason. A waiter whose signal did not fire therefore never sees an
  * AbortError of another's, and the work's own abort names no waiter's

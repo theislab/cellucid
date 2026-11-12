@@ -8,6 +8,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { showReadProgress } from '../assets/js/app/read-progress-notifications.js';
+import { getReadActivityLog } from '../assets/js/data/read-activity-log.js';
 
 function fakeLog() {
   const listeners = new Set();
@@ -79,9 +80,9 @@ test('the reads nothing else shows are one notification, in plain words, gone wh
     ['dismiss', 'n1'],
   ]);
   assert.match(notifications.calls[0][2], /^Reading field cell_type · \S+ B of \S+ KB$/);
-  assert.match(notifications.calls[1][2], /^Reading field cell_type and the neighbour graph · \S+ KB of \S+ KB$/);
-  assert.match(notifications.calls[2][2], /^Reading field cell_type and the neighbour graph · \S+ KB of \S+ KB · .*2 s left$/);
-  assert.match(notifications.calls[3][2], /^Reading the neighbour graph · /);
+  assert.match(notifications.calls[1][2], /^Reading field cell_type and the neighbor graph · \S+ KB of \S+ KB$/);
+  assert.match(notifications.calls[2][2], /^Reading field cell_type and the neighbor graph · \S+ KB of \S+ KB · .*2 s left$/);
+  assert.match(notifications.calls[3][2], /^Reading the neighbor graph · /);
   assert.ok(notifications.calls.every(call => !/obs\[|obsp\[/.test(call[2] ?? '')), 'the reader\'s words stay in the console');
   stop();
   log.record({ ...field, id: 9, status: 'running', elapsedMs: 5000 });
@@ -109,6 +110,33 @@ test('a failed read leaves the card to what asked for it; an opening, a growth s
   // The failure is the caller's to say (an opening's, a field's, a job's):
   // here the card only goes, so it is never said twice.
   assert.deepEqual(notifications.calls.map(call => call[0]), ['progress', 'dismiss', 'progress', 'dismiss']);
+});
+
+test('a gene\'s reads its own loading notification shows (with its wait) are not shown again here (R9W-4)', () => {
+  // Offline while a gene is read: its notification said "Reading gene BARX2: This computer is
+  // offline: …" with Cancel, and a second one said "Reading genes · waiting: This computer is offline".
+  const log = getReadActivityLog();
+  log.clear();
+  const notifications = fakeNotifications();
+  const stop = showReadProgress({ log, notifications, opening: { shows: () => false } });
+  try {
+    log.adopt('field-load-7', 'gene-notification-n3');
+    const waiting = { text: 'This computer is offline: reading goes on as soon as it is back; what was read is kept.' };
+    log.record({ ...base, requests: 3, chunks: 0, decodedBytes: 0, id: 41, kind: 'genes', label: 'gene BARX2 of X', keys: ['field-load-7'], status: 'running', elapsedMs: 5000, waiting });
+    log.flush();
+    assert.deepEqual(notifications.calls, [], 'said once, by the gene\'s notification');
+    // A read of the same kind that no notification owns is still shown.
+    log.record({ ...base, requests: 3, chunks: 0, decodedBytes: 0, id: 42, kind: 'genes', label: '12 genes of X', keys: ['field-load-8'], status: 'running', elapsedMs: 5000, waiting });
+    log.flush();
+    assert.equal(notifications.calls.filter(call => call[0] === 'progress').length, 1);
+    assert.match(notifications.calls[0][2], /^Reading genes · waiting: This computer is offline/);
+  } finally {
+    stop();
+    log.clear();
+  }
+  // Every gene load that shows a notification adopts its reads for it.
+  const loading = readFileSync(new URL('../assets/js/app/state/managers/field/loading.js', import.meta.url), 'utf8');
+  assert.match(loading, /if \(notifId !== null\) getReadActivityLog\(\)\.adopt\(sharedOwner\.readKey, `gene-notification-\$\{notifId\}`\);/);
 });
 
 test('the reader worker posts no progress event of its own: activity is the one channel', () => {

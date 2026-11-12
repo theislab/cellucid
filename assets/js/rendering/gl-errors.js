@@ -6,7 +6,7 @@ import { fenceHasPassed } from './gl-utils.js';
  *
  * A lost context is a terminal condition the viewer already owns a fence for,
  * not a defect: the frame loop stops, the GPU ownership graph is retired, and
- * only a reload builds a coherent replacement. It has to stay recognisable as
+ * only a reload builds a coherent replacement. It has to stay recognizable as
  * that everywhere, and `getError()` alone cannot guarantee it: the
  * specification reports `CONTEXT_LOST_WEBGL` once and `NO_ERROR` afterwards, so
  * whichever check happens to read it first would be the only one to see it.
@@ -37,9 +37,32 @@ export function isContextLostError(error) {
   return error instanceof Error && error.name === CONTEXT_LOST_ERROR_NAME;
 }
 
+/** The name of the failure a browser's refusal of a WebGL2 context carries. */
+export const CONTEXT_REFUSED_ERROR_NAME = 'WebGLContextRefusedError';
+
+/**
+ * The browser handed back no WebGL2 context for `owner` (`getContext`
+ * answered null): a browser without WebGL2, or one whose graphics process
+ * cannot make another context now (reset, blocklisted for this context, too
+ * many contexts). `startup-failure.js` tells the two apart (R9E-6).
+ *
+ * @param {string} owner
+ * @returns {Error}
+ */
+export function contextRefusedError(owner) {
+  const error = new Error(`${owner} got no WebGL2 context from the browser.`);
+  error.name = CONTEXT_REFUSED_ERROR_NAME;
+  return error;
+}
+
+/** Whether `error` is a browser's refusal of a WebGL2 context (`contextRefusedError`). */
+export function isContextRefusedError(error) {
+  return error instanceof Error && error.name === CONTEXT_REFUSED_ERROR_NAME;
+}
+
 /**
  * @param {string} owner
- * @returns {Error} The recognisable refusal for `owner`.
+ * @returns {Error} The recognizable refusal for `owner`.
  */
 export function contextLostError(owner) {
   const error = new Error(
@@ -83,7 +106,7 @@ export function drainWebGLErrors(gl) {
 /**
  * Require an operational context with an empty error queue.
  *
- * Throws the recognisable context-loss refusal when the context is gone, and an
+ * Throws the recognizable context-loss refusal when the context is gone, and an
  * ordinary error naming every pending code otherwise.
  *
  * @param {WebGL2RenderingContext} gl

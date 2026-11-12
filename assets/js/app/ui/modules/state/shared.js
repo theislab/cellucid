@@ -9,7 +9,7 @@
 
 import { showConfirmDialog } from '../../components/confirm-dialog.js';
 import { getNotificationCenter } from '../../../notification-center.js';
-import { failureText, isInternalFailure, isReported, sayFailure } from '../../../../utils/errors.js';
+import { failureDetails, isReported, sayFailure } from '../../../../utils/errors.js';
 import { ActionRefused } from '../../../actions/dispatcher.js';
 
 /** Decorative glyphs (the buttons are named by their labels). */
@@ -56,7 +56,7 @@ export function undoKeys(navigatorOwner = globalThis.navigator) {
  * title, what will happen (a sentence, then a list), an optional name to
  * type (checked by `input.validate` before it is taken), an optional
  * checkbox whose answer may change the sentences, and one or two answers
- * besides Cancel. Resolves the answer chosen, or null when it was cancelled.
+ * besides Cancel. Resolves the answer chosen, or null when it was canceled.
  *
  * @param {{title: string, lines: string[] | ((option: boolean) => string[]),
  *   input?: {label: string, value?: string, validate?: (value: string) => (string|null)}|null,
@@ -70,17 +70,9 @@ export function askHistory({ title, lines, input = null, option = null, answers 
   const confirm = answers[answers.length - 1];
   const other = answers.length === 2 ? answers[0] : null;
   const linesOf = checked => (typeof lines === 'function' ? lines(checked) : lines);
-  // The confirmation is drawn over the page; an open modal dialog (the branch
-  // map, Recently deleted) would leave it inert, so it steps aside for the
-  // question and comes back after it.
-  const aside = [...document.querySelectorAll('dialog[open]')].filter(dialog => dialog.matches(':modal'));
-  for (const dialog of aside) dialog.close();
-  const back = answer => {
-    for (const dialog of aside) if (dialog.isConnected && !dialog.open) dialog.showModal();
-    return answer;
-  };
-  return new Promise(settle => {
-    const resolve = answer => settle(back(answer));
+  // Asked from a dialog (the branch map, Recently deleted), the question
+  // opens over it, and focus goes back into it after.
+  return new Promise(resolve => {
     showConfirmDialog({
       title,
       describe: checked => {
@@ -140,8 +132,7 @@ export function toastEdit(text, undo) {
 export function reportHistoryFailure(what, error) {
   if (!(error instanceof ActionRefused)) console.error(`[state] ${what} failed`, error);
   if (isReported(error)) return;
-  getNotificationCenter().error(`${what} failed: ${sayFailure(error)}`, {
-    category: 'session',
-    ...(isInternalFailure(error) ? { details: failureText(error) } : {}),
-  });
+  // A refusal that says a problem inside Cellucid in its sentence (a replayed step's, its `reason`)
+  // keeps that problem's words under Details, as the problem said on its own does (`failureDetails`).
+  getNotificationCenter().error(`${what} failed: ${sayFailure(error)}`, { category: 'session', ...failureDetails(error) });
 }

@@ -5,7 +5,7 @@
  * a step was kept).
  */
 import { expect, test } from './helpers/test.mjs';
-import { dismissWelcome } from './helpers/welcome.mjs';
+import { continueOffer, continueWhereLeftOff, dismissWelcome } from './helpers/welcome.mjs';
 import { AGENT_DATASET_URL, installScriptedModel, openAgentDataset, openChat, queueReplies, say } from './helpers/agent-chat.mjs';
 
 test('a conversation that made no step survives a reload', async ({ page }) => {
@@ -22,9 +22,9 @@ test('a conversation that made no step survives a reload', async ({ page }) => {
   await page.evaluate(() => window._cellucidHistories.flush());
   await page.goto(AGENT_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  const offer = page.locator('.notification').filter({ hasText: 'Continue where you left off?' });
+  const offer = continueOffer(page);
   await expect(offer).toContainText('1 conversation');
-  await offer.getByRole('button', { name: 'Continue' }).click();
+  await continueWhereLeftOff(page);
   await expect.poll(() => page.evaluate(() => {
     const history = window._cellucidHistories.current();
     return history?.active ? history.chatsOf(history.active.id).length : 0;

@@ -1,10 +1,10 @@
 /**
- * @fileoverview Actions on how the cells are coloured: by which field or
- * gene, a category's colour, and a continuous field's colour map, log scale,
- * gray for zero and colour range.
+ * @fileoverview Actions on how the cells are colored: by which field or
+ * gene, a category's color, and a continuous field's color map, log scale,
+ * gray for zero and color range.
  *
  * They act on the view in focus, as the sidebar does. A continuous setting
- * names the field it is for, which must be the one the view is coloured by:
+ * names the field it is for, which must be the one the view is colored by:
  * a step replayed where another field is shown is refused by name instead of
  * changing that one.
  *
@@ -14,24 +14,27 @@
 import { defineAction } from '../catalog.js';
 import { PLAIN_QUOTE } from '../targets/names.js';
 import { CONTINUOUS_COLORMAPS } from '../../../data/palettes.js';
+import { formatBound } from '../../../utils/format-units.js';
 import {
   CATEGORY_FIELD, CATEGORY_LABEL, FIELD, COLOR, SHOWN_FIELD_READS, fieldArgument, fieldCoalesceKey, fieldWords,
 } from './params.js';
 
 export const COLORMAP_IDS = Object.freeze(CONTINUOUS_COLORMAPS.map(colormap => colormap.id));
+/** A color map's name as the legend shows it (`Viridis`), by its id. */
+const COLORMAP_LABELS = new Map(CONTINUOUS_COLORMAPS.map(colormap => [colormap.id, colormap.label]));
 
 const CONTINUOUS_FIELD = Object.freeze({
   ...FIELD,
-  description: 'The continuous field or gene the view in focus is coloured by, by name.',
+  description: 'The continuous field or gene the view in focus is colored by, by name.',
 });
 
-/** A switch of the shown field's colours: its name resolves in the shown field (context); `reads`, what it is computed from. */
+/** A switch of the shown field's colors: its name resolves in the shown field (context); `reads`, what it is computed from. */
 function switchAction({ type, title, summary, word, code, reads = [], context = SHOWN_FIELD_READS }) {
   return defineAction({
     type,
     title,
     summary,
-    group: 'Colours',
+    group: 'Colors',
     params: {
       type: 'object', additionalProperties: false, required: ['field', 'enabled'],
       properties: { field: CONTINUOUS_FIELD, enabled: { type: 'boolean' } },
@@ -48,16 +51,16 @@ function switchAction({ type, title, summary, word, code, reads = [], context = 
 export const coloringActions = Object.freeze([
   defineAction({
     type: 'color.by',
-    title: 'Colour the cells by a field or gene',
-    summary: 'Colour the view in focus by a column of the cells (source "obs") or a gene (source "var"), reading it first when needed; null clears the colouring.',
-    group: 'Colours',
+    title: 'Color the cells by a field or gene',
+    summary: 'Color the view in focus by a column of the cells (source "obs") or a gene (source "var"), reading it first when needed; null clears the coloring.',
+    group: 'Colors',
     params: {
       type: 'object', additionalProperties: false, required: ['field'],
       properties: {
         field: {
           ...FIELD,
           type: ['object', 'null'],
-          description: 'The field or gene by name; null colours the cells by nothing.',
+          description: 'The field or gene by name; null colors the cells by nothing.',
         },
       },
     },
@@ -67,14 +70,14 @@ export const coloringActions = Object.freeze([
     effect: 'view',
     // A newer choice replaces one still being read.
     supersede: true,
-    describe: (p, outcome, quote = PLAIN_QUOTE) => (p.field === null ? 'Cleared the colouring' : `Coloured by ${fieldWords(p.field, quote)}`),
+    describe: (p, outcome, quote = PLAIN_QUOTE) => (p.field === null ? 'Cleared the coloring' : `Colored by ${fieldWords(p.field, quote)}`),
     code: p => (p.field === null ? 'clear_color()' : `color_by(${fieldArgument(p.field)})`),
   }),
   defineAction({
     type: 'color.category',
-    title: 'Colour one category',
-    summary: 'Give one category of a categorical column another colour.',
-    group: 'Colours',
+    title: 'Color one category',
+    summary: 'Give one category of a categorical column another color in the view in focus: each view keeps its own colors, so view_focus first selects the view to change (a view not colored by the column shows no change).',
+    group: 'Colors',
     params: {
       type: 'object', additionalProperties: false, required: ['field', 'category', 'color'],
       properties: { field: CATEGORY_FIELD, category: CATEGORY_LABEL, color: COLOR },
@@ -83,59 +86,59 @@ export const coloringActions = Object.freeze([
     reads: [],
     context: ['field-overlays', 'views'],
     effect: 'view',
-    // Dragging the colour picker is one step.
+    // Dragging the color picker is one step.
     coalesce: p => `${fieldCoalesceKey(p.field)}:${p.category}`,
-    describe: (p, outcome, quote = PLAIN_QUOTE) => `Coloured ${quote.bare(p.category)} of ${quote.bare(p.field.key)} ${p.color.toLowerCase()}`,
+    describe: (p, outcome, quote = PLAIN_QUOTE) => `Colored ${quote.bare(p.category)} of ${quote.bare(p.field.key)} ${p.color.toLowerCase()}`,
     code: p => `color_category(${JSON.stringify(p.field.key)}, ${JSON.stringify(p.category)}, ${JSON.stringify(p.color.toLowerCase())})`,
   }),
   defineAction({
     type: 'color.continuous.colormap',
-    title: 'Choose a colour map',
-    summary: 'The colour map a continuous field or gene is drawn with.',
-    group: 'Colours',
+    title: 'Choose a color map',
+    summary: 'The color map a continuous field or gene is drawn with in the view in focus (each view keeps its own).',
+    group: 'Colors',
     params: {
       type: 'object', additionalProperties: false, required: ['field', 'colormap'],
       properties: {
         field: CONTINUOUS_FIELD,
-        colormap: { type: 'string', enum: [...COLORMAP_IDS], description: 'The colour map by its id (viridis, magma, coolwarm, …).' },
+        colormap: { type: 'string', enum: [...COLORMAP_IDS], description: 'The color map by its id (viridis, magma, coolwarm, …).' },
       },
     },
     touches: ['colors'],
     reads: [],
     context: SHOWN_FIELD_READS,
     effect: 'view',
-    describe: (p, outcome, quote = PLAIN_QUOTE) => `Drew ${fieldWords(p.field, quote)} in ${p.colormap}`,
+    describe: (p, outcome, quote = PLAIN_QUOTE) => `Drew ${fieldWords(p.field, quote)} in ${COLORMAP_LABELS.get(p.colormap) ?? p.colormap}`,
     code: p => `colormap(${fieldArgument(p.field)}, ${JSON.stringify(p.colormap)})`,
   }),
   switchAction({
     type: 'color.continuous.log',
-    title: 'Log colour scale',
-    summary: 'Colour a continuous field or gene on a log scale, or a linear one.',
-    word: 'the log colour scale',
+    title: 'Log color scale',
+    summary: 'Color a continuous field or gene on a log scale, or a linear one, in the view in focus (each view keeps its own).',
+    word: 'the log color scale',
     code: 'log_color_scale',
   }),
   switchAction({
     type: 'color.continuous.zero-gray',
     title: 'Gray for zero',
-    summary: 'Draw a gene\'s zeros in gray beneath the expressing cells, or in the colour map\'s lowest colour.',
+    summary: 'Draw a gene\'s zeros in gray beneath the expressing cells, or in the color map\'s lowest color, in the view in focus (each view keeps its own).',
     word: 'gray for zero',
     code: 'gray_for_zero',
   }),
   switchAction({
     type: 'color.continuous.rescale',
-    title: 'Rescale colours to the visible range',
-    summary: 'Stretch the colour map over the visible range of a continuous field or gene, or over all its values.',
+    title: 'Rescale colors to the visible range',
+    summary: 'Stretch the color map over the visible range of a continuous field or gene, or over all its values, in the view in focus (each view keeps its own).',
     word: 'rescaling to the visible range',
     code: 'rescale_colors',
-    // Turned on, the colours span the visible range: the filter's, else the open cells' values.
+    // Turned on, the colors span the visible range: the filter's, else the open cells' values.
     reads: ['filters', 'cells'],
     context: SHOWN_FIELD_READS,
   }),
   defineAction({
     type: 'color.continuous.range',
-    title: 'Set the colour range',
-    summary: 'The values the colour map spans for a continuous field or gene that is rescaled to a range.',
-    group: 'Colours',
+    title: 'Set the color range',
+    summary: 'The values the color map spans for a continuous field or gene that is rescaled to a range, in the view in focus (each view keeps its own).',
+    group: 'Colors',
     params: {
       type: 'object', additionalProperties: false, required: ['field', 'min', 'max'],
       properties: { field: CONTINUOUS_FIELD, min: { type: 'number' }, max: { type: 'number' } },
@@ -146,7 +149,7 @@ export const coloringActions = Object.freeze([
     context: [...SHOWN_FIELD_READS, 'cells'],
     effect: 'view',
     coalesce: p => fieldCoalesceKey(p.field),
-    describe: (p, outcome, quote = PLAIN_QUOTE) => `Spanned the colours of ${fieldWords(p.field, quote)} over ${p.min}–${p.max}`,
+    describe: (p, outcome, quote = PLAIN_QUOTE) => `Spanned the colors of ${fieldWords(p.field, quote)} over ${formatBound(p.min)} – ${formatBound(p.max)}`,
     code: p => `color_range(${fieldArgument(p.field)}, ${p.min}, ${p.max})`,
   }),
 ]);

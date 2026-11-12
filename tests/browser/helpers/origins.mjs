@@ -1,7 +1,7 @@
 // Every absolute address a browser-test spec needs, derived from the one module
 // that also decides where the servers bind.
 //
-// `scripts/browser-test-ports.mjs` honours CELLUCID_BROWSER_TEST_PORT and
+// `scripts/browser-test-ports.mjs` honors CELLUCID_BROWSER_TEST_PORT and
 // CELLUCID_BROWSER_TEST_SAMPLE_PORT so a second concurrent run can move off a
 // taken address. A spec that spelled the port out would defeat that from the
 // inside: the page would load from the moved address and then ask for its
@@ -15,7 +15,7 @@
 // surrounding escape sequences get corrupted.
 //
 // Everything here is a Node-side binding. `page.evaluate`, `addInitScript` and
-// `waitForFunction` serialise their callback and run it in the page, where none
+// `waitForFunction` serialize their callback and run it in the page, where none
 // of these names exist — a literal used to survive that boundary because it was
 // part of the function source, and an identifier does not. Pass the value in as
 // an argument instead:

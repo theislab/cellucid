@@ -7,7 +7,7 @@
  *
  * Distances. Each pair's distance is computed in double precision with the
  * per-item terms taken once per item instead of once per pair:
- * - correlation: `1 - r`, r the Pearson coefficient from centred moments
+ * - correlation: `1 - r`, r the Pearson coefficient from centered moments
  *   (`pairedCentredMoments` order of summation), 1 when either item is
  *   constant, r clamped to [-1, 1];
  * - euclidean: square root of the summed squared differences;
@@ -43,7 +43,7 @@ export const LINKAGE_METHODS = Object.freeze(['average', 'complete', 'single']);
 
 /**
  * Bytes clustering `itemCount` items holds at its peak: the condensed
- * distance matrix, one double per pair. Everything else (the items' centred
+ * distance matrix, one double per pair. Everything else (the items' centered
  * values, per-item bookkeeping, the merge table) is linear in the item count.
  *
  * @param {number} itemCount
@@ -95,7 +95,7 @@ export function condensedRowRanges(n, parts) {
 }
 
 /**
- * The per-item terms of a metric: the values each pair sum reads (centred for
+ * The per-item terms of a metric: the values each pair sum reads (centered for
  * correlation) and each item's own sum of squares.
  *
  * @param {ArrayLike<number>} values - Row-major items × features, finite

@@ -12,6 +12,7 @@ import {
   DATA_CONFIG,
   DataSourceError,
   DataSourceErrorCode,
+  explainedFailure,
   resolveUrl,
 } from './data-source.js';
 import {
@@ -89,6 +90,12 @@ export class LocalDemoDataSource {
      * requests behind the failure they are looking at.
      */
     this._askOnce = false;
+    /**
+     * What the listing's reads of the samples' files wait for
+     * (`holdListingUntil`): startup's dataset settled. Null: nothing.
+     * @type {Promise<void>|null}
+     */
+    this._listingHold = null;
 
     /** @type {string|null} Dataset whose base URL was handed out last */
     this.datasetId = null;
@@ -143,12 +150,20 @@ export class LocalDemoDataSource {
   async _loadCatalog(owner = this._captureCatalogGeneration()) {
     this._assertCatalogGeneration(owner);
     if (this.configurationError !== null) {
-      throw new DataSourceError(
-        this.configurationError.message,
-        DataSourceErrorCode.INVALID_FORMAT,
-        this.type,
-        { cause: this.configurationError }
-      );
+      // The link's `sampleCatalog` (R9E-2) is said as the link's, settled;
+      // the page's own meta element is a deployment's error.
+      const sentence = this.configurationError.sentence;
+      throw typeof sentence === 'string'
+        ? explainedFailure(sentence, DataSourceErrorCode.VALIDATION_ERROR, this.type, {
+          cause: this.configurationError,
+          parameter: this.configurationError.parameter,
+        })
+        : new DataSourceError(
+          this.configurationError.message,
+          DataSourceErrorCode.INVALID_FORMAT,
+          this.type,
+          { cause: this.configurationError }
+        );
     }
     if (this.baseUrl === null) {
       throw new DataSourceError(
@@ -190,8 +205,27 @@ export class LocalDemoDataSource {
   }
 
   /**
+   * Read the samples' files for the listing (`listDatasets`) only once
+   * `settled` settles: startup's dataset has opened (or failed, or was
+   * replaced). The listing is asked for as the page starts, a moment before
+   * startup opens its dataset, so it cannot see that opening
+   * (`AnnDataCatalog.describe` takes an opening's own description and reads
+   * the other files after its first view): it would read every sample's
+   * file, the one being opened too, against that first view. The catalog
+   * itself (`datasets.json`, `listCatalogEntries`) is not held.
+   *
+   * @param {Promise<unknown>} settled
+   */
+  holdListingUntil(settled) {
+    if (typeof settled?.then !== 'function') {
+      throw new TypeError('LocalDemoDataSource.holdListingUntil needs a promise.');
+    }
+    this._listingHold = Promise.resolve(settled).then(() => {}, () => {});
+  }
+
+  /**
    * What the Sample dataset list shows: every dataset's name and counts, read
-   * from its file's metadata.
+   * from its file's metadata (after startup's dataset: `holdListingUntil`).
    * @returns {Promise<DatasetSummary[]>}
    */
   async listDatasets() {
@@ -205,6 +239,8 @@ export class LocalDemoDataSource {
     const promise = (async () => {
       const catalog = await this._loadCatalog(owner);
       try {
+        if (this._listingHold !== null) await this._listingHold;
+        this._assertCatalogGeneration(owner);
         const datasets = await catalog.describe(owner.controller.signal);
         this._assertCatalogGeneration(owner);
         this._datasets = datasets;

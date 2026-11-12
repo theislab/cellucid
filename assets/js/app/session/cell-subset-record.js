@@ -44,19 +44,7 @@ import { requireSubsampleSpec } from '../../data/subsample.js';
 import { requireCellOrder } from '../../data/anndata/subsample-plan.js';
 import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
-
-function toBase64(bytes) {
-  let text = '';
-  for (let i = 0; i < bytes.length; i += 0x8000) text += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return btoa(text);
-}
-
-function fromBase64(text) {
-  const binary = atob(text);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
+import { base64OfBytes, bytesOfBase64 } from '../../utils/byte-text.js';
 
 /**
  * The record of the open dataset's cells, or null when every cell is open
@@ -77,7 +65,7 @@ export function captureCellSubsetRecord(dataSourceManager) {
   const identity = createCellIdentity({ nObs: subset.nObs, kept: subset.kept });
   return {
     spec: { ...subset.spec, ...(subset.spec.columns ? { columns: [...subset.spec.columns] } : {}) },
-    kept: toBase64(encodeCellSet(identity)),
+    kept: base64OfBytes(encodeCellSet(identity)),
     digest: identity.digest,
   };
 }
@@ -99,7 +87,7 @@ export function decodeCellSubsetRecord(value, context) {
   if (typeof value.digest !== 'string' || !/^[0-9a-f]{16}$/.test(value.digest)) {
     throw new TypeError(`${context} digest must be 16 lowercase hex digits.`);
   }
-  const identity = decodeCellSet(fromBase64(value.kept), spec.nObs);
+  const identity = decodeCellSet(bytesOfBase64(value.kept), spec.nObs);
   if (identity.n !== spec.k) {
     throw new TypeError(`${context} lists ${formatCountOf(identity.n, 'cell')}; its specification keeps ${spec.k}.`);
   }

@@ -13,7 +13,7 @@
  * fetched together, sized from the central directory plus the entry's
  * central extra field (the usual size of its local one); a local header that
  * turns out longer costs one more read. Entries read in the same task go out
- * together, and the byte reader merges neighbours into one request and runs
+ * together, and the byte reader merges neighbors into one request and runs
  * the rest in parallel.
  *
  * Every entry is checked before its bytes are returned: the local header must
@@ -374,14 +374,14 @@ function checkLocalSizes(record, header, local, label) {
 
 /**
  * @typedef {Object} ZipEntry
- * @property {string} path - Normalised, relative, `/`-separated
+ * @property {string} path - Normalized, relative, `/`-separated
  * @property {number} size - Bytes once decompressed
  * @property {number} compressedSize - Bytes stored in the archive
  * @property {number} method - 0 (stored) or 8 (deflate)
  * @property {number} crc32
  * @property {(options?: {signal?: AbortSignal|null, activity?: Object|null}) => Promise<Uint8Array>} read
  *   The whole entry, checked. A stored entry may be a view into a buffer
- *   shared with neighbouring reads: copy what is kept.
+ *   shared with neighboring reads: copy what is kept.
  * @property {(offset: number, length: number, options?: {signal?: AbortSignal|null, activity?: Object|null}) => Promise<Uint8Array>} readRange
  *   Bytes `[offset, offset + length)` of the entry. A stored entry reads only
  *   that range (no CRC can cover a part); a deflated one is read whole.

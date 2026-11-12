@@ -71,7 +71,7 @@ async function shownResult(Class) {
     _updatePageSelectorCounts: () => {},
     _publishDerivedResults: value => published.push(value),
     _exportResult: () => ({ kind: 'test', version: 2, payload: {} }),
-    _exportModalCSV: () => { throw new Error('a stale result reached the CSV writer'); },
+    tableFile: () => { throw new Error('a stale result reached the CSV writer'); },
   });
   ui._resultInputs = { options: OPTIONS, provenance: await ui._currentProvenance(OPTIONS, [], null) };
   return { ui, state, published, warnings, result };

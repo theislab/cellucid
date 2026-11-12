@@ -119,6 +119,24 @@ test('a Loom file opens like an .h5ad and has no Modality select', async ({ page
   expect(errors).toEqual([]);
 });
 
+test('a Loom clustering of numbers colors the cells: its categories are 0, 1, 2, 3 in the legend', async ({ page }) => {
+  // L18-8 (live pass 5): coloring by velocyto's integer `ClusterID` failed with "Could not load the field:
+  // [CommunityAnnotationSession] category at index 0 must be nonblank": the legend handed the community
+  // annotation session the numbers themselves.
+  const errors = collectBrowserErrors(page);
+  await openStart(page);
+  await chooseFiles(page.locator('#user-data-file-input'), await unpacked('loom', 'loompy-3.0.8', 'velocyto.loom'));
+  await expectOpened(page, 48);
+  await page.locator('#categorical-field').selectOption({ label: 'ClusterID' });
+  await expect.poll(() => page.evaluate(() => window._cellucidState.getActiveField?.()?.key ?? null)).toBe('ClusterID');
+  // Its categories are numbers (read once the field is loaded): the case that failed.
+  expect(await page.evaluate(() => window._cellucidState.getFields().find(field => field.key === 'ClusterID').categories))
+    .toEqual([0, 1, 2, 3]);
+  await expect(page.locator('.notification').filter({ hasText: 'Could not load the field' })).toHaveCount(0);
+  await expect(page.locator('.legend-item .legend-label-main')).toHaveText(['0', '1', '2', '3']);
+  expect(errors).toEqual([]);
+});
+
 test('a CITE-seq .h5mu shows one Modality select; choosing the proteins reads them', async ({ page }) => {
   const errors = collectBrowserErrors(page);
   await openStart(page);

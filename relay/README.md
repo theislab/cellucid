@@ -22,12 +22,13 @@ never edited by hand).
 | Route | Method | Who calls it | What it does |
 | --- | --- | --- | --- |
 | `/` | POST | Claude, ChatGPT, any MCP client, with a bearer token | The MCP endpoint. Streamable HTTP, one JSON-RPC message per POST, JSON answers: `initialize`, `ping`, `server/discover`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `resources/templates/list`, `subscriptions/listen`; GET and DELETE answer 405 (no stream, no session), with a sentence that says this is the connector address |
-| `/health` | GET | anyone | Health: `status`, `contractVersion`, the MCP address, Cellucid version, catalogue digest, endpoints |
+| `/health` | GET | anyone | Health: `status`, `contractVersion`, the MCP address, Cellucid version, catalog digest, endpoints |
 | `/.well-known/oauth-protected-resource` | GET | MCP clients | Protected-resource metadata (RFC 9728) for the MCP endpoint; its `resource` is the bare origin |
 | `/.well-known/oauth-authorization-server` | GET | MCP clients | Authorization-server metadata (RFC 8414) |
 | `/oauth/register` | POST | MCP clients | Dynamic Client Registration (RFC 7591) |
 | `/oauth/authorize` | GET | the person's browser, sent by the client | Checks the request, shows the waiting page with the connect code and "Open Cellucid to approve" |
 | `/oauth/authorize/wait` | POST | the waiting page only | Long poll until the person allowed or denied in Cellucid (or cancel) |
+| `/oauth/claim` | POST (credentialed CORS) | a Cellucid page on an allowed origin, with the browser's cookies | Claim a connect code as this browser: the tab secret names the pairing, the approver cookie the waiting page set proves it is the browser that shows the page; answers, as a socket reply, `{ok: true, value}` (who asks) or `{ok: false, error}` (`other-browser`, `unknown`, `claimed-elsewhere`, `decided`) |
 | `/oauth/assets/authorize.js`, `/oauth/assets/authorize.css` | GET | the waiting page | Its script and style (served here, so the page's CSP is `script-src 'self'`) |
 | `/oauth/token` | POST | MCP clients | `authorization_code` (PKCE S256) and `refresh_token` (rotating) |
 | `/tab` | GET (WebSocket) | a Cellucid page on an allowed origin | The tab's socket, proven by its tab secret |
@@ -49,16 +50,28 @@ other route has a path of its own, so nothing collides with it. The wire between
 2. The client opens `/oauth/authorize` in the person's browser. The relay checks the client
    and its redirect URI (a failure is a page, never a redirect to an unchecked address),
    then PKCE S256, `response_type=code` and the resource (the relay's origin, with or
-   without a trailing slash; failures are redirected
-   back with `error`, `state` and `iss`). It keeps the request under a fresh **connect
+   without a trailing slash; a failure is sent back with `error`, `state` and `iss`: at
+   once to claude.ai and chatgpt.com, and for any other app by a link on a page the person
+   follows, since anyone can register a redirect URI of their own and an automatic redirect
+   would make the relay an open redirect, RFC 9700 §4.11.2). It keeps the request under a fresh **connect
    code** (8 symbols of Crockford base32, 40 bits, ten minutes) in an `approval:<code>`
-   Durable Object and shows the waiting page: who asks (Claude, ChatGPT, or the client's
-   own name with the host that vouches for it), where the answer goes, the code, and
-   **Open Cellucid to approve** (`https://www.cellucid.com/#cellucid_connect=<code>`).
+   Durable Object and shows the waiting page: who asks (Claude, ChatGPT, or the host that
+   vouches for any other app, its own name only quoted), where the answer goes, the code, and
+   **Open Cellucid to approve** (`https://www.cellucid.com/#cellucid_connect=<code>`). The
+   page sets this browser's **approver cookie** (`__Host-cellucid-approver`: `HttpOnly`,
+   `Secure`, `SameSite=Strict`, `Path=/`, ten minutes; one kept already is reused), whose
+   digest the request keeps.
 3. The Cellucid tab takes the code out of the address before any module runs
    (`connect-fragment.js`), connects to `/tab` (pairing this browser first if needed) and
-   **claims** it: the relay shows the tab who asks. On another device the person types the
-   code into Cellucid. The first browser to claim a code is the only one that can decide it.
+   **claims** it with `POST /oauth/claim` (`credentials: 'include'`, its tab secret in the
+   body): the browser adds the approver cookie, since www.cellucid.com and mcp.cellucid.com
+   are one site, and the relay shows the tab who asks only when the cookie is the one of
+   the browser that shows the page. A code or link someone sent from their own browser
+   is refused (`other-browser`): the remote phishing of a device code (RFC 8628 §5.4),
+   where an attacker's Claude would be connected to the person's tab, cannot happen. A
+   code typed into a Cellucid tab of the same browser is claimed the same way; another
+   browser or device cannot take it. The first pairing to claim a code is the only one
+   that can decide it.
 4. The person allows or denies in the tab. Allowing binds the request to that browser's
    pairing and makes a one-time authorization code; the waiting page, long-polling with a
    secret only it knows, sends the browser on to the client with `code`, `state` and `iss`
@@ -95,7 +108,10 @@ Apps reads the tool's text and image content alone.
   a WebSocket, and a URL would put it in logs). The relay derives
   `pairingId = HMAC(key, tabSecret)` and keeps neither. Every tab of one browser profile
   shares the pairing. **Forget** in Cellucid deletes the pairing's connections at the relay,
-  closes every tab of it (`4001`) and deletes the secret in the browser.
+  closes every tab of it (`4001`) and deletes the secret in the browser. A connection that
+  ends (removed in Cellucid, forgotten, closed after a refresh token was used twice, expired)
+  ends its calls in flight too: the tab is told to stop each, and the agent is answered at once
+  that the connection was removed during the call (`pairing.js` `endCalls`).
 - **Tokens.** Signed, not stored: an access token names the issuer, the audience (this
   relay's origin, RFC 8707), the pairing, the connection and its expiry; the MCP endpoint accepts it
   only in the `Authorization` header (one in the address is refused), only when its
@@ -115,7 +131,21 @@ Apps reads the tool's text and image content alone.
   http; a loopback one matches on any port (RFC 8252, Claude Code). The person sees the
   host that vouches for the client (the document's host, or the https redirect's host) and
   where the answer goes; a client that is neither claude.ai nor chatgpt.com carries a
-  warning.
+  warning and is named by that host (or "An app on this computer"), never by the name it
+  gives itself, which is shown only in quotes ("evil.example, which calls itself “Claude”"):
+  that name is what the waiting page and the tab's approval say; a call carries the app's
+  own name with `known` (a grant's), and the tab names an unvouched app's steps, activity
+  line and confirm cards as Manage… does ("evil.example (calls itself “Claude”)",
+  `connect/model.js` `appName`), so two such apps are told apart.
+- **One browser approves.** The approver cookie binds an authorization to the browser
+  that shows its waiting page: only a claim that carries it (from an allowed Cellucid
+  page, with credentialed CORS: the exact origin, never `*`) is answered. The `__Host-`
+  prefix keeps any other cellucid.com host from setting or reading it, `HttpOnly` keeps
+  it from scripts, `SameSite=Strict` keeps every other site's requests from carrying it.
+  A local relay (`wrangler dev` on `http://localhost` or `http://127.0.0.1`) sets the same
+  cookie: Chromium and Firefox keep a `Secure` cookie from a loopback address, Safari does
+  not (use Chromium or Firefox there), and since cookies ignore ports the page and the
+  relay must use the same loopback host name (both `localhost`, or both `127.0.0.1`).
 - **Browsers.** `/tab` and browser calls to the MCP endpoint are accepted only from `ALLOWED_ORIGINS`
   (an `Origin` that is present and not allowed answers 403, which also stops DNS rebinding);
   metadata, registration and token answers carry `Access-Control-Allow-Origin: *` (no
@@ -129,10 +159,18 @@ Apps reads the tool's text and image content alone.
   shed) answers a tool call with a sentence that says so and to read the history, a tool list
   with the bundled one, a cancellation as done: never a failed request. Tabs reconnect by
   themselves (the socket closes; `relay-client.js` dials again with growing waits).
+- **A tab reloaded.** A call in flight when its tab closes is answered at once: whether it was
+  done is not known, read the history before repeating a change. When the last tab of the
+  pairing closed less than `TAB_RECONNECT_WAIT_MS` (20 s) ago, a call, a tool list or a status
+  waits for a tab to be back and say which dataset it shows (`pairing.js` `targetSoon`): a
+  reloaded page reaches the relay again in about 2 s (measured), so the agent's next call runs
+  in it instead of being told no tab is there.
 - **What passes through.** Tool calls and results exist only in memory while in flight;
   nothing of them is stored or logged (errors log a name and a message only). Stored: per
-  pairing, its connections (client id, agent name, client name and host, times, rotation
-  count); per pending authorization, the request for at most fifteen minutes.
+  pairing, its connections (a digest of the client id, agent name, client name and host, times, rotation
+  count); per pending authorization, the request (with the digests of the page's secret and
+  of the approver cookie) for at most fifteen minutes. In the browser: the approver cookie,
+  for ten minutes after a waiting page was shown.
 - **Bounds on hostile input** (each says why in the code): request bodies (64 KiB for OAuth,
   4 MiB for MCP), a registered client id (8 KiB, so it fits an authorization URL under
   Cloudflare's 16 KB), the client document (5 KB, 5 s), a tool result's text (150,000
@@ -162,8 +200,11 @@ npx --yes wrangler@4.115.0 secret put ALLOWED_ORIGINS --config wrangler.relay.js
 ```
 
 - `RELAY_SIGNING_KEY`: the line the `node` command printed.
-- `ALLOWED_ORIGINS`: `https://www.cellucid.com`, plus any local development origin
-  (`http://localhost:8000`), comma separated, exact origins.
+- `ALLOWED_ORIGINS`: `https://www.cellucid.com`, comma separated, exact origins. A local
+  development origin (`http://localhost:8000`) may be added for `/tab` and the MCP endpoint,
+  but it cannot approve a connection here: the approver cookie travels only within the
+  relay's site (`SameSite=Strict`), so local development approves against a local relay on
+  the same loopback host (below).
 - The first deploy creates the two Durable Object classes (migration `v1`, SQLite storage,
   available on the Workers Free plan). Until both secrets are set every route answers 500.
 - The deploy also attaches the custom domain `mcp.cellucid.com` (`routes` in
@@ -172,7 +213,7 @@ npx --yes wrangler@4.115.0 secret put ALLOWED_ORIGINS --config wrangler.relay.js
   domain is the Worker's only address (`workers_dev: false`, `preview_urls: false`). A
   deployment of your own changes that `pattern` to a host in a zone you have, or removes
   `routes` and sets `workers_dev: true` to use its `workers.dev` address.
-- Check `https://mcp.cellucid.com/health`: `"status": "ok"`, `"contractVersion": 1`, `"mcp"`
+- Check `https://mcp.cellucid.com/health`: `"status": "ok"`, `"contractVersion": 2`, `"mcp"`
   the connector address. The page's relay address is `DEFAULT_RELAY_ORIGIN` in
   `relay-client.js`; it must be this Worker's address (`tests/relay-bundle-contract.test.mjs`
   checks it against `routes`).
@@ -184,14 +225,18 @@ npx --yes wrangler@4.115.0 secret put ALLOWED_ORIGINS --config wrangler.relay.js
 Regenerate the bundle after changing an action, the instructions, the protocol or the
 version: `node scripts/generate-relay-bundle.mjs` (`tests/relay-bundle-contract.test.mjs`
 fails until then). A local relay: `npx --yes wrangler@4.115.0 dev --config wrangler.relay.jsonc`
-with the secrets in `.dev.vars`, and on a local Cellucid page
-`window.__CELLUCID_RELAY_ORIGIN__ = 'http://localhost:8787'` before the bridge starts.
+with the secrets in `.dev.vars`, and on a local Cellucid page on the same loopback host name
+(`http://localhost:8000` with `http://localhost:8787`: the approver cookie ignores ports but not
+host names) `window.__CELLUCID_RELAY_ORIGIN__ = 'http://localhost:8787'` before the bridge starts;
+approve in Chromium or Firefox (Safari keeps no `Secure` cookie from `http://localhost`).
 
 **Live check** (after a deploy; not in CI, it needs the network): `node scripts/relay-live-check.mjs
-[--relay https://<relay>] [--idle 90] [--out results.json]` is the MCP client of the deployed
-relay and a Chromium page on `http://127.0.0.1:8000` (an allowed origin) is the person's tab:
-discovery, Dynamic Client Registration, PKCE, the approval link and a typed code approved in the
-tab, both protocol eras, tool calls reaching the tab and back (a dataset opened, a colouring
+[--relay https://<relay>] [--idle 90] [--port 8000] [--out results.json]` is the MCP client of the deployed
+relay and a Chromium page of this checkout is the person's tab, in the relay's site as a claim
+needs: served as `https://www.cellucid.com` (an allowed origin) for the deployed relay, or on
+`http://127.0.0.1:<port>` for a local relay (`--relay http://127.0.0.1:8787`):
+discovery, Dynamic Client Registration, PKCE, the waiting page shown in that browser (its approver
+cookie), the approval link and a typed code approved in the tab, a link from another browser refused, both protocol eras, tool calls reaching the tab and back (a dataset opened, a coloring
 recorded as the agent's step, a picture as image content, one too large left out), the view
 card's resource, a call after the pairing has been idle (hibernated), refresh-token rotation and
 reuse, ChatGPT's and Claude Code's client metadata documents, and Forget ending every

@@ -44,6 +44,47 @@
 import { sameValue } from './same-value.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 
+/**
+ * What a result records about its run, not about the data: how long it took
+ * (the differential's `summary.duration`, the marker genes' `metadata.durationMs`
+ * and `stats.computeDuration`), when (the marker genes' `stats.computedAt`),
+ * how this device's reads were tuned for it (`metadata.tuning`) and whether it
+ * came from this page's cache (`metadata.cached`). A replay or a run elsewhere
+ * computes the same result with other values of these, so a comparison of
+ * analyses leaves them out (`canonicalAnalyses`): Verify said every branch
+ * with an analysis was "not reproduced" (L24-12), then every branch with
+ * marker genes (live-7 L25-16: `computedAt`, `computeDuration`, `tuning`).
+ */
+export const RUN_RECORD_KEYS = Object.freeze(['duration', 'durationMs', 'cached', 'computedAt', 'computeDuration', 'tuning']);
+
+/** An encoded result node (`analysis-result-codec.js`) without its run records, at any depth. */
+function withoutRunRecords(node) {
+  if (node === null || typeof node !== 'object' || ArrayBuffer.isView(node)) return node;
+  if (Array.isArray(node)) return node.map(withoutRunRecords);
+  if (node.$ === 'object' && Array.isArray(node.keys) && Array.isArray(node.values)) {
+    const kept = node.keys.flatMap((key, index) => (RUN_RECORD_KEYS.includes(key) ? [] : [[key, node.values[index]]]));
+    return { ...node, keys: kept.map(([key]) => key), values: kept.map(([, value]) => withoutRunRecords(value)) };
+  }
+  return Object.fromEntries(Object.entries(node).map(([key, value]) => [key, withoutRunRecords(value)]));
+}
+
+/**
+ * The analyses as a comparison sees them (`app/actions/domains.js`
+ * `canonical`): every result without its run records; the value itself is
+ * what a restore puts back.
+ */
+export function canonicalAnalyses(value) {
+  const result = record => (record?.result?.payload === undefined ? record
+    : { ...record, result: { ...record.result, payload: withoutRunRecords(record.result.payload) } });
+  return {
+    windows: value.windows.map(result),
+    docked: value.docked === null ? null : {
+      ...value.docked,
+      modes: Object.fromEntries(Object.entries(value.docked.modes ?? {}).map(([mode, record]) => [mode, result(record)])),
+    },
+  };
+}
+
 /** A deep copy of plain data that keeps typed arrays (immutable results) by reference. */
 function clonePlain(value) {
   if (value === null || typeof value !== 'object' || ArrayBuffer.isView(value)) return value;
@@ -84,6 +125,7 @@ export function createAnalysisDomain({ analysis }) {
 
   return {
     capture,
+    canonical: canonicalAnalyses,
     async restore(value) {
       // Checked whole before anything closes: a refusal changes nothing.
       if (value === null || typeof value !== 'object' || Object.keys(value).length !== 2 || !Array.isArray(value.windows)

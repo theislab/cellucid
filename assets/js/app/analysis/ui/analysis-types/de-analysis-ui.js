@@ -12,19 +12,18 @@
  * @module analysis-types/de-analysis-ui
  */
 
-import { countNoun, formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { PLACES, placePath } from '../../../ui/place-names.js';
+import { countNoun, formatCount, formatCountOf, formatPercent, formatPValue } from '../../../../utils/format-units.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
-import { downloadCSV } from '../../shared/analysis-utils.js';
 import { geneNameColumns, toCSVCell } from '../../compute/csv-export.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 import { expandPagesWithDerived } from '../../shared/page-derivation-utils.js';
 import { DE_DISPLAY_KEYS, DE_OPTIONS } from '../../options/de-options.js';
-import { defineOptions } from '../../options/option-schema.js';
-import { renderOptionsForm } from '../../options/render-options-form.js';
 import { GenesPanelController, categoryOptionId } from '../../genes-panel/genes-panel-controller.js';
 import { countGeneFamilies, geneIdentities } from '../../shared/gene-sets.js';
-import { pseudobulkUnits } from '../../stats/pseudobulk.js';
+import { describePseudobulkModel, describePseudobulkNormalisation, pairedUnits, pseudobulkUnits } from '../../stats/pseudobulk.js';
+import { describeValues, geneValueLabel, isValuesRecord, transformWords, RAW_VALUES } from '../../../../data/expression-transform.js';
 import { missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
 import {
   createResultEnvelope,
@@ -32,27 +31,28 @@ import {
   requireDatasetGenes
 } from '../../shared/analysis-result-session.js';
 import { sharedCellCount } from '../../shared/page-overlap.js';
-import { failureText } from '../../../../utils/errors.js';
+import { failureDetails, joinFailure, sayFailure } from '../../../../utils/errors.js';
+import { buttonClassName } from '../../../ui/components/controls.js';
 
 /** The Wilcoxon p-value conventions as the form names them. */
 const P_CONVENTION_NAMES = Object.freeze(Object.fromEntries(
   DE_OPTIONS.entry('pConvention').choices.map(choice => [choice.value, choice.label])
 ));
 
+/** A result's fold change as its Statistics and its `about` say it. */
+const FOLD_CHANGE_NAMES = Object.freeze({ log1p: 'Undo log1p', stored: 'As stored', log2cpm: 'Group coefficient of log2-CPM (limma)' });
+const FOLD_CHANGE_ABOUT = Object.freeze({
+  log1p: 'of the means after undoing log1p',
+  // F159: a ratio of means of log-scale values is not an "X-fold" change; the result says so to whoever reads it.
+  stored: 'of the means as stored (log2 of their ratio; of log-scale values, such as log1p, a ratio of means is no fold change of expression)',
+  log2cpm: 'the group coefficient of the samples\' log2-CPM (limma; paired: within donors)'
+});
+
 const METHOD_NAMES = Object.freeze({
   wilcox: 'Wilcoxon',
   ttest: 't-test',
   ttest_overestim_var: 't-test (overestimated variance)',
-  pseudobulk: 'Pseudobulk t-test'
-});
-
-/** The volcano's filters and labels, for the expanded view. */
-const DISPLAY_OPTIONS = defineOptions({
-  id: 'differentialDisplay',
-  groups: [],
-  options: DE_OPTIONS.entries
-    .filter(entry => DE_DISPLAY_KEYS.includes(entry.key))
-    .map(entry => ({ ...entry, group: 'essentials' }))
+  pseudobulk: 'Pseudobulk limma'
 });
 
 
@@ -143,7 +143,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
         if (this._isDestroyed || cells !== this._openCells()) return;
         this._pendingFields.delete(field);
         this._fieldGroupFailures.set(field, error);
-        this._notifications.error(`Differential expression groups: ${failureText(error)}`, { category: 'analysis' });
+        this._notifications.error(`Differential expression groups: ${sayFailure(error)}`, { ...failureDetails(error), category: 'analysis' });
         this._refreshOptionsContext();
       }).finally(() => this._fieldReads.delete(read));
       this._fieldReads.add(read);
@@ -184,7 +184,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const failure = this._fieldGroupFailures.get(field);
     return failure === undefined
       ? 'Reading the categories…'
-      : `The categories of ${field} could not be read: ${failureText(failure)}`;
+      : `${joinFailure(`The categories of ${field} could not be read`, sayFailure(failure))}`;
   }
 
   _getOptionsContext() {
@@ -196,7 +196,8 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       pages: this._pageChoices(),
       categoricalFields: this.dataLayer.getAvailableVariables('categorical_obs')
         .filter(variable => (variable.categoryCount ?? variable.categories?.length ?? 2) >= 2)
-        .map(variable => ({ key: variable.key })),
+        .map(variable => ({ key: variable.key, categoryCount: variable.categoryCount ?? variable.categories?.length ?? null })),
+      colorField: this.dataLayer.getColoringCategoricalField(),
       groupsFor: (entry, record) => this._groupsOfField(entry.key === 'withinCategories' ? record.withinField : record.field)
         .map(group => ({ id: group.optionId, name: String(group.groupName), count: group.count, color: group.color })),
       minCellsFor: () => null,
@@ -341,12 +342,15 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     // Counting the samples is a pass over every cell: kept for these groups
     // and this sample field.
     const kept = this._replicateBlocker;
-    if (kept?.resolved === resolved && kept.codes === replicates.codes && kept.minimum === replicates.minCellsPerSample) return kept.blocker;
+    if (kept?.resolved === resolved && kept.codes === replicates.codes && kept.minimum === replicates.minCellsPerSample && kept.paired === options.paired) return kept.blocker;
     const units = pseudobulkUnits(resolved.a.cells, resolved.b.cells, replicates.codes, replicates.missingCode, this.dataLayer.state.pointCount, replicates.minCellsPerSample);
+    const pairs = pairedUnits(units).pairs;
     const blocker = units.unitsA < 2 || units.unitsB < 2
       ? `Each group needs at least 2 samples of ${options.replicates} with ${formatCountOf(replicates.minCellsPerSample, 'cell')} or more`
-      : null;
-    this._replicateBlocker = { resolved, codes: replicates.codes, minimum: replicates.minCellsPerSample, blocker };
+      : options.paired && pairs < 2
+        ? `A paired test needs at least 2 samples of ${options.replicates} with ${formatCountOf(replicates.minCellsPerSample, 'cell')} or more in both groups; ${formatCount(pairs)} ${pairs === 1 ? 'has' : 'have'}`
+        : null;
+    this._replicateBlocker = { resolved, codes: replicates.codes, minimum: replicates.minCellsPerSample, paired: options.paired, blocker };
     return blocker;
   }
 
@@ -368,7 +372,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     const essentials = form.essentials;
     const swap = document.createElement('button');
     swap.type = 'button';
-    swap.className = 'analysis-link-btn de-swap';
+    swap.className = buttonClassName('quiet', 'de-swap');
     swap.textContent = 'Swap A and B';
     swap.addEventListener('click', () => {
       const options = this._options;
@@ -385,9 +389,22 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   // Run
   // ===========================================================================
 
+  /** Every run reads genes (every gene it tests, whatever its options name). @override */
+  _readsGenes() {
+    return true;
+  }
+
   /** @override */
   _takesCellSample() {
     return true;
+  }
+
+  /** Cells: the expression values; samples (pseudobulk): raw counts, whatever the setting. @override */
+  _valuesRead(options) {
+    if (options.replicates !== '') {
+      return { transform: RAW_VALUES, note: `Values: raw counts summed per sample (pseudobulk normalizes the samples, whatever ${placePath(PLACES.dataMapping, PLACES.expressionValues)} says)` };
+    }
+    return super._valuesRead(options);
   }
 
   /** Its genes: a run reads every gene it tests (about the matrix's). @override */
@@ -404,6 +421,15 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       : { a: { ...groups.a, cells: sample.cells(groups.a.cells) }, b: { ...groups.b, cells: sample.cells(groups.b.cells) } };
     const helper = this._helperController();
     const genes = await helper.genesToTest(options);
+    const pseudobulk = options.replicates !== '';
+    // Cells: tested in the expression transform's values; samples: their
+    // raw counts summed, each sample's library size from the cells' stored
+    // totals when the file has them (never a pass over the genes: null sums
+    // each sample's counts over every gene, edgeR's default).
+    const transform = pseudobulk ? RAW_VALUES : this.dataLayer.expressionTransformOf(options.matrix);
+    const cellTotals = pseudobulk && this.dataLayer.matrixHoldsCounts(options.matrix)
+      ? await this.dataLayer.storedCellTotals({ signal: job?.signal ?? null })
+      : null;
     const deResults = await this.multiVariableAnalysis.differentialExpression({
       groupA: resolved.a,
       groupB: resolved.b,
@@ -411,9 +437,11 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       method: options.method,
       pConvention: options.method === 'wilcox' ? options.pConvention : 'exact',
       correction: options.correction,
-      foldChange: helper.foldChangeOf(options.foldChange, options.matrix),
+      foldChange: helper.foldChangeOf(options.foldChange, options.matrix, transform),
       matrix: options.matrix,
-      replicates: options.replicates === '' ? null : this._replicatesOf(options),
+      replicates: pseudobulk ? this._replicatesOf(options) : null,
+      paired: pseudobulk && options.paired,
+      cellTotals,
       minCells: options.minCells,
       job,
       isCurrent: () => this._isCurrentAnalysisRequest(requestId),
@@ -453,14 +481,33 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   }
 
   _significantCount(results, options) {
-    let count = 0;
+    const { up, down } = this._significantCounts(results, options);
+    return up + down;
+  }
+
+  /**
+   * The genes past the shown cutoffs (Max adjusted p, Min |log2FC|, Min %
+   * expressing in either group), up in A and up in B: one count for the
+   * status line, the Statistics and an agent's read.
+   */
+  _significantCounts(results, options) {
+    let up = 0;
+    let down = 0;
     for (const row of results ?? []) {
       const p = row.adjustedPValue;
       if (!isFiniteNumber(p) || !isFiniteNumber(row.log2FoldChange)) continue;
       if (p <= options.maxAdjP && Math.abs(row.log2FoldChange) >= options.minLog2FC &&
-          Math.max(row.pctA ?? 0, row.pctB ?? 0) >= options.minPct) count++;
+          Math.max(row.pctA ?? 0, row.pctB ?? 0) >= options.minPct) {
+        if (row.log2FoldChange > 0) up++;
+        else down++;
+      }
     }
-    return count;
+    return { up, down };
+  }
+
+  /** The cutoffs `_significantCounts` applies, in words. */
+  _significanceWords(options) {
+    return `adj p ≤ ${options.maxAdjP}, |log2FC| ≥ ${options.minLog2FC}${options.minPct > 0 ? `, ≥ ${formatPercent(options.minPct, { figures: 6 })} expressing` : ''}`;
   }
 
   // ===========================================================================
@@ -484,9 +531,10 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       line.className = 'analysis-result-line';
       line.textContent = [
         `${summary.groupAName} (${formatCount(summary.groupASize)}) vs ${summary.groupBName} (${formatCount(summary.groupBSize)})`,
-        METHOD_NAMES[summary.method],
+        summary.replicates?.paired ? 'Pseudobulk limma, paired' : METHOD_NAMES[summary.method],
         `${formatCountOf(summary.genesTested, 'gene')}`,
-        ...(summary.matrix === 'mapped' ? [] : [summary.matrixLabel])
+        ...(summary.matrix === 'mapped' ? [] : [summary.matrixLabel]),
+        ...(summary.values == null ? [] : [transformWords(summary.values)])
       ].join(' · ');
       header.appendChild(line);
       const chips = document.createElement('div');
@@ -521,25 +569,6 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     return rendered;
   }
 
-  _renderModalOptions(container) {
-    super._renderModalOptions(container);
-    if (this._options === null) return;
-    const form = renderOptionsForm({
-      schema: DISPLAY_OPTIONS,
-      value: Object.fromEntries(DE_DISPLAY_KEYS.map(key => [key, this._options[key]])),
-      context: {},
-      onChange: (record, key) => {
-        const before = this._requireOptions();
-        this._options = { ...this._options, ...record };
-        this._optionsForm?.setValue(this._options);
-        this._handleOptionsChanged(key);
-        // The display options are the analysis's options: a step, as in the panel.
-        this._recordOptionsChange(before);
-      }
-    });
-    container.prepend(form.root);
-  }
-
   _renderModalStats(container) {
     const result = this._lastResult;
     const summary = result?.full?.summary;
@@ -548,25 +577,19 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       return;
     }
     const options = this._options;
-    let up = 0;
-    let down = 0;
-    for (const row of result.data.results) {
-      const p = row.adjustedPValue;
-      if (!isFiniteNumber(p) || !isFiniteNumber(row.log2FoldChange)) continue;
-      if (p <= options.maxAdjP && Math.abs(row.log2FoldChange) >= options.minLog2FC) {
-        if (row.log2FoldChange > 0) up++;
-        else down++;
-      }
-    }
+    const { up, down } = this._significantCounts(result.data.results, options);
     const rows = [
       ['Genes tested', formatCount(summary.genesTested)],
       [
-        summary.replicates === null ? 'Not tested (fewer than 2 cells with a value)' : 'Not tested (fewer than 2 samples with a value)',
+        summary.replicates === null ? 'Not tested (fewer than 2 cells with a value)' : 'Not tested (not expressed in the samples, or no sample with a value on a side)',
         formatCount(summary.genesUntestable)
       ],
       ...(summary.replicates === null ? [] : [[
         'Replicates',
         `${summary.replicates.field}: ${formatCount(summary.replicates.samplesA)} vs ${formatCountOf(summary.replicates.samplesB, 'sample')}`
+      ], [
+        'Samples in both groups',
+        `${formatCount(summary.replicates.samplesInBoth)}${summary.replicates.paired ? ', tested paired' : ''}`
       ], [
         `Samples left out (fewer than ${formatCountOf(summary.replicates.minCellsPerSample, 'cell')})`,
         `${formatCount(summary.replicates.smallSamplesA)} vs ${formatCount(summary.replicates.smallSamplesB)} (${formatCountOf(summary.replicates.cellsInSmallSamples, 'cell')})`
@@ -574,13 +597,17 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
         `Genes with samples left out (fewer than ${formatCountOf(summary.replicates.minCellsPerSample, 'cell')} with a value)`,
         formatCount(summary.replicates.genesWithUnmeasuredSamples)
       ]]),
-      [`Significant (adj p ≤ ${options.maxAdjP}, |log2FC| ≥ ${options.minLog2FC})`, formatCount(up + down)],
+      [`Significant (${this._significanceWords(options)})`, formatCount(up + down)],
       ['Up in A', formatCount(up)],
       ['Down in A', formatCount(down)],
       ...(summary.method === 'wilcox' ? [['p-values', P_CONVENTION_NAMES[summary.pConvention]]] : []),
       ['Multiple testing', summary.correction === 'bh' ? 'Benjamini–Hochberg' : 'Bonferroni'],
       ['Expression matrix', summary.matrixLabel],
-      ['Fold change', summary.foldChange.mode === 'log1p' ? 'Undo log1p' : 'As stored']
+      ['Values', summary.replicates === null
+        ? describeValues(summary.values, { counts: summary.counts })
+        : describePseudobulkNormalisation(summary.replicates.model)],
+      ...(summary.replicates === null ? [] : [['Model', describePseudobulkModel(summary.replicates.model, summary.replicates.field)]]),
+      ['Fold change', FOLD_CHANGE_NAMES[summary.foldChange.mode]]
     ];
     const table = document.createElement('table');
     table.className = 'analysis-stats-table de-modal-stats';
@@ -628,7 +655,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
       for (const text of [
         fixed(row.score, 2),
         fixed(row.log2FoldChange, 2),
-        isFiniteNumber(row.adjustedPValue) ? row.adjustedPValue.toExponential(2) : '—',
+        formatPValue(row.adjustedPValue),
         fixed(row.pctA, 0),
         fixed(row.pctB, 0)
       ]) {
@@ -641,14 +668,16 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
   }
 
   /** Every gene: scanpy's column names, the two groups' fractions and AUROC. */
-  _exportModalCSV() {
+  tableFile() {
     const full = this._lastResult?.full;
-    if (!full) return;
+    if (!full) return null;
     // Genes by identifier, the shown name beside it (`geneNameColumns`).
     const { idOf } = geneIdentities(this.dataLayer.state?.varData);
     const shown = full.results.map(row => row.gene);
     const columns = geneNameColumns(shown, shown.map(gene => idOf(gene)));
-    const lines = [`${columns.header},scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,mean_a,mean_b,n_a,n_b`];
+    // The groups' means name the values the run read ("mean_a · log1p(norm.)").
+    const means = ['mean_a', 'mean_b'].map(column => toCSVCell(geneValueLabel(column, full.summary.values)));
+    const lines = [`${columns.header},scores,logfoldchanges,pvals,pvals_adj,pct_nz_group,pct_nz_reference,auroc,${means.join(',')},n_a,n_b`];
     for (const [index, row] of full.results.entries()) {
       lines.push([
         columns.cells(index),
@@ -665,7 +694,7 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
         row.nB
       ].join(','));
     }
-    downloadCSV(lines.join('\n'), 'differential_expression', this._notifications);
+    return { name: 'differential_expression', csv: lines.join('\n') };
   }
 
   // ===========================================================================
@@ -687,7 +716,54 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     return {
       columns: ['higher_in', 'gene', 'score', 'log2_fold_change', 'p_adjusted', 'percent_a', 'percent_b', 'auroc'],
       rows: [...up.map(entry => row(entry, 'A')), ...down.map(entry => row(entry, 'B'))],
-      total: rows.length
+      total: rows.length,
+      about: this._resultAbout(result, top)
+    };
+  }
+
+  /**
+   * How the result was tested, as its expanded view's header and Statistics
+   * say it: the two groups and their cells (samples with replicates), the
+   * test, the correction, the matrix (counts said so) and its values, and
+   * how many genes pass the shown cutoffs. An agent read the rows alone and
+   * had to guess the group sizes and that the values were raw counts.
+   */
+  _resultAbout(result, top) {
+    const summary = result?.full?.summary;
+    if (!summary) return null;
+    const { up, down } = this._significantCounts(result.data.results, this._options);
+    const replicates = summary.replicates;
+    return {
+      group_a: summary.groupAName,
+      cells_a: summary.groupASize,
+      group_b: summary.groupBName,
+      cells_b: summary.groupBSize,
+      test: replicates === null
+        ? `${METHOD_NAMES[summary.method]}, cells as observations${summary.method === 'wilcox' ? ` (${P_CONVENTION_NAMES[summary.pConvention]})` : ''}`
+        : `pseudobulk: limma moderated t between the samples of ${replicates.field}${replicates.paired ? ', paired (donor blocked)' : ''}, each sample's ${replicates.model.counts ? 'log-CPM' : 'mean'}`,
+      ...(replicates === null ? {} : {
+        samples_a: replicates.samplesA,
+        samples_b: replicates.samplesB,
+        samples_left_out: `${replicates.smallSamplesA} of A, ${replicates.smallSamplesB} of B (fewer than ${formatCountOf(replicates.minCellsPerSample, 'cell')})`,
+        pairing: replicates.paired
+          ? `paired: ${formatCountOf(replicates.samplesInBoth, 'sample')} in both groups; ${replicates.samplesA - replicates.samplesInBoth} of A and ${replicates.samplesB - replicates.samplesInBoth} of B in one group only, left out`
+          : replicates.samplesInBoth >= 2
+            ? `unpaired; ${formatCountOf(replicates.samplesInBoth, 'sample')} of ${replicates.field} are in both groups: paired: true tests them paired`
+            : `unpaired; ${formatCountOf(replicates.samplesInBoth, 'sample')} of ${replicates.field} in both groups, too few to pair`
+      }),
+      multiple_testing: summary.correction === 'bh' ? 'Benjamini–Hochberg' : 'Bonferroni',
+      expression_matrix: summary.matrixLabel,
+      values: replicates === null
+        ? describeValues(summary.values, { counts: summary.counts })
+        : describePseudobulkNormalisation(replicates.model),
+      ...(replicates === null ? {} : { model: describePseudobulkModel(replicates.model, replicates.field) }),
+      fold_change: FOLD_CHANGE_ABOUT[summary.foldChange.mode],
+      genes_tested: summary.genesTested,
+      significant_up_in_a: up,
+      significant_up_in_b: down,
+      significance: this._significanceWords(this._options),
+      // `top` counts each direction: an agent asked for 40 each way read top 3,753 first (L14-5).
+      rows: `the top ${formatCountOf(top, 'gene')} by score up in A, then the top ${formatCount(top)} up in B: top counts each direction`
     };
   }
 
@@ -707,8 +783,13 @@ export class DEAnalysisUI extends FormBasedAnalysisUI {
     if (
       !Array.isArray(full?.results) || typeof full.summary !== 'object' || full.summary === null ||
       typeof full.summary.matrix !== 'string' || typeof full.summary.matrixLabel !== 'string' ||
+      typeof full.summary.counts !== 'boolean' || !isValuesRecord(full.summary.values) ||
       full.summary.replicates === undefined ||
-      (full.summary.replicates !== null && !Number.isSafeInteger(full.summary.replicates.genesWithUnmeasuredSamples))
+      (full.summary.replicates !== null && (
+        !Number.isSafeInteger(full.summary.replicates.genesWithUnmeasuredSamples) ||
+        !Number.isSafeInteger(full.summary.replicates.samplesInBoth) || typeof full.summary.replicates.paired !== 'boolean' ||
+        typeof full.summary.replicates.model !== 'object' || full.summary.replicates.model === null
+      ))
     ) {
       throw new TypeError('A differential expression result must hold its gene table, summary and expression matrix');
     }

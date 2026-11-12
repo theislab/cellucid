@@ -26,6 +26,8 @@
  * @module app/ui/modules/benchmark/frame-cause-sampler
  */
 
+import { createListenerSet } from '../../../../utils/listener-set.js';
+
 /** Label of a frame drawn inside the settle window of an earlier cause. */
 export const SETTLE_CAUSE = 'settle';
 
@@ -105,7 +107,7 @@ export function createFrameCauseSampler(options = {}) {
   }
 
   const windows = new Set();
-  const listeners = new Set();
+  const listeners = createListenerSet('the frame-cause sampler');
   let previous = null;
   let handle = null;
   let running = false;
@@ -183,7 +185,7 @@ export function createFrameCauseSampler(options = {}) {
         settled: schedule.settled === true,
         schedule
       });
-      for (const listener of [...listeners]) listener(event);
+      listeners.notify(event);
     }
   }
 
@@ -235,11 +237,7 @@ export function createFrameCauseSampler(options = {}) {
      * @returns {() => void} Unsubscribe.
      */
     subscribe(listener) {
-      if (typeof listener !== 'function') {
-        throw new TypeError('A frame-cause listener must be a function.');
-      }
-      listeners.add(listener);
-      return () => listeners.delete(listener);
+      return listeners.add(listener);
     },
 
     /** Open a window that counts ticks, drawn frames and causes. */

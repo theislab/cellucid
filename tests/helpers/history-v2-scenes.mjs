@@ -9,12 +9,12 @@ import { installFakeHistory } from './history-v2-fake.mjs';
 const filters = { touches: ['filters'] };
 const camera = { type: 'camera.set', touches: ['camera'] };
 
-/** s0 Opened · s1 Coloured · s2 Hid alpha (fork) · s3 Hid gamma · s4 Coloured by score; from s2: s5 Kept a view, s6 Renamed (Branch 1). */
+/** s0 Opened · s1 Colored · s2 Hid alpha (fork) · s3 Hid gamma · s4 Colored by score; from s2: s5 Kept a view, s6 Renamed (Branch 1). */
 function forkedSteps(b) {
-  b.step('Coloured by cell_type');
+  b.step('Colored by cell_type');
   const alpha = b.step('Hid alpha of cell_type', filters);
   b.step('Hid gamma of cell_type', filters);
-  b.step('Coloured by score');
+  b.step('Colored by score');
   b.jump(alpha);
   b.step('Kept a view', { type: 'view.keep', touches: ['views'] });
   b.step('Renamed 0 to T cells', { type: 'category.rename', touches: ['field-overlays'] });
@@ -32,7 +32,7 @@ export const SCENES = Object.freeze({
     b.jump('s1');
   },
   steps2000: b => { for (let i = 0; i < 2000; i++) b.step(`Step ${i + 1}`, filters); },
-  recolours: b => { b.step('Coloured'); b.steps(3, 'Recoloured', { touches: ['colors'] }); b.step('Hid', filters); },
+  recolors: b => { b.step('Colored'); b.steps(3, 'Recolored', { touches: ['colors'] }); b.step('Hid', filters); },
   twoSteps: b => { b.step('A'); b.step('B'); },
   /** 10 000 steps and 100 branches (the stress suite's graph): 100 branches of 10 steps from the first 100 steps, a main line to 10 000, a third of it camera moves. */
   stress10k100: b => {
@@ -47,14 +47,14 @@ export const SCENES = Object.freeze({
   },
   /** Main s0–s3; Branch 1 from s1 (s4, s5); Branch 2 from s4 (s6): a branch with a sub-branch. Main shown at its tip. */
   nested: b => {
-    b.step('Coloured by cell_type');
+    b.step('Colored by cell_type');
     b.step('Hid alpha of cell_type', filters);
     b.step('Hid gamma of cell_type', filters);
     b.jump('s1');
     const first = b.step('Kept a view', { type: 'view.keep', touches: ['views'] });
     b.step('Renamed 0 to T cells', { type: 'category.rename', touches: ['field-overlays'] });
     b.jump(first);
-    b.step('Coloured by score');
+    b.step('Colored by score');
     b.jump('s3');
   },
   /** Steps with author badges (an agent outside a turn, a notebook) and labels that need room beside them. */
@@ -62,13 +62,13 @@ export const SCENES = Object.freeze({
     b.as({ origin: 'agent', agent: 'Claude', model: 'claude-sonnet-4-6' });
     b.step('Hid the doublets after the quality check', filters);
     b.as({ origin: 'host', host: 'python' });
-    b.step('Coloured by the leiden clusters at resolution one', { type: 'color.by', touches: ['active-field'] });
+    b.step('Colored by the leiden clusters at resolution one', { type: 'color.by', touches: ['active-field'] });
     b.as({ origin: 'user' });
     b.step('Kept a view');
   },
-  /** The user walk: QC steps, camera moves, a bookmark, an agent's turn with a note, 40 colour tweaks, a mistake last. */
+  /** The user walk: QC steps, camera moves, a bookmark, an agent's turn with a note, 40 color tweaks, a mistake last. */
   walk: b => {
-    b.step('Coloured by cell_type');
+    b.step('Colored by cell_type');
     b.step('Hid low-quality cells', filters);
     b.step('Hid doublets', filters);
     b.step('Opened the Filters section', { type: 'layout.section.open', touches: ['layout'] });
@@ -78,10 +78,10 @@ export const SCENES = Object.freeze({
     b.bookmark(before, 'Before reclustering');
     b.as({ origin: 'agent', agent: 'Claude', model: 'claude-sonnet-4-6', turn: 'turn-1' }, 'Find T cell markers');
     b.step('Ran DE: T cells vs B cells', { type: 'analysis.run', touches: ['analysis'] });
-    const cd3 = b.step('Coloured by CD3E');
+    const cd3 = b.step('Colored by CD3E');
     b.note(cd3, 'Top hits match the *paper*.');
     b.as({ origin: 'user' });
-    for (let i = 0; i < 40; i++) b.step(`Changed the colour map (${i + 1})`, { type: 'color.continuous.colormap', touches: ['colors'] });
+    for (let i = 0; i < 40; i++) b.step(`Changed the color map (${i + 1})`, { type: 'color.continuous.colormap', touches: ['colors'] });
     b.step('Renamed 0 to T cells', { type: 'category.rename', touches: ['field-overlays'] });
     b.step('Oops: hid every B cell', filters);
   },

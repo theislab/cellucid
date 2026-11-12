@@ -1,6 +1,6 @@
 /**
  * The categories of a text or boolean column (`data/discovered-categories.js`):
- * coded where they are read, listed in code-point order, each in the colour
+ * coded where they are read, listed in code-point order, each in the color
  * its label names, and grown by label without moving any label shown.
  */
 import assert from 'node:assert/strict';
@@ -41,15 +41,15 @@ test('rows coded under known categories keep them; a new label grows them in lab
   assert.throws(() => codeDiscoveredColumn([{}], null, 'Observation field \'n\''), /holds a object value/);
 });
 
-test('a label\'s colour is its own: the same set gives the same colours, whatever order the cells hold it in', () => {
+test('a label\'s color is its own: the same set gives the same colors, whatever order the cells hold it in', () => {
   const labels = Array.from({ length: 40 }, (_, i) => `cluster-${i}`).sort();
   const slots = categoryNameSlots(labels);
-  assert.equal(new Set(slots).size, labels.length, 'no two labels share a colour');
+  assert.equal(new Set(slots).size, labels.length, 'no two labels share a color');
   assert.deepEqual(categoryNameSlots(labels), slots, 'deterministic');
   assert.deepEqual(paletteOfSlots(slots)[0], [...getCategoryColor(slots[0])].slice(0, 3));
 });
 
-test('growing keeps every shown label\'s colour; a new one takes a free colour', () => {
+test('growing keeps every shown label\'s color; a new one takes a free color', () => {
   const before = ['a', 'b', 'c'];
   const slots = categoryNameSlots(before);
   const grown = ['A', 'a', 'b', 'bb', 'c'];

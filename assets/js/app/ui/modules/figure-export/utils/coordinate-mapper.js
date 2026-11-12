@@ -5,11 +5,16 @@
  * often want "real" coordinates, so we reverse the normalization transform
  * captured by the DimensionManager.
  *
+ * A figure's axes are rulers of its plot (`computeSourceAxisBounds` in
+ * `components/axes-builder.js`, which denormalizes with `denormalizeXY`).
+ * Whether any cell is drawn at all is a pass over the cells, run in the
+ * figure-export worker (`sourceHasDrawnCells`).
+ *
  * @module ui/modules/figure-export/utils/coordinate-mapper
  */
 
 import { requirePositionArray } from '../../../../../rendering/position-layout.js';
-import { assertCropRect01, cropRect01ToPx } from './crop.js';
+import { figureSourceRect, projectIntoSource } from './plot-fit.js';
 import {
   assertLodMembership,
   POINT_VISIBILITY_THRESHOLD,
@@ -55,14 +60,9 @@ export function denormalizeXY(x, y, transform) {
 }
 
 /**
- * Compute coordinate bounds for the currently visible region by scanning points
- * that fall within clip space.
- *
- * Bounds are reported in exact real (denormalized) coordinates. A missing
- * normalization transform is a contract failure.
- *
- * This is conservative and fast: it does not attempt to reconstruct viewport
- * corners, but matches what is actually drawn (after filtering + clipping).
+ * Whether a figure of the pane draws any cell: one visible, admitted cell
+ * that projects inside the view or the framing crop (`projectIntoSource`).
+ * Stops at the first.
  *
  * @param {object} options
  * @param {Float32Array|null} options.positions - normalized positions (n*dimension)
@@ -70,25 +70,23 @@ export function denormalizeXY(x, y, transform) {
  * @param {Uint8Array|null} [options.transparency] - per-point visibility (0 or 1)
  * @param {import('../../../../../rendering/high-perf/renderer-contracts.js').LodMembership|null} [options.lodMembership]
  * @param {Float32Array} options.mvpMatrix
- * @param {number} [options.viewportWidth]
- * @param {number} [options.viewportHeight]
- * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop]
- * @param {NormTransform} options.normTransform
- * @returns {{ minX: number, maxX: number, minY: number, maxY: number } | null}
+ * @param {number} options.viewportWidth
+ * @param {number} options.viewportHeight
+ * @param {object|null} [options.crop]
+ * @returns {boolean}
  */
-export function computeVisibleRealBounds({
+export function sourceHasDrawnCells({
   positions,
   dimension,
   transparency = null,
   lodMembership = null,
   mvpMatrix,
-  viewportWidth = 1,
-  viewportHeight = 1,
+  viewportWidth,
+  viewportHeight,
   crop = null,
-  normTransform
 }) {
-  if (!positions || !mvpMatrix) return null;
-
+  if (!positions || !mvpMatrix) return false;
+  const source = figureSourceRect({ renderState: { viewportWidth, viewportHeight }, crop });
   const n = requirePositionArray(
     positions,
     dimension,
@@ -98,193 +96,17 @@ export function computeVisibleRealBounds({
   assertLodMembership(lodMembership, { pointCount: n });
   const admittedIndices = lodMembership?.indices ?? null;
   const candidateCount = admittedIndices?.length ?? n;
-  const m = mvpMatrix;
-  const vw = Math.max(1, Number(viewportWidth) || 1);
-  const vh = Math.max(1, Number(viewportHeight) || 1);
-  const crop01 = assertCropRect01(crop);
-  const cropPx = cropRect01ToPx(crop01, vw, vh);
-  const hasCrop = Boolean(
-    cropPx &&
-    (cropPx.width < vw - 0.5 || cropPx.height < vh - 0.5 || cropPx.x > 0.5 || cropPx.y > 0.5)
-  );
-
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minY = Infinity;
-  let maxY = -Infinity;
-  let any = false;
-
-  for (
-    let candidateIndex = 0;
-    candidateIndex < candidateCount;
-    candidateIndex++
-  ) {
-    const i = admittedIndices === null
-      ? candidateIndex
-      : admittedIndices[candidateIndex];
+  const local = new Float64Array(3);
+  for (let candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++) {
+    const i = admittedIndices === null ? candidateIndex : admittedIndices[candidateIndex];
     const rawAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
-    let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
-    if (alpha < 0) alpha = 0;
-    else if (alpha > 1) alpha = 1;
+    const alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
     if (alpha < POINT_VISIBILITY_THRESHOLD) continue;
-
     const ix = i * dimension;
     const x = positions[ix];
     const y = dimension > 1 ? positions[ix + 1] : 0;
     const z = dimension > 2 ? positions[ix + 2] : 0;
-
-    const clipX = m[0] * x + m[4] * y + m[8] * z + m[12];
-    const clipY = m[1] * x + m[5] * y + m[9] * z + m[13];
-    const clipZ = m[2] * x + m[6] * y + m[10] * z + m[14];
-    const clipW = m[3] * x + m[7] * y + m[11] * z + m[15];
-    if (!Number.isFinite(clipW) || clipW <= 0) continue;
-
-    const ndcX = clipX / clipW;
-    const ndcY = clipY / clipW;
-    const ndcZ = clipZ / clipW;
-    if (
-      ndcX < -1 ||
-      ndcX > 1 ||
-      ndcY < -1 ||
-      ndcY > 1 ||
-      ndcZ < -1 ||
-      ndcZ > 1
-    ) {
-      continue;
-    }
-
-    if (hasCrop && cropPx) {
-      const vx = (ndcX * 0.5 + 0.5) * vw;
-      const vy = (-ndcY * 0.5 + 0.5) * vh;
-      if (vx < cropPx.x || vx > cropPx.x + cropPx.width || vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
-    }
-
-    const real = denormalizeXY(x, y, normTransform);
-    if (!Number.isFinite(real.x) || !Number.isFinite(real.y)) continue;
-    if (real.x < minX) minX = real.x;
-    if (real.x > maxX) maxX = real.x;
-    if (real.y < minY) minY = real.y;
-    if (real.y > maxY) maxY = real.y;
-    any = true;
+    if (projectIntoSource(mvpMatrix, source, x, y, z, local)) return true;
   }
-
-  if (!any) return null;
-  return { minX, maxX, minY, maxY };
-}
-
-/**
- * Compute camera-space (view-space) bounds for the currently visible region.
- *
- * Useful for 3D views where the screen-space X/Y axes are not aligned to the
- * underlying embedding axes. Bounds are computed from `viewMatrix * position`
- * (before perspective projection).
- *
- * @param {object} options
- * @param {Float32Array|null} options.positions - normalized positions (n*dimension)
- * @param {1|2|3} options.dimension - components per position
- * @param {Uint8Array|null} [options.transparency] - per-point visibility (0 or 1)
- * @param {import('../../../../../rendering/high-perf/renderer-contracts.js').LodMembership|null} [options.lodMembership]
- * @param {Float32Array} options.mvpMatrix
- * @param {Float32Array} options.viewMatrix
- * @param {number} [options.viewportWidth]
- * @param {number} [options.viewportHeight]
- * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop]
- * @returns {{ minX: number, maxX: number, minY: number, maxY: number } | null}
- */
-export function computeVisibleCameraBounds({
-  positions,
-  dimension,
-  transparency = null,
-  lodMembership = null,
-  mvpMatrix,
-  viewMatrix,
-  viewportWidth = 1,
-  viewportHeight = 1,
-  crop = null,
-}) {
-  if (!positions || !mvpMatrix || !viewMatrix) return null;
-
-  const n = requirePositionArray(
-    positions,
-    dimension,
-    'Figure-export positions',
-    { allowEmpty: true }
-  );
-  assertLodMembership(lodMembership, { pointCount: n });
-  const admittedIndices = lodMembership?.indices ?? null;
-  const candidateCount = admittedIndices?.length ?? n;
-  const m = mvpMatrix;
-  const v = viewMatrix;
-  const vw = Math.max(1, Number(viewportWidth) || 1);
-  const vh = Math.max(1, Number(viewportHeight) || 1);
-  const crop01 = assertCropRect01(crop);
-  const cropPx = cropRect01ToPx(crop01, vw, vh);
-  const hasCrop = Boolean(
-    cropPx &&
-    (cropPx.width < vw - 0.5 || cropPx.height < vh - 0.5 || cropPx.x > 0.5 || cropPx.y > 0.5)
-  );
-
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minY = Infinity;
-  let maxY = -Infinity;
-  let any = false;
-
-  for (
-    let candidateIndex = 0;
-    candidateIndex < candidateCount;
-    candidateIndex++
-  ) {
-    const i = admittedIndices === null
-      ? candidateIndex
-      : admittedIndices[candidateIndex];
-    const rawAlpha = transparency ? (transparency[i] ?? 1.0) : 1.0;
-    let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
-    if (alpha < 0) alpha = 0;
-    else if (alpha > 1) alpha = 1;
-    if (alpha < POINT_VISIBILITY_THRESHOLD) continue;
-
-    const ix = i * dimension;
-    const x = positions[ix];
-    const y = dimension > 1 ? positions[ix + 1] : 0;
-    const z = dimension > 2 ? positions[ix + 2] : 0;
-
-    const clipX = m[0] * x + m[4] * y + m[8] * z + m[12];
-    const clipY = m[1] * x + m[5] * y + m[9] * z + m[13];
-    const clipZ = m[2] * x + m[6] * y + m[10] * z + m[14];
-    const clipW = m[3] * x + m[7] * y + m[11] * z + m[15];
-    if (!Number.isFinite(clipW) || clipW <= 0) continue;
-
-    const ndcX = clipX / clipW;
-    const ndcY = clipY / clipW;
-    const ndcZ = clipZ / clipW;
-    if (
-      ndcX < -1 ||
-      ndcX > 1 ||
-      ndcY < -1 ||
-      ndcY > 1 ||
-      ndcZ < -1 ||
-      ndcZ > 1
-    ) {
-      continue;
-    }
-
-    if (hasCrop && cropPx) {
-      const vx = (ndcX * 0.5 + 0.5) * vw;
-      const vy = (-ndcY * 0.5 + 0.5) * vh;
-      if (vx < cropPx.x || vx > cropPx.x + cropPx.width || vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
-    }
-
-    const camX = v[0] * x + v[4] * y + v[8] * z + v[12];
-    const camY = v[1] * x + v[5] * y + v[9] * z + v[13];
-    if (!Number.isFinite(camX) || !Number.isFinite(camY)) continue;
-    if (camX < minX) minX = camX;
-    if (camX > maxX) maxX = camX;
-    if (camY < minY) minY = camY;
-    if (camY > maxY) maxY = camY;
-    any = true;
-  }
-
-  if (!any) return null;
-  return { minX, maxX, minY, maxY };
+  return false;
 }

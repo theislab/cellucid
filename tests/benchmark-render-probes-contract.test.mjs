@@ -278,7 +278,7 @@ test('draws are attributed to the pass whose program issued them', async () => {
   const highlightProgram = { name: 'highlight' };
   const gl = new FakeContext({
     uniformsByProgram: new Map([
-      [pointsProgram, ['u_pointScale', 'u_alphaTex']],
+      [pointsProgram, ['u_pointScale', 'u_lodIndexTex']],
       [highlightProgram, ['u_highlightScale', 'u_pointScale']]
     ])
   });

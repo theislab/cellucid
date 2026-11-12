@@ -8,7 +8,7 @@ The dataset is the count matrix of ``benchmark-formats/generate.py`` (sorted
 genes per cell, integer counts, clusters, UMAP and PCA) at ``--genes`` genes,
 with every element kind added: obs columns of each kind (categorical,
 continuous, plain strings, boolean), embeddings in 2 and 3 dimensions and a
-30-dimensional latent space, a velocity field, a neighbour graph
+30-dimensional latent space, a velocity field, a neighbor graph
 (``obsp['connectivities']`` and ``['distances']``), a ``counts`` layer, ``raw``,
 var columns, ``varm`` and ``uns``. It is written as:
 
@@ -69,7 +69,7 @@ NEIGHBOURS = 15
 
 
 def neighbour_graph(rng: np.random.Generator, clusters: np.ndarray) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
-    """A symmetric kNN-like graph: each cell's neighbours are cells of its cluster."""
+    """A symmetric kNN-like graph: each cell's neighbors are cells of its cluster."""
     n = len(clusters)
     order = np.argsort(clusters, kind="stable")
     starts = np.searchsorted(clusters[order], np.arange(clusters.max() + 2))

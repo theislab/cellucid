@@ -401,7 +401,6 @@ test(
     // The memory model stops counting (and trimming) its caches at once.
     layer._stopCounting = () => events.push('memory:stop');
     layer._dataCache = new Map([['page', {}]]);
-    layer._variableCache = new Map([['variable', {}]]);
     layer._pendingRequests = new Map([['request', {}]]);
     layer._prefetchQueue = [{}];
     layer._prefetchTimeout = null;
@@ -449,7 +448,6 @@ test(
     layer._stopCounting = () => {};
     layer._options = { enablePrefetch: true };
     layer._dataCache = new Map();
-    layer._variableCache = new Map();
     layer._pendingRequests = new Map();
     layer._pageVersions = new Map();
     layer._prefetchQueue = [{ pageIds: ['page-a'] }];

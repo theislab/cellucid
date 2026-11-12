@@ -117,7 +117,7 @@ function isFloating(details) {
  * `animationend` bubbles, and the card inside the frame runs a shadow
  * animation of its own, so only an event whose target is the frame itself
  * ends it; a `{ once: true }` listener took whichever event came first, a
- * descendant's included. A cancelled animation (a dock replacing the lift)
+ * descendant's included. A canceled animation (a dock replacing the lift)
  * ends it as well, so the class never outlives the motion it stands for.
  *
  * @param {HTMLElement} frame
@@ -216,22 +216,53 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
   // The bar a phone's closed panel waits as at the foot of the screen
   // (index.html, layouts/_responsive.css): the one way back to the panel.
   const phoneBar = document.getElementById('phone-sheet-bar');
+  // The sidebar's toggle (index.html): the way to close or open the panel.
+  const sidebarToggle = document.getElementById('sidebar-toggle');
 
   /**
    * The area a floating window is placed, dragged, resized and kept in: the
    * window, less the panel's bar while it shows (a phone with its panel
-   * closed). No window is put over the bar, so it is never covered; a
-   * phone's window sheets stand on it (`--phone-bar-space`).
+   * closed) and the strip of the sidebar's toggle while it shows. No window
+   * is put over either, so neither is ever covered; a phone's window sheets
+   * stand on the bar (`--phone-bar-space`). (Found 2026-11-10: on a phone, a
+   * floated Coloring & filtering panel as tall as the screen covered the open
+   * panel's close button.)
    *
-   * @returns {{viewportWidth: number, viewportHeight: number}}
+   * Its height is the visible one: the visual viewport while the page is not
+   * zoomed (a phone's on-screen keyboard shortens it, not the window, and a
+   * window behind the keyboard could not be reached), else the window's.
+   *
+   * @returns {{viewportWidth: number, viewportHeight: number, viewportTop: number}}
    */
   function floatingArea() {
     const viewportWidth = window.innerWidth;
     let viewportHeight = window.innerHeight;
+    let viewportTop = 0;
+    const visual = window.visualViewport ?? null;
+    if (visual !== null && Math.abs(visual.scale - 1) < 0.001) {
+      viewportTop = Math.max(0, visual.offsetTop);
+      viewportHeight = Math.min(viewportHeight, visual.offsetTop + visual.height);
+    }
     if (phoneBar !== null && phoneBar.getClientRects().length > 0) {
       viewportHeight = Math.min(viewportHeight, phoneBar.getBoundingClientRect().top);
     }
-    return { viewportWidth, viewportHeight };
+    if (sidebarToggle !== null && sidebarToggle.getClientRects().length > 0) {
+      viewportTop = Math.max(viewportTop, Math.min(viewportHeight, sidebarToggle.getBoundingClientRect().bottom));
+    }
+    return { viewportWidth, viewportHeight, viewportTop };
+  }
+
+  /**
+   * The area's height for the windows' CSS height caps (`_accordion.css`),
+   * the one measure the clamp places them by. A window placed under the
+   * sidebar's toggle was capped at the viewport's height less the margins, so
+   * after the window shrank it ran past the screen's foot by the toggle's
+   * height (bug hunt S2); and a cap of `100dvh` less the area's edges took the
+   * screen's height from the stylesheet and the edges from here, two
+   * measures that part on a phone (its keyboard, F126).
+   */
+  function publishFloatingArea({ viewportHeight, viewportTop }) {
+    StyleManager.setVariable(floatingRoot, '--floating-area-height', `${Math.max(0, viewportHeight - viewportTop)}px`);
   }
   // The phone layout of the panels registered as sheets; built with the
   // first of them, so a page without any never watches the viewport for it.
@@ -359,7 +390,7 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
     // `.accordion-copy-btn` is this app's existing "show this panel as its own
     // floating window" control — the analysis accordions already use it for
     // exactly that, and it carries the ⧉ glyph. `.accordion-undock-btn` is the
-    // behavioural hook.
+    // behavioral hook.
     const signal = state.controller?.signal;
     const title = panelTitle(summary);
     ensurePanelButton(
@@ -430,6 +461,68 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // Dock all
+  //
+  // With its sections undocked the sidebar stays a column holding the logo and
+  // the footer, and the way back was each window's own dock button, wherever
+  // the window stood (bug hunt F126). While any section floats, the sidebar
+  // shows one control where its sections begin — the place the emptied column
+  // shows — that docks every one of them (`layout.panel.dock-all`: one step,
+  // through `dock`, the path each window's Dock button takes). It is hidden
+  // when nothing floats.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  let dockAllButton = null;
+
+  function ensureDockAllButton() {
+    if (dockAllButton !== null) return dockAllButton;
+    const accordion = sidebar.querySelector('.accordion');
+    const parent = accordion?.parentElement ?? null;
+    if (parent === null) return null;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.id = 'dock-all-panels-btn';
+    button.className = 'btn btn-compact sidebar-dock-all';
+    button.hidden = true;
+    button.addEventListener('click', () => dispatchFromButton('layout.panel.dock-all', {}));
+    parent.insertBefore(button, accordion);
+    dockAllButton = button;
+    return button;
+  }
+
+  /** The control shows while a section floats and names how many do. */
+  function syncDockAll() {
+    const button = ensureDockAllButton();
+    if (button === null) return;
+    const floating = sidebarSections().filter(isFloating);
+    button.hidden = floating.length === 0;
+    if (floating.length === 0) return;
+    const text = floating.length === 1
+      ? `Dock ${sectionTitle(floating[0])}`
+      : `Dock all ${floating.length} panels`;
+    button.textContent = text;
+    button.title = `${text} back into the sidebar`;
+    button.setAttribute('aria-label', `${text} back into the sidebar`);
+  }
+
+  /**
+   * After a person docked every section: the control they used is hidden
+   * now, so focus moves to the first of them in the sidebar (its undock
+   * button), and the move is announced.
+   */
+  function followDockAllWithFocus(docked) {
+    const first = sidebarSections().find(details => docked.includes(details));
+    const frame = first === undefined ? null : panelFrame(first);
+    if (frame !== null) panelActions(frame)?.querySelector('.accordion-undock-btn')?.focus();
+    announceKeyboardMove(
+      document,
+      docked.length === 1
+        ? `${sectionTitle(docked[0])} is docked in the sidebar again.`
+        : `${docked.length} panels are docked in the sidebar again.`
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // Undock - runs ONCE on drop, not during drag
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -468,7 +561,8 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
     const content = details.querySelector('.accordion-content');
 
     // Viewport constraints
-    const { viewportWidth, viewportHeight } = floatingArea();
+    const { viewportWidth, viewportHeight, viewportTop } = floatingArea();
+    publishFloatingArea({ viewportHeight, viewportTop });
     // The limits are the content's and the viewport's: no panel is held
     // narrower or shorter than it has to be. The least height is the header
     // and the content's first row.
@@ -482,7 +576,7 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
     );
 
     const viewportMaxWidth = Math.max(minWidth, viewportWidth - 16);
-    const viewportMaxHeight = Math.max(minHeight, viewportHeight - 16);
+    const viewportMaxHeight = Math.max(minHeight, viewportHeight - viewportTop - 16);
 
     const requestedWidth = isFiniteNumber(preferredSize?.width)
       ? preferredSize.width
@@ -514,7 +608,8 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
       width: initialWidth,
       height: initialHeight,
       viewportWidth,
-      viewportHeight
+      viewportHeight,
+      viewportTop
     };
     let clampedLeft;
     let clampedTop;
@@ -583,6 +678,7 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
       height: Math.round(initialHeight)
     });
     sheets?.refresh();
+    syncDockAll();
 
     if (hasDockHome) {
       // Hide placeholder after layout settles
@@ -643,6 +739,7 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
 
     // Trigger settle animation
     playFrameAnimation(frame, 'dock-settle');
+    syncDockAll();
   }
 
   const interactions = createAccordionInteractions({
@@ -723,7 +820,7 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
         const s = stateByDetails.get(details);
         if (!s) return;
         // A suppression armed by the previous gesture belongs to that gesture.
-        // A cancelled pointer produces no click to consume it, so without this
+        // A canceled pointer produces no click to consume it, so without this
         // it survived to swallow the user's next real click on the header.
         s.suppressNextClick = false;
         if (!isFloating(details)) return;
@@ -787,6 +884,7 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
     }
     stateByDetails.delete(details);
     if (state.sheet) sheets?.release(details);
+    syncDockAll();
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -841,7 +939,8 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
     const [type, params] = kind === 'dock'
       ? ['layout.panel.dock', { panel: details.id }]
       : [kind === 'float' ? 'layout.panel.float' : 'layout.panel.place', { panel: details.id, ...boxOf(details) }];
-    actions.recordObserved(type, params, {}, outcome)
+    // The end of the person's drag or press: their act, never an action's.
+    actions.recordObserved(type, params, {}, outcome, { person: true })
       .catch(error => console.error(`[DockableAccordions] ${type} could not be recorded:`, error));
   }
 
@@ -878,6 +977,14 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
     return { panel: sectionTitle(details) };
   });
 
+  actions.provide('layout.panel.dock-all', (_params, { meta }) => {
+    const floating = sidebarSections().filter(isFloating);
+    if (floating.length === 0) return null;
+    for (const details of floating) dock(details);
+    if (meta.origin === 'user') followDockAllWithFocus(floating);
+    return { panels: floating.map(sectionTitle) };
+  });
+
   actions.provide('layout.panel.place', params => {
     const details = resolveSection(params.panel);
     if (!isFloating(details)) {
@@ -893,6 +1000,7 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
   sidebar.querySelectorAll('details.accordion-section').forEach((details) => {
     register(details, { dockable: true });
   });
+  syncDockAll();
 
   // A floating panel is positioned against the viewport it was placed in. Make
   // the window smaller and it can end up entirely outside the new one, with its
@@ -917,13 +1025,16 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
     if (resizeFrame !== null) return;
     resizeFrame = requestAnimationFrame(() => {
       resizeFrame = null;
-      const { viewportWidth, viewportHeight } = floatingArea();
+      const { viewportWidth, viewportHeight, viewportTop } = floatingArea();
+      publishFloatingArea({ viewportHeight, viewportTop });
       const measured = [];
       for (const frame of [...floatingRoot.children]) {
         const details = frame.querySelector(':scope > details.accordion-section');
         const state = details === null ? undefined : stateByDetails.get(details);
         if (!state) continue;
-        measured.push({ frame, state, rect: frame.getBoundingClientRect() });
+        // Its laid-out size, not its drawn box: a window still in its lift
+        // animation (scaled) measured short and was left past the new foot.
+        measured.push({ frame, state, rect: { width: frame.offsetWidth, height: frame.offsetHeight } });
       }
       for (const { frame, state, rect } of measured) {
         const clamped = clampFloatingPosition({
@@ -932,7 +1043,8 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
           width: rect.width,
           height: rect.height,
           viewportWidth,
-          viewportHeight
+          viewportHeight,
+          viewportTop
         });
         if (clamped.x === state.floatLeft && clamped.y === state.floatTop) continue;
         state.floatLeft = clamped.x;
@@ -942,7 +1054,13 @@ export function initDockableAccordions({ sidebar, actions } = {}) {
     });
   };
   window.addEventListener('resize', reclampFloating);
+  // A phone's keyboard and its browser bars change only the visual viewport.
+  window.visualViewport?.addEventListener('resize', reclampFloating);
+  window.visualViewport?.addEventListener('scroll', reclampFloating);
+  publishFloatingArea(floatingArea());
+  // The bar and the toggle show and hide as the panel opens and closes.
   if (phoneBar !== null) new ResizeObserver(reclampFloating).observe(phoneBar);
+  if (sidebarToggle !== null) new ResizeObserver(reclampFloating).observe(sidebarToggle);
 
   return {
     dock,

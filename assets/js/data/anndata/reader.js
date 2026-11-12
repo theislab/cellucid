@@ -37,11 +37,12 @@ import { allocateTypedArray, copyTypedArray, sparseColumnOf, sparseColumnOfDense
 import { yieldToMacrotask } from '../../utils/yield-macrotask.js';
 import { setOwnDataProperty } from '../../utils/exact-record.js';
 import { createWorkerColumnStoreFactory } from '../column-store-placement.js';
-import { onAbort, abortReason, awaitWithSignal, cancelled, SharedWork, sharedOnce } from '../../utils/abort.js';
+import { abortReason, awaitWithSignal, cancelled, onAbort, sharedOnce, SharedWork } from '../../utils/abort.js';
 import { residencyBudgetBytes, setWorkingSet, typedArrayBytes } from '../memory-budget.js';
 import { isArrayNode, isGroup } from '../../formats/store.js';
 import {
   ANNDATA_OPENING_PATHS,
+  AnnDataFormatError,
   NULLABLE_ENCODINGS,
   attributeValue,
   child,
@@ -72,6 +73,7 @@ import {
   readCodes,
   readDataFrameIndex,
   readGeneNameColumn,
+  readBooleanMask,
   readNullableValues,
   resolveCategoricalColumn,
   validateColumnEncoding,
@@ -80,7 +82,7 @@ import {
 import { sparseContract } from './sparse.js';
 import { denseGraphLines, gatheredGraph, heldGraphLines, inducedGraphLines, placedGraphLines, readGraphRows, readInducedGraph, readPlacedGraphRows, sparseGraphLines } from './graph-lines.js';
 import { cellSubsetRunCosts, columnIndexResidentBytes, geneLayoutOf, geneReadCost, openMatrixColumns, openMatrixRows, readCellSubset, readInWholeChunks, readsThroughRowIndex } from './matrix-access.js';
-import { SLAB_BYTES, asNumbers, readContinuous, readIntegers, readRowSlabs, readRowsInStoreOrder, readStored, scatterRows } from './values.js';
+import { SLAB_BYTES, UNSAFE_INTEGERS_AS_TEXT, asNumbers, holdsUnsafeIntegers, readContinuous, readExactIntegers, readIntegers, readRowSlabs, readRowsInStoreOrder, readStored, scatterRows, stores64BitIntegers } from './values.js';
 import { currentLayoutView, isOlderAnnDataLayout } from './older-layouts.js';
 import { cellMapOf, frameRows } from './views/modalities.js';
 import { noEmbeddingRefusal } from './views/refusal.js';
@@ -255,7 +257,7 @@ function keptRowsOf(rows) {
     cellOf[at++] = cell;
   }
   // The cells by their rows, in a radix order: each row's cell is where the
-  // order puts it, no search a cell (a 50 % uniform share of 10M cells,
+  // order puts it, no search a cell (a 50% uniform share of 10M cells,
   // its rows sorted and each cell then searched among 2.5M runs, took 1.6 s
   // of a CSC gene's 1.8 s).
   const order = orderByKey(rowOf);
@@ -821,16 +823,16 @@ async function readUnsTitle(root, readOptions) {
 }
 
 /**
- * The colours Scanpy keeps for one categorical obs field,
- * `uns['<key>_colors']` (one colour per category, in category order, as
+ * The colors Scanpy keeps for one categorical obs field,
+ * `uns['<key>_colors']` (one color per category, in category order, as
  * `sc.pl.*` writes them; a MuData modality's column `<modality>:<column>`
  * its modality's `uns['<column>_colors']`), as the stored text; null when the
  * file has none.
- * Which entries are colours, and whether there are enough of them, is the
+ * Which entries are colors, and whether there are enough of them, is the
  * page's to judge (`scanpyCategoryPalette`). A palette that cannot be read
- * is no palette: the field is still shown, in Cellucid's colours.
+ * is no palette: the field is still shown, in Cellucid's colors.
  *
- * `at` reads the colours of some categories only: those at the stored
+ * `at` reads the colors of some categories only: those at the stored
  * positions `at.positions` (ascending) of a dictionary of `at.count`, read
  * through `at.gather` (`views/cell-subset.js` `gatheredArray`); a palette
  * shorter than the dictionary is none.
@@ -843,7 +845,7 @@ async function readUnsTitle(root, readOptions) {
  */
 async function readObsFieldColors(root, key, readOptions, at = null) {
   // A modality's column pulled to the cells (`<modality>:<column>`,
-  // `views/mudata.js`) keeps its colours in that modality's own `uns`, where
+  // `views/mudata.js`) keeps its colors in that modality's own `uns`, where
   // Scanpy run on the modality writes them.
   const colon = key.indexOf(':');
   const modality = colon > 0 ? child(child(root, 'mod'), key.slice(0, colon)) : null;
@@ -859,7 +861,7 @@ async function readObsFieldColors(root, key, readOptions, at = null) {
     return Array.from(values, value => String(value));
   } catch (error) {
     if (readOptions.signal?.aborted) throw error;
-    console.warn(`[AnnDataReader] uns['${key}_colors'] could not be read; '${key}' is shown in Cellucid's colours (${error?.message ?? error})`);
+    console.warn(`[AnnDataReader] uns['${key}_colors'] could not be read; '${key}' is shown in Cellucid's colors (${error?.message ?? error})`);
     return null;
   }
 }
@@ -958,7 +960,7 @@ function codesMissingFrom(codes, known) {
  * A present-categories coding (`_categoryCoding`) with the stored categories
  * `added` (ascending, with their `labels` and `colors`) put in stored order
  * among its own; any it holds already (found by a read that ended first)
- * kept as it was. Colours stay only while every category found has one.
+ * kept as it was. Colors stay only while every category found has one.
  */
 function mergedCoding(coding, added, labels, colors, key) {
   const { stored } = coding;
@@ -1066,7 +1068,7 @@ export async function describeAnnDataStore(store, { format }, readOptions = {}) 
   await root.load(ANNDATA_OPENING_PATHS, readOptions);
   requireExactStringAttribute(root, 'encoding-type', 'anndata', `${format.file} root`);
   if (!root.has('obs') || !root.has('var')) {
-    throw new Error(`${format.file} obs and var are required and must be current AnnData dataframes`);
+    throw new AnnDataFormatError(`${format.file} obs and var are required and must be current AnnData dataframes`);
   }
   await Promise.all([child(root, 'obs'), child(root, 'var')].map(frame => loadFrameStructure(frame, readOptions)));
   const extentOf = (frame, label) => {
@@ -1170,7 +1172,7 @@ const FLOAT_DTYPE_MAX = Object.freeze({ float16: 65504, float32: 3.4028234663852
  * - `counts`: whether it holds counts, an integer dtype or float values all
  *   whole and non-negative (raw counts written as float32, as CELLxGENE and
  *   10x conversions write them); data mapping and the analyses say so (a
- *   fold change on counts is not normalised by each cell's depth);
+ *   fold change on counts is not normalized by each cell's depth);
  * - `notLog1p` (only with `log1pBase`, the base the file's `uns['log1p']`
  *   records, null for e): whether the values refute that record. Undo the
  *   log1p of each value (`expm1` in that base) and sum each cell's: that is
@@ -1471,6 +1473,13 @@ export class AnnDataReader {
     this._cellRowsPart = `cell rows ${++readersMade}`;
     this._fullRoot = null;
     /**
+     * Whether each 64-bit integer obs column holds identifiers past 2^53
+     * among every cell of the dataset (`_holdsIdentifiers`), by key: decided
+     * once, whatever cells are open.
+     * @type {Map<string, Promise<boolean>>}
+     */
+    this._identifierColumns = new Map();
+    /**
      * The expression matrix genes are read from by default, as a path below
      * the store root (`subsample-plan.js` `defaultExpressionPath`): what the
      * opening priced a gene by, and whose kept values it reports.
@@ -1565,7 +1574,7 @@ export class AnnDataReader {
      */
     this._passRates = new PassRates();
     /**
-     * How much of each neighbour graph read the subsample keeps
+     * How much of each neighbor graph read the subsample keeps
      * (`subsampleGraphShare`), by `obsp` key.
      * @type {Map<string, {kept: number, of: number}>}
      */
@@ -1647,7 +1656,7 @@ export class AnnDataReader {
    * after a macrotask, and, while no read waits for the index (`waited`),
    * until no extraction someone waits for runs (`_inForeground`). The
    * index's work is the reader thread's, and a graph's extraction took turns
-   * with it (Suo's neighbour graph: 0.8 s while the index of the cells asked
+   * with it (Suo's neighbor graph: 0.8 s while the index of the cells asked
    * for before it was built, 0.4 s alone). Reads are not counted: one may
    * wait for the index itself.
    * @private
@@ -1784,6 +1793,9 @@ export class AnnDataReader {
         // What opening reads of the store's tree (`ANNDATA_OPENING_PATHS`);
         // the rest loads when a reading needs it (`_ready`), never before.
         await candidate._ready(ANNDATA_OPENING_PATHS, options);
+        // A root that is no AnnData store is refused as one first, not for
+        // a part it would have (an embedding).
+        candidate._requireAnnDataRoot();
         // An opening to be drawn of a store with nothing to draw is refused
         // here, before its cells are resolved (pricing them reads the
         // matrix's structure).
@@ -1931,7 +1943,7 @@ export class AnnDataReader {
     let readTo = this._geneRows(resolved);
     // The rows read as a matrix in open order, with their pointers: made
     // when a segment in open order needs it. Rows in store order never do
-    // (a 50 % uniform share of 10M cells is 5M runs of one row in open order).
+    // (a 50% uniform share of 10M cells is 5M runs of one row in open order).
     let rowsRead = null;
     let openRead = null;
     const openRows = () => {
@@ -1984,7 +1996,7 @@ export class AnnDataReader {
       bytesFrom: async row => {
         let bytes = 0;
         // A segment in store order is priced as it reads (its rows in open
-        // order made a sort of every row's run: 3 s of a 50 % share's gene).
+        // order made a sort of every row's run: 3 s of a 50% share's gene).
         const ordered = storeOrdered.get(row) ?? null;
         if (ordered !== null) {
           bytes += await passBytes(ordered.matrix, ordered.nObs ?? ordered.rows);
@@ -2035,7 +2047,7 @@ export class AnnDataReader {
     // `_inStoreOrder`), as one segment whose rows are in store order
     // (`fileOrderedAccess`): its pass reads and decodes each stored chunk
     // once, where segments in open order each read nearly every chunk (a
-    // 10 % uniform share of a 10M-cell CSR file read 517 MB for a gene
+    // 10% uniform share of a 10M-cell CSR file read 517 MB for a gene
     // against 266 MB for every cell). From a kept run of the same rows in
     // store order, or built by a pass and kept as it is.
     const orderedSegmentOf = async (segmentStart, end, run, options = readOptions) => {
@@ -2256,7 +2268,7 @@ export class AnnDataReader {
    * work to index and to answer each gene once (`wholeIsCheaper`, at the
    * rates measured on this source: the index's, the view's and each path's
    * placement of a gene in open order). Unmeasured, a share of two thirds
-   * of the entries or more: a 50 % uniform share of a 10M-cell store took
+   * of the entries or more: a 50% uniform share of a 10M-cell store took
    * 1.3-1.7x on every stored row's index what its own pass took for its
    * first gene and marker genes (Chromium), each gene placing every stored
    * row's entries. A gene sample (fewer rows) grows, segment by
@@ -2322,7 +2334,7 @@ export class AnnDataReader {
    * sample's rows), unless its genes are read through every stored row's
    * index restricted to the open rows (`_restrictsWhole`): that reads the
    * stored row pointers itself, and the open rows' are never needed (a
-   * 50 % uniform share's are 2.5M runs to read and walk at 5M cells). @private
+   * 50% uniform share's are 2.5M runs to read and walk at 5M cells). @private
    */
   _readyGeneRows(element, readOptions = {}) {
     const ready = () => this._readyRows(element, readOptions, this._geneReadRows(element));
@@ -2490,7 +2502,7 @@ export class AnnDataReader {
    * one (the gene sample grown) starts again from the first: chunks kept
    * by recency within a budget smaller than the pass are evicted before
    * the next pass reaches them, so keeping them buys nothing and held a
-   * 50 % uniform share's index pass 132 MB above every cell's (5M cells).
+   * 50% uniform share's index pass 132 MB above every cell's (5M cells).
    * @private
    */
   _scanChunks(resolved) {
@@ -2683,7 +2695,7 @@ export class AnnDataReader {
     }
     // The rows read as a matrix in open order, with their pointers only
     // (`_openRowsMatrix`): made when a kept run is checked or the rest is
-    // read in open order. Rows in store order never need it (a 50 % uniform
+    // read in open order. Rows in store order never need it (a 50% uniform
     // share's open rows in open order are millions of runs of one row).
     let opened = null;
     const openRows = () => (opened ??= this._openRowsMatrix(resolved, readTo));
@@ -2790,9 +2802,9 @@ export class AnnDataReader {
     if (held !== null) pointers.set(held);
     for (let i = 0; i < read.length; i++) pointers[from + i] = Number(read[i]);
     const nnz = matrix.get('indices').shape[0];
-    if (pointers[0] !== 0) throw new Error(`${matrix.path} indptr must start at zero`);
+    if (pointers[0] !== 0) throw new AnnDataFormatError(`${matrix.path} indptr must start at zero`);
     for (let i = Math.max(1, from); i <= rows; i++) {
-      if (!(pointers[i] >= pointers[i - 1]) || pointers[i] > nnz) throw new Error(`${matrix.path} indptr must be monotonic and within its ${formatCountOf(nnz, 'stored value')}`);
+      if (!(pointers[i] >= pointers[i - 1]) || pointers[i] > nnz) throw new AnnDataFormatError(`${matrix.path} indptr must be monotonic and within its ${formatCountOf(nnz, 'stored value')}`);
     }
     // Another read may have taken more meanwhile: the longer prefix is kept.
     if ((this._indptrPrefixes.get(matrix.path)?.length ?? 0) < pointers.length) this._indptrPrefixes.set(matrix.path, pointers);
@@ -3087,7 +3099,7 @@ export class AnnDataReader {
   }
 
   /**
-   * How much of a neighbour graph a subsample keeps, once the graph was
+   * How much of a neighbor graph a subsample keeps, once the graph was
    * read (`readInducedGraph`): `{kept, of}`, its stored entries between two
    * open cells of those of the open cells (the others join an open cell to
    * one left out); null before it is read, or when every cell is open.
@@ -3176,7 +3188,24 @@ export class AnnDataReader {
   }
 
   /**
-   * The store's structure, checked. The var index is checked (its length and
+   * The store's root, checked from what opening loaded: an AnnData root
+   * (its encoding) holding obs and var. Checked before anything else is
+   * (the embedding, the cells), so a store that is no AnnData store is
+   * refused as that. @private
+   */
+  _requireAnnDataRoot() {
+    const root = this._root;
+    const format = this._format;
+    const fileLabel = `${format.file} root`;
+    requireExactStringAttribute(root, 'encoding-type', 'anndata', fileLabel);
+    requireExactStringAttribute(root, 'encoding-version', '0.1.0', fileLabel);
+    if (!root.has('obs')) throw new AnnDataFormatError(`${format.file} obs is required and must be a current AnnData dataframe`);
+    if (!root.has('var')) throw new AnnDataFormatError(`${format.file} var is required and must be a current AnnData dataframe`);
+  }
+
+  /**
+   * The store's structure, checked (its root by `_requireAnnDataRoot`,
+   * before). The var index is checked (its length and
    * kind) but its names are not read: no view waits for the gene names, and
    * they are read when first asked for (`readVarNames`). `carry`: the reader
    * of an earlier opening of the same store, whose title is this one's.
@@ -3185,11 +3214,6 @@ export class AnnDataReader {
   async _readStructure(readOptions = {}, carry = null) {
     const root = this._root;
     const format = this._format;
-    const fileLabel = `${format.file} root`;
-    requireExactStringAttribute(root, 'encoding-type', 'anndata', fileLabel);
-    requireExactStringAttribute(root, 'encoding-version', '0.1.0', fileLabel);
-    if (!root.has('obs')) throw new Error(`${format.file} obs is required and must be a current AnnData dataframe`);
-    if (!root.has('var')) throw new Error(`${format.file} var is required and must be a current AnnData dataframe`);
     const obs = root.get('obs');
     const var_ = root.get('var');
     // Each frame's index and nested column names (`loadFrameStructure`), the
@@ -3226,7 +3250,7 @@ export class AnnDataReader {
       } else {
         validateArrayEncoding(X, format, 'Dense X', 'array');
         [nObs, nVars] = shapeOf(X, 'Dense X', 2);
-        if (!isAnnDataMatrixDataKind(valueKind(X))) throw new Error('Dense X must use a numeric or boolean dtype');
+        if (!isAnnDataMatrixDataKind(valueKind(X))) throw new AnnDataFormatError('Dense X must use a numeric or boolean dtype');
       }
     }
     // The title (one small read) is read beside the indexes: dataset
@@ -3272,13 +3296,13 @@ export class AnnDataReader {
       this._defaultModality = root.defaultModality;
       for (const { modality } of this._modalities.values()) {
         if (!isGroup(child(child(root, 'mod'), modality.name))) {
-          throw new Error(`${format.file} modality '${modality.name}' has no mod group`);
+          throw new AnnDataFormatError(`${format.file} modality '${modality.name}' has no mod group`);
         }
       }
     }
     // A priority-ordered file's original positions are how its cells are
     // named (`priority-layout.js`, the cell identity), not a field: listed,
-    // they would be offered for colouring and filtering and written into
+    // they would be offered for coloring and filtering and written into
     // exports, where a subset's positions no longer name its rows.
     // So are each modality's own (a MuData in priority order: its rows
     // follow their cells, `<modality>:cellucid_original_position`).
@@ -3519,19 +3543,19 @@ export class AnnDataReader {
     if (isGroup(array)) {
       // A sparse matrix, a dataframe, an awkward array: named, never misread.
       const encoding = attributeValue(array, 'encoding-type');
-      throw new Error(
+      throw new AnnDataFormatError(
         `${label} is ${typeof encoding === 'string' && encoding.length > 0 ? `an '${encoding}' element` : 'a group'}, ` +
         'not a dense array; Cellucid reads embeddings stored as dense numeric arrays'
       );
     }
     if (valueKind(array) === 'string') {
-      throw new Error(`${label} holds text, not numbers; Cellucid reads embeddings stored as dense numeric arrays`);
+      throw new AnnDataFormatError(`${label} holds text, not numbers; Cellucid reads embeddings stored as dense numeric arrays`);
     }
     validateArrayEncoding(array, this._format, label, 'array');
     const shape = shapeOf(array, label);
-    if (shape.length !== 1 && shape.length !== 2) throw new Error(`${label} must be a one- or two-dimensional array`);
-    if (shape[0] !== this._nObs) throw new Error(`${label} has ${formatCountOf(shape[0], 'row')} but the dataset has ${formatCountOf(this._nObs, 'cell')}`);
-    if (!isAnnDataNumericValueKind(valueKind(array))) throw new Error(`${label} must use a numeric dtype`);
+    if (shape.length !== 1 && shape.length !== 2) throw new AnnDataFormatError(`${label} must be a one- or two-dimensional array`);
+    if (shape[0] !== this._nObs) throw new AnnDataFormatError(`${label} has ${formatCountOf(shape[0], 'row')} but the dataset has ${formatCountOf(this._nObs, 'cell')}`);
+    if (!isAnnDataNumericValueKind(valueKind(array))) throw new AnnDataFormatError(`${label} must use a numeric dtype`);
     return { array, shape, width: shape.length === 1 ? 1 : shape[1], label };
   }
 
@@ -3587,7 +3611,7 @@ export class AnnDataReader {
     const array = fields === null ? null : child(fields, fieldKey);
     if (array?.kind !== 'array') throw new Error(`${label} does not exist in this file`);
     if (valueKind(array) !== 'float' || array.dtype?.bytes !== 4 || array.shape.length !== 1 || array.shape[0] !== this._nObs) {
-      throw new Error(`${label} must be ${this._nObs} float32 values, one per cell`);
+      throw new AnnDataFormatError(`${label} must be ${this._nObs} float32 values, one per cell`);
     }
     return { array, label };
   }
@@ -3634,7 +3658,7 @@ export class AnnDataReader {
    * every range at once. `signal` cancels the read; `reason` says what the
    * read is for (its activity's label). `cells`: listed open cells alone,
    * in their order (an export's), their rows read in the stored order
-   * (`gatheredArray`): never every open row between them (a 50 % uniform
+   * (`gatheredArray`): never every open row between them (a 50% uniform
    * share's export of one cell type read all 5M open rows, every chunk, for
    * 489,612 cells in rows of their own).
    */
@@ -4010,7 +4034,7 @@ export class AnnDataReader {
     // The open cells' view of a CSR matrix (`views/cell-subset.js`, its
     // `rowPointersPending`) has its shape before their row pointers are read
     // (`readRowPointers`), and describing it never makes its arrays: they
-    // are its kept rows' entry runs in open order (a 50 % uniform share of
+    // are its kept rows' entry runs in open order (a 50% uniform share of
     // 5M cells: 2.5M runs, 140 MB), which a gene read in store order never
     // uses. The matrix as stored was checked when the file was opened.
     const openCellsView = isGroup(node) && typeof node.rowPointersPending === 'function';
@@ -4019,7 +4043,7 @@ export class AnnDataReader {
       : openCellsView ? shapeFromAttribute(attributeValue(node, 'shape'), label) : sparseContract(node, format, label).shape;
     const expectedRows = modality === null ? this._nObs : modality.modality.nCells;
     if (shape[0] !== expectedRows) {
-      throw new Error(`${label} has ${formatCountOf(shape[0], 'row')} for ${formatCountOf(expectedRows, 'cell')}`);
+      throw new AnnDataFormatError(`${label} has ${formatCountOf(shape[0], 'row')} for ${formatCountOf(expectedRows, 'cell')}`);
     }
     // A gene-major (CSC) matrix of a subsample is read as stored, through
     // the kept rows (`views/cell-subset.js`): its genes' entries are read
@@ -4563,7 +4587,7 @@ export class AnnDataReader {
           if (this._generation === generation) onPartial(position, values, rows);
         },
       })));
-      this._assertGeneration(generation, `loading ${positions.length} gene columns of ${label}`);
+      this._assertGeneration(generation, `loading ${formatCountOf(positions.length, 'gene column')} of ${label}`);
       return result;
     }, signal, owner, keys);
   }
@@ -4701,7 +4725,7 @@ export class AnnDataReader {
     const held = columns.entryCount(gene);
     for (const [counts, level] of [[upper, above], [lower, below]]) {
       if (counts !== null && counts[gene] > held) {
-        throw new Error(`varm['cellucid_prefix_counts'] of ${matrix.label} counts ${formatCountOf(counts[gene], 'value')} of gene ${gene} at level ${level}, which holds ${held}; the file is damaged`);
+        throw new AnnDataFormatError(`varm['cellucid_prefix_counts'] of ${matrix.label} counts ${formatCountOf(counts[gene], 'value')} of gene ${gene} at level ${level}, which holds ${held}; the file is damaged`);
       }
     }
     const from = first + (lower === null ? 0 : lower[gene]);
@@ -4715,7 +4739,7 @@ export class AnnDataReader {
       requirePrefixRows(checked.rows, checked.count, upper[gene] - (lower === null ? 0 : lower[gene]), levels[above], gene);
     }
     if (lower !== null && checked.count > 0 && checked.rows[0] < levels[below]) {
-      throw new Error(`varm['cellucid_prefix_counts'] of ${matrix.label} counts ${formatCountOf(lower[gene], 'value')} of gene ${gene} below ${formatCountOf(levels[below], 'row')}, and the next is at row ${checked.rows[0]}; the file is damaged`);
+      throw new AnnDataFormatError(`varm['cellucid_prefix_counts'] of ${matrix.label} counts ${formatCountOf(lower[gene], 'value')} of gene ${gene} below ${formatCountOf(levels[below], 'row')}, and the next is at row ${checked.rows[0]}; the file is damaged`);
     }
     // The entries of rows `[start, end)` (ascending), renumbered from
     // `start`, as a whole column holds them (duplicates summed in float32,
@@ -4788,7 +4812,7 @@ export class AnnDataReader {
       const [columns, cells] = await Promise.all([this._matrixColumns(matrix, generation, readOptions), this._cellsOf(matrix, readOptions)]);
       const result = (await Promise.all(positions.map(gene => columns.sparseColumn(matrix.start + gene, readOptions))))
         .map(column => placeSparseColumn(column, cells, this._nObs, matrix.nRows));
-      this._assertGeneration(generation, `loading ${positions.length} gene columns of ${label}`);
+      this._assertGeneration(generation, `loading ${formatCountOf(positions.length, 'gene column')} of ${label}`);
       return result;
     }, signal, owner);
   }
@@ -4907,7 +4931,7 @@ export class AnnDataReader {
         const current = next;
         next = p + 1 < bounds.length ? readPart(bounds[p + 1]) : null;
         const read = await current;
-        this._assertGeneration(generation, `loading ${positions.length} cell rows of ${label}`);
+        this._assertGeneration(generation, `loading ${formatCountOf(positions.length, 'cell row')} of ${label}`);
         const [first, last] = bounds[p];
         const windowed = [];
         let total = 0;
@@ -4940,13 +4964,13 @@ export class AnnDataReader {
    * every gene, read as a cell subset is (`getMatrixCellSubset`, its
    * activity of kind `cells`) -- a priority-ordered file opened as a prefix
    * reads each gene's prefix alone (its counted entries, one stored chunk a
-   * gene and array at a 1 % share), any other matrix each gene's entries,
+   * gene and array at a 1% share), any other matrix each gene's entries,
    * keeping the cells' -- in runs of consecutive genes of about a slab of
    * stored entries (`SLAB_BYTES`, 8 bytes an entry), two runs read at once;
    * then made rows (genes ascending) and handed out in parts of about
    * `partEntries` entries, in the order asked. What it holds is the cells'
    * entries, the rows it hands out, and a run's reads, never an index of
-   * every stored row: through one, 2,000 cells of a 1 % share of a 10M-cell
+   * every stored row: through one, 2,000 cells of a 1% share of a 10M-cell
    * priority-ordered file decoded every chunk of X (244 MB, 1.9 GB peak).
    * A cell named twice is handed out twice; one a modality did not measure
    * has no entries. @private
@@ -4984,7 +5008,7 @@ export class AnnDataReader {
       const current = next;
       next = r + 1 < runs.length ? readRun(runs[r + 1]) : null;
       blocks.push(await current);
-      this._assertGeneration(generation, `loading ${positions.length} cell rows of ${label}`);
+      this._assertGeneration(generation, `loading ${formatCountOf(positions.length, 'cell row')} of ${label}`);
     }
     // Each distinct cell's row (`starts[c]` to `starts[c + 1]`), genes ascending.
     let total = 0;
@@ -5437,7 +5461,7 @@ export class AnnDataReader {
    * The column access of one matrix, opened once and shared: concurrent first
    * reads must not each start an index. Each caller waits with its own
    * signal, and the opening's reads stop only once every caller withdrew
-   * (`SharedWork`), so one caller cancelling never fails the others.
+   * (`SharedWork`), so one caller canceling never fails the others.
    * @private
    */
   async _matrixColumns(resolved, generation, readOptions = {}) {
@@ -5478,7 +5502,7 @@ export class AnnDataReader {
         // Opened after every caller withdrew: nobody takes it, so it is let go.
         if (signal.aborted) {
           (columns.retire ?? columns.dispose)?.();
-          throw signal.reason;
+          throw abortReason(signal);
         }
         return columns;
       }));
@@ -5557,14 +5581,14 @@ export class AnnDataReader {
     if (prefixRead === null) return columns;
     const { counts, levelRows } = prefixRead;
     if (counts.length !== resolved.sourceVars) {
-      throw new Error(`varm['cellucid_prefix_counts'] of ${resolved.label} counts ${formatCountOf(counts.length, 'gene')} for ${resolved.sourceVars}; the file is damaged`);
+      throw new AnnDataFormatError(`varm['cellucid_prefix_counts'] of ${resolved.label} counts ${formatCountOf(counts.length, 'gene')} for ${resolved.sourceVars}; the file is damaged`);
     }
     const k = resolved.prefix;
     /** The entries a read of gene `gene` takes: its counted ones and the next, when it has one. */
     const counted = gene => {
       const held = columns.entryCount(gene);
       if (counts[gene] > held) {
-        throw new Error(`varm['cellucid_prefix_counts'] of ${resolved.label} counts ${formatCountOf(counts[gene], 'value')} of gene ${gene}, which holds ${held}; the file is damaged`);
+        throw new AnnDataFormatError(`varm['cellucid_prefix_counts'] of ${resolved.label} counts ${formatCountOf(counts[gene], 'value')} of gene ${gene}, which holds ${held}; the file is damaged`);
       }
       return Math.min(held, counts[gene] + 1);
     };
@@ -5626,6 +5650,55 @@ export class AnnDataReader {
   }
 
   /** The obs column `key`, checked to exist. @private */
+  /**
+   * How a 64-bit integer obs column is read (`readExactIntegers`): `'text'`
+   * when it holds an identifier past 2^53 among every cell of the dataset,
+   * else `'numbers'`, the same whatever cells are open. With every cell open
+   * and the whole column asked, the read itself decides (`'decide'`); with a
+   * subsample, or rows of a growing opening, the column as stored is
+   * scanned once (`_holdsIdentifiers`). A caller's `integers` other than
+   * `'decide'` stands. @private
+   */
+  async _integerReading(key, integers, range, readOptions) {
+    if (integers !== 'decide') return integers;
+    const everyCell = range === null && (this._fullRoot === null || this._fullRoot === this._root) && this._cellSubset?.fileRows == null;
+    if (everyCell) return 'decide';
+    return (await this._holdsIdentifiers(key, readOptions)) ? 'text' : 'numbers';
+  }
+
+  /**
+   * Whether the 64-bit integer obs column `key`, as stored (every cell, not
+   * only the open ones), holds a value past 2^53 (`holdsUnsafeIntegers`):
+   * read once a reader, slab by slab, stopping at the first such value; a
+   * nullable column's missing values passed over. @private
+   */
+  _holdsIdentifiers(key, readOptions) {
+    let decided = this._identifierColumns.get(key);
+    if (decided === undefined) {
+      decided = (async () => {
+        const obs = (this._fullRoot ?? this._root).get('obs');
+        await obs.load([key], readOptions);
+        const item = obs.get(key);
+        let values = item;
+        let mask = null;
+        if (isGroup(item) && encodingType(item) === 'nullable-integer') {
+          const contract = nullableContract(item, key, 'nullable-integer', this._format, null);
+          values = contract.valuesArray;
+          mask = await readBooleanMask(contract.maskArray, contract.valuesLength, `Nullable mask for '${key}'`, readOptions);
+        }
+        for await (const slab of readRowSlabs(values, 0, values.shape[0], readOptions)) {
+          if (holdsUnsafeIntegers(slab.values, mask === null ? null : mask.subarray(slab.rowStart, slab.rowEnd))) return true;
+        }
+        return false;
+      })();
+      this._identifierColumns.set(key, decided);
+      decided.catch(() => {
+        if (this._identifierColumns.get(key) === decided) this._identifierColumns.delete(key);
+      });
+    }
+    return decided;
+  }
+
   _obsColumn(key) {
     const obs = this._root.get('obs');
     if (!isGroup(obs) || !obs.has(key)) throw new Error(`Obs field '${key}' not found`);
@@ -5707,8 +5780,8 @@ export class AnnDataReader {
         // its codes (`_readPresentCategorical`).
         result = { dtype: 'categorical', present: true, categoryCount: categoryCount(categorical.categories, key, format), ordered: categorical.ordered, categories: null, colors: null };
       } else if (withCategories) {
-        // The palette is read with the categories it colours, as metadata:
-        // the first colouring, a legend or a restored session all need it
+        // The palette is read with the categories it colors, as metadata:
+        // the first coloring, a legend or a restored session all need it
         // before any code is read.
         const [categories, colors] = await Promise.all([
           this._categories(categorical, key, generation, readOptions),
@@ -5762,18 +5835,21 @@ export class AnnDataReader {
    * of the open cells) reads only those rows -- what an opening grown in
    * place appends (`AnnDataFileSource.resizeCells`) -- and is not cached;
    * every row, cached, by default (a coded text column never: its codes
-   * depend on `categories`). `signal` cancels the read.
+   * depend on `categories`). `signal` cancels the read. A column of 64-bit
+   * integers holding identifiers past 2^53 arrives as text (`asText` says
+   * why, `readExactIntegers`); `integers` is how a column already shown
+   * reads again: `'text'`, `'numbers'`, or `'decide'` from what is read.
    *
    * @param {string} key
-   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null, categories?: ReadonlyArray<string|boolean>|null}} [options]
+   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null, categories?: ReadonlyArray<string|boolean>|null, integers?: 'decide'|'text'|'numbers'}} [options]
    */
-  async getObsField(key, { signal = null, rows = null, categories = null } = {}) {
+  async getObsField(key, { signal = null, rows = null, categories = null, integers = 'decide' } = {}) {
     this._ensureOpen();
     const range = this._rowRange(rows, `obs['${key}']`);
-    const cacheKey = range === null ? `obs:${key}` : null;
+    const cacheKey = range === null && integers !== 'text' ? `obs:${key}` : null;
     if (cacheKey !== null && this._cache.has(cacheKey)) return this._cache.get(cacheKey);
     const label = range === null ? `obs['${key}']` : `obs['${key}'] rows ${range.start}–${range.end}`;
-    const field = await this._track('field', label, readOptions => this._readObsField(key, cacheKey, readOptions, range), signal);
+    const field = await this._track('field', label, readOptions => this._readObsField(key, cacheKey, readOptions, range, integers), signal);
     if (DISCOVERED_DTYPES.has(field.dtype)) {
       const { codes, categories: labels } = field.dtype === 'bool'
         ? codeBooleanColumn(field.flags, categories, `Observation field '${key}'`)
@@ -5784,6 +5860,8 @@ export class AnnDataReader {
         codes,
         categories: labels,
         ordered: false,
+        // Integers read as their text (identifiers past 2^53): why, in one line.
+        ...(field.asText === undefined ? {} : { asText: field.asText }),
         // The values each code names, as a stored categorical's (computed
         // once, only when asked for); a code past the labels is missing.
         get values() {
@@ -5810,7 +5888,7 @@ export class AnnDataReader {
   }
 
   /** @private */
-  async _readObsField(key, cacheKey, readOptions, range = null) {
+  async _readObsField(key, cacheKey, readOptions, range = null, integers = 'decide') {
     const generation = this._generation;
     const format = this._format;
     const obs = this._obsColumn(key);
@@ -5843,16 +5921,27 @@ export class AnnDataReader {
         },
       };
     } else if (NULLABLE_ENCODINGS.has(declared)) {
-      result = await readNullableValues(item, key, declared, format, this._nObs, null, readOptions, range);
+      const nullableIntegers = declared === 'nullable-integer' && stores64BitIntegers(nullableContract(item, key, declared, format, this._nObs).valuesArray)
+        ? await this._integerReading(key, integers, range, readOptions)
+        : integers;
+      result = await readNullableValues(item, key, declared, format, this._nObs, null, readOptions, range, nullableIntegers);
     } else {
       const label = `Observation field '${key}'`;
       const end = range?.end ?? validateOneDimensional(item, format, label, this._nObs);
       if (range !== null) validateOneDimensional(item, format, label, this._nObs);
       const length = end - start;
       const dtype = requirePrimitiveKind(item, label);
-      if (!OBS_KINDS.includes(dtype)) throw new Error(`${label} uses an unsupported element type`);
+      if (!OBS_KINDS.includes(dtype)) throw new AnnDataFormatError(`${label} uses an unsupported element type`);
       let values;
-      if (dtype === 'float' || dtype === 'int' || dtype === 'uint') {
+      if (stores64BitIntegers(item)) {
+        // Integers of 64 bits stay exact: as float64 while every one is a
+        // safe integer, else, identifiers past 2^53, as their decimal text,
+        // coded as a text column is (`readExactIntegers`).
+        const read = await readExactIntegers(item, start, end, label, readOptions, null, await this._integerReading(key, integers, range, readOptions));
+        if (read.text !== undefined) result = { dtype: 'string', values: read.text, asText: UNSAFE_INTEGERS_AS_TEXT };
+        else if (item.labels === true) result = { dtype: 'labels', values: read.values };
+        else values = read.values;
+      } else if (dtype === 'float' || dtype === 'int' || dtype === 'uint') {
         // Integers stay exact (float64 where float32 cannot hold them).
         values = await readContinuous(item, start, end, label, readOptions);
         if (item.labels === true && dtype !== 'float') {
@@ -5909,13 +5998,13 @@ export class AnnDataReader {
    * A categorical coded by the categories its open cells hold
    * (`_categoryCoding`): its codes (of `range`'s rows, or every open row),
    * then the labels of the stored categories they name that no earlier read
-   * found (`readCategoriesAt`: only theirs read), with their colours from
+   * found (`readCategoriesAt`: only theirs read), with their colors from
    * `uns['<key>_colors']` at the same positions. The field's categories are
    * every one found so far, in stored order (an ordered categorical keeps
    * its order); its codes are positions among them, -1 missing;
-   * `present.stored` the stored position of each (its colour by default,
+   * `present.stored` the stored position of each (its color by default,
    * `presentCategoryPalette`), `present.count` the dictionary's size and
-   * `present.colors` the file's colours of them, or null. Exact: each cell's
+   * `present.colors` the file's colors of them, or null. Exact: each cell's
    * label is the one its stored code names. @private
    */
   async _readPresentCategorical(key, categorical, readOptions, range, generation) {
@@ -5926,7 +6015,7 @@ export class AnnDataReader {
     // dictionary (codes spread over it, as a label-ordered dictionary of
     // barcodes is: of c chunks, rows r leave about c * exp(-r / c) unnamed,
     // fewer than one once r > c * ln c): every chunk is read whatever the
-    // codes say, so the dictionary and its colours are read with the codes,
+    // codes say, so the dictionary and its colors are read with the codes,
     // in one plan, as a read of the stored dictionary is -- no round trip
     // waits for the codes, no request or byte more -- and the present ones
     // picked.
@@ -5983,7 +6072,7 @@ export class AnnDataReader {
   seedObsFieldCategories(key, categories, ordered) {
     this._ensureOpen();
     if (!Array.isArray(categories)) return;
-    if (typeof ordered !== 'boolean') throw new Error(`Categorical field '${key}' ordered must be a boolean`);
+    if (typeof ordered !== 'boolean') throw new AnnDataFormatError(`Categorical field '${key}' ordered must be a boolean`);
     const categoriesKey = `obs_categories:${key}`;
     const infoKey = `obs_info:${key}`;
     if (!this._cache.has(categoriesKey)) this._cache.set(categoriesKey, categories);
@@ -6016,7 +6105,7 @@ export class AnnDataReader {
   }
 
   /**
-   * One neighbour graph's metadata (`obsp[key]`), checked without reading
+   * One neighbor graph's metadata (`obsp[key]`), checked without reading
    * it, or null when `obsp` has no such key. @private
    */
   _connectivityMetadata(key) {
@@ -6036,16 +6125,16 @@ export class AnnDataReader {
         if (isGroup(conn)) {
           const sparse = sparseContract(conn, format, 'Connectivity matrix');
           if (sparse.shape[0] !== nStored || sparse.shape[1] !== nStored) {
-            throw new Error(`Connectivity matrix shape ${sparse.shape[0]}×${sparse.shape[1]} does not match ${formatCountOf(nStored, 'cell')}`);
+            throw new AnnDataFormatError(`Connectivity matrix shape ${sparse.shape[0]}×${sparse.shape[1]} does not match ${formatCountOf(nStored, 'cell')}`);
           }
           result = { kind: 'sparse', node: conn };
         } else {
           validateArrayEncoding(conn, format, 'Dense connectivity matrix', 'array');
           const shape = shapeOf(conn, 'Dense connectivity matrix', 2);
           if (shape[0] !== nStored || shape[1] !== nStored) {
-            throw new Error(`Connectivity matrix shape ${shape[0]}×${shape[1]} does not match ${formatCountOf(nStored, 'cell')}`);
+            throw new AnnDataFormatError(`Connectivity matrix shape ${shape[0]}×${shape[1]} does not match ${formatCountOf(nStored, 'cell')}`);
           }
-          if (!isAnnDataMatrixDataKind(valueKind(conn))) throw new Error('Dense connectivity matrix must use a numeric dtype');
+          if (!isAnnDataMatrixDataKind(valueKind(conn))) throw new AnnDataFormatError('Dense connectivity matrix must use a numeric dtype');
           result = { kind: 'dense', node: conn, shape };
         }
       }
@@ -6054,7 +6143,7 @@ export class AnnDataReader {
     return result;
   }
 
-  /** Whether `obsp[key]` holds a neighbour graph. */
+  /** Whether `obsp[key]` holds a neighbor graph. */
   async hasConnectivities(key) {
     this._ensureOpen();
     await this._ready([`obsp/${requireObspKey(key)}`]);
@@ -6067,7 +6156,7 @@ export class AnnDataReader {
    * graph is read line by line (`graph-lines.js`): one slab of it is held
    * at a time, beside the edges being built.
    */
-  async getConnectivityEdges(key, { signal = null } = {}) {
+  async getConnectivityEdges(key, { signal = null, keys = null } = {}) {
     this._ensureOpen();
     await this._ready([`obsp/${requireObspKey(key)}`], { signal });
     const metadata = this._connectivityMetadata(key);
@@ -6078,23 +6167,23 @@ export class AnnDataReader {
       const edges = await connectivityEdgesFromLines(lines, this._nObs, { run: work => this._inForeground(work) });
       this._assertGeneration(generation, 'loading connectivity data');
       return edges;
-    }, signal);
+    }, signal, null, keys);
   }
 
   /**
-   * The neighbours of some open cells in `obsp[key]` (`cells`, distinct
+   * The neighbors of some open cells in `obsp[key]` (`cells`, distinct
    * open cells), read from the file by row: what the k-NN tool expands
-   * through, so no thread holds every cell's neighbour list. A subsample's
-   * cells are read at their stored rows, keeping the neighbours it opened
-   * (renumbered); a cell is never its own neighbour, and a stored zero is no
-   * neighbour (as the edges, `connectivity-edges.js`). Null when the file
+   * through, so no thread holds every cell's neighbor list. A subsample's
+   * cells are read at their stored rows, keeping the neighbors it opened
+   * (renumbered); a cell is never its own neighbor, and a stored zero is no
+   * neighbor (as the edges, `connectivity-edges.js`). Null when the file
    * has no such matrix.
    *
    * @param {string} key
    * @param {Uint32Array} cells
    * @param {{signal?: AbortSignal|null}} [options]
    * @returns {Promise<{offsets: Uint32Array, neighbors: Uint32Array}|null>}
-   *   Cell `cells[i]`'s neighbours are `neighbors[offsets[i] .. offsets[i + 1]]`.
+   *   Cell `cells[i]`'s neighbors are `neighbors[offsets[i] .. offsets[i + 1]]`.
    */
   async getConnectivityRows(key, cells, { signal = null } = {}) {
     this._ensureOpen();
@@ -6128,15 +6217,15 @@ export class AnnDataReader {
         });
       this._assertGeneration(generation, 'loading connectivity rows');
       const positions = subset === null ? null : subset.positions();
-      // Each answer's neighbours, in request order.
+      // Each answer's neighbors, in request order.
       const counts = allocateTypedArray(Uint32Array, cells.length + 1, 'Connectivity row offsets');
-      const kept = allocateTypedArray(Int32Array, read.indices.length, 'Connectivity row neighbours');
+      const kept = allocateTypedArray(Int32Array, read.indices.length, 'Connectivity row neighbors');
       for (let line = 0; line < lines.length; line++) {
         let count = 0;
         for (let entry = read.pointers[line]; entry < read.pointers[line + 1]; entry++) {
           const column = Number(read.indices[entry]);
           if (!(column >= 0 && column < nStored) || !Number.isInteger(column)) {
-            throw new Error(`Connectivity index ${String(read.indices[entry])} is outside axis bounds [0, ${nStored})`);
+            throw new AnnDataFormatError(`Connectivity index ${String(read.indices[entry])} is outside axis bounds [0, ${nStored})`);
           }
           const neighbor = positions === null ? column : positions.get(column);
           kept[entry] = neighbor < 0 || column === lines[line] || Number(read.data[entry]) === 0 ? -1 : neighbor;
@@ -6145,7 +6234,7 @@ export class AnnDataReader {
         counts[order[line] + 1] = count;
       }
       for (let i = 0; i < cells.length; i++) counts[i + 1] += counts[i];
-      const neighbors = allocateTypedArray(Uint32Array, counts[cells.length], 'Connectivity row neighbours');
+      const neighbors = allocateTypedArray(Uint32Array, counts[cells.length], 'Connectivity row neighbors');
       for (let line = 0; line < lines.length; line++) {
         let write = counts[order[line]];
         for (let entry = read.pointers[line]; entry < read.pointers[line + 1]; entry++) {
@@ -6157,7 +6246,7 @@ export class AnnDataReader {
   }
 
   /**
-   * One neighbour graph, `obsp[key]`, as stored (a dense array, or its
+   * One neighbor graph, `obsp[key]`, as stored (a dense array, or its
    * sparse lines gathered), read whole: what a caller that wants the matrix
    * itself reads. Not cached: its edges are.
    */
@@ -6176,7 +6265,7 @@ export class AnnDataReader {
         // Every row, every column: a two-dimensional read, not a row range of
         // a one-dimensional array.
         const data = await metadata.node.read([[0, nRows], [0, nCols]], readOptions);
-        if (!data || data.length !== nRows * nCols) throw new Error('Dense connectivity matrix payload length does not match its shape');
+        if (!data || data.length !== nRows * nCols) throw new AnnDataFormatError('Dense connectivity matrix payload length does not match its shape');
         result = { data, format: 'dense', shape: metadata.shape };
       } else {
         result = await gatheredGraph(await sparseGraphLines(metadata.node, this._format, 'Connectivity matrix', readOptions), 'Connectivity matrix');
@@ -6400,7 +6489,7 @@ export class AnnDataReader {
    * decoded once, then each gene's entries put back at the cells'
    * positions. Read in open order, rows spread through the store (a uniform
    * share) made every read of the run's pipeline decode nearly every stored
-   * chunk again: a 50 % share's DE groups (944,727 cells of a 10M CSR file)
+   * chunk again: a 50% share's DE groups (944,727 cells of a 10M CSR file)
    * read 7.5 GB of a 2.6 GB file. Any other matrix is read as `rows` reads.
    * @private
    */
@@ -6664,6 +6753,7 @@ export class AnnDataReader {
     this._root = null;
     this._fullRoot = null;
     this._cellSubset = null;
+    this._identifierColumns.clear();
     setWorkingSet(this._cellRowsPart, 0);
     this._expression = null;
     this._prefixReads = new Map();

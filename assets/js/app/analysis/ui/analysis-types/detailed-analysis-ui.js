@@ -16,6 +16,7 @@ import { createStatusLine } from '../../../ui/components/controls.js';
 import { BaseAnalysisUI } from '../base-analysis-ui.js';
 // Import PlotRegistry from canonical shared directory
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
+import { BasePlot } from '../../plots/plot-base.js';
 import {
   createPlotTypeSelector,
   createAnalysisModal,
@@ -36,7 +37,7 @@ import { setOwnDataProperty } from '../../../../utils/exact-record.js';
 import { excludeMissingCategoricalValues } from '../../data/data-layer.js';
 import { PLACES } from '../../../ui/place-names.js';
 import { analysisCostKind, runProgressively } from '../../shared/progressive-cells.js';
-import { failureText } from '../../../../utils/errors.js';
+import { failureDetails, joinFailure, sayFailure } from '../../../../utils/errors.js';
 import { listNames, namedError, quoteName } from '../../../actions/targets/names.js';
 
 /** A variable's kind in words, for a refusal. */
@@ -175,7 +176,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     this._controlsContainer.className = 'detailed-analysis-controls';
     this._container.appendChild(this._controlsContainer);
 
-    // The running, cancelled or failed state of the plot's job.
+    // The running, canceled or failed state of the plot's job.
     this._container.appendChild(this._getJobStatusView().root);
 
     // The cells the shown plot used (a first pass's sample, or all), and
@@ -204,6 +205,18 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   _renderControls() {
     this._controlsContainer.innerHTML = '';
 
+    // No dataset open: said as every analysis says it (`validateDataRequirements`).
+    const data = this.validateDataRequirements();
+    if (!data.valid) {
+      this._controlsContainer.replaceChildren(createStatusLine({ tone: 'muted', text: data.error }).root);
+      const invalidationRequestId = this._invalidateAnalysisRequest();
+      this._trackInteractiveTask(
+        this._hidePreview(invalidationRequestId),
+        'Detailed preview cleanup'
+      );
+      return;
+    }
+
     let pages;
     try {
       pages = this.dataLayer.getPages();
@@ -211,7 +224,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       console.error('[DetailedAnalysisUI] Failed to get pages:', err);
       this._controlsContainer.replaceChildren(createStatusLine({
         tone: 'danger',
-        text: 'Failed to load pages. Please try refreshing.'
+        text: `${joinFailure(`The highlight pages could not be read`, sayFailure(err))}`
       }).root);
       return;
     }
@@ -482,11 +495,13 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       if (!applied()) this._variableSelector?.setSelectedVariable(variable?.type ?? '', variable?.key ?? '');
       if (!applied()) this._applyVariable(variable);
     }
+    // Applied, not reported as the person's (the action's own step holds it): a person's change
+    // is a step of its own even while an action runs (dispatcher `recordObserved`, R9W-5).
     if (plot !== undefined && plot !== this._currentConfig.plotType) {
-      this._handlePlotTypeChange(plot);
+      this._applyPlotType(plot);
       this._renderControls();
     }
-    for (const { option, value } of plotOptions ?? []) this._handlePlotOptionChange(option, value);
+    for (const { option, value } of plotOptions ?? []) this._applyPlotOption(option, value);
     return JSON.stringify(this._currentConfig) !== before;
   }
 
@@ -505,8 +520,14 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     this._scheduleUpdate();
   };
 
+  /** A person's choice of plot (the plot type selector): a step (`analysis.detailed.set`). */
   _handlePlotTypeChange(plotTypeId) {
     if (plotTypeId !== this._currentConfig.plotType) this._recordPersonChange('detailed', { plot: plotTypeId });
+    this._applyPlotType(plotTypeId);
+  }
+
+  /** Draw `plotTypeId` with its saved options (a person's choice, or `setPlot`'s). */
+  _applyPlotType(plotTypeId) {
     this._currentConfig.plotType = plotTypeId;
     this._currentConfig.plotOptions = this._getSavedOptionsForPlotType(plotTypeId);
     this._scheduleUpdate();
@@ -522,10 +543,16 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     }
   }
 
+  /** A person's plot option (the expanded view's options): a step (`analysis.detailed.set`). */
   _handlePlotOptionChange(key, value) {
     if (this._currentConfig.plotOptions[key] !== value) {
       this._recordPersonChange('detailed', { plotOptions: [{ option: key, value }] });
     }
+    this._applyPlotOption(key, value);
+  }
+
+  /** Set one plot option and keep it for its plot type (a person's change, or `setPlot`'s). */
+  _applyPlotOption(key, value) {
     setOwnDataProperty(this._currentConfig.plotOptions, key, value);
     this._saveOptionsForPlotType(this._currentConfig.plotType, this._currentConfig.plotOptions);
     this._scheduleUpdate();
@@ -564,8 +591,8 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       error = new TypeError(`${context} failed with a non-Error value`);
     }
     this._notifications.error(
-      `${context} failed: ${failureText(error)}`,
-      { category: 'analysis', title: 'Analysis error' }
+      `${context} failed: ${sayFailure(error)}`,
+      { ...failureDetails(error), category: 'analysis', title: 'Analysis error' }
     );
   }
 
@@ -676,7 +703,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
           },
           onFirstPass: async (_drawn, sample) => {
             this._showCellsUsed(sample, openCells, 'refining');
-            // Cancelled or superseded while refining: the first pass stays
+            // Canceled or superseded while refining: the first pass stays
             // on screen, saying it is one.
             this._registerAnalysisInvalidationCleanup(requestId, () => {
               if (progress.shown === sample) this._showCellsUsed(sample, openCells, 'stopped');
@@ -705,9 +732,8 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     const config = structuredClone(this._currentConfig);
     // A first pass reads each page's cells in the sample (`progressive-cells.js`).
     const pageIds = sample === null ? [...this._selectedPages] : sample.pageIds([...this._selectedPages]);
-    const customColors = new Map(
-      this._pageSelector?.getCustomColors?.() || []
-    );
+    // Every page in its swatch's color, whatever order the pages were picked in.
+    const pageColors = new Map(this._pageSelector?.getPageColors?.() || []);
 
     if (!this._isCurrentAnalysisRequest(requestId)) return;
     this._previewContainer.classList.remove('empty');
@@ -733,10 +759,11 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       const pageDataOfCells = config.dataSource.type === 'categorical_obs'
         ? excludeMissingCategoricalValues(fetchedPageData)
         : fetchedPageData;
-      // A sample's pages are named and coloured as their pages.
-      const pageData = sample === null
+      // A sample's pages are named and colored as their pages.
+      const pageData = (sample === null
         ? pageDataOfCells
-        : pageDataOfCells.map(page => ({ ...page, pageId: sample.basePageId(page.pageId) }));
+        : pageDataOfCells.map(page => ({ ...page, pageId: sample.basePageId(page.pageId) })))
+        .map(page => (pageColors.has(page.pageId) ? { ...page, pageColor: pageColors.get(page.pageId) } : page));
 
       if (!this._isCurrentAnalysisRequest(requestId)) return;
       if (pageData.length === 0) {
@@ -750,7 +777,8 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
         pageNames: pageData.map(pd => pd.pageName),
         syncXAxis: true,
         syncYAxis: true,
-        customColors
+        // The engine takes the colors of the pages it draws, no other.
+        customColors: new Map(pageData.filter(pd => pageColors.has(pd.pageId)).map(pd => [pd.pageId, pageColors.get(pd.pageId)]))
       });
 
       // Get plot type
@@ -769,7 +797,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       const previewPlotDiv = await previewSlot.render(
         {
           pageData,
-          variableName: config.dataSource.variable,
+          valueLabel: BasePlot.getValueLabel(pageData),
           render: candidate => plotType.render(
             pageData,
             mergedOptions,
@@ -788,7 +816,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       this._previewContainer.classList.remove('empty');
       this._currentPageData = pageData;
       this._committedView = Object.freeze({ config, pageData, layoutEngine });
-      // A gene read for a sample of the open cells is summarised on its
+      // A gene read for a sample of the open cells is summarized on its
       // cells with a value (NaN elsewhere): the chip says which.
       const geneSample = config.dataSource.type === 'gene_expression' ? (this.dataLayer.state?.getGeneSample?.() ?? null) : null;
       this._showCellChoice(this.dataLayer.state?.cellIdentity ?? null, geneSample === null ? null : { cells: geneSample.cells, of: geneSample.of, groups: [] });
@@ -824,7 +852,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
   /** @private */
   async _redrawModal(modal, committed, plotType, options, requestId) {
     const { config, pageData, layoutEngine } = committed;
-    this._renderModalHeading(modal, config);
+    this._renderModalHeading(modal, config, pageData);
 
     const slot = this._ensureModalPlotSlot(modal);
     await slot.waitForCommittedLeases();
@@ -837,7 +865,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     const candidate = await slot.render(
       {
         pageData,
-        variableName: config.dataSource.variable,
+        valueLabel: BasePlot.getValueLabel(pageData),
         render: plotCandidate => plotType.render(
           pageData,
           options,
@@ -872,7 +900,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       renderSummaryStats(
         modalAfter._statsContent,
         pageData,
-        config.dataSource.variable
+        BasePlot.getValueLabel(pageData)
       );
     }
 
@@ -990,9 +1018,9 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
    * option being edited in the modal keeps its focus across redraws.
    * @private
    */
-  _renderModalHeading(modal, config) {
+  _renderModalHeading(modal, config, pageData) {
     if (modal._title) {
-      modal._title.textContent = `Comparing: ${config.dataSource.variable}`;
+      modal._title.textContent = `Comparing: ${BasePlot.getValueLabel(pageData)}`;
     }
     if (modal._optionsContent && modal._optionsPlotType !== config.plotType) {
       modal._optionsPlotType = config.plotType;
@@ -1032,7 +1060,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       )
     });
     this._modal = modal;
-    this._renderModalHeading(modal, committed.config);
+    this._renderModalHeading(modal, committed.config, committed.pageData);
     openModal(modal);
     if (modal._plotContainer) {
       await this._whileBusy(
@@ -1061,7 +1089,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       const candidate = await slot.render(
         {
           pageData,
-          variableName: config.dataSource.variable,
+          valueLabel: BasePlot.getValueLabel(pageData),
           render: plotCandidate => plotType.render(
             pageData,
             mergedOptions,
@@ -1095,7 +1123,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
         renderSummaryStats(
           modal._statsContent,
           pageData,
-          config.dataSource.variable
+          BasePlot.getValueLabel(pageData)
         );
       }
 
@@ -1116,7 +1144,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
         modal._plotContainer.innerHTML = '';
         modal._plotContainer.appendChild(createStatusLine({
           tone: 'danger',
-          text: `Failed to render: ${err?.message || err}`
+          text: `${joinFailure(`The plot could not be drawn`, sayFailure(err))} Run the analysis again to redraw it.`
         }).root);
       }
     }
@@ -1165,8 +1193,8 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       const payload = renderResult?.payload;
       if (
         !Array.isArray(payload?.pageData) ||
-        typeof payload.variableName !== 'string' ||
-        payload.variableName.length === 0
+        typeof payload.valueLabel !== 'string' ||
+        payload.valueLabel.length === 0
       ) {
         throw new Error(
           'Detailed CSV export requires exact committed plot data'
@@ -1174,7 +1202,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
       }
       return super._exportCSV(
         payload.pageData,
-        payload.variableName,
+        payload.valueLabel,
         'detailed-analysis-data.csv'
       );
     });
@@ -1227,14 +1255,7 @@ export class DetailedAnalysisUI extends BaseAnalysisUI {
     } catch (error) {
       errors.push(error);
     }
-    if (this._updateTimer) {
-      try {
-        clearTimeout(this._updateTimer);
-      } catch (error) {
-        errors.push(error);
-      }
-      this._updateTimer = null;
-    }
+    this._pendingUpdate.cancel();
     // The update that will not run now is settled, so nothing waits for it.
     this._settleScheduledUpdate?.();
     this._settleScheduledUpdate = null;

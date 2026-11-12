@@ -48,6 +48,8 @@ import { requireExactObjectKeys, requireObjectKeys } from '../../utils/exact-rec
 import { formatCountOf } from '../../utils/format-units.js';
 import { onAbort } from '../../utils/abort.js';
 import { parseOriginAllowlist } from '../../utils/origin-allowlist.js';
+import { bytesOfBase64, randomHex } from '../../utils/byte-text.js';
+import { codeChallengeOf } from '../../data/sources/auth/pkce.js';
 
 const GITHUB_API_ORIGIN = 'https://api.github.com';
 const GITHUB_GRAPHQL_URL = 'https://api.github.com/graphql';
@@ -98,7 +100,7 @@ const WORKER_REQUEST_BODY_MAX_BYTES = 1_400_000;
 /**
  * Chromium keeps a CORS preflight answer for at most 2 hours, Firefox for 24
  * (https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Access-Control-Max-Age):
- * the longest every engine honours.
+ * the longest every engine honors.
  */
 const PREFLIGHT_MAX_AGE_SECONDS = 7200;
 
@@ -287,7 +289,7 @@ function createRequestScope(request) {
 
   const stoppedError = () => {
     if (stopCause === 'caller') {
-      return new WorkerHttpError(499, 'Worker request was cancelled', { cause: stopReason });
+      return new WorkerHttpError(499, 'Worker request was canceled', { cause: stopReason });
     }
     if (stopCause === 'stall') {
       return new WorkerHttpError(
@@ -449,7 +451,7 @@ function isRecord(value) {
 
 /**
  * The JSON object a request carries. JSON is parsed natively, so a repeated
- * key keeps its last value; what is forwarded is always re-serialised from
+ * key keeps its last value; what is forwarded is always re-serialized from
  * the values checked here, never the bytes received.
  */
 async function readJsonRequestObject(request, label, scope, maxBytes = WORKER_REQUEST_BODY_MAX_BYTES) {
@@ -1049,7 +1051,7 @@ function clearOauthOwnerCookie(headers, name) {
 
 /**
  * The owner cookie's value is the PKCE verifier, a dot, and the return URL.
- * A serialised URL is printable ASCII; a cookie value may hold any printable
+ * A serialized URL is printable ASCII; a cookie value may hold any printable
  * ASCII but `"`, `,`, `;` and `\` (RFC 6265 4.1.1), so only those and `%` are
  * percent-escaped: the URL costs its own length, plus two bytes per escape.
  */
@@ -1105,29 +1107,13 @@ function redirectToApp(returnTo, { token = null, expiresIn = null, error = null 
   });
 }
 
-function createRandomHex256() {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
-}
-
-async function createPkceChallenge(verifier) {
-  const digest = new Uint8Array(
-    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))
-  );
-  return btoa(String.fromCharCode(...digest))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-}
-
 async function handleLogin(url, env, allowedOrigins) {
   const returnTo = validateReturnTo(
     getSingleQueryParam(url, 'return_to', { required: true }),
     allowedOrigins
   );
-  const state = createRandomHex256();
-  const codeVerifier = createRandomHex256();
+  const state = randomHex(32);
+  const codeVerifier = randomHex(32);
   const ownerCookie = serializeCookie(
     getOauthOwnerCookieName(state),
     encodeOwnerCookieValue(codeVerifier, returnTo),
@@ -1153,7 +1139,7 @@ async function handleLogin(url, env, allowedOrigins) {
   authUrl.searchParams.set('client_id', requireEnvString(env, 'GITHUB_CLIENT_ID'));
   authUrl.searchParams.set('redirect_uri', `${url.origin}/auth/callback`);
   authUrl.searchParams.set('state', state);
-  authUrl.searchParams.set('code_challenge', await createPkceChallenge(codeVerifier));
+  authUrl.searchParams.set('code_challenge', await codeChallengeOf(codeVerifier));
   authUrl.searchParams.set('code_challenge_method', 'S256');
   const headers = new Headers({
     'Cache-Control': 'no-store',
@@ -2139,7 +2125,7 @@ function assertCanonicalBase64(value, label) {
     CANONICAL_BASE64_LAST_QUANTUM.test(value.slice(-4))
   ) {
     try {
-      decodedBytes = atob(value).length;
+      decodedBytes = bytesOfBase64(value).length;
     } catch {
       decodedBytes = -1;
     }
@@ -2183,7 +2169,7 @@ function requireCallerRepository(route, caller, label) {
 }
 
 /**
- * Check a mutation body and return what is forwarded (re-serialised from the
+ * Check a mutation body and return what is forwarded (re-serialized from the
  * checked values) and, when the mutation is bound to its caller, the check
  * the caller must pass:
  * - a user file `annotations/users/ghid_<n>.json` is written only by user n;

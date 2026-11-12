@@ -160,3 +160,126 @@ test('what a turn does outside the state (a vote published) stays in its record;
   assert.equal(activityTextOf({ ...line, state: 'undone' }), "Claude's turn is undone · 1 vote published, not undoable");
   assert.equal(historyProblem(history), null);
 });
+
+test('the next message tells the agent what changed since its last turn: its turn undone (all since, or only its steps), the person\'s steps (L3-15)', async () => {
+  const { historySeen, historySinceSentence } = await import('../assets/js/app/agent/history-link.js');
+  const { plainSentence } = await import('../assets/js/app/actions/targets/names.js');
+  const { history, act, step } = await makePage();
+  const own = new Set(['turn-1']);
+  const say = seen => {
+    const sentence = historySinceSentence(history.active, seen, own);
+    return sentence === null ? null : plainSentence(sentence);
+  };
+  await step('a.set', { v: 2 }, AGENT);
+  await step('b.inc', {}, AGENT);
+  const seen = historySeen(history.active);
+  assert.equal(say(seen), null, 'nothing changed since');
+  // The person acts between turns.
+  await step('cam.set', { v: 4 });
+  assert.equal(say(seen), 'Since your last turn the history changed: The person\'s step "cam 4" is now in effect. Rely on the state as it is now, not on what your earlier replies said.');
+  // Undo turn, only the agent's steps: they go to Recently deleted, the person's step stays.
+  await act('history.turn.undo', { turn: 'turn-1', only_own: true });
+  const sentence = say(seen);
+  assert.match(sentence, /^Since your last turn the history changed: Your steps "a = 2", "b \+ 1" were removed \(to Recently deleted, no longer in effect\); The person's step "cam 4" is now in effect\./);
+  assert.ok(!/<cellucid-data>/.test(sentence) && /<cellucid-data>"a = 2"<\/cellucid-data>/.test(historySinceSentence(history.active, seen, own)), 'labels are marked as data');
+});
+
+test('a step the person takes while the agent\'s turn runs is told with the next message, as taken during that turn (L18-4)', async () => {
+  const { historySeen, historySinceSentence } = await import('../assets/js/app/agent/history-link.js');
+  const { plainSentence } = await import('../assets/js/app/actions/targets/names.js');
+  const { history, step } = await makePage();
+  const own = new Set(['turn-1']);
+  // The turn starts: the tracker's next step number then.
+  const from = history.active.nextStep;
+  await step('a.set', { v: 2 }, AGENT);
+  // The person colors mid-turn, between the agent's steps.
+  await step('cam.set', { v: 4 });
+  await step('b.inc', {}, AGENT);
+  // The turn ends: what the agent saw is its own steps and what was in effect before it began.
+  const seen = historySeen(history.active, { from, ownTurns: own });
+  assert.equal(plainSentence(historySinceSentence(history.active, seen, own)),
+    'Since your last turn the history changed: The person\'s step "cam 4" was taken while your last turn ran and is in effect. Rely on the state as it is now, not on what your earlier replies said.');
+  // Without a turn start (another tracker shown then), the snapshot is the steps in effect, as before.
+  assert.equal(historySinceSentence(history.active, historySeen(history.active), own), null);
+});
+
+test('Undo turn back to before the turn: its steps are undone, kept for redo; a run of one label is said once with its count', async () => {
+  const { historySeen, historySinceSentence } = await import('../assets/js/app/agent/history-link.js');
+  const { plainSentence } = await import('../assets/js/app/actions/targets/names.js');
+  const { history, act, step } = await makePage();
+  const own = new Set(['turn-1']);
+  await step('a.set', { v: 2 }, AGENT);
+  const seen = historySeen(history.active);
+  await act('history.turn.undo', { turn: 'turn-1' });
+  assert.equal(plainSentence(historySinceSentence(history.active, seen, own)),
+    'Since your last turn the history changed: Your step "a = 2" was undone (kept for redo, no longer in effect). Rely on the state as it is now, not on what your earlier replies said.');
+  // The person goes on from there: a new branch, the agent's step kept on Main.
+  for (let n = 0; n < 3; n++) await step('b.inc');
+  await step('a.set', { v: 5 });
+  const sentence = plainSentence(historySinceSentence(history.active, seen, own));
+  assert.match(sentence, /the branch shown is now "Branch 1" \(it was "Main"\); Your step "a = 2" stays on the branch "Main", not in effect on the branch shown; The person's steps "b \+ 1" \(3 times\), "a = 5" are now in effect\./);
+  await step('cam.set', { v: 1 });
+  await step('cam.set', { v: 2 });
+  assert.match(plainSentence(historySinceSentence(history.active, historySeen(history.active), own) ?? 'none'), /^none$/);
+  assert.equal(historySinceSentence(history.active, null, own), null);
+});
+
+test('another history shown since the last turn is said: which tracker, where it came from, its steps in effect, and the conversation left behind (F270)', async () => {
+  const { historySeen, historySinceSentence, isHistorySeen } = await import('../assets/js/app/agent/history-link.js');
+  const { plainSentence } = await import('../assets/js/app/actions/targets/names.js');
+  const { history, step } = await makePage();
+  const own = new Set(['turn-1']);
+  await step('a.set', { v: 2 }, AGENT);
+  const seen = historySeen(history.active, { ownTurns: own, conversation: 'chat-1' });
+  assert.ok(isHistorySeen(seen) && isHistorySeen(JSON.parse(JSON.stringify(seen))), 'the record reads back as plain data');
+  assert.equal(seen.name, history.active.name);
+  assert.deepEqual(seen.dataset, { id: 'd1', name: 'Demo' });
+  // The person starts another tracker and acts there: the history shown is another one.
+  const first = history.active.name;
+  await history.startTracker({ start: 'shown', name: 'Second look' });
+  assert.equal(plainSentence(historySinceSentence(history.active, seen, own)),
+    'Since your last turn the person changed what is shown: the history shown is now "Second look" (it was '
+    + `"${first}"); no step is in effect there yet. Read this history before relying on it; it is not the one your earlier replies spoke of.`);
+  for (let n = 0; n < 6; n++) await step('b.inc');
+  await step('a.set', { v: 7 }, { origin: 'agent', agent: 'ChatGPT', turn: 'g-1' });
+  // As a session file loaded beside would show it (start: import), and in a conversation other than the last turn's.
+  const loaded = { ...history.active, start: { kind: 'import', from: { file: 'colleague.cellucid-session' } } };
+  const sentence = plainSentence(historySinceSentence(loaded, seen, own, { conversation: 'chat-2' }));
+  assert.equal(sentence,
+    'Since your last turn the person changed what is shown: the history shown is now "Second look", loaded from the session file '
+    + `"colleague.cellucid-session" (it was "${first}"); 7 steps are in effect there (by the person 6, ChatGPT 1); `
+    + 'the latest 5: "b + 1" (4 times), "a = 7"; this conversation is not the one of your last turn: that one stays with '
+    + `"${first}". Read this history before relying on it; it is not the one your earlier replies spoke of.`);
+  // The same conversation: nothing said of it; a malformed record is no record.
+  assert.ok(!/this conversation/.test(historySinceSentence(loaded, seen, own, { conversation: 'chat-1' })));
+  for (const broken of [{ ...seen, steps: 'many' }, { ...seen, extra: 1 }, { ...seen, dataset: null }, { ...seen, next: -1 }, null]) {
+    assert.equal(isHistorySeen(broken), false, JSON.stringify(broken));
+  }
+});
+
+test('a branch switch is said as one, not as an undo: the agent\'s steps stay on their branch; a step taken on the branch left is named (L12-1)', async () => {
+  const { historySeen, historySinceSentence } = await import('../assets/js/app/agent/history-link.js');
+  const { plainSentence } = await import('../assets/js/app/actions/targets/names.js');
+  const { history, act, step } = await makePage();
+  const own = new Set(['turn-1']);
+  const root = history.active.headId;
+  await step('a.set', { v: 2 }, AGENT);
+  await step('b.inc', {}, AGENT);
+  const seen = historySeen(history.active);
+  // The person takes a step on Main, then starts another branch from the opening and stays there.
+  await step('cam.set', { v: 4 });
+  await history.jump(root);
+  await step('a.set', { v: 9 });
+  const shown = history.active.branches.get(history.active.activeBranch).name;
+  const sentence = plainSentence(historySinceSentence(history.active, seen, own));
+  assert.ok(!/undone/.test(sentence), sentence);
+  assert.match(sentence, new RegExp(`the branch shown is now "${shown}" \\(it was "Main"\\)`));
+  assert.match(sentence, /Your steps "a = 2", "b \+ 1" stay on the branch "Main", not in effect on the branch shown/);
+  assert.match(sentence, /The person's step "a = 9" is now in effect/);
+  assert.match(sentence, /The person's step "cam 4" was taken on the branch "Main", not the one shown/);
+  // Back on Main: the agent's steps are in effect again, the person's camera step too.
+  await act('history.branch.switch', { branch: 'Main' });
+  const back = plainSentence(historySinceSentence(history.active, seen, own));
+  assert.match(back, /The person's step "cam 4" is now in effect/);
+  assert.ok(!/Your/.test(back), back);
+});

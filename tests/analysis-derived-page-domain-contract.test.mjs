@@ -51,9 +51,9 @@
  * two agree today only because every form-based selector is constructed with
  * `includeDerivedPages: true`; the option defaults to `false`
  * (`page-selector.js:168`), so a selector built without it would have accepted a
- * rest-of page as a selection and refused a colour for that page, out of one
+ * rest-of page as a selection and refused a color for that page, out of one
  * saved session. All four sites resolve the domain from `selectablePageIdSet`
- * now, and the last two tests pin that the colour half no longer depends on what
+ * now, and the last two tests pin that the color half no longer depends on what
  * a widget happens to be displaying.
  */
 import assert from 'node:assert/strict';
@@ -109,14 +109,14 @@ function formSettings(selectedPages) {
 
 /**
  * A form-based UI positioned as Correlation and Gene Signature are: it owns a
- * page selector, so it can carry custom page colours.
+ * page selector, so it can carry custom page colors.
  *
  * The selector is the real `PageSelectorComponent` prototype rather than an
- * imitation of it, because `includeDerivedPages` is precisely the behaviour
+ * imitation of it, because `includeDerivedPages` is precisely the behavior
  * under test — `_getPages()` is what decides whether the widget's view of the
  * inventory is narrower than the data's.
  */
-function createColourUI(dataLayer, { includeDerivedPages }) {
+function createColorUI(dataLayer, { includeDerivedPages }) {
   const ui = createSelectorlessUI(FormBasedAnalysisUI.prototype, dataLayer);
   const selector = Object.create(PageSelectorComponent.prototype);
   selector.dataLayer = dataLayer;
@@ -239,7 +239,7 @@ test('the four page domains are the same domain', () => {
   const dataLayer = createDataLayer();
   const baseUI = createSelectorlessUI(BaseAnalysisUI.prototype, dataLayer);
   const formUI = createSelectorlessUI(FormBasedAnalysisUI.prototype, dataLayer);
-  const colourUI = createColourUI(dataLayer, { includeDerivedPages: true });
+  const colorUI = createColorUI(dataLayer, { includeDerivedPages: true });
   const manager = Object.create(AnalysisUIManager.prototype);
   manager.dataLayer = dataLayer;
   manager._uis = new Map();
@@ -252,7 +252,7 @@ test('the four page domains are the same domain', () => {
   baseUI._requireAvailableSelectedPages(everyId, 'Analysis selectedPages');
   formUI._requireSettings(formSettings(everyId));
   assert.deepEqual(
-    colourUI._requireCustomPageColors(everyId.map(id => [id, '#3366cc'])),
+    colorUI._requireCustomPageColors(everyId.map(id => [id, '#3366cc'])),
     everyId.map(id => [id, '#3366cc']),
   );
 
@@ -272,19 +272,19 @@ test('the four page domains are the same domain', () => {
     /was not found/,
   );
   assert.throws(
-    () => colourUI._requireCustomPageColors([[stranger, '#3366cc']]),
+    () => colorUI._requireCustomPageColors([[stranger, '#3366cc']]),
     /was not found/,
   );
 });
 
 test(
-  'a custom page colour is judged by the data, not by what the widget shows',
+  'a custom page color is judged by the data, not by what the widget shows',
   () => {
     // `includeDerivedPages` defaults to false, so this is the selector a mode
-    // gets by forgetting one option — and it is what made the colour domain
+    // gets by forgetting one option — and it is what made the color domain
     // narrower than the selection domain it is validated beside.
     const dataLayer = createDataLayer();
-    const ui = createColourUI(dataLayer, { includeDerivedPages: false });
+    const ui = createColorUI(dataLayer, { includeDerivedPages: false });
 
     assert.deepEqual(
       ui._requireSettings(formSettings([REST_OF_PAGE_1])).selectedPages,
@@ -293,14 +293,14 @@ test(
     assert.deepEqual(
       ui._requireCustomPageColors([[REST_OF_PAGE_1, '#3366cc']]),
       [[REST_OF_PAGE_1, '#3366cc']],
-      'one saved session cannot have a page it may select and may not colour',
+      'one saved session cannot have a page it may select and may not color',
     );
   },
 );
 
-test('the colour domain still refuses what it always refused', () => {
+test('the color domain still refuses what it always refused', () => {
   const dataLayer = createDataLayer();
-  const ui = createColourUI(dataLayer, { includeDerivedPages: true });
+  const ui = createColorUI(dataLayer, { includeDerivedPages: true });
 
   assert.throws(
     () => ui._requireCustomPageColors([['page_absent', '#3366cc']]),
@@ -336,7 +336,7 @@ test('the colour domain still refuses what it always refused', () => {
 
 test('widening the domain does not weaken the empty-page rule', () => {
   // A rest-of page whose complement is empty is still not a selectable page:
-  // the fix must widen what exists, not what may be analysed.
+  // the fix must widen what exists, not what may be analyzed.
   const dataLayer = createDataLayer({ emptyPageIds: [REST_OF_PAGE_1] });
   const baseUI = createSelectorlessUI(BaseAnalysisUI.prototype, dataLayer);
   const formUI = createSelectorlessUI(FormBasedAnalysisUI.prototype, dataLayer);

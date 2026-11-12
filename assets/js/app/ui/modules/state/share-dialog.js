@@ -22,6 +22,7 @@
 
 import { authorOf } from './model.js';
 import { wireAppDialog } from '../../components/app-dialog.js';
+import { setControlAvailability } from '../../core/control-availability.js';
 import { createSegmented } from '../../components/controls.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
 
@@ -182,7 +183,9 @@ export function createShareDialog({ dialog, act, history, viewOf, isResult, noti
     const steps = content === 'steps';
     note.textContent = CONTENT_NOTES[content];
     include.hidden = state;
-    for (const input of [notes, chats, journal]) input.disabled = state;
+    for (const input of [notes, chats, journal]) {
+      setControlAvailability(input, state ? 'Current state shares what is shown now, without its steps; choose History to include them' : null);
+    }
     for (const button of choices.results.root.querySelectorAll('.segmented-btn')) button.disabled = steps;
     if (steps) choose('results', 'recompute');
     if (!timesChosen) choose('times', state ? 'none' : 'exact');
@@ -207,7 +210,7 @@ export function createShareDialog({ dialog, act, history, viewOf, isResult, noti
       ['Branches', String(n.branches)],
       ['Cell sets and values', content === 'steps' ? 'Not included' : 'The cells of every filter, label and highlight'],
       ['Analysis results', content === 'steps' || choice('results') === 'recompute' ? 'Computed again on open' : String(n.results)],
-      ['Notes and bookmarks', content === 'state' ? 'Not included' : yes(notes.checked, `${n.notes} notes, ${n.bookmarks} bookmarks`)],
+      ['Notes and bookmarks', content === 'state' ? 'Not included' : yes(notes.checked, `${formatCountOf(n.notes, 'note')}, ${formatCountOf(n.bookmarks, 'bookmark')}`)],
       ['Conversations', content === 'state' ? 'Not included' : yes(chats.checked, String(n.chats))],
       ['Agents and models', content === 'state' || n.agents.size === 0 ? 'None' : [...n.agents].join(', ')],
       ['Names of people', n.people.size === 0 ? 'None' : [...n.people].join(', ')],

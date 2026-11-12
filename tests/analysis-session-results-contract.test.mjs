@@ -67,7 +67,12 @@ function createDataLayer({ genes = GENES, categories = CATEGORIES, pages = PAGES
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
+    // No coloring field: each analysis falls back to its ranked default.
+    getColoringCategoricalField() { return null; },
     getAvailableVariables(type) {
       if (type === 'gene_expression') return genes.map(key => ({ key }));
       if (type === 'categorical_obs') return [{ key: 'cell_type', categories, categoryCount: categories.length }];
@@ -138,6 +143,8 @@ function deFull() {
       foldChange: { mode: 'stored', base: null },
       matrix: 'mapped',
       matrixLabel: 'Mapped (X)',
+      counts: true,
+      values: { normalize: true, log1p: true, totals: "obs['total_counts'] (over all genes)" },
       replicates: null,
       groupAName: 'PAGE-A',
       groupBName: 'PAGE-B',
@@ -153,6 +160,9 @@ function deFull() {
 function signatureRaw() {
   return {
     method: 'mean',
+    groupBy: null,
+    counts: true,
+    values: { normalize: true, log1p: false, totals: 'the sum of its 5 genes of X' },
     unscored: [{ name: 'Empty', unmatched: ['NOPE'] }],
     sets: [{
       name: 'T cells',
@@ -183,6 +193,8 @@ function correlationResult() {
     yValues: Float32Array.from({ length: n }, (_, i) => i * 1.5),
     xVariable: 'CD3E',
     yVariable: 'age',
+    xLabel: 'CD3E · log1p(norm.)',
+    yLabel: 'age',
     sampled: false,
     colorValues: Array.from({ length: n }, (_, i) => (i % 3 === 2 ? null : CATEGORIES[i % 2])),
     colorVariable: 'cell_type',
@@ -232,7 +244,7 @@ function markersRun() {
     genesTestedByGroup: [5, 5, 0],
   };
   const metadata = {
-    groupBy: 'cell_type', matrix: 'mapped', matrixLabel: 'Mapped (X)', method: 'wilcox', pConvention: 'exact', correction: 'bh',
+    groupBy: 'cell_type', matrix: 'mapped', matrixLabel: 'Mapped (X)', counts: false, values: null, method: 'wilcox', pConvention: 'exact', correction: 'bh',
     foldChange: { mode: 'stored', base: null }, minCellsPerSide: 10, geneCount: 5, groupCount: 3, testedCount: 2,
     skippedGroups: [{ name: 'NK cell', cells: 4 }], pooledGroups: [], lowNGroups: [], cached: false, durationMs: 2, tuning: null,
   };
@@ -391,7 +403,7 @@ test('a signature scored on the cells genes were read for restores with them, an
   );
 });
 
-test('a correlation result is refused when its colour field lacks a category', async () => {
+test('a correlation result is refused when its color field lacks a category', async () => {
   const source = createUI(CorrelationAnalysisUI);
   await shown(source, correlationResult());
   await assert.rejects(

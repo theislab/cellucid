@@ -30,7 +30,7 @@
  */
 
 import { BOOL_DTYPE, isArrayNode, isGroup, numericDtype, valueArrayClass } from '../../../formats/store.js';
-import { NULLABLE_ENCODINGS, attributeValue, encodingType } from '../elements.js';
+import { AnnDataFormatError, NULLABLE_ENCODINGS, attributeValue, encodingType } from '../elements.js';
 import { computedArray, encodingAttrs, joinPath, viewGroup } from './view-nodes.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { sharedOnce } from '../../../utils/abort.js';
@@ -81,21 +81,21 @@ export function cellMapOf(modality, nObs) {
   const map = sharedOnce(async options => {
     if (modality.obsmap === null) {
       if (modality.nCells !== nObs) {
-        throw new Error(
+        throw new AnnDataFormatError(
           `Modality '${modality.name}' has ${formatCountOf(modality.nCells, 'cell')} and the dataset ${nObs}, and no cell map (obsmap) says which they are`
         );
       }
       return { rows: null, identity: true, measured: nObs };
     }
     const stored = await modality.obsmap.read(undefined, options);
-    if (stored.length !== nObs) throw new Error(`obsmap['${modality.name}'] has ${formatCountOf(stored.length, 'row')} for ${formatCountOf(nObs, 'cell')}`);
+    if (stored.length !== nObs) throw new AnnDataFormatError(`obsmap['${modality.name}'] has ${formatCountOf(stored.length, 'row')} for ${formatCountOf(nObs, 'cell')}`);
     const rows = allocateTypedArray(Int32Array, nObs, `obsmap['${modality.name}']`);
     let identity = modality.nCells === nObs;
     let measured = 0;
     for (let cell = 0; cell < nObs; cell++) {
       const row = Number(stored[cell]) - 1;
       if (!(row >= -1 && row < modality.nCells) || !Number.isInteger(row)) {
-        throw new RangeError(`obsmap['${modality.name}'] places cell ${cell} at row ${row + 1}, outside its ${formatCountOf(modality.nCells, 'row')}`);
+        throw new AnnDataFormatError(`obsmap['${modality.name}'] places cell ${cell} at row ${row + 1}, outside its ${formatCountOf(modality.nCells, 'row')}`);
       }
       rows[cell] = row;
       if (row >= 0) measured++;
@@ -124,7 +124,7 @@ export function cellMapOf(modality, nObs) {
     for (let i = 0; i < rows.length; i++) {
       const row = Number(stored[i]) - 1;
       if (!(row >= -1 && row < modality.nCells) || !Number.isInteger(row)) {
-        throw new RangeError(`obsmap['${modality.name}'] places cell ${r0 + i} at row ${row + 1}, outside its ${formatCountOf(modality.nCells, 'row')}`);
+        throw new AnnDataFormatError(`obsmap['${modality.name}'] places cell ${r0 + i} at row ${row + 1}, outside its ${formatCountOf(modality.nCells, 'row')}`);
       }
       rows[i] = row;
     }
@@ -220,7 +220,7 @@ function placedCategorical(group, map, nObs, path) {
     sources: [group],
     children: () => {
       const codes = group.get('codes');
-      if (!isArrayNode(codes)) throw new Error(`${group.path} is a categorical column without an array of codes`);
+      if (!isArrayNode(codes)) throw new AnnDataFormatError(`${group.path} is a categorical column without an array of codes`);
       return new Map([
         ['codes', () => computedArray({
           path: joinPath(path, 'codes'),
@@ -331,7 +331,7 @@ function placedNullable(source, encoding, map, nObs, path) {
       const values = isGroup(source) ? source.get('values') : source;
       const mask = isGroup(source) ? source.get('mask') : null;
       if (!isArrayNode(values) || (isGroup(source) && !isArrayNode(mask))) {
-        throw new Error(`${source.path} is a nullable column without arrays of values and mask`);
+        throw new AnnDataFormatError(`${source.path} is a nullable column without arrays of values and mask`);
       }
       return new Map([
         ['values', () => placedElements(values, map, nObs, joinPath(path, 'values'), fill)],
@@ -378,7 +378,7 @@ export function placedObsColumn(node, map, nObs, path) {
  * a graph whose every row is one of the store's cells is placed (each edge
  * needs both ends).
  *
- * The neighbour graph's readers never hold it whole: `graphPlacement` names
+ * The neighbor graph's readers never hold it whole: `graphPlacement` names
  * the stored graph and how its rows lie on the store's cells (`cellOfRow`,
  * 4 bytes a modality row, made once from the cell map; `rowOfCell`, null
  * when they are the same), and `graph-lines.js` reads it in its own rows
@@ -418,7 +418,7 @@ export function placedGraph(group, map, nObs, path) {
     for (let row = 0; row < nRows; row++) {
       const count = lines.pointers[row + 1] - lines.pointers[row];
       if (toCell[row] < 0) {
-        if (count > 0) throw new RangeError(`${group.path} joins a row that no cell of the dataset is mapped to`);
+        if (count > 0) throw new AnnDataFormatError(`${group.path} joins a row that no cell of the dataset is mapped to`);
         continue;
       }
       outPointers[toCell[row] + 1] = count;
@@ -442,7 +442,7 @@ export function placedGraph(group, map, nObs, path) {
         let ordered = true;
         for (let entry = slab.pointers[row - slab.start]; entry < slab.pointers[row - slab.start + 1]; entry++) {
           const column = toCell[slab.indices[entry]];
-          if (column < 0) throw new RangeError(`${group.path} joins a row that no cell of the dataset is mapped to`);
+          if (column < 0) throw new AnnDataFormatError(`${group.path} joins a row that no cell of the dataset is mapped to`);
           if (at > outPointers[cell] && column < outIndices[at - 1]) ordered = false;
           outIndices[at] = column;
           outData[at] = slab.data[entry];

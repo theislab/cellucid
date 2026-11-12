@@ -18,6 +18,7 @@
  */
 
 import { annotationDatasetIdOf } from '../../../community-annotations/runtime-context.js';
+import { setControlAvailability, unavailableReasonOf } from '../../core/control-availability.js';
 import { toCacheScopeKey } from '../../../community-annotations/cache-scope.js';
 import { toGitHubUserKey } from '../../../community-annotations/github-auth.js';
 import { getAnnotationRepoForDataset } from '../../../community-annotations/repo-store.js';
@@ -56,6 +57,8 @@ import {
   openExternal,
 } from './browser-integration.js';
 import { onAbort } from '../../../../utils/abort.js';
+import { sayFailure } from '../../../../utils/errors.js';
+import { NO_DATASET_OPEN } from '../../no-dataset.js';
 
 /** Where a person installs Cellucid's GitHub App on their account, or changes which repositories it reaches. */
 export const GITHUB_APP_INSTALL_URL = 'https://github.com/apps/cellucid-community-annotations/installations/new';
@@ -98,7 +101,7 @@ export function describeSyncOutcome(outcome, doneText) {
     case 'skipped':
       return SYNC_SKIPPED_MESSAGE;
     case 'cancelled':
-      return 'Cancelled.';
+      return 'Canceled.';
     case 'failed':
     case 'unknown':
       if (typeof outcome.error !== 'string' || !outcome.error) {
@@ -1004,7 +1007,7 @@ export function createGitHubConnectionFlow(controller) {
 
             setStatusTone(githubRow.chip, authed ? 'ok' : 'warn');
             githubRow.valueEl.textContent = authed ? (who ? ` @${who}` : ' signed in') : ' not connected';
-            // Shown only when they can act: a greyed icon says nothing and takes no focus.
+            // Shown only when they can act: a grayed icon says nothing and takes no focus.
             githubSettingsBtn.hidden = !authed;
             disconnectGitHubBtn.hidden = !authed;
 
@@ -1045,9 +1048,12 @@ export function createGitHubConnectionFlow(controller) {
                       )
                   );
             autoPullCheckbox.checked = autoPullEnabled;
-            autoPullCheckbox.disabled = busy || !canSync;
+            const syncUnavailable = busy
+              ? 'GitHub is being synced; try again once it has'
+              : !canSync ? 'connect a GitHub repository first' : null;
+            setControlAvailability(autoPullCheckbox, syncUnavailable);
             autoPullSelect.value = `${assertAutoPullIntervalMs(autoPullIntervalMs)}`;
-            autoPullSelect.disabled = busy || !canSync || !autoPullEnabled;
+            setControlAvailability(autoPullSelect, syncUnavailable ?? (autoPullEnabled ? null : 'tick Auto pull first'));
 
             step1Panel.hidden = uiStep !== 1;
             step2Panel.hidden = !(authed && uiStep === 2);
@@ -1071,7 +1077,7 @@ export function createGitHubConnectionFlow(controller) {
                   ? 'Loading repositories…'
                   : (
                     n
-                      ? `${formatCount(n)} repos available.`
+                      ? `${formatCountOf(n, 'repo')} available.`
                       : 'No repos yet: Add repo, then Reload.'
                   );
             }
@@ -1113,7 +1119,7 @@ export function createGitHubConnectionFlow(controller) {
             prevBtn.disabled = busy || uiStep <= 1;
 
             // A disabled Next says why in its title, so the step's blocker is
-            // never a silent grey button.
+            // never a silent gray button.
             let nextText = 'Next';
             let nextBlocker = busy ? 'Wait for the current GitHub request to finish.' : '';
             if (uiStep === 1) {
@@ -1251,7 +1257,7 @@ export function createGitHubConnectionFlow(controller) {
               return;
             }
             if (!did) {
-              status.textContent = 'Missing dataset context.';
+              status.textContent = NO_DATASET_OPEN;
               updateUi();
               return;
             }
@@ -1428,8 +1434,10 @@ export function createGitHubConnectionFlow(controller) {
             autoPullCheckbox.checked = autoPullEnabled;
             autoPullSelect.value =
               `${assertAutoPullIntervalMs(autoPullIntervalMs)}`;
-            autoPullSelect.disabled =
-              autoPullCheckbox.disabled || !autoPullEnabled;
+            setControlAvailability(
+              autoPullSelect,
+              unavailableReasonOf(autoPullCheckbox) ?? (autoPullEnabled ? null : 'tick Auto pull first')
+            );
             const error =
               errors.length === 1
                 ? primaryError
@@ -1484,8 +1492,7 @@ export function createGitHubConnectionFlow(controller) {
               outcome = await run({ signal: modalAbort.signal });
             } catch (error) {
               if (isModalOwnerCurrent()) {
-                status.textContent =
-                  `⚠ ${String(error?.message || 'GitHub sync failed')}`;
+                status.textContent = `GitHub sync failed: ${sayFailure(error)}`;
               }
               throw error;
             }
@@ -1534,7 +1541,7 @@ export function createGitHubConnectionFlow(controller) {
             selectedRepoFullName = '';
             controller.setLastRepoInfo(null);
             access.clearRole?.();
-            status.textContent = 'Repository disconnected.';
+            status.textContent = 'Repository disconnected';
             uiStep = 2;
             updateUi();
           });

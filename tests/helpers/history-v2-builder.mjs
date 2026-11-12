@@ -106,7 +106,7 @@ export function trackerBuilder({ name = 'Tracker 1', at = Date.UTC(2026, 10, 4, 
       if (turn !== undefined) turn.endedAt = clock;
       return id;
     },
-    /** `count` steps at once, labelled `${label} ${i}`; returns their ids. */
+    /** `count` steps at once, labeled `${label} ${i}`; returns their ids. */
     steps(count, label, fields) {
       return Array.from({ length: count }, (_, index) => api.step(`${label} ${index + 1}`, fields));
     },

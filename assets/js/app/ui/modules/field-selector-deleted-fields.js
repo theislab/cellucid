@@ -9,7 +9,7 @@ import { showConfirmDialog } from '../components/confirm-dialog.js';
 import { getFieldRegistry } from '../../utils/field-registry.js';
 import { FieldSource } from '../../utils/field-constants.js';
 import { StateValidator } from '../../utils/state-validator.js';
-import { createButton, createDisclosure } from '../components/controls.js';
+import { ICONS, createButton, createDisclosure, createIconButton } from '../components/controls.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { requireExactKeys, requirePlainRecord } from '../../../utils/exact-record.js';
 import { dispatchFromControl } from '../../actions/control-dispatch.js';
@@ -293,7 +293,16 @@ export function initDeletedFieldsPanel(options) {
     function addGroup(title, entries, source) {
       if (entries.length === 0) return;
       list.appendChild(createText('h3', 'section-title', title));
+      // Several rows of one name (a field deleted, another renamed to its
+      // name and deleted too): each row's actions name its own by its place
+      // among them (`which`), as the list shows them.
+      const ofName = new Map();
+      for (const { field } of entries) ofName.set(field.key, (ofName.get(field.key) ?? 0) + 1);
+      const seen = new Map();
       for (const { field, index } of entries) {
+        const place = (seen.get(field.key) ?? 0) + 1;
+        seen.set(field.key, place);
+        const which = ofName.get(field.key) > 1 ? String(place) : null;
         const row = ownerDocument.createElement('div');
         row.className = 'deleted-field-row';
         let fieldLabel = field.key;
@@ -301,27 +310,37 @@ export function initDeletedFieldsPanel(options) {
           StateValidator.validateFieldKey(field._originalKey);
           fieldLabel = `${field.key} *`;
         }
+        // Rows of one name are told apart by their place, the `which` their actions name.
+        if (which !== null) fieldLabel = `${fieldLabel} (${which} of ${ofName.get(field.key)})`;
         const name = createText('span', 'deleted-field-name', fieldLabel);
-        if (Object.hasOwn(field, '_originalKey')) {
-          name.title = `Original: ${field._originalKey}`;
-        }
+        name.title = Object.hasOwn(field, '_originalKey')
+          ? `${fieldLabel} (original: ${field._originalKey})`
+          : fieldLabel;
         const buttons = ownerDocument.createElement('div');
         buttons.className = 'deleted-field-actions';
+        // A row of the list: its actions are quiet, Restore the main one.
         const restoreButton = createButton({
           label: 'Restore',
-          className: 'btn-compact'
+          variant: 'quiet-primary',
+          ariaLabel: `Restore ${field.key}`
         });
         restoreButton.dataset.action = 'restore-field';
         restoreButton.dataset.source = source;
         restoreButton.dataset.index = String(index);
-        const purgeButton = createButton({
-          label: 'Confirm',
-          className: 'btn-compact',
-          title: 'Permanently confirm deletion (cannot be restored)'
+        // A bin, as every delete of the sidebar's rows: the row's width is
+        // its name's (a worded button left "S_s…").
+        const purgeButton = createIconButton({
+          label: `Delete ${field.key} for good…`,
+          icon: ICONS.delete,
+          tone: 'danger'
         });
         purgeButton.dataset.action = 'purge-field';
         purgeButton.dataset.source = source;
         purgeButton.dataset.index = String(index);
+        if (which !== null) {
+          restoreButton.dataset.which = which;
+          purgeButton.dataset.which = which;
+        }
         if (index === -1) {
           const userDefinedId = requireIdentifier(
             field._userDefinedId,
@@ -365,7 +384,8 @@ export function initDeletedFieldsPanel(options) {
         source,
         index,
         field: inventory[index],
-        userDefinedId: null
+        userDefinedId: null,
+        which: readWhich(button)
       };
     }
     const userDefinedId = requireIdentifier(
@@ -376,7 +396,17 @@ export function initDeletedFieldsPanel(options) {
       userDefinedRegistry.getField(userDefinedId),
       'Deleted virtual field'
     );
-    return { source, index, field, userDefinedId };
+    return { source, index, field, userDefinedId, which: readWhich(button) };
+  }
+
+  /** The row's place among the deleted fields of its name, when several share it. */
+  function readWhich(button) {
+    const which = button.dataset.which;
+    if (which === undefined) return undefined;
+    if (!/^[1-9][0-9]*$/.test(which)) {
+      throw new TypeError('Deleted field place must be a canonical positive integer');
+    }
+    return Number(which);
   }
 
   deletedFieldsSection.addEventListener('click', (event) => {
@@ -401,8 +431,14 @@ export function initDeletedFieldsPanel(options) {
       source,
       index,
       field,
-      userDefinedId
+      userDefinedId,
+      which
     } = readAction(button);
+    // The deleted field as the actions name it: its name, and its place
+    // among the deleted fields of that name when several share it.
+    const named = which === undefined
+      ? { field: { source, key: field.key } }
+      : { field: { source, key: field.key }, which };
     const datasetGeneration = readDatasetGeneration();
 
     const isCapturedFieldCurrent = () => {
@@ -425,11 +461,10 @@ export function initDeletedFieldsPanel(options) {
       let releaseTransient = () => {};
       let retired = false;
       const closeDialog = showConfirmDialog({
-        title: 'Confirm deletion',
+        title: `Delete "${field.key}" for good?`,
         message:
-          `Permanently confirm deletion of "${field.key}"?\n\n`
-          + 'This removes restore capability for this field in the current session and in saved states.',
-        confirmText: 'Confirm delete',
+          'It leaves Deleted fields and can no longer be restored there, nor from a session saved after. Undo still brings it back.',
+        confirmText: 'Delete for good',
         onConfirm: () => {
           const ownsInteraction = retired === false;
           retired = true;
@@ -437,12 +472,12 @@ export function initDeletedFieldsPanel(options) {
           if (!ownsInteraction || !isCapturedFieldCurrent()) return;
           void dispatchFromControl(
             'field.purge',
-            { field: { source, key: field.key } },
-            { failure: 'Failed to confirm deletion of field', category: 'filter' }
+            named,
+            { failure: 'Deleting the field for good failed', category: 'filter' }
           ).then(done => {
             if (done === null) return;
             getNotificationCenter().success(
-              `Confirmed deletion of "${field.key}"`,
+              `Deleted "${field.key}" for good`,
               { category: 'filter', duration: 2500 }
             );
           });
@@ -461,8 +496,8 @@ export function initDeletedFieldsPanel(options) {
 
     void dispatchFromControl(
       'field.restore',
-      { field: { source, key: field.key } },
-      { failure: 'Failed to restore field', category: 'filter' }
+      named,
+      { failure: 'Could not restore the field', category: 'filter' }
     ).then(done => {
       if (done === null) return;
       getNotificationCenter().success(

@@ -17,6 +17,7 @@ import { createMinimalPlotly, getPlotlyConfig } from './plotly-loader.js';
 import { isFiniteNumber } from '../shared/number-utils.js';
 import { pageValueAt } from '../shared/category-counts.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
+import { geneValueLabel } from '../../../data/expression-transform.js';
 
 /**
  * Common hover label style used by all plots
@@ -106,6 +107,20 @@ export class BasePlot {
   }
 
   /**
+   * The color a page is drawn in: the one its data carries (`pageColor`,
+   * the analysis's page selector's: as its swatch shows it), else
+   * `getPageColor`'s.
+   * @param {{pageId: string, pageColor?: string}} pd
+   * @param {Object|null} layoutEngine
+   * @param {number} index
+   * @returns {string}
+   */
+  static colorOfPage(pd, layoutEngine, index) {
+    if (typeof pd?.pageColor === 'string' && pd.pageColor.length > 0) return pd.pageColor;
+    return BasePlot.getPageColor(layoutEngine, pd.pageId, index);
+  }
+
+  /**
    * Calculate global min/max across all page data
    * @param {Object[]} pageData - Array of page data objects
    * @returns {{ min: number, max: number }}
@@ -166,16 +181,20 @@ export class BasePlot {
   }
 
   /**
-   * Get variable name from page data
+   * The name of the values the pages hold, as an axis, a hover and a CSV
+   * name them: the variable's name, with the units of a gene's values when
+   * they are not as stored ("Ins1 · log1p(norm.)", `geneValueLabel`, from
+   * `variableInfo.values`: what the gene was read in, `DataLayer.getDataForPages`).
    * @param {Object[]} pageData - Page data array
-   * @returns {string} Variable name
+   * @returns {string}
    */
-  static getVariableName(pageData) {
-    const name = pageData?.[0]?.variableInfo?.name;
+  static getValueLabel(pageData) {
+    const info = pageData?.[0]?.variableInfo;
+    const name = info?.name;
     if (typeof name !== 'string' || name.length === 0) {
       throw new TypeError('Plot pageData[0].variableInfo.name is required');
     }
-    return name;
+    return geneValueLabel(name, info.values ?? null);
   }
 
   /**
@@ -236,11 +255,9 @@ export class BasePlot {
     return BasePlot.createLayout(options);
   }
 
-  /**
-   * Get variable name (instance method)
-   */
-  getVariableName(pageData) {
-    return BasePlot.getVariableName(pageData);
+  /** The name of the values the pages hold (instance method, `BasePlot.getValueLabel`). */
+  getValueLabel(pageData) {
+    return BasePlot.getValueLabel(pageData);
   }
 
   /**

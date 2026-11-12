@@ -13,18 +13,18 @@
  */
 
 import { getNotificationCenter } from '../notification-center.js';
+import { setControlAvailability } from './core/control-availability.js';
 import { bindDropZone } from './components/drop-zone.js';
 import { StyleManager } from '../../utils/style-manager.js';
-import { getCategoryColor, rgbToCss } from '../../data/palettes.js';
+import { rgbToCss } from '../../data/palettes.js';
+import { pageFieldColor } from '../registries/user-defined-fields.js';
 import { ICONS, bindDisclosure, createIconButton } from './components/controls.js';
-import { formatCompactCount } from './components/display-format.js';
-import { formatCount, formatCountOf, formatOpenCells } from '../../utils/format-units.js';
-import { OverlapStrategy } from '../utils/field-constants.js';
+import { formatCount, formatCountOf, formatOpenCells, formatCompactCount } from '../../utils/format-units.js';
+import { FieldSource, OverlapStrategy, UNASSIGNED_LABEL } from '../utils/field-constants.js';
 import {
-  MAX_INTERSECTION_PAGES,
-  compareIntersectionMasks,
   intersectionMembership,
   orderedMembership,
+  parseIntersectionKey,
   orderedPageCounts
 } from '../utils/page-membership.js';
 import {
@@ -40,8 +40,21 @@ import {
 import { requireObjectRecord } from '../../utils/exact-record.js';
 import { getActions } from '../actions/index.js';
 import { dispatchFromControl, reportActionFailure } from '../actions/control-dispatch.js';
+import { ActionRefused } from '../actions/dispatcher.js';
+import { requireNewCategoryLabel, requireNewName } from '../actions/targets/fields.js';
+import { failureDetails, sayFailure } from '../../utils/errors.js';
+import { isHexColor } from '../../utils/hex-color.js';
+import { openADatasetTo } from './no-dataset.js';
 
 const DROP_MIME = 'application/x-highlight-page';
+
+/**
+ * What the builder still waits for, said quietly (never as a refusal): no
+ * page added yet, no name typed yet.
+ */
+const INCOMPLETE_PAGES = 'Add a highlight page to start.';
+const INCOMPLETE_NAME = 'Name the new column.';
+const INCOMPLETE = new Set([INCOMPLETE_PAGES, INCOMPLETE_NAME]);
 
 /**
  * Every state event that can change what the preview describes.
@@ -52,7 +65,7 @@ const DROP_MIME = 'application/x-highlight-page';
  * are read from the highlight pages' group membership.
  *
  * `page:changed` announces only the page inventory — created, renamed,
- * recoloured, switched, deleted. Adding a lasso to a page, disabling a group,
+ * recolored, switched, deleted. Adding a lasso to a page, disabling a group,
  * or clearing one announces `highlight:changed` instead. Listening to the first
  * alone left the preview describing the selection as it stood before the user's
  * most recent one, while the Create button stayed enabled and the column that
@@ -145,7 +158,7 @@ function requireCountDifference(total, used, label) {
 function requireHexColor(value, label) {
   if (
     typeof value !== 'string'
-    || !/^#[0-9a-fA-F]{6}$/.test(value)
+    || !isHexColor(value)
   ) {
     throw new TypeError(`${label} must be an exact six-digit hex color`);
   }
@@ -191,7 +204,7 @@ export class CategoryBuilder {
     this._droppedPages = []; // [{ pageId, label, originalName }]
     this._preview = null; // { overlapCount, uncoveredCount, pageCounts }
     this._previewKey = null;
-    this._intersectionLabels = {}; // mask string -> label
+    this._intersectionLabels = {}; // intersection key -> label
 
     this._els = {};
   }
@@ -314,8 +327,8 @@ export class CategoryBuilder {
    *
    * The preview is recomputed only when what it counts moved: its key
    * (`_previewInputs`) holds each dropped page's enabled cell lists, which a
-   * page's cells cannot move without replacing. A rename or recolour (a
-   * colour drag fires one per input event) keeps the preview.
+   * page's cells cannot move without replacing. A rename or recolor (a
+   * color drag fires one per input event) keeps the preview.
    */
   _resyncFromState() {
     this._assertInitialized();
@@ -476,6 +489,7 @@ export class CategoryBuilder {
       dropzone,
       pageSelect,
       addPageBtn,
+      uncoveredKeep,
       uncoveredLabel,
       overlapLabel,
       fieldName,
@@ -515,6 +529,12 @@ export class CategoryBuilder {
     }, { signal });
 
     uncoveredLabel.addEventListener('input', () => {
+      this._updatePreview(true);
+      this._updateConfirmState();
+    }, { signal });
+    // Cells on no page keep their category of a field (bug hunt L25-3): split one label of an
+    // annotation with a page per new label, every other cell keeping its label.
+    uncoveredKeep.addEventListener('change', () => {
       this._updatePreview(true);
       this._updateConfirmState();
     }, { signal });
@@ -581,7 +601,7 @@ export class CategoryBuilder {
     this._updateConfirmState();
     this._announce(
       `${page.name} added. The new column now has `
-      + `${this._droppedPages.length} category labels.`
+      + `${formatCountOf(this._droppedPages.length, 'category label')}.`
     );
   }
 
@@ -645,15 +665,18 @@ export class CategoryBuilder {
       const option = this._document.createElement('option');
       option.value = '';
       option.textContent = available.length === 0
-        ? 'Every page is already added'
-        : 'No highlight pages available';
+        ? 'All pages added'
+        : 'No pages yet';
       options.push(option);
     }
     pageSelect.replaceChildren(...options);
     if (usable && available.some(page => page.id === previous)) {
       pageSelect.value = previous;
     }
-    pageSelect.disabled = !usable;
+    setControlAvailability(pageSelect, usable ? null
+      : this._state.pointCount === 0 ? 'no dataset is open'
+        : this._requirePageInventory().length === 0 ? 'there is no highlight page yet; highlight cells to make one'
+          : 'every highlight page is already a category here');
     addPageBtn.disabled = !usable;
   }
 
@@ -714,20 +737,21 @@ export class CategoryBuilder {
       colorInput.className = 'color-swatch-input';
       colorInput.value = pageColor;
       colorInput.title = 'Click to change page color';
+      colorInput.setAttribute('aria-label', `Highlight color for ${p.originalName}`);
       colorInput.addEventListener('input', () => {
         const newColor = requireHexColor(
           colorInput.value,
           'Highlight page color input'
         );
         StyleManager.setVariable(colorIndicator, '--swatch-color', newColor);
-        // The page's colour everywhere: a highlight action (one history step
+        // The page's color everywhere: a highlight action (one history step
         // per page for a drag), named by the page's name.
         const name = this._getPage(p.pageId)?.name;
         if (name === undefined) return;
         void dispatchFromControl(
           'highlight.page.recolor',
           { page: name, color: newColor },
-          { failure: 'Recolouring the highlight page failed', category: 'highlight' }
+          { failure: 'Recoloring the highlight page failed', category: 'highlight' }
         );
       }, { signal });
       colorInput.addEventListener(
@@ -760,6 +784,7 @@ export class CategoryBuilder {
       const input = this._document.createElement('input');
       input.type = 'text';
       input.className = 'obs-select dropzone-item-label';
+      input.setAttribute('aria-label', `Category label for ${p.originalName}`);
       input.value = p.label;
       input.dataset.idx = String(idx);
       input.addEventListener('input', () => {
@@ -769,20 +794,25 @@ export class CategoryBuilder {
           'Dropped page label index'
         );
         this._droppedPages[i].label = input.value;
+        source.hidden = input.value === p.originalName;
         this._updatePreview(true);
         this._updateConfirmState();
       }, { signal });
 
+      // The page a renamed label comes from; a label that is the page's name
+      // says it already.
       const source = this._document.createElement('span');
       source.className = 'dropzone-item-source';
-      source.textContent = `(${p.originalName})`;
+      source.textContent = p.originalName;
+      source.title = `From the page ${p.originalName}`;
+      source.hidden = p.label === p.originalName;
 
       const count = this._document.createElement('span');
       count.className = 'dropzone-item-count';
-      count.textContent = `(${formatCompactCount(pageCount)})`;
+      count.textContent = formatCompactCount(pageCount);
 
       const remove = createIconButton({
-        label: 'Remove this page',
+        label: `Remove ${p.originalName}`,
         icon: ICONS.close,
         tone: 'danger'
       });
@@ -794,7 +824,7 @@ export class CategoryBuilder {
         this._updateConfirmState();
         this._announce(
           `${removedLabel} removed. The new column now has `
-          + `${this._droppedPages.length} category labels.`
+          + `${formatCountOf(this._droppedPages.length, 'category label')}.`
         );
       }, { signal });
 
@@ -1046,9 +1076,8 @@ export class CategoryBuilder {
     // ────────────────────────────────────────────────────────────────────
     if (strategy === OverlapStrategy.INTERSECTIONS) {
       const membership = intersectionMembership(membershipPages, pointCount);
-      const intersectionRows = [...membership.intersectionCounts.entries()]
-        .map(([mask, count]) => ({ mask, count }))
-        .sort((a, b) => compareIntersectionMasks(a.mask, b.mask));
+      const intersectionRows = membership.intersections
+        .map(({ key, count }) => ({ key, count }));
       const uncoveredCount = requireCountDifference(
         pointCount,
         membership.coveredCount,
@@ -1131,26 +1160,6 @@ export class CategoryBuilder {
     }
 
     const strategy = this._getOverlapStrategy();
-    if (
-      strategy === OverlapStrategy.INTERSECTIONS
-      && this._droppedPages.length > MAX_INTERSECTION_PAGES
-    ) {
-      const errorElement = this._document.createElement('p');
-      errorElement.className = 'status-line';
-      errorElement.dataset.tone = 'danger';
-      errorElement.textContent =
-        `Each intersection supports at most ${MAX_INTERSECTION_PAGES} pages.`;
-      preview.replaceChildren(errorElement);
-      conflictSection.hidden = true;
-      uncoveredSection.hidden = true;
-      overlapLabelSection.hidden = true;
-      intersectionSection.hidden = true;
-      this._clearIntersectionInputs();
-      this._preview = null;
-      this._previewKey = null;
-      this._updateConfirmState();
-      return;
-    }
 
     const nextKey = this._previewInputs(strategy);
     const shouldRecompute = !samePreviewInputs(nextKey, this._previewKey);
@@ -1167,6 +1176,7 @@ export class CategoryBuilder {
     uncoveredSection.hidden = this._preview.uncoveredCount === 0;
     if (!uncoveredSection.hidden) {
       uncoveredCount.textContent = formatCount(this._preview.uncoveredCount);
+      this._renderKeepOptions();
     }
 
     overlapLabelSection.hidden =
@@ -1193,8 +1203,15 @@ export class CategoryBuilder {
 
     const categoriesWrap = this._document.createElement('div');
     categoriesWrap.className = 'preview-categories';
+    // Each page's category in its page's color, the rest the palette's: the
+    // colors the field is made with (`pageFieldPalette`), so the preview is
+    // the result (F124).
+    const pageColors = this._droppedPages.map(page => requireHexColor(
+      this._state.getHighlightPageColor(page.pageId),
+      `Highlight page "${page.pageId}" color`
+    ));
 
-    const addPreviewRow = ({ labelText, countValue, colorIndex = null, uncovered = false }) => {
+    const addPreviewRow = ({ labelText, countValue, colorIndex, uncovered = false }) => {
       if (typeof labelText !== 'string') {
         throw new TypeError('Preview category label must be a string');
       }
@@ -1203,12 +1220,9 @@ export class CategoryBuilder {
         this._state.pointCount,
         'Preview category count'
       );
-      if (
-        colorIndex !== null
-        && (!Number.isSafeInteger(colorIndex) || colorIndex < 0)
-      ) {
+      if (!Number.isSafeInteger(colorIndex) || colorIndex < 0) {
         throw new TypeError(
-          'Preview category color index must be null or non-negative'
+          'Preview category color index must be a non-negative integer'
         );
       }
       if (typeof uncovered !== 'boolean') {
@@ -1221,12 +1235,8 @@ export class CategoryBuilder {
 
       const swatch = this._document.createElement('span');
       swatch.className = 'preview-swatch';
-      if (uncovered) {
-        StyleManager.setVariable(swatch, '--preview-swatch-color', 'var(--color-text-secondary)');
-      } else {
-        const cssColor = rgbToCss(getCategoryColor(colorIndex));
-        StyleManager.setVariable(swatch, '--preview-swatch-color', cssColor);
-      }
+      // The color the category takes: its page's, else the palette's of its place.
+      StyleManager.setVariable(swatch, '--preview-swatch-color', rgbToCss(pageFieldColor(pageColors, colorIndex)));
 
       const label = this._document.createElement('span');
       label.className = 'preview-label';
@@ -1278,17 +1288,16 @@ export class CategoryBuilder {
     ) {
       const rows = this._preview.intersectionRows;
       rows.forEach((row, idx) => {
-        const maskKey = String(row.mask);
         if (
-          !Object.hasOwn(this._intersectionLabels, maskKey)
-          || typeof this._intersectionLabels[maskKey] !== 'string'
+          !Object.hasOwn(this._intersectionLabels, row.key)
+          || typeof this._intersectionLabels[row.key] !== 'string'
         ) {
           throw new Error(
-            `Intersection label ${maskKey} is not initialized`
+            `Intersection label ${row.key} is not initialized`
           );
         }
         addPreviewRow({
-          labelText: this._intersectionLabels[maskKey].trim(),
+          labelText: this._intersectionLabels[row.key].trim(),
           countValue: row.count,
           colorIndex: this._droppedPages.length + idx
         });
@@ -1301,13 +1310,17 @@ export class CategoryBuilder {
       );
     }
     const uncoveredText = uncoveredLabel.value.trim();
+    const kept = this._keptField();
     if (
       this._preview.uncoveredCount > 0
-      && uncoveredText.length > 0
+      && (kept !== null || uncoveredText.length > 0)
     ) {
       addPreviewRow({
-        labelText: uncoveredText,
+        // Kept: each cell's own category of that column (several rows in the field, one here).
+        labelText: kept === null ? uncoveredText : `Their ${kept} category`,
         countValue: this._preview.uncoveredCount,
+        // The field's last category, after every row above.
+        colorIndex: categoriesWrap.childElementCount,
         uncovered: true
       });
     }
@@ -1315,19 +1328,13 @@ export class CategoryBuilder {
     const stats = this._document.createElement('div');
     stats.className = 'preview-stats';
     // A subsample's open cells, said against every cell (`formatOpenCells`).
-    stats.textContent = `Total: ${formatOpenCells(this._state.pointCount, this._state.cellIdentity?.nOriginal)} · ${formatCountOf(categoriesWrap.childElementCount, 'category', 'categories')}`;
+    // Kept: the column's categories the cells on no page hold come on top of the rows above (one row says them).
+    stats.textContent = kept === null
+      ? `Total: ${formatOpenCells(this._state.pointCount, this._state.cellIdentity?.nOriginal)} · ${formatCountOf(categoriesWrap.childElementCount, 'category', 'categories')}`
+      : `Total: ${formatOpenCells(this._state.pointCount, this._state.cellIdentity?.nOriginal)} · ${formatCountOf(categoriesWrap.childElementCount - 1, 'category', 'categories')} + their ${kept} ones`;
 
     preview.replaceChildren(categoriesWrap, stats);
     this._updateConfirmState();
-  }
-
-  _formatIntersectionLabel(mask, pageLabels) {
-    if (!Array.isArray(pageLabels)) {
-      throw new TypeError(
-        'Intersection page labels must be an array'
-      );
-    }
-    return formatIntersectionLabel(mask, pageLabels);
   }
 
   _renderIntersectionLabelInputs(rows) {
@@ -1349,7 +1356,7 @@ export class CategoryBuilder {
         listEl: this._els.intersectionList,
         rows,
         pageLabels,
-        labelsByMask: this._intersectionLabels,
+        labelsByKey: this._intersectionLabels,
         onLabelsChanged: () => this._updatePreview(false),
         signal: this._intersectionInputsLifecycle.signal
       });
@@ -1366,13 +1373,12 @@ export class CategoryBuilder {
       pageIndex < this._droppedPages.length;
       pageIndex++
     ) {
-      const label = this._droppedPages[pageIndex].label;
-      if (
-        typeof label !== 'string'
-        || label.length === 0
-        || label !== label.trim()
-      ) {
-        return `Page ${pageIndex + 1} requires a valid non-empty trimmed label`;
+      // The one rule for a label given now, in the words the action refuses with.
+      try {
+        requireNewCategoryLabel(this._droppedPages[pageIndex].label);
+      } catch (error) {
+        if (error instanceof ActionRefused) return `Page ${pageIndex + 1}: ${error.message}`;
+        throw error;
       }
     }
     return null;
@@ -1389,45 +1395,26 @@ export class CategoryBuilder {
       );
     }
     if (this._state.pointCount === 0) {
-      return 'Load a dataset before creating a categorical field';
+      return openADatasetTo('create a categorical field');
     }
-    if (this._droppedPages.length === 0) {
-      return 'Add at least one highlight page';
-    }
+    if (this._droppedPages.length === 0) return INCOMPLETE_PAGES;
     if (this._preview === null) {
       return 'Category preview is unavailable';
     }
     const fieldName = this._els.fieldName.value;
-    if (
-      typeof fieldName !== 'string'
-      || fieldName.length === 0
-      || fieldName !== fieldName.trim()
-      || fieldName.includes(':')
-    ) {
-      return 'Column name must be a valid non-empty trimmed field name';
-    }
-    const fields = this._state.getFields();
-    if (!Array.isArray(fields)) {
+    if (fieldName.length === 0) return INCOMPLETE_NAME;
+    if (!Array.isArray(this._state.getFields())) {
       throw new TypeError(
         'Category builder state.getFields() must return an array'
       );
     }
-    for (let fieldIndex = 0; fieldIndex < fields.length; fieldIndex++) {
-      const field = requireObjectRecord(
-        fields[fieldIndex],
-        `Observation field ${fieldIndex}`
-      );
-      if (
-        typeof field.key !== 'string'
-        || field.key.length === 0
-      ) {
-        throw new TypeError(
-          `Observation field ${fieldIndex} requires a field key`
-        );
-      }
-      if (field._isDeleted !== true && field.key === fieldName) {
-        return `A visible observation field named "${fieldName}" already exists`;
-      }
+    // The one field-name rule, in the words the action refuses with
+    // (`requireNewName`: the writers' rule, `StateValidator.validateFieldKey`).
+    try {
+      requireNewName(this._state, FieldSource.OBS, fieldName);
+    } catch (error) {
+      if (error instanceof ActionRefused) return error.message;
+      throw error;
     }
 
     const pageLabelError = this._getPageLabelValidationError();
@@ -1435,48 +1422,44 @@ export class CategoryBuilder {
     const labels = this._droppedPages.map(page => page.label);
 
     const strategy = this._getOverlapStrategy();
-    if (
-      strategy === OverlapStrategy.INTERSECTIONS
-      && this._droppedPages.length > MAX_INTERSECTION_PAGES
-    ) {
-      return `Each intersection supports at most ${MAX_INTERSECTION_PAGES} pages`;
-    }
     const overlapLabel = this._els.overlapLabel.value;
-    if (
-      typeof overlapLabel !== 'string'
-      || overlapLabel !== overlapLabel.trim()
-    ) {
-      return 'Overlap label must be a trimmed string';
+    if (overlapLabel.length > 0) {
+      try {
+        requireNewCategoryLabel(overlapLabel);
+      } catch (error) {
+        if (error instanceof ActionRefused) return `Overlap label: ${error.message}`;
+        throw error;
+      }
     }
     if (strategy === OverlapStrategy.OVERLAP_LABEL) {
       if (
         overlapLabel.length === 0
       ) {
-        return 'Overlap strategy requires a valid non-empty label';
+        return 'Name the category of cells on several pages.';
       }
       labels.push(overlapLabel);
     }
     if (strategy === OverlapStrategy.INTERSECTIONS) {
       for (const row of this._preview.intersectionRows) {
-        const maskKey = String(row.mask);
-        const label = this._intersectionLabels[maskKey];
-        if (
-          typeof label !== 'string'
-          || label.length === 0
-          || label !== label.trim()
-        ) {
-          return `Intersection ${maskKey} requires a valid non-empty trimmed label`;
+        const label = this._intersectionLabels[row.key];
+        try {
+          requireNewCategoryLabel(typeof label === 'string' ? label : '');
+        } catch (error) {
+          if (error instanceof ActionRefused) return `The cells on ${formatIntersectionLabel(row.key, this._droppedPages.map(page => page.label))}: ${error.message}`;
+          throw error;
         }
         labels.push(label);
       }
     }
 
     const uncoveredLabel = this._els.uncoveredLabel.value;
-    if (
-      typeof uncoveredLabel !== 'string'
-      || uncoveredLabel !== uncoveredLabel.trim()
-    ) {
-      return 'Uncovered label must be a valid trimmed string';
+    if (uncoveredLabel.length > 0) {
+      try {
+        requireNewCategoryLabel(uncoveredLabel);
+      } catch (error) {
+        if (error instanceof ActionRefused) return `Label of uncovered cells: ${error.message}`;
+        throw error;
+      }
     }
     if (
       this._preview.uncoveredCount > 0
@@ -1485,7 +1468,7 @@ export class CategoryBuilder {
       labels.push(uncoveredLabel);
     }
     if (new Set(labels).size !== labels.length) {
-      return 'Every category label must be unique';
+      return 'Two categories have the same label; give each its own.';
     }
     if (labels.length > MAX_CATEGORICAL_CATEGORIES) {
       return (
@@ -1505,9 +1488,7 @@ export class CategoryBuilder {
     const intersectionLabels = {};
     if (overlapStrategy === OverlapStrategy.INTERSECTIONS) {
       for (const row of this._preview.intersectionRows) {
-        const maskKey = String(row.mask);
-        intersectionLabels[maskKey] =
-          this._intersectionLabels[maskKey];
+        intersectionLabels[row.key] = this._intersectionLabels[row.key];
       }
     }
     return {
@@ -1519,8 +1500,42 @@ export class CategoryBuilder {
       uncoveredLabel: this._els.uncoveredLabel.value,
       overlapStrategy,
       overlapLabel: this._els.overlapLabel.value,
-      intersectionLabels
+      intersectionLabels,
+      rest: this._keptField()
     };
+  }
+
+  /** The field whose category the cells on no page keep (its name), or null: they take one label. */
+  _keptField() {
+    const value = this._els.uncoveredKeep.value;
+    return this._preview !== null && this._preview.uncoveredCount > 0 && value !== '' ? value : null;
+  }
+
+  /**
+   * Offer to keep each categorical column's category for the cells on no
+   * page ("Keep their cell_type category"), the choice kept while the column
+   * is there; the label below then names the cells with none there.
+   */
+  _renderKeepOptions() {
+    const { uncoveredKeep, uncoveredLabelName } = this._els;
+    const previous = uncoveredKeep.value;
+    const names = (this._state.obsData?.fields ?? [])
+      .filter(field => field?.kind === 'category' && field._isDeleted !== true && typeof field.key === 'string')
+      .map(field => field.key);
+    const take = this._document.createElement('option');
+    take.value = '';
+    take.textContent = 'Take one label';
+    const keep = names.map(name => {
+      const option = this._document.createElement('option');
+      option.value = name;
+      option.textContent = `Keep their ${name} category`;
+      return option;
+    });
+    uncoveredKeep.replaceChildren(take, ...keep);
+    uncoveredKeep.value = names.includes(previous) ? previous : '';
+    uncoveredLabelName.textContent = uncoveredKeep.value === ''
+      ? 'Label for uncovered cells'
+      : 'Label where it has none';
   }
 
   _updateConfirmState() {
@@ -1528,6 +1543,8 @@ export class CategoryBuilder {
     const validationError = this._getDraftValidationError();
     this._els.confirmBtn.disabled = validationError !== null;
     this._els.validation.hidden = validationError === null;
+    // What is still to do is a quiet hint; only a refusal is in red.
+    this._els.validation.dataset.tone = INCOMPLETE.has(validationError) ? 'muted' : 'danger';
     this._els.validation.textContent =
       validationError === null ? '' : validationError;
   }
@@ -1542,8 +1559,8 @@ export class CategoryBuilder {
     if (pages.some(entry => typeof entry.page !== 'string')) {
       throw new Error('A page of the new column was removed; add the pages again.');
     }
-    const intersectionLabels = Object.entries(draft.intersectionLabels).map(([mask, label]) => ({
-      pages: pages.filter((_entry, position) => (Number(mask) & (1 << position)) !== 0).map(entry => entry.page),
+    const intersectionLabels = Object.entries(draft.intersectionLabels).map(([key, label]) => ({
+      pages: parseIntersectionKey(key, pages.length).map(position => pages[position].page),
       label,
     }));
     return {
@@ -1553,18 +1570,19 @@ export class CategoryBuilder {
       overlap: draft.overlapStrategy,
       overlap_label: draft.overlapLabel,
       intersection_labels: intersectionLabels,
+      ...(draft.rest === null ? {} : { rest: { source: 'obs', key: draft.rest } }),
     };
   }
 
   _handleConfirm() {
     this._assertInitialized();
     const notifications = getNotificationCenter();
-    const notifyId = notifications.loading('Creating categorical...', { category: 'data' });
+    const notifyId = notifications.loading('Creating the field…', { category: 'data' });
     let params;
     try {
       params = this._actionParams(this._buildDraft());
     } catch (error) {
-      notifications.fail(notifyId, requireError(error, 'Create categorical action').message);
+      notifications.fail(notifyId, `Could not create the field: ${sayFailure(error)}`, failureDetails(error));
       return;
     }
     void getActions().dispatch('field.create-from-pages', params).then(
@@ -1578,7 +1596,7 @@ export class CategoryBuilder {
       },
       error => {
         notifications.dismiss(notifyId);
-        reportActionFailure(error, { failure: 'Could not create the column', category: 'data' });
+        reportActionFailure(error, { failure: 'Could not create the field', category: 'data' });
       }
     );
   }
@@ -1591,7 +1609,7 @@ export class CategoryBuilder {
     this._intersectionLabels = {};
 
     this._els.fieldName.value = '';
-    this._els.uncoveredLabel.value = 'Unassigned';
+    this._els.uncoveredLabel.value = UNASSIGNED_LABEL;
     this._els.overlapLabel.value = 'Overlap';
     this._clearIntersectionInputs();
     const first = this._els.panel.querySelector(

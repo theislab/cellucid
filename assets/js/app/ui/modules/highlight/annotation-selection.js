@@ -12,6 +12,7 @@ import { CellSet } from '../../../utils/cell-set.js';
 import { debug } from '../../../../utils/debug.js';
 import {
   annotationFieldForPane,
+  annotationGroupName,
   combineAnnotationCandidates,
   computeAnnotationGestureCells
 } from './annotation-cells.js';
@@ -23,8 +24,7 @@ import {
   SELECT_BAR_HINT,
   SELECTION_NOTICE,
   idleSelectionNoticeHtml,
-  selectionNoticeHtml
-} from './mode-copy.js';
+  selectionNoticeHtml, combineHelpHtml } from './mode-copy.js';
 import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
 import {
@@ -78,6 +78,7 @@ export function initAnnotationSelection(options) {
       'getCellIndicesForCategory',
       'getCellIndicesForRange',
       'getFieldForView',
+      'getLegendModel',
       'on',
       'setPreviewHighlightFromIndices'
     ]
@@ -133,6 +134,8 @@ export function initAnnotationSelection(options) {
   // ("Alt to replace" for categories, "Alt to intersect" for ranges) follows
   // it, so it describes the panel the user is selecting in.
   let gestureFieldKind = null;
+  // The field the selection's gestures were read on: what its group is named by (`annotationGroupName`).
+  let gestureField = null;
   // Views on screen, from the last presented layout; null until the canvas
   // has an area, when only the focused view is known.
   let presentedViewIds = null;
@@ -168,6 +171,7 @@ export function initAnnotationSelection(options) {
     selectionState.annotationHistory = [];
     selectionState.annotationRedoStack = [];
     gestureFieldKind = null;
+    gestureField = null;
     viewer.restoreUnifiedState(new Uint32Array(0), 0);
   }
 
@@ -200,6 +204,7 @@ export function initAnnotationSelection(options) {
       return;
     }
     gestureFieldKind = field.kind;
+    gestureField = field;
 
     const mode = stepEvent.mode;
     const newCellIndices = computeAnnotationGestureCells({
@@ -273,11 +278,13 @@ export function initAnnotationSelection(options) {
     }
 
     const cellIndices = selectionState.annotationCandidateSet.toUint32Array();
-    const stepsLabel = selectionState.annotationStepCount > 1 ? ` (${formatCountOf(selectionState.annotationStepCount, 'step')})` : '';
 
+    // Named by what it is (its categories, its range); the list shows its
+    // count. A gene's range is named in the units of its values (the legend's).
+    const valuesIn = gestureField !== null && gestureField.kind === 'continuous' ? state.getLegendModel(gestureField).values : null;
     void confirmer.confirm({
       tool: 'annotation',
-      label: `Annotation${stepsLabel} (${formatCountOf(cellIndices.length, 'cell')})`,
+      label: annotationGroupName(gestureField, cellIndices, valuesIn) ?? 'Annotation',
       cellIndices
     });
 
@@ -286,7 +293,7 @@ export function initAnnotationSelection(options) {
       cellIndices,
       source: 'annotation',
       onFailure: error => {
-        if (!destroyed) showSelectionDeliveryFailure(error, 'annotation');
+        if (!destroyed) showSelectionDeliveryFailure(error, 'annotation', viewerHostSource.getHostRuntime());
       }
     }));
 
@@ -488,9 +495,7 @@ export function initAnnotationSelection(options) {
     }
 
     if (stepEvent.step === 0 && stepEvent.keepControls) {
-      const helpText = isCategorical
-        ? 'Alt to replace, Shift+Alt to add, Ctrl+Alt to subtract'
-        : 'Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract';
+      const helpText = combineHelpHtml({ categorical: isCategorical });
       const stepInfo = `<strong>No selection</strong><br><small>${helpText}</small>`;
 
       showAnnotationControls(0, notice);
@@ -514,9 +519,7 @@ export function initAnnotationSelection(options) {
       modeLabel = ' <span class="lasso-mode-tag intersect">intersected</span>';
     }
 
-    const helpText = isCategorical
-      ? 'Alt to replace, Shift+Alt to add, Ctrl+Alt to subtract'
-      : 'Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract';
+    const helpText = combineHelpHtml({ categorical: isCategorical });
 
     const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCountOf(stepEvent.candidateCount, 'cell')}${modeLabel}<br><small>${helpText}</small>`;
 
@@ -531,6 +534,7 @@ export function initAnnotationSelection(options) {
     selectionState.annotationHistory = [];
     selectionState.annotationRedoStack = [];
     gestureFieldKind = null;
+    gestureField = null;
     selectionState.annotationCandidateSet = unifiedState.inProgress
       ? CellSet.fromCellList(unifiedState.candidates, state.pointCount)
       : null;

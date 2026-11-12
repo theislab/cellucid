@@ -29,7 +29,7 @@ import { CONTINUOUS_COLORMAPS } from '../assets/js/data/palettes.js';
 import { createMulberry32 } from '../assets/js/app/utils/random-utils.js';
 import { geneSampleLayersNote } from '../assets/js/data/gene-read-plan.js';
 
-/** CIE L* of an sRGB colour (0..1), by its definition. */
+/** CIE L* of an sRGB color (0..1), by its definition. */
 function lightness(rgb) {
   const linear = c => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
   const y = 0.2126 * linear(rgb[0]) + 0.7152 * linear(rgb[1]) + 0.0722 * linear(rgb[2]);
@@ -81,7 +81,7 @@ test('the grey for 0 is made from the background at a fixed contrast: today\'s o
   assert.throws(() => zeroCellColor([1, 1]), /three channels/);
 });
 
-test('every surface draws a cell from its colours the same way: its own RGB on top, the layer\'s colour beneath', () => {
+test('every surface draws a cell from its colors the same way: its own RGB on top, the layer\'s color beneath', () => {
   const colors = Uint8Array.of(10, 20, 30, 255, 211, 211, 211, BENEATH_ALPHA_BYTE, 211, 211, 211, UNREAD_ALPHA_BYTE);
   for (const background of [[1, 1, 1], [0.08, 0.09, 0.1]]) {
     const layerColors = cellLayerColors(background);
@@ -112,7 +112,7 @@ test('a cell not read is the background faded a small lightness step toward the 
   assert.throws(() => unreadCellColor([2, 0, 0]), /from 0 to 1/);
 });
 
-test('the layers of a field\'s colours are counted in one pass, aligned or not', () => {
+test('the layers of a field\'s colors are counted in one pass, aligned or not', () => {
   const colors = new Uint8Array(4 * 10).fill(255);
   assert.deepEqual(colorLayersOf(colors), { layered: false, unread: 0 });
   colors[3] = BENEATH_ALPHA_BYTE;
@@ -142,11 +142,11 @@ function sampledMap(n, stride, random = createMulberry32(5)) {
 const IDENTITY = Float32Array.from([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
 const frameOf = (positions, extra = {}) => ({
   positions, dimension: 2, transparency: null, mvpMatrix: IDENTITY,
-  width: 1600, height: 1200, pointSize: 2, sizeAttenuation: 0, fov: Math.PI / 4, ...extra,
+  width: 1600, height: 1200, pointSize: 2, sizeAttenuation: 0, fov: Math.PI / 4, pointSizeMax: 160, ...extra,
 });
 
 test('the read cells are sized by their density on screen: a sparse sample large, a dense one normal, every cell read normal', () => {
-  // 2,000 of 2M cells over 64 % of a 1600 x 1200 screen: discs covering the
+  // 2,000 of 2M cells over 64% of a 1600 x 1200 screen: discs covering the
   // covered fraction of the map have d = sqrt(c * A / n) device pixels.
   const sparse = sampledMap(200_000, 100);
   const probes = readCellProbes(sparse.colors, sparse.unread);
@@ -211,15 +211,15 @@ test('picking finds a read cell at its drawn size, over the cells not read aroun
   const colors = Uint8Array.of(200, 0, 0, 255, NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, UNREAD_ALPHA_BYTE);
   const base = {
     dimension: 2, positions, transparency, mvpMatrix: IDENTITY,
-    pane: { cssWidth: 100, cssHeight: 100, framebufferHeight: 100 }, pointSize: 2, sizeAttenuation: 0, fov: Math.PI / 4,
+    pane: { cssWidth: 100, cssHeight: 100, framebufferHeight: 100 }, pointSize: 2, sizeAttenuation: 0, fov: Math.PI / 4, pointSizeMax: 160,
   };
-  // The pointer over cell 1's centre: it is drawn there, but the read cell drawn
+  // The pointer over cell 1's center: it is drawn there, but the read cell drawn
   // 20 px wide over it is on top.
   const cursor = { x: 51, y: 50 };
   assert.equal(findScreenSpacePick({ ...base, cursor }).cellIndex, 1, 'without layers, the nearer centre');
   const pointLayers = { colors, readEveryLevel: true, readPointSize: 20 };
   assert.equal(findScreenSpacePick({ ...base, cursor, pointLayers }).cellIndex, 0, 'the read layer wins');
-  // 8 px from the read cell's centre: inside its drawn 10 px radius only.
+  // 8 px from the read cell's center: inside its drawn 10 px radius only.
   assert.equal(findScreenSpacePick({ ...base, cursor: { x: 58, y: 50 }, pointLayers }).cellIndex, 0);
   assert.equal(findScreenSpacePick({ ...base, cursor: { x: 58, y: 50 } }).cellIndex, -1);
   // A level drawing only cell 1: the read cell is still drawn (every level), and picked.
@@ -241,7 +241,7 @@ test('a figure draws the layers bottom first and every read cell when the pane d
   assert.deepEqual(Array.from(drawnSequence(null, drawOrder, colors)), [3, 0, 4, 1, 5, 2]);
   assert.deepEqual(Array.from(drawnSequence(membership, drawOrder, colors)), [3, 4, 5]);
   assert.deepEqual(Array.from(drawnSequence(membership, drawOrder, colors, true)), [3, 4, 1, 5, 2]);
-  // The colours of the cells not read and of the grey beneath come from the figure's paper.
+  // The colors of the cells not read and of the grey beneath come from the figure's paper.
   const layers = figurePointLayersOf(colors, { readScale: 3, readEveryLevel: true }, [1, 1, 1]);
   assert.deepEqual(layers.unreadColor, Array.from(unreadCellColor([1, 1, 1])));
   assert.deepEqual(layers.zeroColor, Array.from(zeroCellColor([1, 1, 1])));

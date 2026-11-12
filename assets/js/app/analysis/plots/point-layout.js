@@ -5,7 +5,7 @@
  * (point-layer.js) can lay points out in a worker.
  *
  * - Jitter: each point's spread is `sqrt(0.01 · span · (g − d) / (v_g − v_d +
- *   1e-9 · span))` over its ±5 neighbours in sorted order (outliers bounded by
+ *   1e-9 · span))` over its ±5 neighbors in sorted order (outliers bounded by
  *   the fences unless every point is drawn), clamped to [0, 1] and scaled by
  *   `2 · jitter / max`; the offset is `spread · (pseudoRandom() − 0.5)`, with
  *   Plotly's `Lib.pseudoRandom` (69069 LCG from 2e9, reseeded for every trace,

@@ -36,7 +36,7 @@ import { agentDataStore, createShapeTracker, setShapeTracker } from './data-scop
  *   `state`: the page's data state, whose highlighted cells the chat can attach
  */
 export function initAgents({ dom, viewer, actions, state = null, notify }) {
-  const dock = initAgentDock({ dock: dom.dock, viewer });
+  const dock = initAgentDock({ dock: dom.dock, grip: dom.dockGrip, sidebar: dom.dock.ownerDocument.getElementById('sidebar'), viewer });
   const dataStore = agentDataStore();
   // Which groups and fields an agent shaped by naming cells, for the tool call's guard.
   const shapes = createShapeTracker({ actions, state });
@@ -50,7 +50,7 @@ export function initAgents({ dom, viewer, actions, state = null, notify }) {
   });
   let chat = null;
   try {
-    chat = initAgentChat({ dom, actions, presence, selection: createSelectionSource(state) });
+    chat = initAgentChat({ dom, actions, presence, selection: createSelectionSource(state), opensAsSide: dock.opensAsSide });
   } catch (error) {
     console.error('[agents] the chat bar could not start', error);
     for (const part of [dom.toggle, dom.panel]) if (part instanceof HTMLElement) part.hidden = true;

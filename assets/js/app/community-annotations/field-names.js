@@ -15,6 +15,9 @@
  * @module app/community-annotations/field-names
  */
 
+import { categoryLabel } from '../actions/targets/names.js';
+import { isAnnotationExactNonblank } from './wire-contract.js';
+
 /**
  * The field's key in the shared repository: its key in the dataset.
  * @param {{key: string, _originalKey?: string}} field
@@ -25,14 +28,31 @@ export function annotationFieldKey(field) {
 }
 
 /**
- * The field's categories in the shared repository: the dataset's labels, in
- * the same positions as `field.categories` (a rename keeps each position).
+ * The field's categories in the shared repository: the dataset's labels as
+ * text, as the legend shows them (a Loom `ClusterID` of numbers is "0",
+ * "1", …; a boolean "true"), in the same positions as `field.categories` (a
+ * rename keeps each position). The repository keys categories by name; the
+ * numbers themselves made the session refuse the field, and coloring by it
+ * failed (bug hunt live pass 5, L18-8).
  * @param {{categories?: unknown[], _originalCategories?: unknown[]}} field
- * @returns {unknown[]}
+ * @returns {string[]}
  */
 export function annotationCategories(field) {
-  if (Array.isArray(field?._originalCategories)) return field._originalCategories;
-  return Array.isArray(field?.categories) ? field.categories : [];
+  const categories = Array.isArray(field?._originalCategories)
+    ? field._originalCategories
+    : (Array.isArray(field?.categories) ? field.categories : []);
+  return categories.map(categoryLabel);
+}
+
+/**
+ * Whether the repository can key these categories (`annotationCategories`):
+ * each nonblank without spaces at its ends, none twice. A field whose
+ * categories it cannot key is not open to community annotation; it is still
+ * shown and colored as any other.
+ * @param {string[]} categories
+ */
+export function annotationKeyable(categories) {
+  return categories.every(isAnnotationExactNonblank) && new Set(categories).size === categories.length;
 }
 
 /**
@@ -42,7 +62,8 @@ export function annotationCategories(field) {
 export function hasLocalNames(field) {
   if (annotationFieldKey(field) !== field.key) return true;
   const original = annotationCategories(field);
-  return original !== field.categories && original.some((label, index) => label !== field.categories[index]);
+  const shown = Array.isArray(field?.categories) ? field.categories : [];
+  return original.some((label, index) => label !== categoryLabel(shown[index]));
 }
 
 /**

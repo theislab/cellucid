@@ -1,12 +1,12 @@
 /**
  * Stores in a draw order are gathered on the GPU (GpuPermuter): the bytes
  * written must equal a CPU gather exactly -- 1, 2 and 3 words a point
- * (colours, 1D/2D/3D positions), into a new store, in place from page
+ * (colors, 1D/2D/3D positions), into a new store, in place from page
  * memory, or in place from the store itself (its words drawn into the
  * source texture on the GPU) -- at sizes around the texture row width, and
  * the pass must leave every binding and state it touches as it found it.
- * The highlight colour words of a store's slots are the CPU's.
- * End to end, a recolour of an ordered live store holds the recoloured bytes
+ * The highlight color words of a store's slots are the CPU's.
+ * End to end, a recolor of an ordered live store holds the recolored bytes
  * in the live draw order, and an adopted store holds its positions in it.
  */
 import { expect, test } from './helpers/test.mjs';
@@ -71,12 +71,12 @@ test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
       gl.bindBuffer(gl.ARRAY_BUFFER, sentinel);
       // A complete framebuffer of the caller's, bound across the pass.
       const framebuffer = gl.createFramebuffer();
-      const colour = gl.createRenderbuffer();
-      gl.bindRenderbuffer(gl.RENDERBUFFER, colour);
+      const color = gl.createRenderbuffer();
+      gl.bindRenderbuffer(gl.RENDERBUFFER, color);
       gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, 64, 64);
       gl.bindRenderbuffer(gl.RENDERBUFFER, null);
       gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, colour);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, color);
       gl.viewport(3, 4, 50, 60);
       gl.enable(gl.SCISSOR_TEST);
       gl.enable(gl.BLEND);
@@ -131,7 +131,7 @@ test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
       gl.bindVertexArray(null);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.deleteFramebuffer(framebuffer);
-      gl.deleteRenderbuffer(colour);
+      gl.deleteRenderbuffer(color);
       gl.disable(gl.SCISSOR_TEST);
       gl.disable(gl.BLEND);
       gl.colorMask(true, true, true, true);
@@ -215,7 +215,7 @@ test('the GPU gather is byte-exact and restores GL state', async ({ page }) => {
   expect(pageErrors).toEqual([]);
 });
 
-test('a recolour of an ordered live store holds the new colours in draw order', async ({ page }) => {
+test('a recolor of an ordered live store holds the new colors in draw order', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });

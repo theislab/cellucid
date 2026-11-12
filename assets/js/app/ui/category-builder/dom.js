@@ -8,6 +8,7 @@
  */
 
 import { renderInfoTip } from '../components/info-tips.js';
+import { UNASSIGNED_LABEL } from '../../utils/field-constants.js';
 
 const TEMPLATE = `
   <div class="disclosure" id="cat-builder-accordion-item">
@@ -65,8 +66,12 @@ const TEMPLATE = `
             <span><span id="uncovered-count">0</span> cells not in any page</span>
           </div>
           <div class="section-content">
-            <label for="uncovered-label">Label for uncovered cells</label>
-            <input type="text" class="obs-select" id="uncovered-label" value="Unassigned" />
+            <label for="uncovered-keep">Cells on no page</label>
+            <select class="obs-select" id="uncovered-keep">
+              <option value="">Take one label</option>
+            </select>
+            <label for="uncovered-label" id="uncovered-label-name">Label for uncovered cells</label>
+            <input type="text" class="obs-select" id="uncovered-label" value="${UNASSIGNED_LABEL}" />
           </div>
         </div>
 
@@ -139,6 +144,8 @@ export function renderCategoryBuilderDom(containerEl) {
     intersectionList: wrapper.querySelector('#intersection-labels'),
     uncoveredSection: wrapper.querySelector('#uncovered-section'),
     uncoveredCount: wrapper.querySelector('#uncovered-count'),
+    uncoveredKeep: wrapper.querySelector('#uncovered-keep'),
+    uncoveredLabelName: wrapper.querySelector('#uncovered-label-name'),
     uncoveredLabel: wrapper.querySelector('#uncovered-label'),
     fieldName: wrapper.querySelector('#cat-builder-name'),
     preview: wrapper.querySelector('#cat-builder-preview'),

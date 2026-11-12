@@ -503,7 +503,7 @@ test('Spearman correlation still ranks through the shared kernel', () => {
 
     const xRanks = referenceMidRanks(xValues);
     const yRanks = referenceMidRanks(yValues);
-    // Pearson on the ranks, from centred two-pass moments.
+    // Pearson on the ranks, from centered two-pass moments.
     const n = xRanks.length;
     let sx = 0, sy = 0;
     for (let i = 0; i < n; i++) {
@@ -647,8 +647,10 @@ test('signature median scores and their statistics equal the sort-based definiti
     readGeneColumns: async () => columns,
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     getPageCells: pageIds => pageIds.map(pageId => ({ pageId, pageName: 'Page A', cellIndices })),
-    performCacheCleanup() {},
   };
   analysis._computeManager = null;
   const { sets: [{ pages: [result] }] } = await analysis.computeSignatureScore({

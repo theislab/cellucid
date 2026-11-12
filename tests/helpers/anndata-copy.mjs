@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import { openDatasetStore } from '../../assets/js/data/anndata/open.js';
 import { writeAnnDataCopy } from '../../assets/js/data/anndata/write/copy.js';
 import { isArrayNode, isGroup } from '../../assets/js/formats/store.js';
+import { folderKey, portableElementName } from '../../assets/js/data/anndata/write/names.js';
 
 const CACHE_BYTES = 64 * 1024 * 1024;
 
@@ -128,12 +129,15 @@ export async function compareCopy(source, copy, { skip = () => false } = {}) {
   await source.load();
   await copy.load();
   const seen = { arrays: 0, transposed: [] };
+  // A MuData's columns placed on its cells (`<modality>:<column>`) are the
+  // reader's, presented alike in the source and the copy, never stored.
+  const placed = name => (copy.modalities ?? []).some(modality => name.startsWith(`${modality.name}:`));
   const walk = async (from, to, path) => {
-    for (const key of from.keys()) {
+    for (const [key, as] of copiedNames(from, placed)) {
       const at = path === '' ? key : `${path}/${key}`;
       if (skip(at)) continue;
       const node = from.get(key);
-      const other = to.get(key);
+      const other = to.get(as);
       assert.ok(other !== null, `${at} is in the copy`);
       if (isArrayNode(node)) {
         assert.ok(isArrayNode(other), `${at} is an array in the copy`);
@@ -160,8 +164,12 @@ export async function compareCopy(source, copy, { skip = () => false } = {}) {
       // A MuData copy's reader places each modality's columns and mask in
       // obs (`<modality>:<column>`, `<modality>:measured`), where a source
       // presented by a layout of its own (10x) may not: only those may be added.
+      if (Array.isArray(attrs['column-order'])) {
+        // Each column under the name the copy gives it (`portableElementName`).
+        const names = copiedNames(node, placed);
+        attrs['column-order'] = attrs['column-order'].map(name => names.get(name) ?? name);
+      }
       if (Array.isArray(copied['column-order']) && Array.isArray(attrs['column-order'])) {
-        const placed = name => (copy.modalities ?? []).some(modality => name.startsWith(`${modality.name}:`));
         copied['column-order'] = copied['column-order'].filter(name => attrs['column-order'].includes(name) || !placed(name));
       }
       assert.deepEqual(copied, attrs, `${at}: the same attributes`);
@@ -170,6 +178,35 @@ export async function compareCopy(source, copy, { skip = () => false } = {}) {
   };
   await walk(source, copy, '');
   return seen;
+}
+
+/**
+ * A group's children and the names the copy writes them under, as
+ * `copy.js` names them (`portableElementName`): a dataframe's columns in
+ * their order after its index (a column named with `/`, which an HDF5 file
+ * stores as a group of that prefix, by its whole name), then its other
+ * children; any other group's children in turn.
+ *
+ * @returns {Map<string, string>}
+ */
+function copiedNames(group, placed) {
+  const names = new Map();
+  const portable = (name, taken) => (placed(name) ? name : portableElementName(name, taken));
+  const order = Array.isArray(group.attrs?.['column-order']) ? group.attrs['column-order'].map(String) : null;
+  if (order === null) {
+    const taken = new Set();
+    for (const key of group.keys()) names.set(key, portable(key, taken));
+    return names;
+  }
+  const index = typeof group.attrs._index === 'string' ? group.attrs._index : '_index';
+  const taken = new Set([folderKey(index)]);
+  if (group.has(index)) names.set(index, index);
+  for (const name of order) if (!names.has(name) && group.has(name)) names.set(name, portable(name, taken));
+  for (const key of group.keys()) {
+    if (names.has(key) || order.some(name => name.startsWith(`${key}/`))) continue;
+    names.set(key, portable(key, taken));
+  }
+  return names;
 }
 
 /** Every array of a copy's store is chunked within the specification's sizes, and compressed. */

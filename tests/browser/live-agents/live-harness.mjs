@@ -90,7 +90,19 @@ export const PRICES = Object.freeze({
 /** Tokens and cost of every model call of the run, by model. */
 export function createLedger() {
   const byModel = new Map();
+  const progress = [];
   return {
+    /** What the person could read while a task's turn worked (`lastTurn`'s `progress`), printed with the cost. */
+    addProgress(task, shown, usage) {
+      const output = usage.reduce((sum, entry) => sum + (entry.output ?? 0), 0);
+      const cost = usage.reduce((sum, entry) => {
+        const price = PRICES[entry.model];
+        if (price === undefined) return sum;
+        const fresh = entry.input - (entry.cacheRead ?? 0) - (entry.cacheWrite ?? 0);
+        return sum + (fresh * price.input + (entry.cacheRead ?? 0) * price.cacheRead + (entry.cacheWrite ?? 0) * price.cacheWrite + (entry.output ?? 0) * price.output) / 1e6;
+      }, 0);
+      progress.push(`  ${task}: ${usage.length} model calls, ${output} output tokens, $${cost.toFixed(4)}; words in ${shown.spoke} of ${shown.working} working calls (${shown.notes} progress notes), before the first call: ${shown.beforeFirstCall ? 'yes' : 'no'}, longest stretch with nothing to read: ${shown.longestSilent} calls`);
+    },
     add(model, usage) {
       const entry = byModel.get(model) ?? { calls: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
       entry.calls += 1;
@@ -112,18 +124,29 @@ export function createLedger() {
         lines.push(`  ${model}: ${entry.calls} calls, ${entry.input} prompt tokens (${entry.cacheRead} cache reads, ${entry.cacheWrite} cache writes), ${entry.output} output tokens${cost === null ? '' : `, $${cost.toFixed(4)}`}`);
       }
       lines.push(`  total: $${total.toFixed(4)}${priced ? '' : ' (models without a listed price not counted)'}`);
+      if (progress.length > 0) lines.push('What the person could read while each turn worked:', ...progress);
       return lines.join('\n');
     },
   };
 }
 
-/** Open the fixture and the chat with `provider` and `model`, its key given as the stand-in. */
+/** page → the providers whose key `openLiveChat` routes on it. */
+const ROUTED = new WeakMap();
+
+/** Open the fixture and the chat with `provider` and `model`, its key given as the stand-in (again too: after another dataset was opened). */
 export async function openLiveChat(page, { provider, model }) {
-  await routeLiveKey(page, provider);
+  // The key is routed once per page and provider (a second open, after another dataset, keeps it).
+  const routed = ROUTED.get(page) ?? new Set();
+  ROUTED.set(page, routed);
+  if (!routed.has(provider)) {
+    routed.add(provider);
+    await routeLiveKey(page, provider);
+  }
   await page.goto(LIVE_DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await waitForHistory(page);
-  await page.locator('#agent-chat-toggle').click();
+  // The chat opens as this browser left it (open after a reload): opened here only when closed.
+  if (await page.locator('#agent-chat-toggle').getAttribute('aria-expanded') !== 'true') await page.locator('#agent-chat-toggle').click();
   if (await page.locator('#agent-chat-settings').isHidden()) await page.locator('#agent-chat-settings-btn').click();
   await page.locator('#agent-chat-provider').selectOption(provider);
   await page.locator('#agent-chat-key').fill(PROVIDERS[provider].standIn);
@@ -156,7 +179,11 @@ export async function liveTurn(page, text, { timeout = 5 * 60_000 } = {}) {
   return { ...(await lastTurn(page)), answered };
 }
 
-/** The last turn of the chat: its id, tool calls with results, notes, and each model call's usage. */
+/**
+ * The last turn of the chat: its id, tool calls with results (a refused
+ * action's `code`, as the chat keeps it), notes, each model call's usage, and whether the person got words (`replied`: a reply's
+ * text, or a question the chat shows with its choices, `ask_person`).
+ */
 export function lastTurn(page) {
   return page.evaluate(() => {
     const messages = window._cellucidUi.agents.chat.conversation.messages;
@@ -170,11 +197,34 @@ export function lastTurn(page) {
         .filter(part => part.type === 'tool-call')
         .map(part => {
           const result = results.get(part.id) ?? null;
-          return { name: part.name, args: part.args, isError: result?.isError ?? null, step: result?.step ?? null, text: result?.content?.[0]?.text ?? null };
+          return {
+            name: part.name, args: part.args, isError: result?.isError ?? null, step: result?.step ?? null,
+            text: result?.content?.[0]?.text ?? null, code: result?.code ?? null,
+          };
         })),
       notes: own.filter(message => message.role === 'note').map(message => ({ kind: message.kind, text: message.text })),
       usage: own.filter(message => message.role === 'assistant' && message.usage).map(message => ({ model: message.model, ...message.usage })),
-      replied: own.some(message => message.role === 'assistant' && message.parts.some(part => part.type === 'text' && part.text.trim() !== '')),
+      replied: own.some(message => message.role === 'assistant' && message.parts.some(part => (part.type === 'text' && part.text.trim() !== '')
+        || (part.type === 'tool-call' && part.name === 'ask_person' && results.get(part.id)?.isError === false))),
+      progress: (() => {
+        // What the person could read while the turn worked: words (text or a progress note) in a model
+        // call that went on to call tools; the longest run of such calls with nothing to read.
+        const working = own.filter(message => message.role === 'assistant' && message.parts.some(part => part.type === 'tool-call'));
+        const says = message => message.parts.some(part => (part.type === 'text' || part.type === 'progress') && part.text.trim() !== '');
+        let run = 0;
+        let longestSilent = 0;
+        for (const message of working) {
+          run = says(message) ? 0 : run + 1;
+          longestSilent = Math.max(longestSilent, run);
+        }
+        return {
+          working: working.length,
+          spoke: working.filter(says).length,
+          beforeFirstCall: working.length > 0 && says(working[0]),
+          notes: own.flatMap(message => message.parts ?? []).filter(part => part.type === 'progress' && part.text.trim() !== '').length,
+          longestSilent,
+        };
+      })(),
     };
   });
 }

@@ -1,0 +1,22 @@
+{
+  "examples": [
+    {
+      "log1p": false,
+      "normalise": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "log1p": {
+        "type": "boolean"
+      },
+      "normalise": {
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "type": "expression.transform.set",
+  "version": 1
+}

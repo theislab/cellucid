@@ -3,13 +3,13 @@
  * packages) are the web connector's tools.
  *
  * `tests/fixtures/mcp-tools.json` is `mcpToolsDocument` of the action
- * catalogue (`app/agent/bridge/local-agents.js`) as canonical JSON, written
- * by `scripts/generate-action-catalog.mjs` beside the catalogue itself;
+ * catalog (`app/agent/bridge/local-agents.js`) as canonical JSON, written
+ * by `scripts/generate-action-catalog.mjs` beside the catalog itself;
  * cellucid-python (`src/cellucid/mcp_tools.json`) and cellucid-r
  * (`inst/mcp_tools.json`) hold the one made from their own copy of the
- * catalogue, and pin the same SHA-256 when their catalogue is this one.
+ * catalog, and pin the same SHA-256 when their catalog is this one.
  * Its tools are exactly what the relay answers while no tab is connected
- * (the same function of the same catalogue), so a connector and a local
+ * (the same function of the same catalog), so a connector and a local
  * connection list the same names, schemas, descriptions and annotations.
  */
 
@@ -43,9 +43,9 @@ import { RELAY_STATUS_TOOL } from '../assets/js/app/agent/bridge/relay-protocol.
 /**
  * The digest of `mcp-tools.json`. cellucid-python (`tests/test_mcp.py`) and
  * cellucid-r (`tests/testthat/test-mcp.R`) pin the same one while their
- * catalogue is this one.
+ * catalog is this one.
  */
-const MCP_TOOLS_SHA256 = '3cf96bc8a522b98661693099ce113d484c2f182505f3b500a085cab218b7dc38';
+const MCP_TOOLS_SHA256 = '65b1e61533966676c2fb60f5c307cc00b43b0db952f044dc72fa8839297ffaa0';
 
 const REGENERATE = 'Run node scripts/generate-action-catalog.mjs (it writes the catalogue and the local agent tools, '
   + 'here and in both packages, and prints both digests), and pin the printed digests in the three repositories\' tests.';

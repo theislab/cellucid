@@ -29,7 +29,7 @@
  * the restored context forgets it and reads every value again. Without that
  * the shadow went on answering the values from before the loss while the
  * context had its initial ones (measured in Firefox 159 after
- * `WEBGL_lose_context`: the shadow's clear colour was the background, the
+ * `WEBGL_lose_context`: the shadow's clear color was the background, the
  * context's own transparent black, and the pulse's sample reset drew the
  * former where whole frames cleared to the latter).
  *

@@ -1,8 +1,9 @@
-import { formatBytes, formatDuration, formatRemaining, formatCountOf } from '../utils/format-units.js';
+import { formatBytes, formatDuration, formatPercent, formatRemaining, formatCountOf } from '../utils/format-units.js';
+import { createListenerSet } from '../utils/listener-set.js';
 /**
  * The read activity log: every read operation of the open dataset's files,
  * live — what is read (an obs field, a batch of genes, an embedding, a gene
- * index, the neighbour graph), how many requests it made, how many bytes it
+ * index, the neighbor graph), how many requests it made, how many bytes it
  * fetched, how many chunks it decoded and to how many bytes, how far a long
  * one has come, and how it ended. Local files and remote ones alike.
  *
@@ -55,9 +56,9 @@ export function describeReadProgress(activity) {
   const total = activity.bytesTotal ?? null;
   if (total !== null && total > 0) {
     const share = Math.min(100, Math.floor((100 * activity.bytesFetched) / total));
-    parts.push(`${formatBytes(activity.bytesFetched)} of ${formatBytes(total)} (${share}%)`);
+    parts.push(`${formatBytes(activity.bytesFetched)} of ${formatBytes(total)} (${formatPercent(share)})`);
   } else if (activity.progress && activity.progress.total > 0) {
-    parts.push(`${Math.floor((100 * activity.progress.done) / activity.progress.total)}%`);
+    parts.push(formatPercent(Math.floor((100 * activity.progress.done) / activity.progress.total)));
   } else if (activity.bytesFetched > 0) {
     parts.push(`${formatBytes(activity.bytesFetched)} so far`);
   }
@@ -86,7 +87,7 @@ export function describeReadActivity(activity) {
   }
   const status = activity.status === 'failed'
     ? `failed: ${activity.detail}`
-    : activity.status === 'cancelled' ? 'cancelled' : activity.status === 'running' ? 'reading' : 'done';
+    : activity.status === 'cancelled' ? 'canceled' : activity.status === 'running' ? 'reading' : 'done';
   return `${activity.label} — ${parts.join(', ')}, ${formatDuration(activity.elapsedMs)} (${status})`;
 }
 
@@ -99,7 +100,7 @@ class ReadActivityLog {
     this._activities = new Map();
     /** Totals of the operations that ended, for the open dataset. */
     this._ended = { operations: 0, requests: 0, bytesFetched: 0, decodedBytes: 0 };
-    this._listeners = new Set();
+    this._listeners = createListenerSet('the read activity');
     /** @type {Map<number, number>} When a running operation was last written */
     this._written = new Map();
     /** @type {Map<number, Object>} The latest report of each operation since the last flush */
@@ -110,9 +111,11 @@ class ReadActivityLog {
   }
 
   /**
-   * A job (`owner`, `app/jobs/cancellable-job.js`) joined the shared load
-   * `key` that something else started (a view's gene): the operations that
-   * read for that load are the job's too (`adoptedBy`), shown in the job's
+   * An owner that shows the reads of the shared load `key` itself took it
+   * (`owner`): a job (`app/jobs/cancellable-job.js`) that joined a load
+   * something else started (a view's gene), or the gene's own loading
+   * notification (`state/managers/field/loading.js`). The operations that
+   * read for that load are the owner's (`adoptedBy`), shown in its
    * notification and not as reads of their own, from now on and for those
    * still to come.
    *
@@ -184,13 +187,7 @@ class ReadActivityLog {
         else if (activity.elapsedMs >= NOTABLE_MS || activity.kind === 'index' || activity.kind === 'open') console.info(line);
         else quiet.push(line);
       }
-      for (const listener of this._listeners) {
-        try {
-          listener(activity);
-        } catch (error) {
-          console.error('[cellucid:read] An activity listener failed:', error);
-        }
-      }
+      this._listeners.notify(activity);
     }
     if (quiet.length > 0) console.debug(quiet.join('\n'));
   }
@@ -232,8 +229,7 @@ class ReadActivityLog {
    * @returns {() => void} Unsubscribe
    */
   subscribe(listener) {
-    this._listeners.add(listener);
-    return () => this._listeners.delete(listener);
+    return this._listeners.add(listener);
   }
 }
 

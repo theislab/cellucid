@@ -14,7 +14,7 @@ version of it is being read. The data-source classes that use these
 | `anndata-catalog.js` | A dataset catalog (`datasets.json` and the files it lists). |
 | `identity.js` | **The** identity and version rule every keeper files under (kept stores, kept parts, the page's range cache, Zarr store objects): `fileIdentityOf`, `persistsAcrossVisits`, `strongEtag`. |
 | `link-credentials.js` | A link's two forms: what it is read with, and what it may be shown or kept as (`publicLink`, `linkIdentity`): tokens and signatures never reach logs, sessions or identities. |
-| `access.js` | Access of files behind a sign-in or an expiring link, owned by the page; revocation. |
+| `access.js` | Access of files behind a sign-in or an expiring link, owned by the page; registered once a file is described, released with the source that reads it (or an opening not adopted); revocation. |
 | `api-request.js` | One JSON request to a provider API (Drive, Graph, Figshare) with the byte layer's retry rules. |
 | `auth/` | Google and Microsoft sign-in with no server (`google.js`, `microsoft.js`, `pkce.js`), the tab's token store (`token-store.js`, `sessionStorage` only), sign-in steps waiting on the person (`sign-in.js`). |
 | `provider-config.js` | Public client identifiers for Drive and OneDrive. |

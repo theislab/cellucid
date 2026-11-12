@@ -46,7 +46,8 @@ const RUNS = [
   },
 ];
 const DEPLOYED = 'https://www.cellucid.com';
-const TASK = 'Colour the cells by the first categorical field of this dataset. Read the fields first. Reply in one short sentence.';
+// A field the dataset does not open colored by (it opens colored by its cell types, F21), so the turn changes the coloring.
+const TASK = 'Color the cells by the first continuous field of this dataset. Read the fields first. Reply in one short sentence.';
 
 // No trace, screenshot or video: nothing that could keep a request.
 test.use(LIVE_USE);
@@ -82,7 +83,7 @@ for (const run of RUNS) {
       const turn = await liveTurn(page, TASK);
       for (const usage of turn.usage) ledger.add(usage.model, usage);
       const steps = await stepsOfTurn(page, turn.turn);
-      expect(steps.some(step => step.type === 'color.by' && step.origin === 'agent' && step.agent === run.agent), 'the turn coloured the cells, as the agent').toBe(true);
+      expect(steps.some(step => step.type === 'color.by' && step.origin === 'agent' && step.agent === run.agent), 'the turn colored the cells, as the agent').toBe(true);
       return turn;
     }
 

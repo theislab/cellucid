@@ -524,6 +524,33 @@ function zenodoBlocking(time, bytes, { blockAt = 20, lockoutMs = 300_000, roundT
   return host;
 }
 
+test('a host on this machine that goes silent (a local server restarting) learns no pace and keeps none', async () => {
+  // Found 2026-11-10: lost answers from the local catalog server taught it a block pace, kept for a
+  // day: Suo then read at 5-60 KB/s for 95 s on every visit.
+  const { rememberHostPace, rememberedHostPace, hostLinkSeed } = await import('../assets/js/data/host-link-memory.js');
+  const time = virtualTime();
+  const bytes = pattern(100_000);
+  const memory = new Map();
+  const storage = { getItem: key => memory.get(key) ?? null, setItem: (key, value) => memory.set(key, String(value)), removeItem: key => memory.delete(key) };
+  for (const url of ['http://127.0.0.1:54683/anndata/suo.zarr/obsm/0.0', 'http://localhost:8765/a.h5ad', 'http://[::1]:8765/a.h5ad']) {
+    const silent = zenodoBlocking(time, bytes);
+    const book = createHostBook({ now: time.now, after: time.after, epoch: () => EPOCH + time.now() });
+    const learnt = [];
+    book.watchPace((origin, paceMs) => { learnt.push(paceMs); rememberHostPace(origin, paceMs, storage); });
+    const link = new LinkMeter(REMOTE_POLICY, { clock: time.now, after: time.after });
+    const source = httpByteSource({ url, size: bytes.length }, { fetch: silent.fetch, hosts: book });
+    for (let i = 0; i < 60; i++) await source.read(i * 100, 100, { link });
+    assert.ok(silent.blocks >= 1, `${url}: the burst met the silence`);
+    assert.deepEqual(learnt, [], `${url}: no pace is learnt`);
+    assert.equal(book.pace(url), 0, `${url}: requests are not spaced`);
+    const origin = new URL(url).origin;
+    // Even a pace written before this rule is not kept or used.
+    rememberHostPace(origin, 6_000, storage);
+    assert.equal(rememberedHostPace(origin, storage), 0);
+    assert.equal(hostLinkSeed(origin, { storage, timeline: null }).paceMs, 0);
+  }
+});
+
 test('a host that blocks this network (Zenodo\'s "unusual traffic", within the budget it states) is waited out, paced at half what met the block, kept per host, and a later visit never meets it', async () => {
   const { rememberHostPace, rememberedHostPace, hostLinkSeed, forgetHostLinks } = await import('../assets/js/data/host-link-memory.js');
   const time = virtualTime();
@@ -575,4 +602,79 @@ test('a host that blocks this network (Zenodo\'s "unusual traffic", within the b
   // Forgetting the hosts (the Stored dialog) forgets their pace too.
   forgetHostLinks(storage);
   assert.equal(rememberedHostPace('https://zenodo.org', storage), 0);
+});
+
+// Round 9, R9P-5: a link that dropped for a few seconds while Suo opened from GitHub Pages
+// (requests failing at once: net::ERR_INTERNET_DISCONNECTED) taught theislab.github.io a block
+// pace; Suo then grew at 70 KB/s over a fast link ("limits how many requests it answers: the next
+// go in 2.4 s"), and the pace was kept for a day.
+function droppingLink(time, bytes, { dropAt = 20, dropMs = 5_000, roundTripMs = 100, failAfterMs = 0 } = {}) {
+  let downUntil = -Infinity;
+  const link = { times: [], drops: 0, isDown: () => time.now() < downUntil };
+  link.fetch = async (url, init) => {
+    const at = time.now();
+    link.times.push(at);
+    if (link.times.length === dropAt + 1) { downUntil = at + dropMs; link.upAt = downUntil; link.drops++; }
+    if (at < downUntil) {
+      // This side's link is down: the request never leaves (or never reaches the host).
+      await time.sleep(failAfterMs);
+      throw new TypeError('Failed to fetch');
+    }
+    await time.sleep(roundTripMs);
+    return ranged(bytes, init);
+  };
+  return link;
+}
+
+test('requests lost on this side of the link (an instant failure, or this computer offline) teach the host no pace', async () => {
+  const bytes = pattern(100_000);
+  const url = 'https://theislab.github.io/cellucid-datasets/anndata/suo.zarr/obsm/X_umap_3d/0.0';
+  for (const [name, options, offlineWhileDown] of [
+    ['failing at once', { failAfterMs: 0 }, false],
+    ['failing within half the quickest answer', { failAfterMs: 40 }, false],
+    ['this computer offline (failing slowly)', { failAfterMs: 150 }, true],
+  ]) {
+    const time = virtualTime();
+    const link = droppingLink(time, bytes, options);
+    const online = offlineWhileDown ? () => !link.isDown() : () => true;
+    const book = createHostBook({ now: time.now, after: time.after, epoch: () => EPOCH + time.now(), online });
+    const learnt = [];
+    book.watchPace((origin, paceMs) => learnt.push(paceMs));
+    const meter = new LinkMeter(REMOTE_POLICY, { clock: time.now, after: time.after });
+    const source = httpByteSource({ url, size: bytes.length }, { fetch: link.fetch, hosts: book });
+    for (let i = 0; i < 60; i++) {
+      assert.deepEqual(await source.read(i * 100, 100, { link: meter }), bytes.subarray(i * 100, i * 100 + 100), `${name}: read ${i}`);
+    }
+    assert.equal(link.drops, 1, `${name}: the link dropped`);
+    assert.deepEqual(learnt, [], `${name}: no pace is learnt`);
+    assert.equal(book.pace(url), 0, `${name}: requests are not spaced once the link is back`);
+  }
+});
+
+// Round 9, R9P-7: after an 18 s outage (this computer offline), Suo's opening waited up to 20 s
+// more before asking again: the read's back-off and the address's quiet were a host's, and the
+// read said the host "may be refusing requests from this network".
+test('a read that loses requests while this computer is offline waits for the connection, says so, and asks again the moment it is back', async () => {
+  const time = virtualTime();
+  const bytes = pattern(100_000);
+  const url = 'https://theislab.github.io/cellucid-datasets/anndata/suo.zarr/obsm/X_umap_3d/0.0';
+  const link = droppingLink(time, bytes, { dropAt: 10, dropMs: 18_000, failAfterMs: 0 });
+  const online = () => !link.isDown();
+  const book = createHostBook({ now: time.now, after: time.after, epoch: () => EPOCH + time.now(), online });
+  const meter = new LinkMeter(REMOTE_POLICY, { clock: time.now, after: time.after });
+  const source = httpByteSource({ url, size: bytes.length }, { fetch: link.fetch, hosts: book });
+  const told = [];
+  let backAt = null;
+  for (let i = 0; i < 30; i++) {
+    const read = await source.read(i * 100, 100, { link: meter, onWait: wait => { if (wait !== null) told.push(wait.text); } });
+    assert.deepEqual(read, bytes.subarray(i * 100, i * 100 + 100), `read ${i}`);
+    if (backAt === null && link.drops === 1 && !link.isDown()) backAt = time.now();
+  }
+  assert.equal(link.drops, 1);
+  assert.ok(told.some(text => /This computer is offline: reading goes on as soon as it is back/.test(text)), told.join(' | '));
+  assert.ok(!told.some(text => /refusing requests/.test(text)), `said as a refusal: ${told.join(' | ')}`);
+  // The first read after the outage went out within a poll of the connection's return.
+  const firstAfter = link.times.find(at => at >= link.upAt);
+  assert.ok(firstAfter - link.upAt <= 1_000, `asked ${firstAfter - link.upAt} ms after the connection was back`);
+  assert.equal(book.pace(url), 0);
 });

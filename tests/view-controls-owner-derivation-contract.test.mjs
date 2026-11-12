@@ -27,12 +27,14 @@ import test from 'node:test';
 
 import { viewContextCoreMethods } from
   '../assets/js/app/state/managers/view-context-core.js';
-import { initViewControls } from
+import { initViewControls, SMOKE_NEEDS_ONE_VIEW } from
   '../assets/js/app/ui/modules/view-controls.js';
 import { clearPublishedSnapshotViews } from
   '../assets/js/app/view-snapshot-publication.js';
 import { createViewsDomain } from
   '../assets/js/app/state/domains/views.js';
+import { getActions } from '../assets/js/app/actions/index.js';
+import { unavailableReasonOf } from '../assets/js/app/ui/core/control-availability.js';
 
 /* ------------------------------------------------------------------ *
  * A DOM small enough to read and complete enough to drive the module. *
@@ -92,6 +94,14 @@ class FakeHTMLElement {
         owner.className = owner.className.split(' ')
           .filter(name => name && !names.includes(name))
           .join(' ');
+      },
+      contains(name) {
+        return owner.className.split(' ').includes(name);
+      },
+      toggle(name, force = !this.contains(name)) {
+        if (force) this.add(name);
+        else this.remove(name);
+        return force;
       },
     };
   }
@@ -177,6 +187,7 @@ function installDom(t) {
     navigationTargetBadge: element(),
   };
   const renderDom = { renderModeSelect: select('points') };
+  renderDom.renderModeSelect.options = ['points', 'smoke'].map(value => ({ value, disabled: false, title: '' }));
   return { dom, renderDom };
 }
 
@@ -435,6 +446,15 @@ function createOwners() {
     getLiveViewLabel() {
       return 'Live';
     },
+    // viewer.js `getViewName()` / `setViewName()`: the name a view was given.
+    viewNames: new Map(),
+    getViewName(viewId) {
+      return this.viewNames.get(viewId) ?? null;
+    },
+    setViewName(viewId, name) {
+      if (name === null) this.viewNames.delete(viewId);
+      else this.viewNames.set(viewId, name);
+    },
     getSnapshotViews() {
       return snapshots.map(snapshot => ({ ...snapshot }));
     },
@@ -478,7 +498,11 @@ function createOwners() {
     setCamerasLocked(value) {
       camerasLocked = value;
     },
+    // viewer.js `setLiveViewHidden()`: hiding needs a kept view, and one with focus.
     setLiveViewHidden(value) {
+      if (value && (snapshots.length === 0 || !snapshots.some(snapshot => snapshot.id === focusedViewId))) {
+        throw new Error('The live view can be hidden only while a published snapshot has focus.');
+      }
       liveViewHidden = value;
     },
     setNavigationMode(mode) {
@@ -655,6 +679,73 @@ test('a cleared inventory leaves no hidden live view in the badge renderer', asy
   );
 });
 
+/** The removable rows: each row's number, name and whether it has a ×. */
+function rowsOf(dom) {
+  return dom.badgesList.children.map(badge => {
+    const select = badge.children.find(child => child.className === 'split-badge-select');
+    const name = select.children.find(child => child.className === 'split-badge-name');
+    return {
+      number: select.children.find(child => child.className === 'split-badge-pill').textContent,
+      name: name === undefined ? null : name.textContent,
+      remove: badge.children.some(child => child.className === 'split-badge-remove'),
+    };
+  });
+}
+
+/** Press the × of the row at `index`. */
+async function removeRow(dom, index) {
+  const badge = dom.badgesList.children[index];
+  badge.children.find(child => child.className === 'split-badge-remove').fire('click');
+  await settle();
+}
+
+test('a row\'s × removes the view that row shows, with one, two or three kept views (F144)', async t => {
+  for (const kept of [1, 2, 3]) {
+    const names = ['Base', 'Early', 'Mid', 'Late'].slice(0, kept + 1);
+    // The × of the live row: the live view goes, every kept view stays with its name.
+    await t.test(`${kept} kept, the live row's ×`, async st => {
+      const owners = createOwners();
+      const { dom } = mountViewControls(st, owners);
+      for (let index = 0; index < kept; index += 1) await keepView(dom);
+      for (const [index, name] of names.entries()) {
+        await getActions().dispatch('view.rename', { view: `View ${index + 1}`, name });
+      }
+      assert.deepEqual(rowsOf(dom).map(row => row.remove), names.map(() => true), `${kept} kept: every row has a ×`);
+      owners.state.setActiveView('live');
+      await removeRow(dom, 0);
+      assert.equal(owners.viewer.getLiveViewHidden(), true, `${kept} kept: the live view is hidden`);
+      assert.equal(owners.viewer.getSnapshotViews().length, kept, `${kept} kept: no kept view is removed`);
+      assert.deepEqual(rowsOf(dom).map(row => row.name), names.slice(1), `${kept} kept: the kept views keep their names`);
+      assert.equal(owners.state.getActiveViewId(), 'snap_1', 'the first kept view takes the live view\'s focus');
+      // The last open view has no ×.
+      assert.deepEqual(rowsOf(dom).map(row => row.remove), names.slice(1).map(() => kept > 1));
+      if (kept === 1) {
+        await assert.rejects(getActions().dispatch('view.remove', { view: 'View 1' }), /The last view cannot be removed/);
+      }
+    });
+    // The × of each kept row: that kept view goes, the others and the live view stay.
+    for (let removed = 1; removed <= kept; removed += 1) {
+      await t.test(`${kept} kept, row ${removed + 1}'s ×`, async st => {
+      const owners = createOwners();
+      const { dom } = mountViewControls(st, owners);
+      for (let index = 0; index < kept; index += 1) await keepView(dom);
+      for (const [index, name] of names.entries()) {
+        await getActions().dispatch('view.rename', { view: `View ${index + 1}`, name });
+      }
+      await removeRow(dom, removed);
+      assert.equal(owners.viewer.getLiveViewHidden(), false);
+      assert.equal(owners.viewer.getSnapshotViews().length, kept - 1);
+      const left = names.filter((_, index) => index !== removed);
+      assert.deepEqual(
+        kept === 1 ? [owners.viewer.getViewName('live')] : rowsOf(dom).map(row => row.name),
+        left,
+        `${kept} kept, row ${removed + 1} removed: the view it showed goes`,
+      );
+      });
+    }
+  }
+});
+
 test('a views restore raises nothing on the frames it schedules', async t => {
   const owners = createOwners();
   const { controls, dom, frameErrors } = mountViewControls(t, owners);
@@ -717,7 +808,7 @@ function rowText(badge) {
   };
 }
 
-test('each row names what its view shows, with the colouring field under it', async t => {
+test('each row names what its view shows, with the coloring field under it', async t => {
   const owners = createOwners();
   const { dom } = mountViewControls(t, owners);
 
@@ -738,13 +829,59 @@ test('each row names what its view shows, with the colouring field under it', as
     dom.badgesList.children[1].children
       .find(child => child.className === 'split-badge-select')
       .getAttribute('aria-label'),
-    'View 2: UMAP · 2D, coloured by All cells',
+    'View 2: UMAP · 2D, colored by All cells',
   );
   // The pane chips on the plot carry the same number and representation.
   assert.deepEqual([...owners.viewer.titlePrefixes], [
     ['live', '1 · UMAP 2D'],
     ['snap_1', '2 · UMAP 2D'],
   ]);
+});
+
+test('a view given a name shows it in its row, on its pane chip and to the picker; view.rename and view.keep name views (F130)', async t => {
+  const owners = createOwners();
+  const { controls, dom } = mountViewControls(t, owners);
+  const actions = getActions();
+
+  await keepView(dom);
+  const first = await actions.dispatch('view.rename', { view: 'View 2', name: 'Late' });
+  assert.deepEqual(first.outcome, { view: 'View 2' });
+  const row = dom.badgesList.children[1];
+  const select = row.children.find(child => child.className === 'split-badge-select');
+  assert.deepEqual(select.children.map(child => [child.className, child.textContent]).slice(2), [
+    ['split-badge-name', 'Late'],
+    ['split-badge-label split-badge-label-after-name', 'UMAP · 2D'],
+  ]);
+  assert.equal(select.getAttribute('aria-label'), 'View 2 "Late": UMAP · 2D, colored by All cells');
+  assert.equal(select.getAttribute('aria-keyshortcuts'), 'F2');
+  assert.deepEqual([...owners.viewer.titlePrefixes], [
+    ['live', '1 · UMAP 2D'],
+    ['snap_1', '2 · Late · UMAP 2D'],
+  ]);
+  assert.equal(controls.describeViewPosition('snap_1'), 'View 2 "Late"');
+  assert.equal(controls.describeViewPosition('live'), 'View 1');
+
+  // Renamed: the outcome says the name it had; an action on it says its name.
+  const again = await actions.dispatch('view.rename', { view: 'View 2', name: 'Day 7' });
+  assert.deepEqual(again.outcome, { view: 'View 2', was: 'Late' });
+  const focused = await actions.dispatch('view.focus', { view: 'View 2' });
+  assert.deepEqual(focused.outcome, { view: 'View 2', label: 'Day 7' });
+  // A name of the form "View N" is refused and changes nothing.
+  await assert.rejects(actions.dispatch('view.rename', { view: 'View 1', name: 'View 2' }), /is how views are numbered/);
+  assert.equal(owners.viewer.getViewName('live'), null);
+  // Null takes it away: the row is as an unnamed view's again.
+  await actions.dispatch('view.rename', { view: 'View 2', name: null });
+  assert.equal(owners.viewer.getViewName('snap_1'), null);
+  assert.deepEqual(dom.badgesList.children.map(rowText)[1], { number: '2', shows: 'UMAP · 2D', field: 'All cells', linked: false });
+
+  // Keep and name in one step; a removed view's step names it.
+  const kept = await actions.dispatch('view.keep', { name: 'Early' });
+  assert.deepEqual(kept.outcome, { view: 'View 3' });
+  assert.equal(owners.viewer.getViewName('snap_2'), 'Early');
+  await assert.rejects(actions.dispatch('view.keep', { name: 'View 9' }), /is how views are numbered/);
+  assert.equal(owners.viewer.getSnapshotViews().length, 2, 'a refused name keeps no view');
+  const removed = await actions.dispatch('view.remove', { view: 'View 3' });
+  assert.deepEqual(removed.outcome, { view: 'View 3', label: 'Early' });
 });
 
 test('Link cameras is offered only between views that show one representation', async t => {
@@ -782,4 +919,48 @@ test('Link cameras is offered only between views that show one representation', 
       { number: '2', shows: 'UMAP · 2D', field: 'All cells', linked: false },
     ],
   );
+});
+
+test('smoke leaves the views\' layout as it is: only the selector says one view (F59)', t => {
+  const owners = createOwners();
+  const { controls, dom, renderDom } = mountViewControls(t, owners);
+  assert.equal(owners.layoutMode(), 'grid');
+  renderDom.renderModeSelect.value = 'smoke';
+  controls.updateSplitViewUI();
+  assert.equal(owners.layoutMode(), 'grid', 'a refresh in smoke kept the layout a starting view put back');
+  assert.equal(dom.layoutModeSelect.value, 'single');
+  renderDom.renderModeSelect.value = 'points';
+  controls.updateSplitViewUI();
+  assert.equal(owners.layoutMode(), 'grid');
+  assert.equal(dom.layoutModeSelect.value, 'grid');
+});
+
+test('while views are kept the smoke choice is off and says why; cleared, it is on again (R9R-4)', async t => {
+  const owners = createOwners();
+  const { controls, dom, renderDom } = mountViewControls(t, owners);
+  const smoke = renderDom.renderModeSelect.options.find(option => option.value === 'smoke');
+  assert.equal(smoke.disabled, false);
+  await keepView(dom);
+  assert.equal(smoke.disabled, true);
+  assert.equal(unavailableReasonOf(smoke), SMOKE_NEEDS_ONE_VIEW);
+  assert.equal(smoke.title, SMOKE_NEEDS_ONE_VIEW);
+  clearPublishedSnapshotViews({ state: owners.state, viewer: owners.viewer });
+  controls.updateSplitViewUI();
+  assert.equal(smoke.disabled, false);
+  assert.equal(smoke.title, '');
+});
+
+test('a keep that fails, with the controls failing to redraw after, says its failure once (no "failed failed")', async t => {
+  const owners = createOwners();
+  mountViewControls(t, owners);
+  owners.state.getSnapshotPayload = () => { throw new ReferenceError('unnamed is not defined'); };
+  // The redraw after the failure reads the inventory and fails too.
+  owners.viewer.getSnapshotViews = () => { throw new Error('the inventory is gone'); };
+  await assert.rejects(getActions().dispatch('view.keep', {}), error => {
+    assert.ok(error instanceof AggregateError);
+    // The caller says what failed ("Keep view failed: …"); this says what followed, without "failed".
+    assert.equal(error.message, 'The view controls could not be drawn again after it.');
+    assert.equal(error.errors[0].message, 'unnamed is not defined');
+    return true;
+  });
 });

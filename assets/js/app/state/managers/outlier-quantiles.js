@@ -29,7 +29,7 @@
  *   be read (a NaN), so another must be chosen.
  *
  * Each job is a `CancellableJob` (`app/jobs/cancellable-job.js`, the one
- * mechanism every expensive run uses): it is cancelled by
+ * mechanism every expensive run uses): it is canceled by
  * `cancelOutlierQuantiles` (the outlier control's Cancel) or its progress
  * notification's Cancel: its reads stop in the worker, nothing it got is
  * kept, and every view's threshold of the field is back at 100%, as before
@@ -41,6 +41,7 @@
 
 import { CancellableJob } from '../../jobs/cancellable-job.js';
 import { awaitWithSignal, isCancellation } from '../../../utils/abort.js';
+import { sayFailure } from '../../../utils/errors.js';
 import { categorySizes } from '../../../data/latent-outliers.js';
 import { latentReadLabel } from '../../../data/latent-outliers-stream.js';
 import { MappingLoadError, obsmWidth, parseMappingLatentPath } from '../../../data/data-mapping-candidates.js';
@@ -241,7 +242,7 @@ export class DataStateOutlierQuantileMethods {
    * copy of the field and the field cache. Null when the field has none (no
    * latent space, not a field of the file) or the dataset or its latent space
    * was replaced meanwhile. Rejects with an `AbortError` when the job was
-   * cancelled or `signal` aborted (the job goes on for other callers), and
+   * canceled or `signal` aborted (the job goes on for other callers), and
    * with the failure otherwise.
    *
    * @param {number} fieldIndex
@@ -263,7 +264,7 @@ export class DataStateOutlierQuantileMethods {
    * being got.
    *
    * @param {number} [fieldIndex] - The active field by default
-   * @returns {boolean} Whether a job was cancelled
+   * @returns {boolean} Whether a job was canceled
    */
   cancelOutlierQuantiles(fieldIndex = this.activeFieldIndex) {
     const descriptor = this._outlierDescriptor(fieldIndex);
@@ -274,7 +275,7 @@ export class DataStateOutlierQuantileMethods {
 
   /**
    * Retire every outlier job of the dataset being replaced: each is
-   * cancelled (its reads of the latent space stop), and the plans and
+   * canceled (its reads of the latent space stop), and the plans and
    * failures recorded for its fields go with it. Called when another dataset
    * (or none) is published: a job left running would keep reading the old
    * latent space and then report on, or mark choices of, the new dataset.
@@ -291,8 +292,8 @@ export class DataStateOutlierQuantileMethods {
   /**
    * Get the quantiles of every field whose outlier filter is in use (a
    * threshold below 100% in some view) and does not have them — after the
-   * latent space changed — and recolour the views once each arrives. Each is
-   * an ordinary job: it shows progress and can be cancelled.
+   * latent space changed — and recolor the views once each arrives. Each is
+   * an ordinary job: it shows progress and can be canceled.
    */
   resumeOutlierFilters() {
     const indexes = new Set();
@@ -309,7 +310,7 @@ export class DataStateOutlierQuantileMethods {
       if (this.obsData?.fields?.[index]?.outlierQuantiles instanceof Float32Array) continue;
       this.ensureOutlierQuantiles(index).then(
         quantiles => {
-          if (quantiles !== null) this._recolourCategoricalViews();
+          if (quantiles !== null) this._recolorCategoricalViews();
         },
         () => {
           // The job's own status and notification say what happened.
@@ -434,7 +435,7 @@ export class DataStateOutlierQuantileMethods {
           this.emit('mapping:choices-changed', { group: 'latent' });
         }
         console.warn(`[cellucid:outliers] The outlier quantiles of "${job.fieldKey}" could not be got:`, error);
-        cancellable.fail(error, `Outlier filter of "${job.fieldKey}" unavailable: ${message}`);
+        cancellable.fail(error, `The outlier filter of "${job.fieldKey}" is unavailable: ${sayFailure(error)}`);
       }
       if (current && this.getActiveField?.() === this.obsData?.fields?.[job.fieldIndex]) {
         this.computeGlobalVisibility?.();

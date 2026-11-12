@@ -2,7 +2,7 @@
  * Auto-fit at the largest sizes (`data/anndata/subsample-plan.js`): the
  * per-cell working set is what 100M 3D cells with levels of detail measured
  * (64.6 bytes a cell of physical memory, Chromium on Apple M1 Pro, plus the
- * coloured field and one continuous field with its outlier quantile), so a
+ * colored field and one continuous field with its outlier quantile), so a
  * device opens a count it can hold. On a 16 GB machine (an 8 GB allowance)
  * that is about 104M cells: 100M 3D cells built their levels of detail
  * there, 125M went into swap building them. 200M cells open whole once the

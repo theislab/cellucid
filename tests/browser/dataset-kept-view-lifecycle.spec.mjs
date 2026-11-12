@@ -160,8 +160,10 @@ async function configureSmallPngExport(page) {
   if (await framingPanel.getAttribute('aria-expanded') !== 'true') {
     await framingPanel.click();
   }
-  await page.getByLabel('Export width (px)').fill('320');
-  await page.getByLabel('Export height (px)').fill('240');
+  // A small figure: the single-column width (89 mm); its height follows the
+  // plot's shape (the figure is sized as printed, utils/figure-size.js).
+  await page.getByLabel('Figure width preset').selectOption('single-column');
+  await expect(page.getByLabel('Figure width (mm)')).toHaveValue('89');
   const downloadPanel = page.getByRole('button', { name: /^Download\b/ });
   if (await downloadPanel.getAttribute('aria-expanded') !== 'true') {
     await downloadPanel.click();

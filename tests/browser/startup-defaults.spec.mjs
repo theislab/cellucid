@@ -153,7 +153,7 @@ test('the default light studio publishes stable light framebuffer pixels', async
     background: 'studio',
     rootBackground: 'studio',
   });
-  // Studio (light) clears to its surface colour, #ececec.
+  // Studio (light) clears to its surface color, #ececec.
   expect(evidence.renderBackground).toEqual([
     Math.fround(236 / 255),
     Math.fround(236 / 255),
@@ -164,7 +164,7 @@ test('the default light studio publishes stable light framebuffer pixels', async
     // Nearly the whole canvas is the cleared background; the remainder is the
     // cells themselves. Stated as a fraction of an even grid this is a stronger
     // claim than the five-of-six it replaces, and it cannot be satisfied by a
-    // background that is the wrong colour.
+    // background that is the wrong color.
     expect(frame.sampleCount).toBe(64);
     expect(frame.lightPixelFraction).toBeGreaterThan(0.85);
     expect(frame.clearColor).toEqual([
@@ -181,4 +181,28 @@ test('the default light studio publishes stable light framebuffer pixels', async
     0.01,
   );
   expect(browserErrors).toEqual([]);
+});
+
+test('a sample opening says the name its catalog gives it from the catalog\'s answer on, never its id (round 9 close)', async ({ page }) => {
+  // The fixture catalog, with the dataset's name a published catalog carries (`datasets.json` `name`).
+  await page.route('**/tests/browser/fixtures/catalog/datasets.json', async route => {
+    const response = await route.fetch();
+    const catalog = await response.json();
+    catalog.datasets = catalog.datasets.map(entry => ({ ...entry, name: 'Current UI (named by its catalog)' }));
+    await route.fulfill({ response, json: catalog });
+  });
+  await page.addInitScript(() => {
+    window.__openings = [];
+    new MutationObserver(() => {
+      const shown = document.querySelector('.opening-title, #opening-progress, [data-opening]');
+      const text = shown?.innerText.replace(/\s+/g, ' ').trim();
+      if (text && !window.__openings.includes(text)) window.__openings.push(text);
+    }).observe(document, { subtree: true, childList: true, characterData: true });
+  });
+  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=startup-defaults-ci`, { waitUntil: 'domcontentloaded' });
+  await expectWelcomeShown(page);
+  await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
+  const openings = await page.evaluate(() => window.__openings);
+  expect(openings.some(text => text.includes('Opening Current UI (named by its catalog)'))).toBe(true);
+  expect(openings.filter(text => /Opening current-ui\b/.test(text))).toEqual([]);
 });

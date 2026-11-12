@@ -124,6 +124,10 @@ test('the address bar routes what is typed the same way every time', () => {
     '127.0.0.1:9000/': { kind: 'server', url: 'http://127.0.0.1:9000' },
     'lab-server:8765': { kind: 'server', url: 'http://lab-server:8765' },
     'http://localhost:8765/': { kind: 'server', url: 'http://localhost:8765' },
+    // A path naming data is that data, read over http:// (R9S-4).
+    '127.0.0.1:8000/data/atlas.zarr.zip': { kind: 'link', value: '127.0.0.1:8000/data/atlas.zarr.zip' },
+    'lab-server:8080/atlas.h5ad': { kind: 'link', value: 'lab-server:8080/atlas.h5ad' },
+    'localhost:8000/catalog/datasets.json': { kind: 'link', value: 'localhost:8000/catalog/datasets.json' },
     'https://example.org/data/cells.h5ad': { kind: 'link', value: 'https://example.org/data/cells.h5ad' },
     'https://example.org/data/cells.zarr/': { kind: 'link', value: 'https://example.org/data/cells.zarr/' },
     'https://example.org/data/datasets.json': { kind: 'link', value: 'https://example.org/data/datasets.json' },

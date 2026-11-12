@@ -23,10 +23,14 @@ import { ANALYSIS_MODES } from '../../analysis/options/analysis-modes.js';
 import {
   HEATMAP_VIEW_CHOICES, HEATMAP_VIEW_SWITCHES, MARKER_SHOW_CHOICES, viewKeysOf,
 } from '../../analysis/options/analysis-views.js';
-import { PLACES } from '../../ui/place-names.js';
-import { VISIBLE_CELLS_READS } from './params.js';
+import { describeValue } from '../../analysis/options/option-schema.js';
+import { PLACES, placePath } from '../../ui/place-names.js';
+import { VISIBLE_CELLS_READS, categoriesWords } from './params.js';
+import { formatCountOf } from '../../../utils/format-units.js';
+import { lowerFirst } from '../../../utils/text-case.js';
 
 const PANEL = PLACES.analysis.name;
+const EXPRESSION_PLACE = placePath(PLACES.dataMapping, PLACES.expressionValues);
 
 const NAMES = ANALYSIS_MODES.map(mode => mode.name);
 const RUNNABLE = ANALYSIS_MODES.filter(mode => mode.options !== null).map(mode => mode.name);
@@ -47,7 +51,8 @@ const WINDOW = Object.freeze({ type: 'integer', minimum: 1, description: 'A floa
 
 /**
  * What an analysis result is computed on (`shared/result-provenance.js`): the
- * open cells and the cells genes are read for, the data mapping, the fields
+ * open cells and the cells genes are read for, the data mapping and the
+ * expression values (Data mapping › Expression values), the fields
  * (user fields, renames), the highlight pages, and for "Visible cells" what
  * the view in focus shows. Quick and Detailed compute as their pages and
  * fields change, and a copied window computes its first result, so the
@@ -56,7 +61,7 @@ const WINDOW = Object.freeze({ type: 'integer', minimum: 1, description: 'A floa
 const RESULT_INPUTS = Object.freeze([...VISIBLE_CELLS_READS, 'highlights']);
 /**
  * What an analysis made on first use takes its opening settings from: the
- * field the view is coloured by (its group-by), the fields, genes and pages
+ * field the view is colored by (its group-by), the fields, genes and pages
  * it offers.
  */
 const OPENING_INPUTS = Object.freeze(['active-field', 'field-overlays', 'mapping', 'highlights']);
@@ -67,10 +72,11 @@ const titleOf = name => ANALYSIS_MODES.find(mode => mode.name === name)?.title ?
 
 /** The action parameter schema of one option (`option-schema.js` entry). */
 export function optionParamSchema(entry) {
-  const description = entry.label;
+  const description = entry.means === undefined ? entry.label : `${entry.label}: ${entry.means}`;
   switch (entry.kind) {
     case 'select':
     case 'segmented':
+      if (entry.pages === true) return { type: 'string', description: `${description}: a highlight page by its name, or "Rest of <page>"` };
       return Array.isArray(entry.choices)
         ? { type: 'string', enum: entry.choices.map(choice => choice.value), description }
         : { type: 'string', description };
@@ -140,7 +146,7 @@ export function optionsParamSchema(options) {
 
 const PROVENANCE = Object.freeze({
   type: ['object', 'null'], additionalProperties: false,
-  required: ['dataset', 'cells', 'genes_read_for', 'mapping', 'pages', 'visible_only'],
+  required: ['dataset', 'cells', 'genes_read_for', 'mapping', 'values', 'pages', 'visible_only'],
   description: 'What the result was computed on.',
   properties: {
     dataset: { type: ['string', 'null'] },
@@ -156,6 +162,7 @@ const PROVENANCE = Object.freeze({
       properties: { cells: { type: 'integer' }, of: { type: 'integer' } },
     },
     mapping: { type: ['string', 'null'] },
+    values: { type: ['string', 'null'], description: `The expression values its genes were read in (${EXPRESSION_PLACE}, as the matrix it read takes them): raw values, normalized, log1p or normalized · log1p; raw values for one that reads raw counts whatever the setting (pseudobulk, UCell); null when it read no gene values. The result goes stale only when these would change.` },
     pages: {
       type: 'array',
       items: {
@@ -169,6 +176,66 @@ const PROVENANCE = Object.freeze({
 
 /** The analyses with a view to set (`analysis/options/analysis-views.js`). */
 const VIEWED = ANALYSIS_MODES.filter(mode => viewKeysOf(mode).length > 0);
+const TEXT = Object.freeze({ type: 'string' });
+const COUNT = Object.freeze({ type: 'integer', minimum: 0 });
+const NAMED_COUNTS = Object.freeze({
+  type: 'array',
+  items: { type: 'object', additionalProperties: false, required: ['name', 'cells'], properties: { name: TEXT, cells: COUNT } },
+});
+/**
+ * How a result was computed (`analysis.result`), as its expanded view's
+ * statistics say it: what each analysis gives of these (`_resultAbout` of its
+ * UI). Null for an analysis that has none to say (correlation: its rows say
+ * it).
+ */
+const RESULT_ABOUT = Object.freeze({
+  type: ['object', 'null'], additionalProperties: false,
+  description: 'How it was computed, as its expanded view\'s statistics say: the groups and their cells (samples), the test and its pairing (pseudobulk: its limma model), the correction, the expression matrix and its values, the fold change, tests between pages or groups, what the rows are.',
+  properties: {
+    group_a: TEXT, cells_a: COUNT, group_b: TEXT, cells_b: COUNT,
+    samples_a: COUNT, samples_b: COUNT, samples_left_out: TEXT,
+    group_by: TEXT, cells_per_group: NAMED_COUNTS, compared_with: TEXT, groups_tested: TEXT,
+    cell_types: TEXT, samples: { type: ['string', 'null'] }, condition: { type: ['string', 'null'] }, cells: COUNT,
+    cells_per_unit: NAMED_COUNTS,
+    samples_per_condition: {
+      type: 'array',
+      items: { type: 'object', additionalProperties: false, required: ['name', 'samples'], properties: { name: TEXT, samples: COUNT } },
+    }, overall: TEXT, proportions: TEXT,
+    test: { type: ['string', 'null'] }, method: TEXT, multiple_testing: TEXT, expression_matrix: TEXT, fold_change: TEXT,
+    values: { ...TEXT, description: `The values computed from (${EXPRESSION_PLACE}, expression_transform_set): ln(1 + x · 10,000 / cell total), x · 10,000 / cell total or ln(1 + x), with where the cell totals came from, or raw counts as stored; pseudobulk: the raw counts summed per sample, TMM factors (and where the library sizes came from) and log-CPM, or each sample's mean of a matrix that is not counts.` },
+    model: { ...TEXT, description: 'Pseudobulk: the limma fit, its design (~ group, or ~ donor + group paired) and its empirical-Bayes prior (prior df d0, prior variance s0², trend with the mean).' },
+    pairing: { ...TEXT, description: 'Paired or unpaired, and how many samples (donors) have cells in both groups or conditions.' },
+    genes_tested: COUNT, significant_up_in_a: COUNT, significant_up_in_b: COUNT, significance: TEXT,
+    sets: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false, required: ['name', 'genes', 'not_found', 'constant', 'tests'],
+        properties: {
+          name: TEXT, genes: COUNT,
+          not_found: { type: 'array', items: TEXT }, constant: { type: 'array', items: TEXT },
+          tests: {
+            description: 'The tests between its pages, or why there are none (one page, pages sharing cells).',
+            oneOf: [
+              TEXT,
+              {
+                type: 'array',
+                items: {
+                  type: 'object', additionalProperties: false, required: ['test', 'statistic', 'p_value', 'effect_size', 'effect_size_type'],
+                  properties: {
+                    test: TEXT, statistic: { type: ['number', 'null'] }, p_value: { type: ['number', 'null'] },
+                    effect_size: { type: ['number', 'null'] }, effect_size_type: { type: ['string', 'null'] },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+    rows: { ...TEXT, description: 'What the rows are and their order.' },
+  },
+});
+
 const VIEWED_ANALYSIS = Object.freeze({ ...ANALYSIS, enum: VIEWED.map(mode => mode.name), description: 'An analysis with an options form.' });
 const OPTION_GROUPS = [...new Set(VIEWED.flatMap(mode => mode.options.groups.map(group => group.id)))];
 
@@ -230,10 +297,23 @@ function describeView(params, outcome, quote = PLAIN_QUOTE) {
   const at = where(params, quote);
   if (keys.length === 1) {
     if (keys[0] === 'more') return `${view.more ? 'Opened' : 'Closed'} More options of ${title}${at}`;
+    if (keys[0] === 'groups') {
+      // The groups left open, by their titles: "Showed Values, Layout options of Dot plot".
+      const groups = ANALYSIS_MODES.find(mode => mode.name === params.analysis)?.options?.groups ?? [];
+      const titles = view.groups.map(id => groups.find(group => group.id === id)?.title ?? id);
+      return titles.length === 0
+        ? `Closed the option groups of ${title}${at}`
+        : `Showed ${titles.join(', ')} options of ${title}${at}`;
+    }
     if (keys[0] === 'show') return `Showed ${title} as ${SHOW_WORDS[view.show]}${at}`;
     if (keys[0] === 'group') return `Listed ${view.group === null ? 'the first group' : quote.bare(view.group)} in ${title}${at}`;
     if (keys[0] === 'set') return `Showed the gene set ${quote.bare(view.set)} in ${title}${at}`;
-    if (keys[0] === 'plot') return `Set ${view.plot.map(entry => `${quote.bare(entry.option)} to ${quote.bare(entry.value)}`).join(', ')} in the plot of ${title}${at}`;
+    // As the options column labels them (the outcome's, `plotOptionWords`), else by their keys.
+    if (keys[0] === 'plot') {
+      return Array.isArray(outcome?.plot)
+        ? `${title}: ${outcome.plot.join(', ')}${at}`
+        : `Set ${view.plot.map(entry => `${quote.bare(entry.option)} to ${quote.bare(entry.value)}`).join(', ')} in the plot of ${title}${at}`;
+    }
   }
   return `Changed how ${title} is shown${at}`;
 }
@@ -246,11 +326,86 @@ const RESULT_STATE = Object.freeze({
   computed_on: PROVENANCE,
 });
 
+/**
+ * An option's value as a step names it: the label its form shows ("Mean,
+ * scaled 0–1 per gene", "On"), the sets of genes with their sizes, a field,
+ * a page and categories by name.
+ */
+function optionValueWords(entry, value, quote) {
+  if (entry.kind === 'gene-sets') {
+    if (value.length === 0) return 'none';
+    // A set by name and size, a few; more (the markers of every group sent on) by their count.
+    if (value.length > 3) return `${formatCountOf(value.length, 'gene set')} (${formatCountOf(value.reduce((sum, set) => sum + set.genes.length, 0), 'gene')})`;
+    return value.map(set => `${quote.bare(set.name)} (${formatCountOf(set.genes.length, 'gene')})`).join(', ');
+  }
+  if (entry.kind === 'groups') return value.mode === 'all' ? 'all' : categoriesWords(value.ids, quote);
+  if (entry.kind === 'variable') return value === null ? 'none' : quote.bare(value.key);
+  if ((entry.kind === 'select' || entry.kind === 'segmented') && typeof entry.choices === 'function') {
+    // Choices the data offers: those it offers without data (All cells) by their label, a page and a field by name.
+    let fixed = [];
+    try { fixed = entry.choices({}, {}) ?? []; } catch { fixed = []; }
+    const label = fixed.find(choice => choice.value === value)?.label;
+    if (label !== undefined) return label;
+    if (typeof value === 'string' && value.startsWith('page:')) return `page ${quote.bare(value.slice('page:'.length))}`;
+    return quote.bare(String(value));
+  }
+  return describeValue(entry, value);
+}
+
+/** An option's label inside a sentence: "group by", "min |log2FC|", "X axis". */
+function labelInSentence(label) {
+  return /^[A-Z][a-z]/.test(label) ? lowerFirst(label) : label;
+}
+
+/** The most options a step names one by one; the rest are counted. */
+const NAMED_OPTIONS = 5;
+
+/**
+ * What was chosen, as the form names the options: "Color set to Mean, scaled
+ * 0–1 per gene" for one; for several each label with its value, the first
+ * five, apart by semicolons (a value may hold a comma: "Group by cell_type;
+ * compare against Rest; top genes per group 5"); null for none. The one naming of an analysis's option steps (set, and
+ * opened with options).
+ */
+export function optionsWords(schema, options, quote = PLAIN_QUOTE) {
+  const keys = Object.keys(options);
+  if (keys.length === 0) return null;
+  if (keys.length === 1) {
+    const entry = schema.entry(keys[0]);
+    return `${entry.label} set to ${optionValueWords(entry, options[keys[0]], quote)}`;
+  }
+  const phrases = keys.slice(0, NAMED_OPTIONS).map((key, index) => {
+    const entry = schema.entry(key);
+    const label = index === 0 ? entry.label : labelInSentence(entry.label);
+    return `${label} ${optionValueWords(entry, options[key], quote)}`;
+  });
+  const more = keys.length - NAMED_OPTIONS;
+  return more > 0 ? `${phrases.join('; ')}; and ${formatCountOf(more, 'more option')}` : phrases.join('; ');
+}
+
+/**
+ * The version of each analysis's options parameters (`catalog.js` `version`)
+ * and its upgraders: options are given partially, so a step of an earlier
+ * version holds options the later one still has, and goes up unchanged.
+ *
+ * - 2 (2026-11-11): Pair samples across groups (differential) and
+ *   conditions (composition); Group by, Groups to score and Cells
+ *   (signature).
+ */
+const SET_VERSIONS = Object.freeze({ differential: 2, signature: 2, composition: 2 });
+
+function setVersioning(name) {
+  const version = SET_VERSIONS[name] ?? 1;
+  if (version === 1) return {};
+  return { version, upgrade: Object.fromEntries(Array.from({ length: version - 1 }, (_, index) => [index + 1, params => params])) };
+}
+
 function perAnalysisActions(mode) {
   const optionsSchema = optionsParamSchema(mode.options);
   return [
     defineAction({
       type: `analysis.${mode.name}.set`,
+      ...setVersioning(mode.name),
       title: `Set ${mode.title.toLowerCase()} options`,
       summary: `Change options of the ${mode.title.toLowerCase()} analysis (only those given); nothing runs.`,
       group: 'Analysis',
@@ -271,9 +426,16 @@ function perAnalysisActions(mode) {
       effect: 'state',
       // Typing into an option: one step while it is the last thing changed.
       coalesce: params => `${String(params.in)}:${params.show === true}:${Object.keys(params.options).sort().join(',')}`,
-      describe: (params, outcome, quote = PLAIN_QUOTE) => (params.show === true
-        ? `Opened ${mode.title} with ${Object.keys(params.options).join(', ') || 'its options'}${where(params, quote)}`
-        : `Set ${Object.keys(params.options).join(', ') || 'no options'} of ${mode.title}${where(params, quote)}`),
+      // "Dot plot: Color set to Mean, scaled 0–1 per gene", "Marker genes: Group by cell_type; top genes per
+      // group 5": what was chosen, as the form names the options.
+      describe: (params, outcome, quote = PLAIN_QUOTE) => {
+        // The options the step changed (its outcome's `changed`), else every option given (a step not run yet).
+        const changed = typeof outcome?.changed === 'string' ? new Set(outcome.changed.split(', ')) : null;
+        const named = changed === null ? params.options : Object.fromEntries(Object.entries(params.options).filter(([key]) => changed.has(key)));
+        const words = optionsWords(mode.options, named, quote);
+        if (params.show === true) return `Opened ${mode.title}${words === null ? '' : `: ${words}`}${where(params, quote)}`;
+        return `${mode.title}: ${words ?? 'options unchanged'}${where(params, quote)}`;
+      },
       code: params => `analysis_set(${JSON.stringify(mode.name)}, ${JSON.stringify(params.options)}${whereCode(params)}${params.show === true ? ', show=True' : ''})`,
     }),
     defineAction({
@@ -458,7 +620,7 @@ export const analysisActions = Object.freeze([
   defineAction({
     type: 'analysis.run',
     title: 'Run an analysis',
-    summary: 'Run an analysis with its options and pages, and wait for its result.',
+    summary: `Run an analysis with its options and pages, and wait for its result. The ${PANEL} panel shows one analysis at a time: run in it, an analysis is shown first when another is (its section and the sidebar must be open).`,
     group: 'Analysis',
     params: {
       type: 'object', additionalProperties: false, required: ['analysis'],
@@ -474,14 +636,15 @@ export const analysisActions = Object.freeze([
   defineAction({
     type: 'analysis.cancel',
     title: 'Stop an analysis',
-    summary: 'Stop a running analysis; what it was showing stays, nothing else changes.',
+    summary: 'Stop a running analysis, at once, also while its run is still waiting for it; what it was showing stays, nothing else changes.',
     group: 'Analysis',
     params: {
       type: 'object', additionalProperties: false, required: ['analysis'],
       properties: { analysis: RUNNABLE_ANALYSIS, in: WHERE },
     },
     reads: [],
-    effect: 'read',
+    // Stepless, so it never waits behind the run it stops (catalog.js `isSteplessEffect`).
+    effect: 'control',
     result: {
       type: 'object', additionalProperties: false, required: ['stopped'],
       properties: { stopped: { type: 'boolean', description: 'False when it was not running.' } },
@@ -623,26 +786,27 @@ export const analysisActions = Object.freeze([
   defineAction({
     type: 'analysis.result',
     title: 'Read an analysis result',
-    summary: 'The top rows of an analysis\'s result table (N a parameter), with what it was computed on and whether it is stale.',
+    summary: 'The top rows of an analysis\'s result table (N a parameter), with how it was tested (groups and their cells, test, matrix), what it was computed on and whether it is stale.',
     group: 'Analysis',
     params: {
       type: 'object', additionalProperties: false, required: ['analysis'],
       properties: {
         analysis: RUNNABLE_ANALYSIS,
         in: WHERE,
-        top: { type: 'integer', minimum: 1, default: 20, description: 'At most this many rows (per group, where the result has groups).' },
+        top: { type: 'integer', minimum: 1, default: 20, description: 'At most this many rows: per group of marker genes, per direction of a differential expression (top 40: 40 up in A and 40 up in B); about.rows says how it counted.' },
       },
     },
     reads: [],
     effect: 'read',
     result: {
       type: 'object', additionalProperties: false,
-      required: ['analysis', 'columns', 'rows', 'total_rows', 'stale', 'stale_reasons', 'computed_on'],
+      required: ['analysis', 'columns', 'rows', 'total_rows', 'about', 'stale', 'stale_reasons', 'computed_on'],
       properties: {
         analysis: { type: 'string' },
         columns: { type: 'array', items: { type: 'string' } },
         rows: { type: 'array', items: { type: 'array', items: { type: ['string', 'number', 'boolean', 'null'] } } },
         total_rows: { type: 'integer', description: 'Rows in the whole result.' },
+        about: RESULT_ABOUT,
         stale: { type: 'boolean' },
         stale_reasons: { type: 'array', items: { type: 'string' } },
         computed_on: PROVENANCE,
@@ -650,6 +814,34 @@ export const analysisActions = Object.freeze([
     },
     describe: params => `Read the ${titleOf(params.analysis).toLowerCase()} result`,
     code: params => `analysis_result(${JSON.stringify(params.analysis)}${whereCode(params)}, top=${params.top})`,
+  }),
+  defineAction({
+    type: 'analysis.export',
+    title: 'Export an analysis result',
+    summary: 'Write an analysis\'s whole result table as a CSV file, as its expanded view\'s CSV button does: differential expression every gene with scanpy\'s columns (scores, logfoldchanges, pvals, pvals_adj, pct_nz_group, pct_nz_reference, auroc, means, cells); marker genes the shown markers of each group, or with all every gene of every group; the dot plot one row per group and gene; gene signature every cell\'s score per set and page (per set and group with a Group by field); composition the results per cell type with a test, else the counts; correlation each page\'s statistics. Refused, saying why, when there is no result or it is out of date (run it again first).',
+    group: 'Exports',
+    params: {
+      type: 'object', additionalProperties: false, required: ['analysis'],
+      properties: {
+        analysis: RUNNABLE_ANALYSIS,
+        in: WHERE,
+        all: { type: 'boolean', default: false, description: 'Marker genes only: every gene of every group (the All genes CSV) instead of the shown markers.' },
+      },
+    },
+    reads: [],
+    effect: 'outside',
+    confirm: 'writes-file',
+    acts: { one: 'file written', other: 'files written' },
+    result: {
+      type: 'object', additionalProperties: false, required: ['analysis', 'file', 'bytes'],
+      properties: {
+        analysis: { type: 'string', description: 'The analysis exported.' },
+        file: { type: 'string', description: 'The file written.' },
+        bytes: { type: 'integer', minimum: 0 },
+      },
+    },
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Exported the ${titleOf(params.analysis).toLowerCase()} result${params.all === true ? ' (every gene)' : ''}${where(params, quote)} as CSV`,
+    code: params => `export_analysis(${JSON.stringify(params.analysis)}${whereCode(params)}${params.all === true ? ', all=True' : ''})`,
   }),
   ...ANALYSIS_MODES.filter(mode => mode.options !== null).flatMap(perAnalysisActions),
 ]);

@@ -215,7 +215,7 @@ test('a file on seven addresses (six connections each) is measured at its round 
   // A public S3 object: its own host and six mirrors, HTTP/1.1, 235 ms.
   // Requests dispatched at the streams (100) wait in the browser for one of
   // the 42 connections; measured from dispatch, they looked like 0.6-1.3 s
-  // round trips and a multiplexing host (Genes read for at 100 % priced ~10x).
+  // round trips and a multiplexing host (Genes read for at 100% priced ~10x).
   let now = 0;
   const meter = new LinkMeter({ ...REMOTE_POLICY, concurrency: 6 * 7 }, { clock: () => now });
   const slots = new Array(42).fill(0);

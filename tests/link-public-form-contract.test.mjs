@@ -159,7 +159,7 @@ test('every provider whose values can carry a key resolves to a read target and 
   const s3 = registry.resolve('s3://bucket/a.h5ad?X-Amz-Signature=SECRET');
   assert.equal(s3.locator, 'https://bucket.s3.amazonaws.com/a.h5ad?X-Amz-Signature=SECRET');
   assert.equal(s3.publicLocator, 'https://bucket.s3.amazonaws.com/a.h5ad');
-  // Unrecognised text is shown without whatever looks like a credential.
+  // Unrecognized text is shown without whatever looks like a credential.
   assert.equal(registry.publicFormOf('ftp://bucket/a.h5ad?X-Amz-Signature=SECRET'), 'ftp://bucket/a.h5ad');
   assert.throws(() => registry.resolve('ftp://bucket/a.h5ad?X-Amz-Signature=SECRET'), error => {
     assertNoSecret(error.message, 'refusal message');

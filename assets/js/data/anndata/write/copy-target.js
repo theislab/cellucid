@@ -19,7 +19,7 @@
  */
 
 import { isArrayNode, isGroup } from '../../../formats/store.js';
-import { attributeValue, encodingType } from '../elements.js';
+import { attributeValue, encodingType, valueKind } from '../elements.js';
 import { currentLayoutView, isOlderAnnDataLayout } from '../older-layouts.js';
 import { frameRows } from '../views/modalities.js';
 import { readPriorityLayout } from '../priority-layout.js';
@@ -77,9 +77,22 @@ async function readColumn(node, order, label, readOptions) {
 }
 
 /**
+ * A column's colors as Scanpy keeps them, `uns['<column>_colors']`, when
+ * they are its form (one-dimensional text); null for none, or for another
+ * form (which a copy does not carry: `app/history/exports/anndata-copy.js`).
+ */
+async function readTextColors(unsNode, name, readOptions) {
+  const node = isGroup(unsNode) && unsNode.has(`${name}_colors`) ? unsNode.get(`${name}_colors`) : null;
+  if (!isArrayNode(node) || node.shape?.length !== 1 || valueKind(node) !== 'string') return null;
+  return Array.from(await node.read(undefined, readOptions), String);
+}
+
+/**
  * The obs columns of the store at `source` (a MuData's global obs: the
  * columns placed from its modalities, `<modality>:<key>`, apart), the
- * values of the columns `names` lists that it has, and its `uns['cellucid']`.
+ * values of the columns `names` lists that it has, its root `uns` keys, the
+ * colors of the columns `colors` lists (`uns['<column>_colors']` as text, or
+ * null), and its `uns['cellucid']`.
  *
  * Also the columns of the var frame a copy's var changes go to (`varModality`'s
  * in a MuData, as `copy.js` `CopyChanges` names it; the root's otherwise).
@@ -87,11 +100,11 @@ async function readColumn(node, order, label, readOptions) {
  * @param {Object} source - The store root as stored (`AnnDataReader.storedRoot`)
  * @param {string[]} names - The obs columns whose values the plan reads
  * @param {{signal?: AbortSignal|null, activity?: Object|null}} [readOptions]
- * @param {{varModality?: string|null}} [options]
+ * @param {{varModality?: string|null, colors?: string[]}} [options]
  * @returns {Promise<{nObs: number, obsColumns: string[], modalityColumns: string[], varColumns: string[],
- *   columns: Record<string, Object>, cellucid: Object|null}>}
+ *   columns: Record<string, Object>, unsKeys: string[], colors: Record<string, string[]|null>, cellucid: Object|null}>}
  */
-export async function readCopyTarget(source, names, readOptions = {}, { varModality = null } = {}) {
+export async function readCopyTarget(source, names, readOptions = {}, { varModality = null, colors: colorsOf = [] } = {}) {
   if (!isGroup(source)) throw new TypeError('A copy is planned against a store root group.');
   const root = isOlderAnnDataLayout(source) ? await currentLayoutView(source, readOptions) : source;
   await root.load(undefined, readOptions);
@@ -123,5 +136,11 @@ export async function readCopyTarget(source, names, readOptions = {}, { varModal
   const varFrame = modality === null ? root.get('var') : root.get(`mod/${modality}/var`);
   const varOrder = isGroup(varFrame) ? attributeValue(varFrame, 'column-order') : null;
   const varColumns = Array.isArray(varOrder) ? varOrder.map(String) : [];
-  return { nObs, obsColumns, modalityColumns: stored.filter(placed), varColumns, columns, cellucid };
+  const unsKeys = isGroup(unsNode) ? unsNode.keys().map(String) : [];
+  const colors = {};
+  for (const name of new Set(colorsOf)) {
+    throwIfAborted(readOptions.signal ?? null);
+    colors[name] = await readTextColors(unsNode, name, readOptions);
+  }
+  return { nObs, obsColumns, modalityColumns: stored.filter(placed), varColumns, columns, unsKeys, colors, cellucid };
 }

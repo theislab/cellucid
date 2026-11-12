@@ -6,7 +6,7 @@
  * A data mapping (`data/data-mapping.js`) enables any number of embeddings
  * (representations) of any mix of dimensions, names each dimension's default,
  * binds vector fields to embeddings and, for an AnnData source, names the
- * neighbour graph, gene names, expression matrix and latent space. This
+ * neighbor graph, gene names, expression matrix and latent space. This
  * manager owns, per dataset:
  * - the current mapping and where it came from (`origin`: the default rule,
  *   the best guess, a session or the user);
@@ -22,7 +22,7 @@
  *
  * A mapping is applied as one transaction: every layout a view must move to
  * is loaded and checked first, and so is every other changed group
- * (neighbour graph, gene names, expression matrix, latent space, vector
+ * (neighbor graph, gene names, expression matrix, latent space, vector
  * bindings; see `mapping-groups.js`). Then the enabled set and defaults are
  * published, every view whose representation is disabled -- or that follows
  * a default that changed -- moves, and the other groups are published; any
@@ -56,11 +56,13 @@ import {
   obsmWidth,
   resolveCandidateRef,
 } from '../../../data/data-mapping-candidates.js';
-import { layoutEmbeddingRef } from '../../../data/dataset-mapping.js';
+import { describeEmbeddingRef, layoutEmbeddingRef } from '../../../data/dataset-mapping.js';
 import { representationName } from '../../../data/representation-names.js';
 import { cellsSteady, trackCellWork } from '../../../data/open-cells-work.js';
 import { sameJson } from '../../utils/same-json.js';
-import { cancelled, isCancellation } from '../../../utils/abort.js';
+import { awaitWithSignal, cancelled, isCancellation, throwIfAborted } from '../../../utils/abort.js';
+import { RAW_VALUES } from '../../../data/expression-transform.js';
+import { NO_DATASET_OPEN } from '../../ui/no-dataset.js';
 
 /** Where the current mapping came from. */
 export const MAPPING_ORIGINS = Object.freeze(['default', 'best_guess', 'session', 'user', 'notebook']);
@@ -130,6 +132,12 @@ export class DataStateMappingMethods {
     // Each publication is another dataset (or none): a change asked of the
     // one before never lands on it (`applyDataMapping`).
     this._mappingPublication = (this._mappingPublication ?? 0) + 1;
+    // A dataset opens with its values as stored (its gene loader is the
+    // matrix's own, `setVarFieldLoader`); one read again with other cells
+    // gets its transform back with every other domain (`session/view-carry.js`).
+    this._expressionTransform = RAW_VALUES;
+    // Its matrices' cells' totals are its own (`expression-values.js`).
+    this.resetCellTotals();
     if (mapping === null) {
       this.dataMapping = null;
       this._mappingCandidates = null;
@@ -252,6 +260,19 @@ export class DataStateMappingMethods {
   }
 
   /**
+   * The short name of one representation, unique among the open dataset's
+   * `obsm` arrays (`representationName`): what every menu, the Data mapping
+   * checklist, the agents' reads and a figure's title call it.
+   *
+   * @param {{label: string, layoutKey: string, provenance: Object|null, width?: number}} layout
+   * @returns {string}
+   */
+  representationNameOf(layout) {
+    const arrays = this.getMappingCandidates()?.obsm?.map(entry => ({ key: entry.key, width: obsmWidth(entry) })) ?? [];
+    return representationName(layout, { arrays });
+  }
+
+  /**
    * The AnnData candidate catalog of the loaded dataset, or null when none
    * is loaded.
    *
@@ -347,7 +368,7 @@ export class DataStateMappingMethods {
         return {
           layoutKey,
           dimension: layout.dimension,
-          name: representationName(layout),
+          name: this.representationNameOf(layout),
           label: layout.label,
           ref: mapped ? layoutEmbeddingRef(dimensionManager, layoutKey) : null,
           isDefault: dimensionManager.getDefaultLayout(layout.dimension) === layoutKey,
@@ -407,7 +428,7 @@ export class DataStateMappingMethods {
       return enabledRefs.map(ref => {
         const layout = dimensionManager.getLayout(dimensionManager.resolveRepresentation(ref));
         return choice(ref, {
-          name: representationName(layout),
+          name: this.representationNameOf(layout),
           dimension: layout.dimension,
           width: null,
           usable: true,
@@ -423,7 +444,7 @@ export class DataStateMappingMethods {
       const width = item.usable ? obsmWidth(item) : null;
       if (!item.usable) {
         choices.push(choice({ key: item.key, columns: null }, {
-          name: representationName({ layoutKey: item.key, label: item.key, provenance: null }),
+          name: this.representationNameOf({ layoutKey: item.key, label: item.key, provenance: null }),
           dimension: null,
           width: null,
           usable: false,
@@ -437,7 +458,7 @@ export class DataStateMappingMethods {
         : [{ key: item.key, columns: Array.from({ length: width > 3 ? 2 : width }, (_, index) => index) }];
       for (const ref of shown) {
         (width > 3 ? wideChoices : choices).push(choice(ref, {
-          name: representationName({
+          name: this.representationNameOf({
             layoutKey: item.key,
             label: item.key,
             provenance: { key: item.key, columns: ref.columns },
@@ -477,7 +498,7 @@ export class DataStateMappingMethods {
     const layout = dimensionManager.getLayout(layoutKey);
     return {
       dimension: layout.dimension,
-      name: representationName(layout),
+      name: this.representationNameOf(layout),
       label: layout.label,
       layoutKey,
       isDefault: dimensionManager.getDefaultLayout(layout.dimension) === layoutKey,
@@ -491,11 +512,12 @@ export class DataStateMappingMethods {
    *
    * @param {string} viewId
    * @param {{key: string, columns: number[]}} ref
+   * @param {{signal?: AbortSignal|null}} [how] - What stops the change (`setViewRepresentation`)
    * @returns {Promise<string>} The layout key now shown.
    */
-  async setViewEmbeddingRef(viewId, ref) {
+  async setViewEmbeddingRef(viewId, ref, { signal = null } = {}) {
     try {
-      return await this.setViewEmbedding(viewId, ref);
+      return await this.setViewEmbedding(viewId, ref, { signal });
     } catch (error) {
       if (isMappingLoadError(error)) this._unusableEmbeddings.set(error.key, error.reason);
       throw error;
@@ -542,13 +564,14 @@ export class DataStateMappingMethods {
    */
   describeDataMappingRefusal(next) {
     const current = this.dataMapping;
-    if (current === null) return 'No dataset is loaded.';
+    if (current === null) return NO_DATASET_OPEN;
     const groupRefusal = this.describeMappingGroupRefusal(current, next);
     if (groupRefusal !== null) return groupRefusal;
     for (const ref of next.embeddings.enabled) {
       if (refsInclude(current.embeddings.enabled, ref)) continue;
       const refusal = this.describeEmbeddingRefusal(ref);
-      if (refusal !== null) return `${ref.key} is enabled, but ${refusal}.`;
+      // One sentence, as a group's: the clause says what of it this dataset lacks.
+      if (refusal !== null) return `This mapping enables ${describeEmbeddingRef(ref)}, which ${refusal}.`;
     }
     for (const slot of DIMENSION_SLOTS) {
       const ref = next.embeddings.defaults[slot];
@@ -633,11 +656,22 @@ export class DataStateMappingMethods {
    * progressive opening's step), on the cells open then, and holds the next
    * one until it ends.
    *
+   * Normalized expression values of a matrix whose cells' totals are not
+   * kept read them while staging, asked for as heavy work by `heavy` (the
+   * action's `ctx.heavy`; a person acting saw the price on the panel).
+   * `expression`: the Expression values the new matrix is shown in, asked
+   * with it (a restore's, put back with the mapping), else the ones asked
+   * now: a matrix is summed only for the values it ends up shown in.
+   *
    * @param {Object} next - A DataMapping of the loaded dataset's kind.
-   * @param {{origin: 'session'|'user'|'notebook'}} options
+   * @param {{origin: 'session'|'user'|'notebook', heavy?: ((estimate: Object) => Promise<void>)|null,
+   *   expression?: import('../../../data/expression-transform.js').ExpressionTransform,
+   *   signal?: AbortSignal|null}} options - `signal`: the action's or the history move's
+   *   Stop (F147): every wait and read ends with it, nothing is published once it
+   *   aborts, and a commit under way is rolled back
    * @returns {Promise<boolean>} Whether anything changed.
    */
-  async applyDataMapping(next, { origin }) {
+  async applyDataMapping(next, { origin, heavy = null, expression = undefined, signal = null }) {
     requireOrigin(origin);
     const canonical = validateDataMapping(next, { label: 'Requested data mapping' });
     // The dataset it was asked of: one published meanwhile supersedes it.
@@ -648,9 +682,9 @@ export class DataStateMappingMethods {
     // The gene list shown is installed first (`var-axis.js`): a change
     // replaces, and rolls back to, an installed list. A gene list that could
     // not be read can still be replaced by another one.
-    await this.whenGenesListed().catch(error => {
+    await awaitWithSignal(this.whenGenesListed().catch(error => {
       if (error !== this.getGeneListFailure()) throw error;
-    });
+    }), signal);
     requirePublished();
     const refusal = this.describeDataMappingRefusal(canonical);
     if (refusal !== null) throw new RangeError(refusal);
@@ -662,13 +696,14 @@ export class DataStateMappingMethods {
     // and the next one waits for it to end.
     for (;;) {
       while (this._mappingChangeLock) {
-        await this._mappingChangeLock;
+        await awaitWithSignal(this._mappingChangeLock, signal);
       }
       const steady = cellsSteady();
       if (steady === null) break;
-      await steady;
+      await awaitWithSignal(steady, signal);
     }
     requirePublished();
+    throwIfAborted(signal);
     // From here no change of the open cells commits until this one ends:
     // the generation names the dataset and the cells it reads.
     const generation = this.getDatasetGeneration();
@@ -679,7 +714,7 @@ export class DataStateMappingMethods {
     this._mappingChangeLock = new Promise(resolve => {
       unlock = resolve;
     });
-    return trackCellWork(this._applyLockedDataMapping(canonical, origin, requireCurrent, unlock));
+    return trackCellWork(this._applyLockedDataMapping(canonical, origin, requireCurrent, unlock, { heavy, expression, signal }));
   }
 
   /**
@@ -687,7 +722,12 @@ export class DataStateMappingMethods {
    * when they end).
    * @private
    */
-  async _applyLockedDataMapping(canonical, origin, requireCurrent, unlock) {
+  async _applyLockedDataMapping(canonical, origin, requireCurrent, unlock, { heavy, expression, signal = null }) {
+    // Stopped: nothing more is read or published (a commit under way is rolled back below).
+    const requireLive = () => {
+      requireCurrent();
+      throwIfAborted(signal);
+    };
     const releases = [];
     try {
       const dimensionManager = this.dimensionManager;
@@ -709,7 +749,7 @@ export class DataStateMappingMethods {
       for (const layoutKey of new Set(moves.map(move => move.to))) {
         releases.push(dimensionManager.pinLayout(layoutKey));
         try {
-          await dimensionManager.getPositions(layoutKey);
+          await awaitWithSignal(dimensionManager.getPositions(layoutKey), signal);
         } catch (error) {
           requireCurrent();
           if (isMappingLoadError(error)) {
@@ -722,7 +762,8 @@ export class DataStateMappingMethods {
 
       // Stage every other changed group (mapping-groups.js): their data is
       // loaded and checked before anything is published.
-      const groups = await this._stageMappingGroups(current, canonical, { requireCurrent });
+      const groups = await this._stageMappingGroups(current, canonical, { requireCurrent: requireLive, heavy, expression, signal });
+      throwIfAborted(signal);
       if (!embeddingsChanged && !groups.changed) return false;
 
       // Commit: publish the representations, then move the views, then the
@@ -736,11 +777,14 @@ export class DataStateMappingMethods {
           const followed = this.viewFollowsDefault(move.viewId);
           await this.setViewRepresentation(move.viewId, move.to, {
             followsDefault: move.followsDefault,
+            signal,
           });
           moved.push({ ...move, followed });
-          requireCurrent();
+          requireLive();
         }
         await groups.commit();
+        // Stopped as the last group committed: put back like any failure.
+        throwIfAborted(signal);
       } catch (error) {
         requireCurrent();
         const restoreErrors = await groups.rollback();

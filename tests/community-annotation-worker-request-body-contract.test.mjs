@@ -21,7 +21,7 @@ const MUTATION_PATH =
 const OPERATION_ID =
   '018f5e3a-7b9c-4d2e-8f10-123456789abc';
 const CALLER_ABORT_DOCUMENT = Object.freeze({
-  error: 'Worker request was cancelled',
+  error: 'Worker request was canceled',
 });
 const OVERSIZED_BODY_DOCUMENT = Object.freeze({
   error:

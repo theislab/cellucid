@@ -48,7 +48,7 @@
 
 import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy, hostFaultFailure } from '../../data-source.js';
 import { describeRemoteFile, headBytesFor } from '../remote-file.js';
-import { fileFormatOfName, folderFormatOfName, readsFromHead, titleOfName } from '../../input-formats.js';
+import { fileFormatOfName, folderFormatOfName, readsFromHead, storeFolderOfPath, titleOfName } from '../../input-formats.js';
 import { HEAD_BYTES, fetchOnce, headOfFile, hostFaultOfStatus, readFileHead } from '../../../formats/io/byte-source.js';
 import { isCancellation } from '../../../utils/abort.js';
 
@@ -58,6 +58,24 @@ import { isCancellation } from '../../../utils/abort.js';
  * `HEAD`. No branch can be named `HEAD`, so it never shadows one.
  */
 const DEFAULT_GITHUB_REF = 'HEAD';
+
+/**
+ * GitHub's own rules for the names in a repository's address: an account
+ * is letters, digits and single hyphens (at most 39, never starting with a
+ * hyphen: never a dot, so `example.org/atlas.h5ad` is no repository); a
+ * repository letters, digits, `.`, `_` and `-`.
+ */
+const GITHUB_OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+const GITHUB_REPO = /^[A-Za-z0-9._-]{1,100}$/;
+
+/** A clone address's repository (`git@github.com:owner/repo.git`). */
+const GITHUB_SSH = /^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?\/?$/i;
+
+/**
+ * Query keys a github.com file page takes that change nothing of what it
+ * names (`?raw=true`, `?plain=1`): the file.
+ */
+const GITHUB_PAGE_QUERY = new Set(['raw', 'plain']);
 
 function isSafeGitHubSegment(value) {
   return !(
@@ -120,17 +138,24 @@ export const INVALID_GITHUB_PATH_MESSAGE =
 export function parseGitHubPath(input) {
   const parsed = parseGitHubLocation(input);
   if (parsed === null) return null;
-  // A link to a catalog's datasets.json names its folder.
+  // A clone address's `.git` is not part of the repository's name.
+  const repo = parsed.repo.replace(/\.git$/i, '');
+  if (!GITHUB_OWNER.test(parsed.owner) || !GITHUB_REPO.test(repo) || repo === '.' || repo === '..') return null;
+  // A link to a catalog's datasets.json names its folder; a link to what is
+  // inside a store folder (its `.zmetadata`, a group) names the store.
   const segments = parsed.path.split('/');
-  return segments.at(-1) === 'datasets.json'
-    ? { ...parsed, path: segments.slice(0, -1).join('/') }
-    : parsed;
+  const path = segments.at(-1) === 'datasets.json'
+    ? segments.slice(0, -1).join('/')
+    : storeFolderOfPath(parsed.path) ?? parsed.path;
+  return { ...parsed, repo, path };
 }
 
 function parseGitHubLocation(input) {
   if (typeof input !== 'string') return null;
   const cleaned = input.trim();
   if (cleaned.length === 0) return null;
+  const ssh = GITHUB_SSH.exec(cleaned);
+  if (ssh !== null) return { owner: ssh[1], repo: ssh[2], branch: DEFAULT_GITHUB_REF, path: '' };
 
   let url = null;
   try {
@@ -140,13 +165,13 @@ function parseGitHubLocation(input) {
   }
 
   if (url !== null) {
+    const onGitHub = url.hostname.toLowerCase() === 'github.com' || url.hostname.toLowerCase() === 'www.github.com';
     if (
       url.protocol !== 'https:' ||
       url.username !== '' ||
       url.password !== '' ||
       url.port !== '' ||
-      url.search !== '' ||
-      url.hash !== ''
+      (url.search !== '' && !(onGitHub && [...url.searchParams.keys()].every(key => GITHUB_PAGE_QUERY.has(key))))
     ) {
       return null;
     }
@@ -156,7 +181,12 @@ function parseGitHubLocation(input) {
     );
     if (segments === null) return null;
 
-    if (url.hostname.toLowerCase() === 'github.com') {
+    if (onGitHub) {
+      // The repository's own page (or its clone address): its default
+      // branch's top folder, as the shorthand `owner/repo` is.
+      if (segments.length === 2) {
+        return { owner: segments[0], repo: segments[1], branch: DEFAULT_GITHUB_REF, path: '' };
+      }
       // A folder (`tree`), a file page (`blob`) or its Raw button (`raw`,
       // which redirects to raw.githubusercontent.com without CORS: the file
       // is read from there directly).
@@ -200,7 +230,7 @@ function parseGitHubLocation(input) {
     cleaned.includes('://') ||
     cleaned.includes('?') ||
     cleaned.includes('#') ||
-    /^github\.com\//i.test(cleaned) ||
+    /^(?:www\.)?github\.com\//i.test(cleaned) ||
     /^raw\.githubusercontent\.com\//i.test(cleaned)
   ) {
     return null;

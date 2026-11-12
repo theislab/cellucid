@@ -159,19 +159,13 @@ test('a throwing callback does not keep the others from running', () => {
     throw new Error('one listener fails');
   });
   onAbort(controller.signal, () => calls.push('next'));
-  // Reported as an event listener's error is (thrown in a microtask).
-  const queue = globalThis.queueMicrotask;
-  globalThis.queueMicrotask = task => {
-    try {
-      task();
-    } catch (error) {
-      reported.push(error.message);
-    }
-  };
+  // Reported as every listener's failure is (`utils/listener-set.js`).
+  const consoleError = console.error;
+  console.error = (message, error) => reported.push(error.message);
   try {
     controller.abort();
   } finally {
-    globalThis.queueMicrotask = queue;
+    console.error = consoleError;
   }
   assert.deepEqual(calls, ['next']);
   assert.deepEqual(reported, ['one listener fails']);

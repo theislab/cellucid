@@ -292,21 +292,40 @@ test('the model\'s rules are the writer\'s and the reader\'s: a broken tree is r
   }
 });
 
-test('a file of a newer Cellucid names the part of the state this version lacks and the version that wrote it', async () => {
+test('a file of another Cellucid is read part by part: a state part or a tracker this version lacks is left for the history to leave out (F164)', async () => {
   const session = await golden();
   const { manifest, chunks } = await chunksOf(await session.write());
-  const id = manifest.trackers[1].steps[0];
-  const index = manifest.chunks.findIndex(chunk => chunk.id === id);
   const { gzipDecompress } = await import('../assets/js/app/session/codecs/gzip.js');
-  const meta = manifest.chunks[index];
-  const steps = JSON.parse(new TextDecoder().decode(meta.codec === 'gzip' ? await gzipDecompress(chunks[index].bytes, { maxOutputBytes: meta.uncompressedBytes, signal: null }) : chunks[index].bytes));
-  steps[1].touches = [...steps[1].touches, 'holograms'];
-  steps[1].before.holograms = 'a'.repeat(64);
-  steps[1].after.holograms = 'b'.repeat(64);
+  const stepsOf = async index => {
+    const meta = manifest.chunks[index];
+    return JSON.parse(new TextDecoder().decode(meta.codec === 'gzip' ? await gzipDecompress(chunks[index].bytes, { maxOutputBytes: meta.uncompressedBytes, signal: null }) : chunks[index].bytes));
+  };
   const newer = structuredClone(manifest);
   newer.app.version = '0.9.9';
-  const blob = await replaceChunk(newer, chunks, id, new TextEncoder().encode(JSON.stringify(steps)));
-  assert.match((await refusal(blob)).message, /written by Cellucid 0\.9\.9 .* \("holograms"\)\. Open it with that version or a newer one/);
+  // A state domain this version does not have, holding values the file holds: read, kept on the step as written.
+  const id = manifest.trackers[1].steps[0];
+  const index = manifest.chunks.findIndex(chunk => chunk.id === id);
+  const steps = await stepsOf(index);
+  const held = steps[1].after[steps[1].touches[0]];
+  steps[1].touches = [...steps[1].touches, 'holograms'];
+  steps[1].before.holograms = held;
+  steps[1].after.holograms = held;
+  const read = await readHistoryFile(await replaceChunk(newer, chunks, id, new TextEncoder().encode(JSON.stringify(steps))));
+  const step = read.history.trackers[1].steps[1];
+  assert.equal(step.after.holograms, held, 'the history leaves the part out, naming it (history.js readSaved)');
+  // A tracker whose records this version refuses (a field it does not know): the others are read, it is kept for the history to name.
+  const other = manifest.trackers.find(tracker => tracker.id !== manifest.activeTracker);
+  const otherId = other.steps[0];
+  const otherIndex = manifest.chunks.findIndex(chunk => chunk.id === otherId);
+  const otherSteps = await stepsOf(otherIndex);
+  otherSteps[1].sparkle = true;
+  const partly = await readHistoryFile(await replaceChunk(newer, chunks, otherId, new TextEncoder().encode(JSON.stringify(otherSteps))));
+  assert.equal(partly.history.trackers.length, manifest.trackers.length);
+  assert.equal(partly.history.trackers.find(tracker => tracker.id === other.id).steps[1].sparkle, true);
+  // The header and how the trackers agree are checked whole: the scope naming a tracker the file lacks refuses it.
+  const scoped = structuredClone(newer);
+  scoped.scope.trackers = [...scoped.scope.trackers, 't-00000000-0000-4000-8000-0000000000aa'];
+  assert.match((await refusal(await replaceChunk(scoped, chunks, otherId, new TextEncoder().encode(JSON.stringify(otherSteps))))).message, /scope must name exactly the trackers it holds/);
 });
 
 test('steps of an action this catalogue lacks, or of parameters it cannot upgrade, are shown and not replayable', async () => {

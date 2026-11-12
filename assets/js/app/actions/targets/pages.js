@@ -26,7 +26,7 @@ export function resolvePage(state, name) {
 }
 
 /**
- * The highlight group labelled `label` on `page`.
+ * The highlight group labeled `label` on `page`.
  * @param {object} page
  * @param {string} label
  */

@@ -9,7 +9,9 @@
  *   `tests/fixtures/history-golden.expected.json` (this repository);
  * - `tests/fixtures/history_golden/history_golden.cellucid-session` and
  *   `history_golden.expected.json` in cellucid-python;
- * - `tests/testthat/fixtures/history_golden/` in cellucid-r (same names);
+ * - `tests/testthat/fixtures/history_golden/` in cellucid-r (same names), and
+ *   the session again as `inst/extdata/history_golden.cellucid-session`, the
+ *   example its help pages read (`system.file("extdata", …)`);
  *
  * byte for byte the same, each pinned by SHA-256 in its repository's tests.
  *
@@ -35,7 +37,7 @@
  * The records are made with the model's own constructors and validated whole
  * (`validateSession`); domain values have the shapes the app's owners capture
  * (`app/state/domains/README.md`); labels and pseudocode lines are the
- * catalogue's own (`describe`, `code`). The file is framed, encoded and hashed
+ * catalog's own (`describe`, `code`). The file is framed, encoded and hashed
  * as `app/session/history-file.js` frames them (`bundle/writer.js`, the
  * cell-set codec, `value-parts.js`, `value-pool.js`).
  *
@@ -98,10 +100,13 @@ export const HISTORY_GOLDEN_EXPECTED_PATH = path.join(ROOT, 'tests', 'fixtures',
 /** The golden's current state only (Share › Current state only), as the web app writes it. */
 export const HISTORY_GOLDEN_STATE_PATH = path.join(ROOT, 'tests', 'fixtures', 'history-golden-state.cellucid-session');
 
-/** Where each package keeps its copies, relative to its repository. */
+/**
+ * Where each package keeps its copies, relative to its repository; `example`:
+ * a folder that ships the session with the package (its help pages' example).
+ */
 export const HISTORY_GOLDEN_MIRRORS = Object.freeze([
-  Object.freeze({ repository: 'cellucid-python', env: 'CELLUCID_PYTHON_ROOT', dir: 'tests/fixtures/history_golden' }),
-  Object.freeze({ repository: 'cellucid-r', env: 'CELLUCID_R_ROOT', dir: 'tests/testthat/fixtures/history_golden' }),
+  Object.freeze({ repository: 'cellucid-python', env: 'CELLUCID_PYTHON_ROOT', dir: 'tests/fixtures/history_golden', example: null }),
+  Object.freeze({ repository: 'cellucid-r', env: 'CELLUCID_R_ROOT', dir: 'tests/testthat/fixtures/history_golden', example: 'inst/extdata' }),
 ]);
 export const PACKAGE_SESSION_NAME = 'history_golden.cellucid-session';
 export const PACKAGE_EXPECTED_NAME = 'history_golden.expected.json';
@@ -153,9 +158,12 @@ const emptyOverlays = { renamedFields: [], renamedCategories: [], deletedFields:
 const ROOT_VALUES = {
   cells: { open: null, genes: null },
   mapping,
+  // The values as stored, the default (`app/state/domains/expression.js`).
+  expression: { normalize: false, log1p: false },
   'field-overlays': emptyOverlays,
   'gene-sets': { sets: [] },
-  views: { layout: 'single', focus: 0, liveHidden: false, camerasLinked: false, views: [{ embedding: { key: 'X_umap', columns: [0, 1] }, followsDefault: true, centroids: false }] },
+  // The live view is named (`view.rename`): a named view's entry carries `name`, an unnamed one's has no key.
+  views: { layout: 'single', focus: 0, liveHidden: false, camerasLinked: false, views: [{ embedding: { key: 'X_umap', columns: [0, 1] }, followsDefault: true, centroids: { points: false, labels: false }, name: 'Early' }] },
   'active-field': { views: [{ source: 'obs', key: 'cell_type' }] },
   filters: { views: [[]] },
   colors: { views: [[]] },
@@ -196,7 +204,7 @@ const mergedField = {
   },
   categories: mergedCategories,
   codes: { cells: null, values: Uint8Array.from(range(0, N), i => (cellTypeOf(i) === 2 ? 1 : 0)) },
-  sourcePages: [], overlapStrategy: 'first', overlapLabel: null, intersectionLabels: null, uncoveredLabel: null,
+  sourcePages: [], overlapStrategy: 'first', overlapLabel: null, intersectionLabels: null, uncoveredLabel: null, palette: null,
 };
 const nkRename = { source: 'obs', field: 'cell_type', category: 'NK cell', name: 'NK' };
 const markersResult = {
@@ -226,7 +234,7 @@ async function rootHashes() {
 
 /**
  * Record one step of a tracker: its action (labels and code from the
- * catalogue), the domains it changes (`changes`: domain → value; only those
+ * catalog), the domains it changes (`changes`: domain → value; only those
  * that differ are its touches), who took it and when.
  */
 async function recordStep(tracker, { id, parent, branch, type, params, by, changes, outcome = null, at = tick(), until = at, merged = 1, ms = 12.5, reads = {}, replayOf = null, coalesceKey = null }) {
@@ -259,7 +267,7 @@ async function recordStep(tracker, { id, parent, branch, type, params, by, chang
 
 /**
  * Record a squashed step (no action of its own): the net change `changes`
- * makes from its parent's state, labelled as the history labels one.
+ * makes from its parent's state, labeled as the history labels one.
  */
 async function recordSquashed(tracker, { id, parent, branch, squashed, changes, at, ms = null, by = user }) {
   const before = statesOf.get(`${tracker.id}/${parent}`);
@@ -357,7 +365,7 @@ async function makeAnnotation() {
   const s4 = await recordStep(tracker, {
     id: 's4', parent: 's3', branch: 'b0', type: 'analysis.run', by: claude('claude-1'), ms: 4200,
     params: { analysis: 'markers' },
-    changes: { analysis: { windows: [], sizes: null, docked: { openMode: 'markers', modes: { markers: { settings: { groupBy: 'cell_type', topN: 5 }, result: markersResult } } } } },
+    changes: { analysis: { windows: [], docked: { openMode: 'markers', modes: { markers: { settings: { groupBy: 'cell_type', topN: 5 }, result: markersResult } } } } },
     reads: await readsAt(tracker, 's3', catalog.get('analysis.run').reads),
     outcome: { analysis: 'markers' },
   });
@@ -381,7 +389,7 @@ async function makeAnnotation() {
   const overlaysS7 = statesOf.get(`${T1}/s7`)['field-overlays'];
   const s8 = await recordStep(tracker, {
     id: 's8', parent: 's7', branch: 'b1', type: 'highlight.category', by: user,
-    params: { field: { source: 'obs', key: 'cell_type' }, category: 'T cell', page: 'Types', color: '#2563eb' },
+    params: { field: { source: 'obs', key: 'cell_type' }, categories: ['T cell'], page: 'Types', color: '#2563eb' },
     changes: {
       highlights: {
         active: 'page_2',
@@ -391,7 +399,7 @@ async function makeAnnotation() {
         }],
       },
     },
-    outcome: { group: 'cell_type: T cell', page: 'Types', cells: tCells.length },
+    outcome: { page: 'Types', groups: ['cell_type: T cell'], categories: ['T cell'], cells: tCells.length, updated: 0 },
   });
   // A nested fork from the rename: a cluster renamed (then locked).
   const s9 = await recordStep(tracker, {
@@ -429,7 +437,7 @@ async function makeAnnotation() {
     changes: { 'field-overlays': { ...overlaysS3, userFields: [scoreField, mergedField] } },
     outcome: { name: 'cell_type (merged)', merged: 'T cell', in_place: false },
   });
-  // Later, recording paused on the scratch branch: the person changed a colour
+  // Later, recording paused on the scratch branch: the person changed a color
   // map and a notebook a point size; resuming kept them as one squashed step.
   const s14 = await recordSquashed(tracker, {
     id: 's14', parent: 's10', branch: 'b3', at: tick(), ms: null,
@@ -515,13 +523,13 @@ async function makeAnnotation() {
     {
       ...createTurn({ id: 'claude-1', by: claude('claude-1'), label: 'Find markers', conversation: 'conv-1', message: 'msg-2', startedAt: s4.at, branch: 'b0' }),
       endedAt: s6.at,
-      notes: [note('Ran markers on cell_type, kept the T cell markers and coloured by CD3E.', claude('claude-1'))],
+      notes: [note('Ran markers on cell_type, kept the T cell markers and colored by CD3E.', claude('claude-1'))],
     },
   ];
   tracker.chats = [['conv-1', {
     messages: [
       { id: 'msg-1', role: 'user', text: 'Find the T cell markers and show the top one.' },
-      { id: 'msg-2', role: 'assistant', text: 'Ran markers on cell_type, kept the T cell markers and coloured by CD3E.', turn: 'claude-1' },
+      { id: 'msg-2', role: 'assistant', text: 'Ran markers on cell_type, kept the T cell markers and colored by CD3E.', turn: 'claude-1' },
     ],
   }]];
 
@@ -884,6 +892,8 @@ function headProvenance(sha, rows) {
     columns: rows.filter(entry => ['user-field', 'highlight'].includes(entry.kind) && ['write', 'replace'].includes(entry.status)).map(entry => entry.name),
     renamed: [{ kind: 'category', column: 'cell_type', from: 'NK cell', to: 'NK' }],
     skipped: rows.filter(entry => entry.status === 'not-applied').map(entry => ({ kind: entry.kind, name: entry.name, note: entry.note })),
+    // The head's expression values (its `expression` value, the opening's).
+    expression: { ...statesOf.get(`${T1}/s13`).expression },
     session: null,
   };
 }
@@ -908,7 +918,7 @@ export async function goldenSession() {
   for (const state of statesOf.values()) for (const value of Object.values(state)) hashOf.set(value, await hashValue(value));
 
   const app = await appStamp({ catalog, version: '0.9.6' });
-  if (app.catalog !== createHash('sha256').update(renderActionCatalog()).digest('hex')) throw new Error('The app stamp is not the catalogue document\'s digest');
+  if (app.catalog !== createHash('sha256').update(renderActionCatalog()).digest('hex')) throw new Error('The app stamp is not the catalog document\'s digest');
   // One stamp per action and version its steps (journal included) use.
   const actions = await actionStamps(trackers.flatMap(tracker => [
     ...tracker.steps, ...tracker.journal.flatMap(entry => (entry.purged ? [] : [...entry.before.steps, ...entry.after.steps])),
@@ -1049,7 +1059,7 @@ export function historyGoldenExpectedOf(expectedText, session) {
 /** Each place the files go: this repository's, then each package's (null when absent). */
 export function historyGoldenTargets(env = process.env) {
   return [
-    { repository: 'cellucid', session: HISTORY_GOLDEN_SESSION_PATH, expected: HISTORY_GOLDEN_EXPECTED_PATH, state: HISTORY_GOLDEN_STATE_PATH },
+    { repository: 'cellucid', session: HISTORY_GOLDEN_SESSION_PATH, expected: HISTORY_GOLDEN_EXPECTED_PATH, state: HISTORY_GOLDEN_STATE_PATH, example: null },
     ...HISTORY_GOLDEN_MIRRORS.map(mirror => {
       const root = env[mirror.env] ?? path.join(ROOT, '..', mirror.repository);
       const present = existsSync(root);
@@ -1058,6 +1068,7 @@ export function historyGoldenTargets(env = process.env) {
         session: present ? path.join(root, mirror.dir, PACKAGE_SESSION_NAME) : null,
         expected: present ? path.join(root, mirror.dir, PACKAGE_EXPECTED_NAME) : null,
         state: present ? path.join(root, mirror.dir, PACKAGE_STATE_NAME) : null,
+        example: present && mirror.example !== null ? path.join(root, mirror.example, PACKAGE_SESSION_NAME) : null,
       };
     }),
   ];
@@ -1088,8 +1099,10 @@ async function main() {
     const session = await readOrNull(target.session);
     const expected = await readOrNull(target.expected);
     const stateNow = await readOrNull(target.state);
+    const example = target.example === null ? null : await readOrNull(target.example);
     if (check) {
-      const same = stateNow !== null && historyGoldenContent(new Uint8Array(stateNow)) === historyGoldenContent(state) && session !== null && historyGoldenContent(new Uint8Array(session)) === historyGoldenContent(file.bytes)
+      const exampleSame = target.example === null || (example !== null && session !== null && example.equals(session));
+      const same = exampleSame && stateNow !== null && historyGoldenContent(new Uint8Array(stateNow)) === historyGoldenContent(state) && session !== null && historyGoldenContent(new Uint8Array(session)) === historyGoldenContent(file.bytes)
         && expected !== null && expected.toString('utf8') === historyGoldenExpectedOf(expectedText, session);
       console.log(`${same ? 'current' : 'stale  '} ${target.repository}`);
       if (!same) stale += 1;
@@ -1099,6 +1112,10 @@ async function main() {
     await writeFile(target.session, written);
     await writeFile(target.expected, expectedText);
     await writeFile(target.state, state);
+    if (target.example !== null) {
+      await mkdir(path.dirname(target.example), { recursive: true });
+      await writeFile(target.example, written);
+    }
     console.log(`wrote   ${target.repository}`);
   }
   if (!check) {

@@ -694,7 +694,7 @@ test('picking in the left cell returns the cell drawn under the pointer', async 
   expect(productErrors).toEqual([]);
 });
 
-async function colourByCellType(page) {
+async function colorByCellType(page) {
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
   // An annotation press reads the pressed pane's field from the state, so
@@ -727,7 +727,7 @@ test('a lasso drawn in the left cell selects exactly the cells drawn inside it',
   const productErrors = observeProductErrors(page);
   await page.setViewportSize({ width: 1440, height: 900 });
   await openGrid(page, 2);
-  await colourByCellType(page);
+  await colorByCellType(page);
   const projected = await projectViewCells(page, 'live');
   const { pane } = projected;
   const rect = {
@@ -768,7 +768,7 @@ test('proximity and KNN drags in the left cell grow from the cell under the poin
   const productErrors = observeProductErrors(page);
   await page.setViewportSize({ width: 1440, height: 900 });
   await openGrid(page, 2);
-  await colourByCellType(page);
+  await colorByCellType(page);
   const projected = await projectViewCells(page, 'live');
   const seed = isolatedCell(projected);
 
@@ -790,7 +790,7 @@ test('proximity and KNN drags in the left cell grow from the cell under the poin
   await page.keyboard.press('Escape');
   await expect(page.locator('#proximity-step-controls')).toHaveCount(0);
 
-  // A chain graph (each cell's neighbours are the previous and next index),
+  // A chain graph (each cell's neighbors are the previous and next index),
   // handed over as the k-NN tool's row source (rows read by cell, as the
   // reader worker reads them from the file).
   await page.evaluate(() => {

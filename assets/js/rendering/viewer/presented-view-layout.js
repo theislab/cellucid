@@ -16,11 +16,17 @@
  */
 
 import { cloneCameraState } from '../camera-state-contract.js';
+import { BASE_FIELD_OF_VIEW, fieldOfViewFor } from './field-of-view.js';
 import {
   assertExactBoolean,
   assertExactFunction,
   assertViewId
 } from './viewer-contracts.js';
+
+/** The field of view of a presented area this wide and tall (CSS px); a degenerate one keeps the base. */
+function paneFieldOfView(width, height) {
+  return width > 0 && height > 0 ? fieldOfViewFor(width / height) : BASE_FIELD_OF_VIEW;
+}
 
 /**
  * Execute one borrowed-data callback inside a strictly synchronous ownership
@@ -107,17 +113,37 @@ function assertPositiveFinite(value, label) {
 }
 
 /**
- * Number of grid columns for one pane count: 1-3 panes sit side by side,
- * more panes fill the smallest square-ish grid.
+ * Number of grid columns for one pane count in a presented area of one
+ * shape: the arrangement whose panes are largest where it counts, their
+ * shorter side (a plot is fitted by it), so three panes stand side by side
+ * on a wide screen and one above the other on a phone held upright, never
+ * three slivers (found 2026-11-11: a 390 px phone laid three panes of about
+ * 120 px in one row). Ties go to the fewest empty cells, then to the wider
+ * arrangement (panes side by side). The one rule of the viewer's grid and of
+ * a figure's (`computeGridDims` in figure export).
  *
  * @param {number} viewCount
+ * @param {number} areaWidth - the presented area's width (any unit, > 0)
+ * @param {number} areaHeight - its height, in the same unit
  * @returns {number}
  */
-export function getPresentedGridColumns(viewCount) {
+export function getPresentedGridColumns(viewCount, areaWidth, areaHeight) {
   if (!Number.isSafeInteger(viewCount) || viewCount <= 0) {
     throw new RangeError('Presented grid view count must be a positive safe integer.');
   }
-  return viewCount <= 3 ? viewCount : Math.ceil(Math.sqrt(viewCount));
+  assertPositiveFinite(areaWidth, 'Presented grid area width');
+  assertPositiveFinite(areaHeight, 'Presented grid area height');
+  let best = null;
+  for (let cols = 1; cols <= viewCount; cols += 1) {
+    const rows = Math.ceil(viewCount / cols);
+    const shorterSide = Math.min(areaWidth / cols, areaHeight / rows);
+    const empty = cols * rows - viewCount;
+    const better = best === null
+      || shorterSide > best.shorterSide * (1 + 1e-9)
+      || (shorterSide >= best.shorterSide * (1 - 1e-9) && empty <= best.empty);
+    if (better) best = { cols, shorterSide, empty };
+  }
+  return best.cols;
 }
 
 /**
@@ -136,7 +162,7 @@ export function getPresentedGridColumns(viewCount) {
  * - A single view keeps rendering the whole canvas (the scene continues
  *   behind the sidebar), but its projection is shifted so the principal
  *   point - the camera target in Orbit/Planar, the look direction in
- *   Free-fly - sits at the centre of the presented area.
+ *   Free-fly - sits at the center of the presented area.
  *
  * Every pane carries two rectangles in canvas-local CSS pixels (top-left
  * origin): `css*`, the rectangle the pane renders into and the one its
@@ -214,7 +240,16 @@ export function resolvePresentedLayout(options) {
   const scaleY = cssHeight / canvasHeight;
   const viewCount = viewIds.length;
   const gridMultiview = mode === 'grid' && viewCount > 1;
-  const cols = gridMultiview ? getPresentedGridColumns(viewCount) : 1;
+  // The arrangement follows the presented area's shape (the part of the
+  // canvas the sidebar leaves); a sidebar over nearly all of it leaves a
+  // sliver, which stacks the panes.
+  const cols = gridMultiview
+    ? getPresentedGridColumns(
+      viewCount,
+      Math.max(cssWidth * (1 - leftOcclusionRatio), Number.MIN_VALUE),
+      cssHeight
+    )
+    : 1;
   const rows = gridMultiview ? Math.ceil(viewCount / cols) : 1;
 
   // The presented area always keeps at least one framebuffer pixel per
@@ -236,8 +271,8 @@ export function resolvePresentedLayout(options) {
         `Focused view "${exactFocusedViewId}" is absent from the presented render inventory.`
       );
     }
-    // NDC x of the presented area's centre inside the full-canvas pane: the
-    // centre of [ratio, 1] in [0, 1] maps to NDC `ratio`.
+    // NDC x of the presented area's center inside the full-canvas pane: the
+    // center of [ratio, 1] in [0, 1] maps to NDC `ratio`.
     const projectionCenterNdcX = Math.min(
       leftOcclusionRatio,
       maximumLeft / canvasWidth
@@ -249,6 +284,8 @@ export function resolvePresentedLayout(options) {
       cssLeft: 0,
       cssTop: 0,
       cssWidth,
+      // Fitted to the part of the canvas the sidebar leaves (`field-of-view.js`).
+      fov: paneFieldOfView(cssWidth - presentedCssLeft, cssHeight),
       projectionCenterNdcX,
       row: 0,
       scissorEnabled: false,
@@ -289,6 +326,10 @@ export function resolvePresentedLayout(options) {
         cssLeft,
         cssTop,
         cssWidth: paneCssWidth,
+        // Each pane's own shape: two views side by side make portrait panes,
+        // which the presented area's (landscape) field of view cut off at
+        // both sides (a kept view cropped Pancreas's 2-D UMAP, 2026-11-11).
+        fov: paneFieldOfView(paneCssWidth, paneCssHeight),
         projectionCenterNdcX: 0,
         row,
         scissorEnabled: true,

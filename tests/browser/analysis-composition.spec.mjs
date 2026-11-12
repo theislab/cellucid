@@ -151,6 +151,13 @@ test('finds its fields, counts without a condition, then tests across samples', 
   await expect(modal.locator('.composition-table tbody tr')).toHaveCount(4);
   await modal.getByLabel('Plot', { exact: true }).selectOption({ label: 'Per sample' });
   await expect(modal.locator('.analysis-modal-plot .js-plotly-plot .boxlayer')).toHaveCount(1);
+  // The analysis's display options stand beside the plot's, through a change of the plot's,
+  // and drive the analysis's own options.
+  const display = modal.locator('.analysis-modal-options .analysis-modal-display');
+  await expect(display.getByLabel('Cell type order', { exact: true })).toBeVisible();
+  await display.getByRole('button', { name: 'Proportions' }).click();
+  await expect.poll(() => page.evaluate(() => window._comparisonModule.getUI('composition')._options.values)).toBe('proportion');
+  await expect(panel.getByRole('button', { name: 'Proportions' })).toHaveAttribute('aria-pressed', 'true');
   const results = page.waitForEvent('download');
   await modal.getByRole('button', { name: /^CSV/ }).click();
   await expectDownloadNamed(await results, 'composition_results.csv');

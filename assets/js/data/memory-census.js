@@ -24,7 +24,7 @@
  */
 
 import { onHeldChange, setOtherInstances } from './memory-budget.js';
-import { createOpaqueId } from '../app/utils/opaque-id.js';
+import { createOpaqueId } from '../utils/opaque-id.js';
 
 const CHANNEL = 'cellucid-memory';
 const LOCK_PREFIX = 'cellucid-memory:';

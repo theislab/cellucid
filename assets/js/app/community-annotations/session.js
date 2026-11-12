@@ -33,7 +33,8 @@ import {
   isReservedAnnotationFieldKey,
   parseExactJson,
 } from './wire-contract.js';
-import { throwIfAborted } from '../../utils/abort.js';
+import { throwIfAborted, requireSignalOrNull } from '../../utils/abort.js';
+import { webStorage } from '../../utils/web-storage.js';
 
 /**
  * The local state format. 2: suggestion ids carry their owner
@@ -69,35 +70,6 @@ function instantOf(value) {
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function reportSessionListenerFailures(errors) {
-  if (!Array.isArray(errors) || errors.length === 0) return;
-  let failure = errors.length === 1
-    ? errors[0]
-    : new AggregateError(
-      errors,
-      'Multiple community annotation session change listeners failed'
-    );
-  if (typeof globalThis.reportError === 'function') {
-    try {
-      globalThis.reportError(failure);
-      return;
-    } catch (reportingFailure) {
-      failure = new AggregateError(
-        [failure, reportingFailure],
-        'Community annotation listener and error reporting both failed'
-      );
-    }
-  }
-  try {
-    globalThis.console?.error?.(
-      '[Cellucid] Community annotation session change listener failed',
-      failure
-    );
-  } catch {
-    // A diagnostic observer cannot rewrite an already committed Pull.
-  }
 }
 
 function normalizeGitHubUserIdOrNull(userId) {
@@ -1561,7 +1533,8 @@ export class CommunityAnnotationSession extends EventEmitter {
   }
 
   clearLocalCache({ keepVotingMode = true } = {}) {
-    if (typeof localStorage === 'undefined') {
+    const kept = webStorage('localStorage');
+    if (kept === null) {
       throw new Error('[CommunityAnnotationSession] localStorage is unavailable');
     }
     const key = toSessionStorageKey({
@@ -1569,7 +1542,7 @@ export class CommunityAnnotationSession extends EventEmitter {
       repoRef: this._repoRef,
       userId: this._cacheUserId,
     });
-    if (key) localStorage.removeItem(key);
+    if (key) kept.removeItem(key);
 
     const next = defaultState();
     if (keepVotingMode) {
@@ -2087,8 +2060,12 @@ export class CommunityAnnotationSession extends EventEmitter {
       return key;
     };
     const netOf = (s) => s.upvotes.length - s.downvotes.length;
+    // The consensus's own rank (`consensusOf`): net votes, then upvotes, so
+    // the first suggestion listed is the one the consensus line names (bug
+    // hunt R9A-2: a leader by upvotes was listed after a tied-net label).
     const memberOrder = (a, b) =>
       (netOf(b) - netOf(a)) ||
+      (b.upvotes.length - a.upvotes.length) ||
       compareCodeUnits(labelOf(a), labelOf(b)) ||
       compareCodeUnits(a.id, b.id);
 
@@ -3331,7 +3308,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     }
 
     this._pullApplicationTransactionActive = false;
-    this._touch({ isolateListenerFailures: true });
+    this._touch();
     return result;
   }
 
@@ -3363,19 +3340,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     remoteFileShas,
     signal = null,
   } = {}) {
-    if (
-      signal !== null &&
-      (
-        typeof signal !== 'object' ||
-        typeof signal.aborted !== 'boolean' ||
-        typeof signal.addEventListener !== 'function' ||
-        typeof signal.removeEventListener !== 'function'
-      )
-    ) {
-      throw new TypeError(
-        '[CommunityAnnotationSession] Pull application signal must be an AbortSignal or null'
-      );
-    }
+    requireSignalOrNull(signal, '[CommunityAnnotationSession] Pull application signal');
     if (!Array.isArray(categoricalFieldKeys)) {
       throw new TypeError(
         '[CommunityAnnotationSession] categorical field keys must be an array'
@@ -3871,7 +3836,8 @@ export class CommunityAnnotationSession extends EventEmitter {
   _ensureLoaded() {
     const key = toSessionStorageKey({ datasetId: this._datasetId, repoRef: this._repoRef, userId: this._cacheUserId });
     if (this._loadedForKey === key) return;
-    if (key && typeof localStorage === 'undefined') {
+    const kept = webStorage('localStorage');
+    if (key && kept === null) {
       const error = new Error(
         'localStorage is required for exact community annotation session persistence'
       );
@@ -3881,7 +3847,7 @@ export class CommunityAnnotationSession extends EventEmitter {
     let raw = null;
     if (key) {
       try {
-        raw = localStorage.getItem(key);
+        raw = kept.getItem(key);
       } catch (cause) {
         this._persistenceOk = false;
         const error = new Error(
@@ -3980,30 +3946,14 @@ export class CommunityAnnotationSession extends EventEmitter {
     this.emit('changed', { reason: 'load' });
   }
 
-  _emitChangedSafely(event) {
-    const listeners = this._listeners.get('changed');
-    if (listeners === undefined) return;
-    const errors = [];
-    for (const callback of [...listeners]) {
-      try {
-        callback(event);
-      } catch (error) {
-        errors.push(error);
-      }
-    }
-    reportSessionListenerFailures(errors);
-  }
-
-  _touch({ isolateListenerFailures = false } = {}) {
+  _touch() {
     this._revision += 1;
     if (this._pullApplicationTransactionActive) {
       return;
     }
     this._state.updatedAt = nowIso();
     if (this._persistenceOk) this._scheduleSave();
-    const event = { reason: 'update' };
-    if (isolateListenerFailures) this._emitChangedSafely(event);
-    else this.emit('changed', event);
+    this.emit('changed', { reason: 'update' });
   }
 
   _scheduleSave() {
@@ -4111,7 +4061,9 @@ export class CommunityAnnotationSession extends EventEmitter {
     }
     const payload = JSON.stringify(persisted);
     try {
-      localStorage.setItem(key, payload);
+      const kept = webStorage('localStorage');
+      if (kept === null) throw new Error('localStorage is unavailable');
+      kept.setItem(key, payload);
       this._persistenceErrorEmittedForKey = null;
     } catch (cause) {
       this._persistenceOk = false;

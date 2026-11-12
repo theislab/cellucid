@@ -34,7 +34,7 @@ const hdf5Fixture = name => new Uint8Array(readFileSync(path.join(here, 'fixture
 const turns = async (n = 5) => { for (let i = 0; i < n; i++) await new Promise(resolve => setImmediate(resolve)); };
 const cancelled = () => new DOMException('cancelled', 'AbortError');
 
-/** A gate every read of the store waits at until `open()`; reads honour their signal. */
+/** A gate every read of the store waits at until `open()`; reads honor their signal. */
 function gate() {
   let opened = false;
   let waiters = [];

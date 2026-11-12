@@ -4,9 +4,12 @@
  * The viewer draws three kinds of thing on top of the point layer:
  *
  * 1. **Data overlays** — connectivity edges and the velocity vector field.
- *    These carry measurements. Figure export cannot draw them, so exporting
- *    while one is on would publish a figure that omits data the user was
- *    looking at. Those are blockers.
+ *    These carry measurements. Figure export cannot draw the edges, so
+ *    exporting while they are on would publish a figure that omits data the
+ *    user was looking at: a blocker. The vector field is drawn as a still
+ *    picture of its flow, arrows on a grid
+ *    (`components/vector-field-figure.js`); only a switch that cannot be read
+ *    blocks.
  * 2. **Interaction chrome** — the orbit compass, lasso and selection
  *    indicators, the projectile sandbox, the multiview title chips. These are
  *    navigation aids, not measurements, and no figure should carry them.
@@ -18,7 +21,6 @@
  * @module ui/modules/figure-export/utils/overlay-fidelity
  */
 
-import { PLACES } from '../../../place-names.js';
 
 /** Element id of the control that owns the velocity overlay. */
 export const VELOCITY_OVERLAY_CONTROL_ID = 'velocity-overlay-enabled';
@@ -52,6 +54,45 @@ export function readVelocityOverlayEnabled(documentRef) {
     return null;
   }
   return control.checked;
+}
+
+/** Element id of the select that names the vector field shown. */
+const VELOCITY_FIELD_CONTROL_ID = 'velocity-field';
+/** Element id of the overlay's color scheme. */
+const VELOCITY_COLORMAP_CONTROL_ID = 'velocity-colormap';
+
+/**
+ * What a figure draws of the vector field: the field the overlay shows and
+ * its color scheme, or null when no field is shown
+ * (`components/vector-field-figure.js` draws it as arrows on a grid).
+ *
+ * @param {{ getElementById: (id: string) => unknown }|null} documentRef
+ * @returns {{fieldId: string, colormapId: string}|null}
+ */
+export function readShownVectorFieldOverlay(documentRef) {
+  const fieldId = readShownVectorFieldId(documentRef);
+  if (fieldId === null) return null;
+  const colormap = documentRef.getElementById(VELOCITY_COLORMAP_CONTROL_ID);
+  if (colormap === null || typeof colormap !== 'object' || typeof colormap.value !== 'string' || colormap.value.length === 0) {
+    throw new TypeError('The vector field\'s color scheme control cannot be read.');
+  }
+  return { fieldId, colormapId: colormap.value };
+}
+
+/**
+ * The vector field the overlay shows now (the id `Vector field` names while
+ * `Show overlay` is on), or null when none is shown or the controls cannot be
+ * read. What `vector-field.summary` reads when it is not told a field: the
+ * one the person is looking at.
+ *
+ * @param {{ getElementById: (id: string) => unknown }|null} documentRef
+ * @returns {string|null}
+ */
+export function readShownVectorFieldId(documentRef) {
+  if (readVelocityOverlayEnabled(documentRef) !== true) return null;
+  const select = documentRef.getElementById(VELOCITY_FIELD_CONTROL_ID);
+  if (select === null || typeof select !== 'object' || typeof select.value !== 'string') return null;
+  return select.value.length > 0 ? select.value : null;
 }
 
 /**
@@ -94,16 +135,6 @@ export function buildOverlayFidelityWarnings({
         'Figure export draws the point layer only, and the velocity-overlay '
         + 'control could not be read, so whether the viewer is drawing a vector '
         + 'field cannot be confirmed. Reload the page and export again.',
-    });
-  } else if (velocityEnabled) {
-    warnings.push({
-      title: 'Velocity overlay not exported',
-      detail:
-        'The velocity vector field is enabled in the viewer, but figure export '
-        + 'renders the point layer only, so the exported figure would omit the '
-        + 'flow the active view shows. Turn "Show overlay" off under '
-        + `${PLACES.vectorField.name} before exporting.`,
-      fix: { label: 'vector field', controlId: VELOCITY_OVERLAY_CONTROL_ID },
     });
   }
 

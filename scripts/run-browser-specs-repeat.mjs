@@ -37,7 +37,7 @@ import {
 } from './browser-test-ports.mjs';
 import {
   PLAYWRIGHT_CLI,
-  environmentWithoutForcedColour,
+  environmentWithoutForcedColor,
   extractBoundedShardInventory,
   planBrowserBatchPorts,
   resolveBrowserShardLimits,
@@ -349,7 +349,7 @@ function testsOfSpecs(project, specs, grep, environment) {
     {
       cwd: REPOSITORY_ROOT,
       encoding: 'utf8',
-      env: environmentWithoutForcedColour(environment),
+      env: environmentWithoutForcedColor(environment),
       maxBuffer: MAX_CAPTURE_BYTES,
     },
   );
@@ -385,7 +385,7 @@ function runBatch(project, { files, repeatEach }, grep, environment, reportFile)
     {
       cwd: REPOSITORY_ROOT,
       env: {
-        ...environmentWithoutForcedColour(environment),
+        ...environmentWithoutForcedColor(environment),
         [BROWSER_TEST_PORT_VARIABLE]: String(ports.port),
         [BROWSER_TEST_SAMPLE_PORT_VARIABLE]: String(ports.samplePort),
         PLAYWRIGHT_JSON_OUTPUT_FILE: reportFile,

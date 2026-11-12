@@ -1,26 +1,41 @@
 /**
- * @fileoverview The page's global keys: F (fullscreen), H (the sidebar), 1,
- * 2 and 3 (a dimension's views), ? (the shortcuts), X (clear the highlight
- * page), O, P and G (the navigation mode). Each that changes state goes
- * through its action (`main.js` wires them), so a key records exactly the
- * step its control would, and a key that is no shortcut here changes nothing
- * (`isShortcutPress`).
+ * @fileoverview The page's key listener: the plain key presses the shortcut
+ * table binds (`shortcut-table.js`: F, H, R, 1–3, O/P/G, X, ?, /), each run
+ * by the module that owns its command (`provideShortcut`), and the Keyboard
+ * shortcuts panel drawn from the same table. Each that changes state goes
+ * through its action, so a key records exactly the step its control would,
+ * and a key that is no shortcut here changes nothing (`isShortcutPress`).
+ * Keys pressed in an open dialog never reach it: the dialog keeps its keys
+ * (`ui/components/app-dialog.js`).
  * @module ui/onboarding/keyboard-shortcuts
  */
 
-import { isWelcomeModalVisible } from './welcome-modal.js';
+import { isPageKey } from '../../../utils/key-ownership.js';
+import { revealInSidebar } from '../modules/sidebar-controls.js';
+import { SHORTCUT_COMMANDS, SHORTCUT_PRESSES, renderShortcutPanel } from './shortcut-table.js';
 
-let shortcutsCallbacks = {
-  onResetCamera: null,
-  onToggleFullscreen: null,
-  onToggleSidebar: null,
-  onCycleRepresentation: null,
-  onShowHelp: null,
-  onClearHighlights: null,
-  onSetNavigationMode: null
-};
+/** command → the function that runs it (`provideShortcut`). */
+const shortcutHandlers = new Map();
 
 let shortcutsListenerAttached = false;
+
+/**
+ * Run `command` (a command of the shortcut table) with `handler` when its key
+ * is pressed. One module owns each command.
+ *
+ * @param {string} command
+ * @param {(arg: unknown) => void} handler - Takes the key's argument (the dimension, the mode)
+ * @returns {() => void} Withdraw it.
+ */
+export function provideShortcut(command, handler) {
+  if (!SHORTCUT_COMMANDS.has(command)) throw new RangeError(`No key of the shortcut table runs "${command}".`);
+  if (typeof handler !== 'function') throw new TypeError(`The shortcut "${command}" needs a function.`);
+  if (shortcutHandlers.has(command)) throw new Error(`The shortcut "${command}" is already provided.`);
+  shortcutHandlers.set(command, handler);
+  return () => {
+    if (shortcutHandlers.get(command) === handler) shortcutHandlers.delete(command);
+  };
+}
 
 function toggleFullscreen() {
   if (!document.fullscreenElement) {
@@ -32,97 +47,74 @@ function toggleFullscreen() {
   document.exitFullscreen();
 }
 
-function showShortcutsHelp() {
-  const shortcutsSection = document.getElementById('shortcuts-section');
-  if (!shortcutsSection) return;
-  shortcutsSection.open = true;
-  shortcutsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+/**
+ * ? : the Keyboard shortcuts panel, opened, in view and focused, so Tab goes
+ * on inside it. The sidebar is shown first when the panel is in it (pressed
+ * with the sidebar hidden, the panel opened inside a hidden, inert sidebar:
+ * nothing to see). The scroll is instant, as every move to a control is
+ * (`revealGeneReadControl`): an explicit smooth scroll overrode the reduced
+ * motion setting (`scroll-behavior` in CSS does not apply to it).
+ *
+ * The sidebar is shown (its step, `layout.sidebar.show`) before the panel
+ * opens (its own, `layout.section.open`): opened first, the panel's opening
+ * reached the history while the sidebar's action was starting and was kept
+ * as a change made outside the history (R9K-2).
+ */
+function showShortcutsHelp(ownerDocument = document) {
+  const section = ownerDocument.getElementById('shortcuts-section');
+  if (section === null) return;
+  const open = () => {
+    section.open = true;
+    section.scrollIntoView({ block: 'start' });
+    section.querySelector(':scope > summary')?.focus({ preventScroll: true });
+  };
+  if (section.closest('#sidebar') === null) open();
+  else void revealInSidebar(ownerDocument, open);
 }
 
 /**
- * Whether a key press is one of these shortcuts' to take: not typed into a
- * field (an input, a select, anything editable), not a chord with Ctrl, ⌘ or
- * Alt (⌘P prints, ⌘F finds, ⌘1 picks a browser tab: the browser's and the
- * system's keys, never a navigation mode, the fullscreen or a view), and not
- * the auto-repeat of a key held down (H held would hide and show the sidebar
- * over and over, a step each).
+ * Whether a key press is one of these shortcuts' to take: a key the page
+ * answers (`isPageKey`: not typed into a field or a select, not pressed in a
+ * menu or a dialog, not taken by the focused control), not a chord with
+ * Ctrl, ⌘ or Alt (⌘P prints, ⌘F finds, ⌘1 picks a browser tab: the
+ * browser's and the system's keys, never a navigation mode, the fullscreen
+ * or a view), and not the auto-repeat of a key held down (H held would hide
+ * and show the sidebar over and over, a step each).
  *
- * @param {{target?: object|null, ctrlKey?: boolean, metaKey?: boolean, altKey?: boolean, repeat?: boolean}} event
+ * @param {{target?: object|null, defaultPrevented?: boolean, ctrlKey?: boolean, metaKey?: boolean, altKey?: boolean, repeat?: boolean}} event
  * @returns {boolean}
  */
 export function isShortcutPress(event) {
-  const target = event.target ?? null;
-  const tagName = String(target?.tagName || '');
-  if (tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT' || target?.isContentEditable === true) {
-    return false;
-  }
-  return !event.ctrlKey && !event.metaKey && !event.altKey && !event.repeat;
+  return isPageKey(event) && !event.ctrlKey && !event.metaKey && !event.altKey && !event.repeat;
 }
 
-function handleGlobalKeyDown(e) {
+/**
+ * The page's key listener: a shortcut press runs its command, once its
+ * module has provided it.
+ *
+ * @param {KeyboardEvent} e
+ */
+export function answerShortcutKey(e) {
   if (!isShortcutPress(e)) return;
-
-  if (isWelcomeModalVisible() && e.key !== 'Escape') {
-    return;
-  }
-
-  const key = String(e.key || '').toLowerCase();
-  switch (key) {
-    case 'f':
-      e.preventDefault();
-      if (shortcutsCallbacks.onToggleFullscreen) {
-        shortcutsCallbacks.onToggleFullscreen();
-      } else {
-        toggleFullscreen();
-      }
-      break;
-    case 'h':
-      e.preventDefault();
-      if (shortcutsCallbacks.onToggleSidebar) shortcutsCallbacks.onToggleSidebar();
-      break;
-    case '1':
-      e.preventDefault();
-      if (shortcutsCallbacks.onCycleRepresentation) shortcutsCallbacks.onCycleRepresentation(1);
-      break;
-    case '2':
-      e.preventDefault();
-      if (shortcutsCallbacks.onCycleRepresentation) shortcutsCallbacks.onCycleRepresentation(2);
-      break;
-    case '3':
-      e.preventDefault();
-      if (shortcutsCallbacks.onCycleRepresentation) shortcutsCallbacks.onCycleRepresentation(3);
-      break;
-    case '?':
-      e.preventDefault();
-      if (shortcutsCallbacks.onShowHelp) {
-        shortcutsCallbacks.onShowHelp();
-      } else {
-        showShortcutsHelp();
-      }
-      break;
-    case 'x':
-      e.preventDefault();
-      if (shortcutsCallbacks.onClearHighlights) shortcutsCallbacks.onClearHighlights();
-      break;
-    case 'o':
-      e.preventDefault();
-      if (shortcutsCallbacks.onSetNavigationMode) shortcutsCallbacks.onSetNavigationMode('orbit');
-      break;
-    case 'p':
-      e.preventDefault();
-      if (shortcutsCallbacks.onSetNavigationMode) shortcutsCallbacks.onSetNavigationMode('planar');
-      break;
-    case 'g':
-      e.preventDefault();
-      if (shortcutsCallbacks.onSetNavigationMode) shortcutsCallbacks.onSetNavigationMode('free');
-      break;
-  }
+  const binding = SHORTCUT_PRESSES.get(String(e.key || '').toLowerCase());
+  if (binding === undefined) return;
+  const handler = shortcutHandlers.get(binding.command);
+  if (handler === undefined) return;
+  e.preventDefault();
+  handler(binding.arg);
 }
 
-export function initKeyboardShortcuts(callbacks = {}) {
-  shortcutsCallbacks = { ...shortcutsCallbacks, ...callbacks };
+/**
+ * Draw the Keyboard shortcuts panel from the table and answer its keys from
+ * here on. Fullscreen and Show shortcuts are this module's own.
+ *
+ * @param {{ownerDocument?: Document}} [options]
+ */
+export function initKeyboardShortcuts({ ownerDocument = document } = {}) {
   if (shortcutsListenerAttached) return;
   shortcutsListenerAttached = true;
-  document.addEventListener('keydown', handleGlobalKeyDown);
+  renderShortcutPanel(ownerDocument);
+  provideShortcut('fullscreen.toggle', () => toggleFullscreen());
+  provideShortcut('shortcuts.show', () => showShortcutsHelp(ownerDocument));
+  ownerDocument.addEventListener('keydown', answerShortcutKey);
 }
-

@@ -6,8 +6,8 @@
  *
  * This module is the controller. It owns everything that must exist exactly
  * once per controls instance and that more than one screen reads: the cache
- * context and its ownership generation, role resolution and its retries, the
- * automatic-pull scheduler, background-task reporting, the single owned modal,
+ * context and its ownership generation, role resolution (asked again on
+ * coming online and with each Pull), the automatic-pull scheduler, background-task reporting, the single owned modal,
  * the sync status (`syncBusy`, `syncError`, `lastRepoInfo`, `lastRoleContext`),
  * and the Pull and Publish transactions that move that status. It also owns
  * teardown.
@@ -22,9 +22,11 @@
  *
  * plus leaf helpers with no controller state at all: `dom.js`, `cleanup.js`,
  * `modal-shell.js`, `identity-assertions.js`, `consensus-math.js`,
- * `github-error-classification.js`, `browser-integration.js`, and
+ * `github-error-classification.js`, `browser-integration.js`,
  * `published-baseline.js` (what the person has published, what is not
- * published yet, and a vote published alone).
+ * published yet, and a vote published alone), and `sync-stop.js` (how the
+ * Pull or Publish under way is stopped: a cancellation is never said as a
+ * failure).
  *
  * Three rules hold everywhere here:
  *
@@ -34,10 +36,11 @@
  * - **One tab.** Another tab annotating the same scope pauses annotation here
  *   (`runtime-context.js`: "Open in another tab — annotation paused here",
  *   Use here); it never fails the dataset controls or disconnects.
- * - **An agent's vote** (`annotation.vote`) publishes itself alone, asks with
- *   where it goes, never opens a dialog, waits for a Pull under way, and
- *   says honestly what happened when it is stopped or the connection drops
- *   (a Pull follows an outcome GitHub may or may not have applied).
+ * - **An agent's votes and suggestions** (`annotation.publish`) are published
+ *   together as one commit and nothing else of the person's, asked once with
+ *   where they go, never open a dialog, wait for a Pull under way, and say
+ *   honestly what happened when stopped or the connection drops (a Pull
+ *   follows an outcome GitHub may or may not have applied).
  *
  * @module ui/modules/community-annotation-controls
  */
@@ -46,7 +49,7 @@ import { getNotificationCenter } from '../../notification-center.js';
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
 import { getCommunityAnnotationFileCache } from '../../community-annotations/file-cache.js';
 import { describeCacheScope, removeRetiredFileShaIndexes, toCacheScopeKey } from '../../community-annotations/cache-scope.js';
-import { annotationCategories, annotationFieldKey } from '../../community-annotations/field-names.js';
+import { annotationCategories, annotationFieldKey, annotationKeyable } from '../../community-annotations/field-names.js';
 import {
   clearPublishedBaseline,
   differingMerges,
@@ -55,8 +58,7 @@ import {
   publishedBaseline,
   sameJson,
   setPublishedBaseline,
-  withOneSuggestion,
-  withOneVote,
+  withChanges,
 } from './community-annotation/published-baseline.js';
 import {
   ANNOTATION_PAUSED_HERE,
@@ -135,20 +137,20 @@ import {
   workerPath,
 } from './community-annotation/github-error-classification.js';
 import { PLACES } from '../place-names.js';
-import { isCancellation, onAbort } from '../../../utils/abort.js';
-import { defaultWorkerTransport } from '../../community-annotations/worker-request.js';
-import { retryWaitMs } from '../../../formats/io/byte-source.js';
-import { MAX_QUIET_MS } from '../../../formats/io/hosts.js';
+import { abortReason, cancel, cancelled, isCancellation, onAbort, throwIfAborted } from '../../../utils/abort.js';
+import { bindSyncOwner, createSyncStop, isStoppedForFailure, stoppedSyncOutcome, syncFailureOf } from './community-annotation/sync-stop.js';
+import { realmHosts } from '../../../formats/io/hosts.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
 import { resolveCategory, resolveLoadedField } from '../../actions/targets/fields.js';
 import { categoryLabel, listNames, quoteName } from '../../actions/targets/names.js';
 import { RESULT_TEXT_CHARS } from '../../agent/bridge/relay-protocol.js';
+import { createListenerSet } from '../../../utils/listener-set.js';
 
 /**
  * @param {object} options
  * @param {{provide: (type: string, handler: Function) => () => void}|null} [options.actions] - the
  *   page's dispatcher, on which the voting dialog's reads and votes are provided as
- *   `annotation.suggestions` and `annotation.vote`; null (another instance than the page's own)
+ *   `annotation.suggestions` and `annotation.publish`; null (another instance than the page's own)
  *   provides nothing, as the page's dispatcher takes one implementation per action
  */
 export function initCommunityAnnotationControls({
@@ -181,17 +183,19 @@ export function initCommunityAnnotationControls({
   const githubAuth = getGitHubAuthSession();
 
   /**
-   * @typedef {{status: 'done'|'skipped'|'cancelled'|'failed', error?: string}} SyncOutcome
+   * A Pull's or Publish's outcome: `cancelled` when it was stopped (`kind`
+   * and `words` of the cancellation: `sync-stop.js`), `failed` with the
+   * error said.
+   * @typedef {{status: 'done'|'skipped'|'cancelled'|'failed'|'unknown', error?: string, kind?: string, words?: string}} SyncOutcome
    */
   let syncBusy = false;
-  /** @type {Set<() => void>} */
-  const syncBusyListeners = new Set();
+  const syncBusyListeners = createListenerSet('community annotation sync busy');
   let syncError = null;
   /** A link that acts on the sync error it was made for (`getSyncErrorLink`): fork on GitHub, install the app. */
   let syncErrorLink = null;
 
   function notifySyncBusyChange() {
-    for (const listener of [...syncBusyListeners]) listener();
+    syncBusyListeners.notify();
   }
 
   /**
@@ -202,13 +206,7 @@ export function initCommunityAnnotationControls({
    * @returns {() => void} unsubscribe
    */
   function subscribeSyncBusy(listener) {
-    if (typeof listener !== 'function') {
-      throw new TypeError('Sync busy listener must be a function');
-    }
-    syncBusyListeners.add(listener);
-    return () => {
-      syncBusyListeners.delete(listener);
-    };
+    return syncBusyListeners.add(listener);
   }
   let lastRepoInfo = null;
   /**
@@ -218,106 +216,8 @@ export function initCommunityAnnotationControls({
    * @type {{scopeKey: string, config: object|null, merges: object[]}|null}
    */
   let authorBaseline = null;
-  /** @type {AbortController|null} */
-  let activeSyncAbort = null;
-  let activeSyncAbortReason = null;
-  let activeSyncFatalMessage = null;
-
-  function beginActiveSyncAbortScope() {
-    activeSyncFatalMessage = null;
-    activeSyncAbortReason = null;
-    if (activeSyncAbort !== null) {
-      if (typeof activeSyncAbort.abort !== 'function') {
-        throw new TypeError('Active annotation sync controller must expose abort()');
-      }
-      activeSyncAbort.abort();
-    }
-    if (typeof AbortController !== 'function') {
-      throw new TypeError('Community annotation sync requires AbortController');
-    }
-    activeSyncAbort = new AbortController();
-    return activeSyncAbort;
-  }
-
-  function bindActiveSyncOwnerSignal(controller, signal) {
-    if (
-      !controller ||
-      typeof controller.abort !== 'function' ||
-      !controller.signal
-    ) {
-      throw new TypeError(
-        'Active annotation sync signal binding requires an AbortController'
-      );
-    }
-    if (
-      !signal ||
-      typeof signal !== 'object' ||
-      typeof signal.addEventListener !== 'function' ||
-      typeof signal.removeEventListener !== 'function' ||
-      typeof signal.aborted !== 'boolean'
-    ) {
-      throw new TypeError(
-        'Active annotation sync owner must expose an AbortSignal'
-      );
-    }
-    return onAbort(signal, () => controller.abort(signal.reason));
-  }
-
-  function endActiveSyncAbortScope(controller) {
-    if (activeSyncAbort !== controller) return;
-    activeSyncAbort = null;
-    activeSyncAbortReason = null;
-    activeSyncFatalMessage = null;
-  }
-
-  function abortActiveSync(reason) {
-    const msg =
-      reason === null || reason === undefined
-        ? 'Annotation sync aborted.'
-        : reason;
-    if (
-      typeof msg !== 'string' ||
-      !msg ||
-      /^\s|\s$/.test(msg)
-    ) {
-      throw new Error('Annotation sync abort reason must be an exact string');
-    }
-    activeSyncFatalMessage = msg;
-    activeSyncAbortReason = msg;
-    if (activeSyncAbort !== null) {
-      if (typeof activeSyncAbort.abort !== 'function') {
-        throw new TypeError('Active annotation sync controller must expose abort()');
-      }
-      activeSyncAbort.abort();
-    }
-  }
-
-  function throwIfActiveSyncAborted(controller) {
-    if (!controller || !controller.signal) {
-      throw new TypeError('Annotation sync abort checks require an active controller');
-    }
-    if (activeSyncFatalMessage) {
-      const err = new Error(activeSyncFatalMessage);
-      err.code = 'ANNOTATION_SYNC_STOPPED';
-      throw err;
-    }
-    if (controller.signal.aborted) {
-      const err = new Error(activeSyncAbortReason || 'Annotation sync aborted.');
-      err.code = 'ANNOTATION_SYNC_STOPPED';
-      throw err;
-    }
-  }
-
-  function normalizeActiveSyncError(error, controller) {
-    if (error?.operation?.outcome === 'unknown') return error;
-    if (!controller?.signal?.aborted) return error;
-    try {
-      throwIfActiveSyncAborted(controller);
-    } catch (abortError) {
-      return abortError;
-    }
-    return error;
-  }
+  /** The Pull or Publish under way, stopped with why (`community-annotation/sync-stop.js`). */
+  const syncStop = createSyncStop();
 
   /** @type {Record<string, {minAnnotators:number, threshold:number}>} */
   const annotatableSettingsDraft = Object.create(null);
@@ -361,9 +261,8 @@ export function initCommunityAnnotationControls({
   };
   const reconcileOfflineEvent = () => {
     stopAutoPullScheduler();
-    if (activeSyncAbort !== null) {
-      abortActiveSync('Network connection was lost.');
-    }
+    // Not a cancellation: the Pull or Publish failed, and says why.
+    syncStop.stop(new Error('Network connection was lost.'));
     closeActiveGitHubConnectionModal();
     render();
   };
@@ -482,7 +381,7 @@ export function initCommunityAnnotationControls({
         'Owned community annotation modal close handle must be a function'
       );
     }
-    close({ restoreFocus: false });
+    close();
   }
 
   function closeActiveGitHubConnectionModal() {
@@ -493,18 +392,13 @@ export function initCommunityAnnotationControls({
         'GitHub connection modal close handle must be a function or null'
       );
     }
-    close({ restoreFocus: false });
+    close();
     if (activeGitHubConnectionClose === close) {
       activeGitHubConnectionClose = null;
     }
     return true;
   }
 
-  /**
-   * A role resolution that failed in a way that may pass, asked again after
-   * a back-off: `{owner, attempt, timer}`.
-   */
-  let roleRetryState = null;
   let suppressActiveSyncContextAbort = false;
 
   function contextIdentity(ctx) {
@@ -533,7 +427,6 @@ export function initCommunityAnnotationControls({
       publishedContextAbort = new AbortController();
       publishedContextIdentity = identity;
       contextGeneration += 1;
-      cancelScheduledRoleRetry();
       pendingOnlineRoleRetryOwner = null;
       pendingSyncBusyRoleRetryOwner = null;
       clearAnnotatableSettingsDraft();
@@ -543,12 +436,13 @@ export function initCommunityAnnotationControls({
       }
       if (
         hadPublishedContext &&
-        activeSyncAbort !== null &&
+        syncStop.running &&
         !suppressActiveSyncContextAbort
       ) {
-        abortActiveSync(
+        syncStop.stop(cancelled(
+          'closed',
           'Annotation dataset, repository, or authenticated user changed.'
-        );
+        ));
       }
     }
     return Object.freeze({
@@ -624,7 +518,7 @@ export function initCommunityAnnotationControls({
   function currentAutoPullRuntime() {
     if (
       contextDestroyed ||
-      navigator.onLine === false ||
+      !realmHosts.online() ||
       !githubAuth.isAuthenticated?.()
     ) {
       return null;
@@ -661,7 +555,7 @@ export function initCommunityAnnotationControls({
     if (
       autoPullRuntime !== runtime ||
       syncBusy ||
-      navigator.onLine === false ||
+      !realmHosts.online() ||
       !isContextOwnerCurrent(runtime.owner)
     ) {
       return;
@@ -797,57 +691,8 @@ export function initCommunityAnnotationControls({
     }
   }
 
-  function cancelScheduledRoleRetry(owner = null) {
-    if (
-      roleRetryState === null ||
-      (owner !== null && !isSameContextOwner(roleRetryState.owner, owner))
-    ) {
-      return false;
-    }
-    if (roleRetryState.timer !== null) clearTimeout(roleRetryState.timer);
-    roleRetryState = null;
-    return true;
-  }
-
-  /**
-   * Ask for the role again after a failure that may pass (the Worker or
-   * GitHub unreachable, busy, or limiting). Each request was already asked
-   * again while that could help, at the pace the host named
-   * (`worker-request.js`); this asks the whole resolution again after the
-   * shared back-off: the Worker link's retransmission timeout, doubled per
-   * attempt (`retryWaitMs`), never longer than RFC 6298's 60 s
-   * (`MAX_QUIET_MS`). It goes on while this context is current: coming back
-   * online, a Pull, or a context change ends it.
-   */
-  function scheduleTransientRoleRetry(owner) {
-    if (!isContextOwnerCurrent(owner)) {
-      cancelScheduledRoleRetry(owner);
-      return null;
-    }
-    const attempt =
-      roleRetryState !== null && isSameContextOwner(roleRetryState.owner, owner)
-        ? roleRetryState.attempt + 1
-        : 0;
-    cancelScheduledRoleRetry();
-    const link = defaultWorkerTransport(githubAuth.getWorkerOrigin()).clock;
-    const delayMs = Math.min(MAX_QUIET_MS, retryWaitMs(attempt, link.timeoutMs));
-    const scheduled = { owner, attempt, timer: null };
-    scheduled.timer = setTimeout(() => {
-      if (roleRetryState !== scheduled) return;
-      scheduled.timer = null;
-      if (!isContextOwnerCurrent(owner)) {
-        roleRetryState = null;
-        return;
-      }
-      scheduleResolveConnectedRole(owner);
-    }, delayMs);
-    roleRetryState = scheduled;
-    return delayMs;
-  }
-
   function retryConnectedRoleImmediately(owner) {
     if (!isContextOwnerCurrent(owner)) return false;
-    cancelScheduledRoleRetry(owner);
     if (
       activeRoleResolutionOwner !== null &&
       isSameContextOwner(activeRoleResolutionOwner, owner)
@@ -869,14 +714,8 @@ export function initCommunityAnnotationControls({
     if (syncBusy || pendingSyncBusyRoleRetryOwner === null) return false;
     const owner = pendingSyncBusyRoleRetryOwner;
     pendingSyncBusyRoleRetryOwner = null;
-    if (!isContextOwnerCurrent(owner)) {
-      cancelScheduledRoleRetry(owner);
-      return false;
-    }
-    if (access.getRole() !== 'unknown') {
-      cancelScheduledRoleRetry(owner);
-      return false;
-    }
+    if (!isContextOwnerCurrent(owner)) return false;
+    if (access.getRole() !== 'unknown') return false;
     scheduleResolveConnectedRole(owner);
     return true;
   }
@@ -1022,19 +861,7 @@ export function initCommunityAnnotationControls({
     if (!owner.datasetId || !owner.repoRef) return;
     if (!githubAuth.isAuthenticated?.()) return;
     if (!isAnnotationRepoConnected(owner.datasetId, owner.userKey)) return;
-    if (retryIfBusy) cancelScheduledRoleRetry(owner);
-    if (access.getRole() !== 'unknown') {
-      cancelScheduledRoleRetry(owner);
-      return;
-    }
-    if (
-      !retryIfBusy &&
-      roleRetryState !== null &&
-      isSameContextOwner(roleRetryState.owner, owner) &&
-      roleRetryState.timer !== null
-    ) {
-      return;
-    }
+    if (access.getRole() !== 'unknown') return;
     if (
       activeRoleResolutionOwner !== null &&
       isSameContextOwner(activeRoleResolutionOwner, owner)
@@ -1145,7 +972,6 @@ export function initCommunityAnnotationControls({
         });
       }
 
-      cancelScheduledRoleRetry(owner);
       if (
         isSameContextOwner(pendingSyncBusyRoleRetryOwner, owner)
       ) {
@@ -1167,7 +993,6 @@ export function initCommunityAnnotationControls({
           ? 'the annotation repository'
           : parsedRepo.ownerRepo;
       if (isWorkerCompatibilityFailure(err)) {
-        cancelScheduledRoleRetry(owner);
         access.clearRole();
         syncError = `${msg}\nThe repository connection was preserved.`;
         notifications.error(syncError, {
@@ -1178,14 +1003,16 @@ export function initCommunityAnnotationControls({
         return false;
       }
       if (isTransientRoleResolutionFailure(err)) {
+        // Each request was already asked again as long as that could help
+        // (`worker-request.js`: the transport's one retry policy, at the pace
+        // the host named): the failure is said, not asked again on a timer of
+        // its own. A Pull (the person's or an automatic one) reads the role
+        // again, and so does this computer coming back online.
         access.clearRole();
-        const delayMs = scheduleTransientRoleRetry(owner);
         syncError =
           `Unable to verify your role for ${repoLabel} while GitHub is ` +
           `unreachable.\n${msg}\nThe repository connection was preserved; ` +
-          (delayMs === null
-            ? 'Cellucid asks again when this context is shown again.'
-            : `Cellucid asks again in ${Math.max(1, Math.ceil(delayMs / 1000))} s, and at once when this computer comes back online.`);
+          'Cellucid asks again with the next Pull, and at once when this computer comes back online.';
         notifications.warning(syncError, {
           category: 'annotation',
           duration: 10_000,
@@ -1193,7 +1020,6 @@ export function initCommunityAnnotationControls({
         render();
         return false;
       }
-      cancelScheduledRoleRetry(owner);
       if (
         isSameContextOwner(pendingSyncBusyRoleRetryOwner, owner)
       ) {
@@ -1259,9 +1085,10 @@ export function initCommunityAnnotationControls({
       );
     }
 
-    abortActiveSync(
-      message === null ? 'Annotation repo disconnected.' : message
-    );
+    syncStop.stop(cancelled(
+      'closed',
+      message === null || message === '' ? 'Annotation repo disconnected.' : message
+    ));
 
     clearAnnotationRepoForDataset(did, key);
     setUrlAnnotationRepo(null);
@@ -1303,7 +1130,7 @@ export function initCommunityAnnotationControls({
    */
   function forgetRefusedSignIn() {
     const msg = 'Your GitHub sign-in expired or was revoked. Sign in again to Pull or Publish; your unpublished changes stay in this browser.';
-    if (activeSyncAbort !== null) abortActiveSync(msg);
+    syncStop.stop(cancelled('closed', msg));
     githubAuth.forgetRefused();
     notifications.error(msg, { category: 'annotation', duration: 8000 });
     syncError = msg;
@@ -1692,6 +1519,9 @@ export function initCommunityAnnotationControls({
    * @type {{repository: string, datasetId: string}|null}
    */
   let urlRepositoryApplied = null;
+  /** A link's `annotations` that names no repository, said with the parameter's real name (R9E-12). */
+  const LINK_REPOSITORY_REFUSED =
+    'This link\'s "annotations" is not a repository: it is owner/repo or owner/repo@branch.';
   const linkedRepository = value => (parseOwnerRepo(value)?.ownerRepo ?? String(value)).toLowerCase();
 
   const setDatasetContextFromManager = () => {
@@ -1731,13 +1561,11 @@ export function initCommunityAnnotationControls({
             signal: owner.signal,
           });
           if (resolved === null) {
-            throw new Error(
-              'The annotation_repo URL parameter is not a canonical owner/repo reference'
-            );
+            throw new Error(LINK_REPOSITORY_REFUSED);
           }
           if (resolved === false) {
             throw new Error(
-              'GitHub sign-in is required to resolve the annotation repository default branch'
+              'Sign in with GitHub to connect the repository this link names ("annotations"): its default branch is read from GitHub.'
             );
           }
           if (
@@ -1765,7 +1593,7 @@ export function initCommunityAnnotationControls({
           throw error;
         });
         observeBackgroundTask(resolutionTask, {
-          label: 'Unable to apply the annotation_repo URL parameter',
+          label: 'The repository this link names ("annotations") could not be connected',
           owner,
         });
       } else {
@@ -1776,14 +1604,12 @@ export function initCommunityAnnotationControls({
             username,
           });
           if (!ok) {
-            throw new Error(
-              'The annotation_repo URL parameter is not a canonical owner/repo@branch reference'
-            );
+            throw new Error(LINK_REPOSITORY_REFUSED);
           }
           applySessionCacheContext({ datasetId });
         } catch (error) {
           syncError = String(
-            error?.message || 'Unable to apply annotation_repo URL parameter'
+            error?.message || 'The repository this link names ("annotations") could not be connected.'
           );
           notifications.error(syncError, {
             category: 'annotation',
@@ -1830,13 +1656,13 @@ export function initCommunityAnnotationControls({
   // and the connection stays (it is shared by both tabs).
   const unsubscribeSessionLockLost = session.on('lock:lost', (evt) => {
     if (isHeldElsewhere(evt) && typeof evt?.scopeKey === 'string') {
-      if (activeSyncAbort !== null) abortActiveSync('Annotation moved to another tab.');
+      syncStop.stop(cancelled('closed', 'Annotation moved to another tab.'));
       pauseAnnotationScopeHere(evt.scopeKey);
       reconcileContext({});
       return;
     }
     const msg = toCleanString(evt?.message || '') || 'Lost cross-tab lock. Disconnected annotation repo.';
-    abortActiveSync(msg);
+    syncStop.stop(cancelled('closed', msg));
     disconnectAnnotationRepo({
       datasetId: evt?.datasetId ?? annotationDatasetIdOf(dataSourceManager) ?? null,
       userKey: getCacheUserKey(),
@@ -1851,7 +1677,7 @@ export function initCommunityAnnotationControls({
     // pauses annotation here; nothing is disconnected.
     if (isHeldElsewhere(evt)) return;
     const msg = toCleanString(evt?.message || '') || 'Unable to acquire cross-tab lock. Disconnected annotation repo.';
-    abortActiveSync(msg);
+    syncStop.stop(cancelled('closed', msg));
     disconnectAnnotationRepo({
       datasetId: evt?.datasetId ?? annotationDatasetIdOf(dataSourceManager) ?? null,
       userKey: getCacheUserKey(),
@@ -1863,7 +1689,7 @@ export function initCommunityAnnotationControls({
 
   const unsubscribeSessionPersistenceError = session.on('persistence:error', (evt) => {
     const msg = toCleanString(evt?.message || '') || 'Local persistence failed. Disconnected annotation repo.';
-    abortActiveSync(msg);
+    syncStop.stop(cancelled('closed', msg));
     disconnectAnnotationRepo({
       datasetId: evt?.datasetId ?? annotationDatasetIdOf(dataSourceManager) ?? null,
       userKey: getCacheUserKey(),
@@ -1875,7 +1701,7 @@ export function initCommunityAnnotationControls({
 
   const unsubscribeSessionIntegrityError = session.on('integrity:error', (evt) => {
     const msg = toCleanString(evt?.message || '') || 'Annotation data integrity error. Disconnected annotation repo.';
-    abortActiveSync(msg);
+    syncStop.stop(cancelled('closed', msg));
     disconnectAnnotationRepo({
       datasetId: evt?.datasetId ?? annotationDatasetIdOf(dataSourceManager) ?? null,
       userKey: getCacheUserKey(),
@@ -1977,7 +1803,6 @@ export function initCommunityAnnotationControls({
     contextDestroyed = true;
     syncBusyListeners.clear();
     stopAutoPullScheduler();
-    cancelScheduledRoleRetry();
     publishedContextIdentity = null;
     if (publishedContextAbort !== null) {
       publishedContextAbort.abort();
@@ -1988,9 +1813,7 @@ export function initCommunityAnnotationControls({
     pendingOnlineRoleRetryOwner = null;
     pendingSyncBusyRoleRetryOwner = null;
     clearAnnotatableSettingsDraft();
-    if (activeSyncAbort !== null) {
-      abortActiveSync('Community annotation controls were destroyed.');
-    }
+    syncStop.stop(cancelled('closed', 'Community annotation controls were destroyed.'));
     runExactCleanup('Community annotation controls teardown', [
       ['active community annotation modal', closeOwnedCommunityModal],
       ['session change subscription', unsubscribe],
@@ -2041,20 +1864,20 @@ export function initCommunityAnnotationControls({
       syncBusy = true;
       syncError = null;
       const entryOwner = publishContextOwner(getCacheContext({}));
-      opAbort = beginActiveSyncAbortScope();
+      opAbort = syncStop.begin();
       releaseEntryOwnerSignal =
-        bindActiveSyncOwnerSignal(opAbort, entryOwner.signal);
+        bindSyncOwner(opAbort, entryOwner.signal);
       releaseCallerSignal =
         signal === null
           ? null
-          : bindActiveSyncOwnerSignal(opAbort, signal);
+          : bindSyncOwner(opAbort, signal);
       notifySyncBusyChange();
       render();
       return await operation({ entryOwner, opAbort });
     } finally {
       releaseCallerSignal?.();
       releaseEntryOwnerSignal?.();
-      if (opAbort !== null) endActiveSyncAbortScope(opAbort);
+      if (opAbort !== null) syncStop.end(opAbort);
       syncBusy = false;
       notifySyncBusyChange();
       flushRoleRetryAfterActiveSync();
@@ -2138,10 +1961,10 @@ export function initCommunityAnnotationControls({
     }
 
     // Cancel stops the Pull; what it read is kept, and the next Pull goes on from there.
-    const trackerId = quiet ? null : notifications.progress(`Pulling annotations from ${repoInput}...`, 0, {
+    const trackerId = quiet ? null : notifications.progress(`Pulling annotations from ${repoInput}…`, 0, {
       category: 'annotation',
       onCancel: () => {
-        if (activeSyncAbort === opAbort) abortActiveSync('Pull cancelled; what it read is kept for the next Pull.');
+        cancel(opAbort, 'user', 'Pull canceled; what it read is kept for the next Pull.');
       },
     });
     const updateProgress = (pct, opts) => {
@@ -2176,7 +1999,7 @@ export function initCommunityAnnotationControls({
         await githubAuth.ensureWorkerCompatible({
           signal: opAbort.signal,
         });
-        throwIfActiveSyncAborted(opAbort);
+        throwIfAborted(opAbort.signal);
         // Cache scoping requires the current authenticated GitHub identity.
           const userId = getCacheUserId();
         if (!userId) throw new Error('Missing GitHub numeric user id. Disconnect GitHub and sign in again.');
@@ -2191,7 +2014,7 @@ export function initCommunityAnnotationControls({
           githubUserId: userId,
           promptIfMissing: false,
         });
-        throwIfActiveSyncAborted(opAbort);
+        throwIfAborted(opAbort.signal);
 
       const parsed = parseOwnerRepo(repoInput);
       if (!parsed) throw new Error('Invalid annotation repo');
@@ -2226,7 +2049,7 @@ export function initCommunityAnnotationControls({
       // A wait GitHub names (a rate limit's reset) is said in the progress
       // notification; its Cancel stops the Pull, and what was read is kept.
       let progressPct = 5;
-      let progressMessage = `Validating repo: ${parsed.ownerRepo}...`;
+      let progressMessage = `Checking the repository ${parsed.ownerRepo}…`;
       const setProgress = (pct, message) => {
         progressPct = pct;
         progressMessage = message;
@@ -2254,7 +2077,7 @@ export function initCommunityAnnotationControls({
         datasetId,
         signal: opAbort.signal,
       });
-      throwIfActiveSyncAborted(opAbort);
+      throwIfAborted(opAbort.signal);
 
           lastRepoInfo = repoInfo;
         access.setRoleFromRepoInfo(lastRepoInfo);
@@ -2331,13 +2154,13 @@ export function initCommunityAnnotationControls({
           tone: 'primary',
           signal: opAbort.signal,
         });
-        throwIfActiveSyncAborted(opAbort);
+        throwIfAborted(opAbort.signal);
         if (!ok) {
           lastRepoInfo = prevRepoInfo;
           access.setRole(prevRole);
           lastRoleContext = prevRoleContext;
-          syncError = 'Cancelled.';
-          complete('Cancelled.');
+          syncError = 'Canceled.';
+          complete('Canceled.');
           return { status: 'cancelled' };
         }
         if (!quiet) {
@@ -2382,7 +2205,7 @@ export function initCommunityAnnotationControls({
             githubUserId: userId,
             promptIfMissing: false,
           });
-          throwIfActiveSyncAborted(opAbort);
+          throwIfAborted(opAbort.signal);
 
           resolvedCacheScope = {
             datasetId,
@@ -2390,7 +2213,7 @@ export function initCommunityAnnotationControls({
             userId,
           };
           await fileCache.init();
-          throwIfActiveSyncAborted(opAbort);
+          throwIfAborted(opAbort.signal);
 
         // -------------------------------------------------------------------
         // 1) Read what changed since the last Pull into the file cache, by
@@ -2414,7 +2237,7 @@ export function initCommunityAnnotationControls({
             );
           },
         });
-        throwIfActiveSyncAborted(opAbort);
+        throwIfAborted(opAbort.signal);
 
         // The SHAs the session keeps: the files it publishes onto.
         const pulledFileShas = { 'annotations/config.json': configSha };
@@ -2449,7 +2272,7 @@ export function initCommunityAnnotationControls({
           const folded = await foldCachedFiles({ fileCache, cacheScope, remoteUserFiles });
           excluded = folded.excluded;
           const moderationDocument = folded.moderationDocument;
-          throwIfActiveSyncAborted(opAbort);
+          throwIfAborted(opAbort.signal);
 
           // This synchronous call is the visible-session commit point. It
           // publishes moderation, the complete rebuilt view, settings/access
@@ -2539,7 +2362,7 @@ export function initCommunityAnnotationControls({
         excluded: lastAppliedPull?.excluded ?? [],
       };
       } catch (caughtError) {
-          const err = normalizeActiveSyncError(caughtError, opAbort);
+          const err = syncFailureOf(caughtError, opAbort);
           const statusCode = httpStatusOrNull(err);
         const apiPath = gitHubApiPath(err) || workerPath(err);
         const msg = String(err?.message || 'Pull failed').trim() || 'Pull failed';
@@ -2554,7 +2377,9 @@ export function initCommunityAnnotationControls({
           const workerCompatibilityFailure =
             isWorkerCompatibilityFailure(err);
 
-        if (err?.code === 'ANNOTATION_SYNC_STOPPED') {
+        if (isCancellation(err)) return stoppedSyncOutcome(err, notifications, trackerId);
+        if (isStoppedForFailure(err, opAbort)) {
+          // Stopped for a failure of its own (the connection lost): said as it.
           syncError = msg;
           fail(msg);
           return { status: 'failed', error: msg, aborted: true };
@@ -2595,10 +2420,11 @@ export function initCommunityAnnotationControls({
           }
           let ownershipError = null;
           try {
-            throwIfActiveSyncAborted(opAbort);
+            throwIfAborted(opAbort.signal);
           } catch (error) {
             ownershipError = error;
           }
+          if (isCancellation(ownershipError)) return stoppedSyncOutcome(ownershipError, notifications, trackerId);
           if (
             ownershipError !== null ||
             !isContextOwnerCurrent(entryOwner)
@@ -2669,34 +2495,44 @@ export function initCommunityAnnotationControls({
           };
         }
 
+          // Each branch that tells the person in its own sentence is that failure said
+          // once: the Pull's card is then dismissed, not failed again (bug hunt R9A-6).
+          let said = false;
           if (workerCompatibilityFailure) {
             // The error says the remedy: redeploy an older Worker, or reload
             // Cellucid for a newer one.
             syncError = `${msg}\nThe repository connection was preserved.`;
+            said = true;
             notifications.error(syncError, {
               category: 'annotation',
               duration: 10_000,
             });
           } else if (isWorkerOriginSecurityError(err)) {
+            said = true;
             disconnectGitHubAndAnnotationRepo({
             datasetId,
             message: err?.message || `Invalid GitHub worker origin.${apiSuffix}`,
           notify: 'error'
         });
       } else if (isTokenAuthFailure(err)) {
+        said = true;
         forgetRefusedSignIn();
       } else if (isRateLimitError(err)) {
         syncError = `GitHub rate limit: ${msg}`;
+        said = true;
         notifications.warning(syncError, { category: 'annotation', duration: 8000 });
       } else if (isWorkerUnreachable(err)) {
         syncError = describeGitHubAuthReachabilityError(err);
+        said = true;
         notifications.error(syncError, { category: 'annotation', duration: 10000 });
       } else if (statusCode === 403) {
         const base = `Lost access to ${repoLabel}. GitHub returned 403 (forbidden).${apiSuffix}`;
         if (preserveExisting) {
           syncError = `${base}\nExisting repo connection preserved.`;
+          said = true;
           notifications.error(syncError, { category: 'annotation', duration: 10000 });
         } else {
+          said = true;
           disconnectAnnotationRepo({
             datasetId,
             userKey: cacheUser,
@@ -2708,8 +2544,10 @@ export function initCommunityAnnotationControls({
         const base = `Annotation repo not accessible (deleted/renamed or access removed): ${repoLabel}.${apiSuffix}`;
         if (preserveExisting) {
           syncError = `${base}\nExisting repo connection preserved.`;
+          said = true;
           notifications.error(syncError, { category: 'annotation', duration: 10000 });
         } else {
+          said = true;
           disconnectAnnotationRepo({
             datasetId,
             userKey: cacheUser,
@@ -2723,8 +2561,10 @@ export function initCommunityAnnotationControls({
         const base = `Repo ${repoLabel}${where}: ${msg}`;
         if (preserveExisting) {
           syncError = `${base}\nExisting repo connection preserved.`;
+          said = true;
           notifications.error(syncError, { category: 'annotation', duration: 10000 });
         } else {
+          said = true;
           disconnectAnnotationRepo({
             datasetId,
             userKey: cacheUser,
@@ -2736,9 +2576,11 @@ export function initCommunityAnnotationControls({
           // A repository file its authors fix (annotations/config.json): the
           // connection stays.
           syncError = `Repo ${repoLabel}: ${msg}`;
+          said = true;
           notifications.error(syncError, { category: 'annotation', duration: 10000 });
         } else {
           syncError = msg;
+          said = true;
           notifications.error(syncError, { category: 'annotation', duration: 8000 });
         }
 
@@ -2755,6 +2597,7 @@ export function initCommunityAnnotationControls({
           ) {
           const stillConnected = Boolean(getAnnotationRepoForDataset(datasetId, cacheUser));
           if (stillConnected) {
+            said = true;
             disconnectAnnotationRepo({
               datasetId,
               userKey: cacheUser,
@@ -2773,34 +2616,53 @@ export function initCommunityAnnotationControls({
           session.setCacheContext({ datasetId, repoRef: storedRepoRef, userId });
         }
 
-          fail(syncError || msg);
+          if (said) {
+            if (!quiet && trackerId != null) notifications.dismiss(trackerId);
+          } else {
+            fail(syncError || msg);
+          }
           return { status: 'failed', error: syncError || msg };
       }
     }
 
   /**
-   * Publish the person's own work (the panel's Publish), or only one change
-   * (`only`: an agent's `annotation.vote` or `annotation.suggest`).
+   * Publish the person's own work (the panel's Publish), or only some changes
+   * (`only`: an agent's `annotation.publish`, one commit).
    *
    * - A Publish writes the person's file with every change of theirs not
    *   published, and for an author the repository settings and merges.
-   * - One change is written on top of the person's file as published now
-   *   (`only.compose(publishedView, {githubUserId, login})`): the rest of
-   *   their unpublished work stays in this browser, an author's settings and
-   *   merges too, and a change that changes nothing writes nothing
-   *   (`changed` false). `only.what` names it ("vote", "suggestion").
+   * - Some changes are written on top of the person's file as published now
+   *   (`only.compose(publishedView, {githubUserId, login})`, `withChanges`):
+   *   the rest of their unpublished work stays in this browser, an author's
+   *   settings and merges too, and changes that change nothing write nothing
+   *   (`changed` false). `only.what` names them ("vote", "3 votes and 1
+   *   suggestion").
    *
    * `interactive` false (an agent's call): never opens a dialog; the
    * profile's optional fields stay as they are and the GitHub login names
    * the file. An outcome GitHub may or may not have applied (`unknown`: a
    * Stop or a dropped connection while a write was under way) is followed by
    * a Pull, so what this browser knows of the person's file is GitHub's again.
+   * A person's file changed on GitHub since the last Pull (another device or
+   * tab published) is pulled (merged with what is here) and published again,
+   * once; for the person's own Publish only while no author settings or
+   * merges are staged (`publishExclusive`).
    *
    * @param {{signal?: AbortSignal|null, only?: {what: string, compose: (published: object|null, who: {githubUserId: number, login: string}) => object}|null, interactive?: boolean}} [options]
    * @returns {Promise<SyncOutcome & {mode?: string, prUrl?: string|null, changed?: boolean, pulled?: SyncOutcome}>}
    */
   async function pushToGitHub({ signal = null, only = null, interactive = true } = {}) {
-    const outcome = await runExclusiveSync(signal, (scope) => publishExclusive(scope, { only, interactive }));
+    let outcome = await runExclusiveSync(signal, (scope) => publishExclusive(scope, { only, interactive }));
+    if (outcome.status === 'failed' && outcome.conflict === true) {
+      // The person's file changed on GitHub since the last Pull: Pull (it
+      // merges that file with what is here), then publish again, once.
+      await whenSyncIdle(signal);
+      const pulled = await pullFromGitHub({ signal, quiet: !interactive });
+      if (pulled.status === 'cancelled') return pulled;
+      if (pulled.status !== 'done') return { status: 'failed', error: pulled.error ?? outcome.error, pulled };
+      await whenSyncIdle(signal);
+      outcome = await runExclusiveSync(signal, (scope) => publishExclusive(scope, { only, interactive }));
+    }
     if (outcome.status !== 'unknown') return outcome;
     const pulled = await pullFromGitHub({ quiet: true });
     return { ...outcome, pulled };
@@ -2822,7 +2684,7 @@ export function initCommunityAnnotationControls({
         });
         const removeAbort = onAbort(signal, () => {
           unsubscribe();
-          reject(signal.reason);
+          reject(abortReason(signal));
         });
       });
     }
@@ -2846,7 +2708,7 @@ export function initCommunityAnnotationControls({
       return { status: 'failed', error: syncError };
     }
 
-    const trackerId = notifications.loading(`Publishing your annotations to ${repo}...`, { category: 'annotation' });
+    const trackerId = notifications.loading(`Publishing your annotations to ${repo}…`, { category: 'annotation' });
     const completedPublicationSteps = [];
     let activePublicationPath = null;
 
@@ -2854,7 +2716,7 @@ export function initCommunityAnnotationControls({
       await githubAuth.ensureWorkerCompatible({
         signal: opAbort.signal,
       });
-      throwIfActiveSyncAborted(opAbort);
+      throwIfAborted(opAbort.signal);
       const parsed = parseOwnerRepo(repo);
       if (!parsed) throw new Error('Invalid annotation repo');
 
@@ -2883,7 +2745,7 @@ export function initCommunityAnnotationControls({
         datasetId,
         signal: opAbort.signal,
       });
-      throwIfActiveSyncAborted(opAbort);
+      throwIfAborted(opAbort.signal);
       lastRepoInfo = repoInfo;
       access.setRoleFromRepoInfo(lastRepoInfo);
       if ((access.getRole?.() || 'unknown') === 'unknown') {
@@ -2950,14 +2812,14 @@ export function initCommunityAnnotationControls({
       // Ensure local cache key uses (datasetId, repo, branch, user) with the resolved default branch.
       const userId = getCacheUserId();
       if (!userId) throw new Error('Missing GitHub numeric user id. Disconnect GitHub and sign in again.');
-      throwIfActiveSyncAborted(opAbort);
+      throwIfAborted(opAbort.signal);
       session.setCacheContext({ datasetId, repoRef: canonicalRepoRef, userId });
-      throwIfActiveSyncAborted(opAbort);
+      throwIfAborted(opAbort.signal);
       // An agent's call never opens a dialog: the profile's fields are optional.
       const okIdentity = interactive
         ? await ensureIdentityForPush()
         : await syncIdentityFromAuth({ promptIfMissing: false });
-      throwIfActiveSyncAborted(opAbort);
+      throwIfAborted(opAbort.signal);
       if (!okIdentity) {
         throw new Error('Unable to determine your GitHub username.');
       }
@@ -3105,7 +2967,7 @@ export function initCommunityAnnotationControls({
           setPublishedBaseline(publishedScope, { sha: result.sha, view: result.view });
         }
         // An author's settings and merges are a next step a Stop still prevents.
-        if (authorPayload) throwIfActiveSyncAborted(opAbort);
+        if (authorPayload) throwIfAborted(opAbort.signal);
         const extras = await publishAuthorExtras();
         activePublicationPath = null;
 
@@ -3135,7 +2997,7 @@ export function initCommunityAnnotationControls({
         else if (extras.merges.mode === 'direct' && extras.merges.changed) parts.push('published merges');
         notifications.complete(trackerId, parts.join(' • '), { announce: true });
         // Written: a Stop now changes nothing of it (the stored reference waits for the next run).
-        if (!opAbort.signal.aborted && activeSyncFatalMessage === null) commitRepoRefIfChanged();
+        if (!opAbort.signal.aborted) commitRepoRefIfChanged();
         if (
           authorPayload !== null
           && extras.config.mode !== 'fork-pull-request'
@@ -3166,7 +3028,7 @@ export function initCommunityAnnotationControls({
         changed: result.mode !== 'none' || extras.config.changed || extras.merges.changed,
       };
     } catch (caughtError) {
-      const err = normalizeActiveSyncError(caughtError, opAbort);
+      const err = syncFailureOf(caughtError, opAbort);
       const statusCode = httpStatusOrNull(err);
       const apiPath = gitHubApiPath(err) || workerPath(err);
       let msg = String(err?.message || 'Publish failed').trim() || 'Publish failed';
@@ -3200,16 +3062,14 @@ export function initCommunityAnnotationControls({
         return { status: 'unknown', error: msg };
       }
 
-      if (err?.code === 'ANNOTATION_SYNC_STOPPED') {
+      // Stopped: what was already published is still said (`msg`).
+      if (isCancellation(err)) return stoppedSyncOutcome(err, notifications, trackerId, msg);
+
+      if (isStoppedForFailure(err, opAbort)) {
+        // Stopped for a failure of its own (the connection lost): said as it.
         syncError = msg;
         notifications.fail(trackerId, msg);
         return { status: 'failed', error: msg };
-      }
-
-      if (isCancellation(err)) {
-        syncError = 'Cancelled.';
-        notifications.complete(trackerId, 'Cancelled.');
-        return { status: 'cancelled' };
       }
 
       const repoLabel = (() => {
@@ -3217,24 +3077,35 @@ export function initCommunityAnnotationControls({
         return p?.ownerRepo || String(repo || '').split('@')[0].trim() || 'repo';
       })();
 
+      // A branch that tells the person in its own sentence (a notification of
+      // its own) is that failure said once: the publication's card is then
+      // dismissed, never failed again with the raw error beside it (bug hunt
+      // R9A-6: "GitHub PUT … failed with HTTP 401" beside "Your GitHub sign-in
+      // expired…").
+      let said = false;
       if (workerCompatibilityFailure) {
         msg = `${msg}\nThe repository connection was preserved.`;
         syncError = msg;
       } else if (isWorkerOriginSecurityError(err)) {
+        said = true;
         disconnectGitHubAndAnnotationRepo({
           datasetId,
           message: err?.message || `Invalid GitHub worker origin.${apiSuffix}`,
           notify: 'error'
         });
       } else if (isTokenAuthFailure(err)) {
+        said = true;
         forgetRefusedSignIn();
       } else if (isRateLimitError(err)) {
+        said = true;
         syncError = `GitHub rate limit: ${msg}`;
         notifications.warning(syncError, { category: 'annotation', duration: 8000 });
       } else if (isWorkerUnreachable(err)) {
+        said = true;
         syncError = describeGitHubAuthReachabilityError(err);
         notifications.error(syncError, { category: 'annotation', duration: 10000 });
       } else if (statusCode === 403) {
+        said = true;
         disconnectAnnotationRepo({
           datasetId,
           userKey: cacheUser,
@@ -3242,6 +3113,7 @@ export function initCommunityAnnotationControls({
           notify: 'error'
         });
       } else if (isRepoNotFoundOrNoAccess(err)) {
+        said = true;
         disconnectAnnotationRepo({
           datasetId,
           userKey: cacheUser,
@@ -3249,6 +3121,7 @@ export function initCommunityAnnotationControls({
           notify: 'error'
         });
       } else if (isAnnotationRepoStructureError(err)) {
+        said = true;
         disconnectAnnotationRepo({
           datasetId,
           userKey: cacheUser,
@@ -3288,20 +3161,32 @@ export function initCommunityAnnotationControls({
         }
       }
 
-      notifications.fail(trackerId, msg);
+      // The person's own file changed on GitHub since the last Pull (another
+      // device or tab published): a Pull merges it, then the same publication
+      // is made again (`pushToGitHub`), so the card is not failed with "Pull
+      // first" (bug hunt R9A-3). Not when an author's staged settings or
+      // merges wait: a Pull would bring the repository's over them, so the
+      // person is told to Pull themselves.
+      const ownFileConflict = err?.code === 'COMMUNITY_ANNOTATION_CONFLICT'
+        && completedPublicationSteps.length === 0
+        && err?.path === ownUserFilePath(getCacheUserId());
+      const staged = pendingChanges();
+      const retry = ownFileConflict && (only !== null || staged === null || (staged.settings === 0 && staged.merges === 0));
+      if (said || retry) notifications.dismiss(trackerId);
+      else notifications.fail(trackerId, msg);
       return {
         status: 'failed',
         error: syncError || msg,
-        // The person's file changed on GitHub since the last Pull: a Pull, then the same publication.
-        conflict: err?.code === 'COMMUNITY_ANNOTATION_CONFLICT',
+        ...(retry ? { conflict: true } : {}),
       };
     }
   }
 
   // ------------------------------------------------------------- as actions
-  // `annotation.suggestions` reads what the voting dialog shows; `annotation.vote` is its ▲ ▼ and
-  // `annotation.suggest` its New suggestion, each published alone (`pushToGitHub` with `only`):
-  // the person's file as published plus this one change, nothing else of theirs. Connecting the repository and signing in stay the person's.
+  // `annotation.suggestions` reads what the voting dialog shows; `annotation.publish` is its ▲ ▼
+  // and New suggestion, published together as one commit (`pushToGitHub` with `only`): the
+  // person's file as published plus these changes, nothing else of theirs. Connecting the
+  // repository and signing in stay the person's.
   // A field and its categories are named as the app shows them and keyed on the dataset's
   // names in the repository (`field-names.js`).
 
@@ -3335,6 +3220,12 @@ export function initCommunityAnnotationControls({
     const { field } = await resolveLoadedField(state, ref, { kind: 'category', signal });
     const key = annotationFieldKey(field);
     const categories = annotationCategories(field);
+    if (!annotationKeyable(categories)) {
+      throw new ActionRefused(
+        `${quoteName(field.key)} cannot be annotated by the community: a category is blank, has spaces at its ends, or is named twice, and the repository keys categories by name.`,
+        { code: 'refused' },
+      );
+    }
     session.setFieldCategories(key, categories);
     return { field, key, categories };
   }
@@ -3419,31 +3310,44 @@ export function initCommunityAnnotationControls({
   }
 
   /**
-   * Publish one change alone (`only`), waiting for any Pull or Publish under
+   * Publish some changes alone (`only`), waiting for any Pull or Publish under
    * way (an automatic Pull) rather than being skipped; a file changed on
-   * GitHub since the last Pull is pulled first, then the change is
-   * published on it.
+   * GitHub since the last Pull is pulled, then the changes are published on
+   * it (`pushToGitHub`).
    */
   async function publishOne(only, signal) {
-    for (let pulledFirst = false; ;) {
+    for (;;) {
       await whenSyncIdle(signal);
       const outcome = await pushToGitHub({ signal, only, interactive: false });
-      if (outcome.status === 'skipped') continue;
-      if (outcome.status === 'failed' && outcome.conflict === true && !pulledFirst) {
-        pulledFirst = true;
-        await whenSyncIdle(signal);
-        const pulled = await pullFromGitHub({ signal, quiet: true });
-        if (pulled.status !== 'done') return outcome;
-        continue;
-      }
-      return outcome;
+      if (outcome.status !== 'skipped') return outcome;
     }
   }
 
   const unprovideActions = actions === null ? [] : [
-    actions.provide('annotation.suggestions', async ({ field: ref, category, cursor }, { signal }) => {
+    actions.provide('annotation.suggestions', async ({ field: ref, category, cursor, pull }, { signal }) => {
       const type = 'annotation.suggestions';
       const repository = connectedRepository(type);
+      // Never pulled, the browser holds none of the others' suggestions: a
+      // read of it would say "none suggested" of a repository full of them
+      // (live pass 5, L18-6). It is pulled first, as Pull latest does.
+      if (pull === true || (pull === undefined && session.getLastPullAt() === null)) {
+        await whenSyncIdle(signal);
+        const pulled = await pullFromGitHub({ signal, quiet: true });
+        throwIfAborted(signal);
+        if (pulled.status === 'failed') {
+          throw new ActionRefused(
+            `Pulling ${repository} failed: ${pulled.error ?? 'GitHub did not answer'} Nothing was read; the person can try Pull latest in Community annotation › GitHub sync.`,
+            { code: 'unavailable', type },
+          );
+        }
+        if (pulled.status === 'cancelled') {
+          // Stopped by the person or a change of context, not by this call.
+          throw new ActionRefused(
+            `Pulling ${repository} was stopped: ${pulled.words} Nothing was read.`,
+            { code: 'unavailable', type },
+          );
+        }
+      }
       const target = await annotatedField(ref, signal);
       const indices = category === undefined
         ? target.field.categories.map((_label, index) => index)
@@ -3478,169 +3382,224 @@ export function initCommunityAnnotationControls({
         pulled_at: session.getLastPullAt(),
         annotated: session.isFieldAnnotated(target.key),
         closed: session.isFieldClosed(target.key),
+        consensus_rule: (() => {
+          const rule = session.getAnnotatableConsensusSettings(target.key);
+          return rule === null ? null : { voters_needed: rule.minAnnotators, threshold: rule.threshold };
+        })(),
         ...(target.key === target.field.key ? {} : { repository_field: target.key }),
         categories,
         total_categories: indices.length,
         next,
       };
     }),
-    actions.provide('annotation.vote', async ({ field: ref, category, suggestion: wanted, vote }, { signal, confirm }) => {
-      const type = 'annotation.vote';
+    actions.provide('annotation.publish', async ({ votes = [], suggestions = [] }, { signal, confirm }) => {
+      const type = 'annotation.publish';
       const repository = connectedRepository(type);
+      if (votes.length + suggestions.length === 0) {
+        throw new ActionRefused('Nothing to publish: the call gives no votes and no suggestions.', { code: 'refused', type });
+      }
       if (!githubAuth.isAuthenticated?.()) {
         throw new ActionRefused(`The person is not signed in to GitHub in Community annotation, so nothing can be published: they sign in there first.`, { code: 'unavailable', type });
       }
-      const target = await annotatedField(ref, signal);
-      const shownCategory = categoryLabel(target.field.categories[resolveCategory(target.field, category)]);
-      const label = repositoryCategory(target, category);
-      if (!session.isFieldAnnotated(target.key)) {
-        throw new ActionRefused(`${quoteName(target.field.key)} is not open to community annotation in this repository.`, { code: 'unavailable', type });
-      }
-      if (session.isFieldClosed(target.key) && !access.isAuthor()) {
-        throw new ActionRefused(`Voting on ${quoteName(target.field.key)} is closed; only its repository's authors still vote.`, { code: 'unavailable', type });
-      }
-      // An automatic Pull under way finishes first: the vote is checked against what it brings.
+      // An automatic Pull under way finishes first: every change is checked against what it brings.
       await whenSyncIdle(signal);
       const userId = await requireIdentity(type);
-      const suggestions = session.getSuggestions(target.key, label);
-      const chosen = targetSuggestion(type, shownCategory, suggestions, wanted);
-      const chosenLabel = toCleanString(chosen.label);
       const scope = { datasetId: annotationDatasetIdOf(dataSourceManager), repoRef: getCacheContext({}).repoRef, userId };
       const published = publishedBaseline(scope, session.getRemoteFileShas());
-      const ownDraft = chosen.proposedBy === `ghid_${userId}`
-        && published !== undefined
-        && !Object.values(published?.suggestions ?? {}).some(list => list.some(entry => entry.id === chosen.id));
-      if (ownDraft) {
+
+      // Every change is checked before the person is asked: one refused, none is published.
+      const problems = [];
+      const refusedAt = (what, error) => {
+        if (!(error instanceof ActionRefused)) throw error;
+        problems.push({ what, error });
+      };
+      /** Each field named, resolved once: its target, or the refusal said once. */
+      const fields = new Map();
+      const fieldOf = async ref => {
+        const key = `${ref.source}\u0000${ref.key}`;
+        if (!fields.has(key)) {
+          fields.set(key, (async () => {
+            const target = await annotatedField(ref, signal);
+            if (!session.isFieldAnnotated(target.key)) {
+              throw new ActionRefused(`${quoteName(target.field.key)} is not open to community annotation in this repository.`, { code: 'unavailable', type });
+            }
+            if (session.isFieldClosed(target.key) && !access.isAuthor()) {
+              throw new ActionRefused(`Voting and suggesting on ${quoteName(target.field.key)} are closed; only its repository's authors still take part.`, { code: 'unavailable', type });
+            }
+            return target;
+          })().then(target => ({ target }), error => ({ error })));
+        }
+        const known = await fields.get(key);
+        if ('error' in known) {
+          if (!(known.error instanceof ActionRefused)) throw known.error;
+          if (!known.told) {
+            known.told = true;
+            problems.push({ what: null, error: known.error });
+          }
+          return null;
+        }
+        return known.target;
+      };
+      /** Where a change goes: its field, the category as shown, and its name in the repository. */
+      const placeOf = async (change, what) => {
+        const target = await fieldOf(change.field);
+        if (target === null) return null;
+        try {
+          const index = resolveCategory(target.field, change.category);
+          return { target, shown: categoryLabel(target.field.categories[index]), label: categoryLabel(target.categories[index]) };
+        } catch (error) {
+          refusedAt(what, error);
+          return null;
+        }
+      };
+
+      const planned = { votes: [], suggestions: [] };
+      for (const [at, change] of suggestions.entries()) {
+        const what = `suggestion ${at + 1} (${quoteName(toCleanString(change.label))})`;
+        const place = await placeOf(change, what);
+        if (place === null) continue;
+        const label = toCleanString(change.label);
+        const compared = exactLabelForCompare(label);
+        const existing = session.getSuggestions(place.target.key, place.label)
+          .find(entry => exactLabelForCompare(toCleanString(entry.label)) === compared);
+        if (existing !== undefined) {
+          refusedAt(what, new ActionRefused(
+            `${quoteName(place.shown)} already has the suggestion ${quoteName(label)} (id ${quoteName(existing.id)}); vote on it instead.`,
+            { code: 'exists', type },
+          ));
+          continue;
+        }
+        if (planned.suggestions.some(other => other.target.key === place.target.key && other.label === place.label && other.compared === compared)) {
+          refusedAt(what, new ActionRefused(`${quoteName(label)} is suggested twice for ${quoteName(place.shown)} in this call.`, { code: 'refused', type }));
+          continue;
+        }
+        planned.suggestions.push({ ...place, text: label, compared, ontologyId: change.ontology_id ?? null, evidence: change.evidence ?? null });
+      }
+      for (const [at, change] of votes.entries()) {
+        const what = `vote ${at + 1} (${quoteName(toCleanString(change.suggestion))})`;
+        const place = await placeOf(change, what);
+        if (place === null) continue;
+        const wanted = exactLabelForCompare(toCleanString(change.suggestion));
+        if (planned.suggestions.some(entry => entry.target.key === place.target.key && entry.label === place.label && entry.compared === wanted)) {
+          refusedAt(what, new ActionRefused(
+            `${quoteName(toCleanString(change.suggestion))} is suggested in this call and comes with the person's upvote; leave its vote out.`,
+            { code: 'refused', type },
+          ));
+          continue;
+        }
+        let chosen;
+        try {
+          chosen = targetSuggestion(type, place.shown, session.getSuggestions(place.target.key, place.label), change.suggestion);
+        } catch (error) {
+          refusedAt(what, error);
+          continue;
+        }
+        const chosenLabel = toCleanString(chosen.label);
+        const ownDraft = chosen.proposedBy === `ghid_${userId}`
+          && published !== undefined
+          && !Object.values(published?.suggestions ?? {}).some(list => list.some(entry => entry.id === chosen.id));
+        if (ownDraft) {
+          refusedAt(what, new ActionRefused(
+            `${quoteName(chosenLabel)} is the person's own suggestion and is not published yet, so a vote on it cannot be published without it: they Publish in Community annotation first.`,
+            { code: 'unavailable', type },
+          ));
+          continue;
+        }
+        const direction = change.vote === 'none' ? null : change.vote;
+        const twice = planned.votes.find(other => other.chosen.id === chosen.id);
+        if (twice !== undefined) {
+          if (twice.direction !== direction) {
+            refusedAt(what, new ActionRefused(`${quoteName(chosenLabel)} of ${quoteName(place.shown)} is voted twice in this call, differently.`, { code: 'refused', type }));
+          }
+          continue;
+        }
+        const publishedVote = published === undefined ? undefined : (published?.votes?.[chosen.id] ?? null);
+        const localVote = session.getMyVoteDirect(place.target.key, place.label, chosen.id) ?? null;
+        planned.votes.push({ ...place, chosen, direction, publishedVote, localVote, settled: publishedVote === direction && localVote === direction });
+      }
+      if (problems.length > 0) {
+        const codes = new Set(problems.map(problem => problem.error.code));
+        const said = problems.map(problem => (problem.what === null ? problem.error.marked : `${problem.what}: ${problem.error.marked}`));
         throw new ActionRefused(
-          `${quoteName(chosenLabel)} is the person's own suggestion and is not published yet, so a vote on it cannot be published alone: they Publish in Community annotation first.`,
-          { code: 'unavailable', type },
+          `${said.join(' ')}${votes.length + suggestions.length > 1 ? ' Nothing of this call was published.' : ''}`,
+          { code: codes.size === 1 ? [...codes][0] : 'refused', type },
         );
       }
-      const direction = vote === 'none' ? null : vote;
-      const factsNow = () => suggestionFacts(target.key, label, session.getSuggestions(target.key, label).find(entry => entry.id === chosen.id) ?? chosen);
-      const answer = (route, pullRequest) => {
-        const facts = factsNow();
+
+      const factsOf = vote => suggestionFacts(vote.target.key, vote.label, session.getSuggestions(vote.target.key, vote.label).find(entry => entry.id === vote.chosen.id) ?? vote.chosen);
+      const answer = (route, pullRequest, ids = []) => {
         const pending = pendingChanges();
         return {
           repository,
           published: route,
           pull_request: pullRequest,
-          suggestion: facts.label,
-          vote: facts.mine ?? 'none',
-          up: facts.up,
-          down: facts.down,
+          votes: planned.votes.map(vote => {
+            const facts = factsOf(vote);
+            return { category: vote.shown, suggestion: facts.label, vote: facts.mine ?? 'none', up: facts.up, down: facts.down };
+          }),
+          suggestions: planned.suggestions.map((entry, index) => ({ category: entry.shown, id: ids[index], label: entry.text })),
           not_published: pending === null ? null : pending.total,
         };
       };
       // Nothing to change (as published, and here): nothing is asked, nothing is written.
-      const publishedVote = published === undefined ? undefined : (published?.votes?.[chosen.id] ?? null);
-      const localVote = session.getMyVoteDirect(target.key, label, chosen.id) ?? null;
-      if (publishedVote === direction && localVote === direction) return answer('unchanged', null);
+      const changing = planned.votes.filter(vote => !vote.settled);
+      if (changing.length === 0 && planned.suggestions.length === 0) return answer('unchanged', null);
+
       const route = publicationRoute();
       const pending = pendingChanges();
-      // This suggestion's own pending vote is settled by this publication; the rest stays.
-      const others = pending === null ? 0 : pending.total - (localVote !== publishedVote ? 1 : 0);
+      // Pending votes this publication settles are not "other" changes; the rest stays.
+      const settledHere = changing.filter(vote => vote.localVote !== vote.publishedVote).length;
+      const others = pending === null ? 0 : Math.max(0, pending.total - settledHere);
+      const counted = [
+        changing.length > 0 ? formatCountOf(changing.length, 'vote') : null,
+        planned.suggestions.length > 0 ? `${formatCountOf(planned.suggestions.length, 'suggestion')} (each with your upvote)` : null,
+      ].filter(Boolean).join(' and ');
       await confirm(
-        `It publishes this one vote to ${repository}${route === 'pull-request' ? ' as a pull request, which the repository\'s authors merge' : ''}, `
-        + 'where others see it on their next Pull; the history cannot take it back.'
+        `It publishes ${counted} to ${repository} as one commit${route === 'pull-request' ? ', in a pull request the repository\'s authors merge' : ''}, `
+        + 'where others see them on their next Pull; the history cannot take it back.'
         + (others > 0 ? ` Nothing else is published: your other ${formatCountOf(others, 'unpublished change')} ${countNoun(others, 'stays', 'stay')} in this browser.` : ''),
       );
-      // Here as the dialog's ▲ ▼ leave it, then published alone.
-      if (localVote !== direction) {
-        if (localVote !== null) session.vote(target.key, label, chosen.id, localVote);
-        if (direction !== null) session.vote(target.key, label, chosen.id, direction);
+      // Here as the dialog's ▲ ▼ and New suggestion leave them, then published together.
+      for (const vote of changing) {
+        if (vote.localVote === vote.direction) continue;
+        if (vote.localVote !== null) session.vote(vote.target.key, vote.label, vote.chosen.id, vote.localVote);
+        if (vote.direction !== null) session.vote(vote.target.key, vote.label, vote.chosen.id, vote.direction);
       }
+      const ids = planned.suggestions.map(entry => session.addSuggestion(entry.target.key, entry.label, {
+        label: entry.text, ontologyId: entry.ontologyId, evidence: entry.evidence,
+      }));
+      // Each suggestion as the person's file holds it, with its bucket there.
+      const own = ids.length === 0 ? null : session.buildUserFileDocument({ githubUserId: userId });
+      const held = own === null ? [] : Object.entries(own.suggestions).flatMap(([bucket, list]) => list.map(entry => ({ bucket, suggestion: entry })));
+      const composedSuggestions = ids.map(id => held.find(entry => entry.suggestion.id === id));
+      const composedVotes = changing.map(vote => ({ suggestionId: vote.chosen.id, direction: vote.direction }));
+      const what = changing.length + ids.length === 1
+        ? (ids.length === 1 ? 'suggestion' : 'vote')
+        : counted.replace(' (each with your upvote)', '');
       const outcome = await publishOne({
-        what: 'vote',
-        compose: (publishedNow, who) => withOneVote(publishedNow, { ...who, suggestionId: chosen.id, direction }),
+        what,
+        compose: (publishedNow, who) => withChanges(publishedNow, { ...who, votes: composedVotes, suggestions: composedSuggestions }),
       }, signal);
       if (outcome.status === 'done') {
-        return answer(outcome.mode === 'fork-pull-request' ? 'pull-request' : outcome.changed ? 'repository' : 'unchanged', outcome.prUrl ?? null);
+        return answer(outcome.mode === 'fork-pull-request' ? 'pull-request' : outcome.changed ? 'repository' : 'unchanged', outcome.prUrl ?? null, ids);
       }
       if (outcome.status === 'unknown') {
-        // GitHub may have it: the Pull after it says what GitHub holds now.
+        // GitHub may have them: the Pull after it says what GitHub holds now.
         const after = publishedBaseline(scope, session.getRemoteFileShas());
-        if (after !== undefined && (after?.votes?.[chosen.id] ?? null) === direction) return answer('repository', null);
+        const there = after !== undefined
+          && composedVotes.every(vote => (after?.votes?.[vote.suggestionId] ?? null) === vote.direction)
+          && ids.every(id => Object.values(after?.suggestions ?? {}).some(list => list.some(entry => entry.id === id)));
+        if (there) return answer('repository', null, ids);
         throw new ActionRefused(
-          `Publishing the vote was interrupted and it may already be published to ${repository}; `
+          `Publishing was interrupted and the ${what} may already be published to ${repository}; `
           + (outcome.pulled?.status === 'done'
-            ? 'the Pull after it does not show it, so it is kept in this browser, not published.'
+            ? 'the Pull after it does not show them, so they are kept in this browser, not published.'
             : 'the person Pulls in Community annotation to see.'),
           { code: 'may-be-published', type },
         );
       }
       throw new ActionRefused(
-        `The vote is kept in this browser but was not published (${outcome.status === 'cancelled' ? 'cancelled' : outcome.error ?? outcome.status}); the person can Publish it from Community annotation.`,
-        { code: 'not-published', type },
-      );
-    }),
-    actions.provide('annotation.suggest', async ({ field: ref, category, label: wanted, ontology_id: ontologyId, evidence }, { signal, confirm }) => {
-      const type = 'annotation.suggest';
-      const repository = connectedRepository(type);
-      if (!githubAuth.isAuthenticated?.()) {
-        throw new ActionRefused(`The person is not signed in to GitHub in Community annotation, so nothing can be published: they sign in there first.`, { code: 'unavailable', type });
-      }
-      const target = await annotatedField(ref, signal);
-      const shownCategory = categoryLabel(target.field.categories[resolveCategory(target.field, category)]);
-      const bucketLabel = repositoryCategory(target, category);
-      if (!session.isFieldAnnotated(target.key)) {
-        throw new ActionRefused(`${quoteName(target.field.key)} is not open to community annotation in this repository.`, { code: 'unavailable', type });
-      }
-      if (session.isFieldClosed(target.key) && !access.isAuthor()) {
-        throw new ActionRefused(`Suggesting for ${quoteName(target.field.key)} is closed; only its repository's authors still suggest.`, { code: 'unavailable', type });
-      }
-      await whenSyncIdle(signal);
-      const userId = await requireIdentity(type);
-      const label = toCleanString(wanted);
-      const existing = session.getSuggestions(target.key, bucketLabel)
-        .find(entry => exactLabelForCompare(toCleanString(entry.label)) === exactLabelForCompare(label));
-      if (existing !== undefined) {
-        throw new ActionRefused(
-          `${quoteName(shownCategory)} already has the suggestion ${quoteName(label)} (id ${quoteName(existing.id)}); vote on it instead.`,
-          { code: 'exists', type },
-        );
-      }
-      const route = publicationRoute();
-      const pending = pendingChanges();
-      const others = pending === null ? 0 : pending.total;
-      await confirm(
-        `It publishes this one suggestion, with your upvote, to ${repository}${route === 'pull-request' ? ' as a pull request, which the repository\'s authors merge' : ''}, `
-        + 'where others see it on their next Pull; the history cannot take it back.'
-        + (others > 0 ? ` Nothing else is published: your other ${formatCountOf(others, 'unpublished change')} ${countNoun(others, 'stays', 'stay')} in this browser.` : ''),
-      );
-      const id = session.addSuggestion(target.key, bucketLabel, {
-        label, ontologyId: ontologyId ?? null, evidence: evidence ?? null,
-      });
-      // The suggestion as the person's file holds it, and its bucket there.
-      const own = session.buildUserFileDocument({ githubUserId: userId });
-      const [bucket, suggestion] = Object.entries(own.suggestions)
-        .flatMap(([key, list]) => list.map(entry => [key, entry]))
-        .find(([, entry]) => entry.id === id);
-      const answer = (published, pullRequest) => {
-        const left = pendingChanges();
-        return { repository, published, pull_request: pullRequest, id, label, not_published: left === null ? null : left.total };
-      };
-      const outcome = await publishOne({
-        what: 'suggestion',
-        compose: (publishedNow, who) => withOneSuggestion(publishedNow, { ...who, bucket, suggestion }),
-      }, signal);
-      if (outcome.status === 'done') return answer(outcome.mode === 'fork-pull-request' ? 'pull-request' : 'repository', outcome.prUrl ?? null);
-      if (outcome.status === 'unknown') {
-        const scope = { datasetId: annotationDatasetIdOf(dataSourceManager), repoRef: getCacheContext({}).repoRef, userId };
-        const after = publishedBaseline(scope, session.getRemoteFileShas());
-        if (after !== undefined && Object.values(after?.suggestions ?? {}).some(list => list.some(entry => entry.id === id))) {
-          return answer('repository', null);
-        }
-        throw new ActionRefused(
-          `Publishing the suggestion was interrupted and it may already be published to ${repository}; `
-          + (outcome.pulled?.status === 'done'
-            ? 'the Pull after it does not show it, so it is kept in this browser, not published.'
-            : 'the person Pulls in Community annotation to see.'),
-          { code: 'may-be-published', type },
-        );
-      }
-      throw new ActionRefused(
-        `The suggestion is kept in this browser but was not published (${outcome.status === 'cancelled' ? 'cancelled' : outcome.error ?? outcome.status}); the person can Publish it from Community annotation.`,
+        `The ${what} ${changing.length + ids.length === 1 ? 'is' : 'are'} kept in this browser but not published (${outcome.status === 'cancelled' ? 'cancelled' : outcome.error ?? outcome.status}); the person can Publish from Community annotation.`,
         { code: 'not-published', type },
       );
     }),

@@ -4,6 +4,7 @@ import test from 'node:test';
 import { planLinearTexture } from '../assets/js/rendering/linear-texture.js';
 
 import {
+  trailChannelFades,
   VelocityOverlay,
 } from '../assets/js/rendering/overlays/velocity/velocity-overlay.js';
 import {
@@ -749,7 +750,7 @@ test('velocity simulation and complete trail aging preserve 60 Hz timing contrac
     PARTICLE_UPDATE_VS,
     /pow\(|dropChance \* dt \* 60\.0|mix\(a_velocity, velocity, 0\.25\)/,
   );
-  const simulationSource = VelocityOverlay.prototype._simulate.toString();
+  const simulationSource = VelocityOverlay.prototype._advanceParticles.toString();
   assert.match(
     simulationSource,
     /normalizeVelocityDropChance\(this\.config\.dropRate, frameScale\)/,
@@ -767,10 +768,12 @@ test('velocity simulation and complete trail aging preserve 60 Hz timing contrac
   }
   assert.doesNotMatch(TRAIL_FADE_FS, /pow\(/);
   const passFadeSource = VelocityOverlay.prototype._passFade.toString();
+  assert.match(passFadeSource, /trailChannelFades\(\s*fadeAt60Hz,/);
+  const channelFadeSource = trailChannelFades.toString();
   for (const calibratedFactor of ['0.025', '0.005', '0.035']) {
-    assert.match(passFadeSource, new RegExp(`fadeAt60Hz[^;]*${calibratedFactor}`));
+    assert.match(channelFadeSource, new RegExp(`fadeAt60Hz[^;]*${calibratedFactor}`));
   }
-  assert.match(passFadeSource, /Math\.min\(1,/);
+  assert.match(channelFadeSource, /Math\.min\(1,/);
   assert.doesNotMatch(
     TRAIL_FADE_FS,
     /ambientGlow|hdrBoost|temperatureShift|\+\s*ambient/,
@@ -928,6 +931,7 @@ test('a positive particle-count change force-initializes every active slot and c
     dimensionLevel: 3,
     frameId: 7,
     getViewPositions: () => positions,
+    reducedMotion: false,
     time: 1,
     viewId: 'live',
   });
@@ -1746,6 +1750,7 @@ test('committed empty visibility retires the prior full-resolution trail generat
     dimensionLevel: 3,
     frameId: 1,
     getViewPositions: () => new Float32Array(3),
+    reducedMotion: false,
     viewId: 'live',
   });
 

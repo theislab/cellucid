@@ -31,6 +31,7 @@ import { instrumentGlUploads, uploadCounterFields } from './gl-upload-counter.js
 import { createInputLatencyTracker } from './input-latency.js';
 import { createLongTaskProbe } from './long-task-probe.js';
 import { createPassProfiler } from './pass-profiler.js';
+import { yieldToMacrotask } from '../../../../utils/yield-macrotask.js';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 
@@ -68,9 +69,6 @@ function readMemory(viewer) {
   };
 }
 
-function nextMacrotask() {
-  return new Promise(resolve => setTimeout(resolve, 0));
-}
 
 /**
  * Install every render probe.
@@ -128,7 +126,7 @@ export function installRenderProbes(options = {}) {
   async function closeWindow(token) {
     const frames = sampler.closeWindow(token.frames);
     const uploadsDelta = subtractUploads(cumulativeUploads(uploads), token.uploadsBefore);
-    await nextMacrotask();
+    await yieldToMacrotask();
     const longTaskSummary = longTasks.closeWindow(token.longTasks);
     const inputSummary = inputs.closeWindow(token.inputs);
     const passSummary = await passes.closeWindow(token.passes);

@@ -6,14 +6,18 @@
  * the tab secret (`tab-secret.js`), and:
  *
  * - **runs tool calls**: a call names a tool; the tab finds its action in the
- *   catalogue and dispatches it as the agent (`origin: 'agent'`, the agent's
+ *   catalog and dispatches it as the agent (`origin: 'agent'`, the agent's
  *   name from the connection, a turn id), so the person's history records
  *   it, labels it and can undo the agent's whole turn at once. The answer is
  *   MCP content (`mcp-content.js`). A call the agent gives up on is stopped.
- * - **answers the tool list** from the catalogue (`mcp-tools.js`).
+ * - **answers the tool list** from the catalog (`mcp-tools.js`).
  * - **reports focus**: commands go to the tab of this browser focused last.
  * - **approves connections**: a connect code (from the relay's approval
- *   page, by link or typed) is claimed; the relay says who asks
+ *   page, by link or typed) is claimed by a request this browser sends
+ *   with its cookies for the relay (`POST /oauth/claim`, `credentials:
+ *   'include'`): the relay answers only the browser that shows the code's
+ *   page (its approver cookie), so a code or link someone sent from their
+ *   own browser attaches nothing here. The relay says who asks
  *   (`onApproval`); the person allows or denies (`approve` / `deny`).
  * - **lists and removes connections**, and **forgets** the pairing.
  * - **stays connected** over changing links: reconnects with growing,
@@ -29,8 +33,11 @@
  * @module app/agent/bridge/relay-client
  */
 
+import { backoffDelayMs } from '../../../utils/backoff.js';
+import { isSecureContextLoopbackHost } from '../../../utils/loopback.js';
 import { isLocalDevHost } from '../../utils/local-dev.js';
 import { createAgentCalls } from './agent-calls.js';
+import { appName } from '../connect/model.js';
 import { formatConnectCode, normalizeConnectCode, takeConnectCode } from './connect-code.js';
 import { pageVersion } from '../../utils/page-version.js';
 import {
@@ -70,7 +77,8 @@ function exactRelayOrigin(value) {
   } catch {
     return null;
   }
-  const loopback = url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]';
+  // Plain http only where a browser trusts it (never 0.0.0.0): the tab secret goes there.
+  const loopback = isSecureContextLoopbackHost(url.hostname);
   if (url.origin !== value) return null;
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) return null;
   return url.origin;
@@ -102,6 +110,7 @@ function relayError(message, code) {
  *   actions: {catalog: object, dispatch: Function, subscribe: Function},
  *   secrets?: {read: () => string|null, ensure: () => string, forget: () => void},
  *   WebSocketImpl?: typeof WebSocket,
+ *   fetchImpl?: typeof fetch,
  *   win?: object|null,
  *   doc?: object|null,
  *   version?: string,
@@ -119,13 +128,14 @@ function relayError(message, code) {
  *   picture is after);
  *   `permissionFor({kind, connection})`: what the person's settings make
  *   of a kind of action (`change`, or a `confirm` kind) for a connection:
- *   `ask`, `allow`, `deny`, or null (the default); its tool list says so
+ *   `ask`, `allow`, `deny`, or null (the default); its agent is told it after its results
  */
 export function createRelayClient({
   relayOrigin,
   actions,
   secrets = { read: () => readTabSecret(), ensure: () => ensureTabSecret(), forget: () => forgetTabSecret() },
   WebSocketImpl = globalThis.WebSocket,
+  fetchImpl = (input, init) => globalThis.fetch(input, init),
   win = globalThis.window ?? null,
   doc = globalThis.document ?? null,
   version = '',
@@ -241,17 +251,21 @@ export function createRelayClient({
     else entry.reject(relayError(String(error?.message ?? 'The relay refused it'), String(error?.code ?? 'refused')));
   }
 
-  function runCall({ id, tool, args, agent, grant, client = null, host = null }) {
+  function runCall({ id, tool, args, agent, grant, client = null, host = null, known = false }) {
     if (!calls.has(tool)) {
       send({ type: 'result', id, error: { code: 'unknown-tool', message: `Cellucid has no tool "${tool}"` } });
       return;
     }
-    void calls.run({ id, tool, args, agent, connection: { id: grant, client, host } });
+    // One name everywhere a person sees this agent (activity line, confirm card, history steps), as
+    // Manage… names the connection (`connect/model.js` `appName`): an app no site vouches for is its
+    // host (or an app on this computer) with its own name quoted, so two of them are told apart (L26-4).
+    const named = known === true ? agent : appName(agent, client, false);
+    void calls.run({ id, tool, args, agent: named, connection: { id: grant, client, host, known: known === true } });
   }
 
-  /** The tools as the connection `grant` may use them: each question as the person's settings answer it for that connection. */
-  function answerList(id, grant) {
-    send({ type: 'tools', id, tools: calls.list(typeof grant === 'string' ? grant : null) });
+  /** The tools: one list whatever the person's settings (`mcp-tools.js`; the agent is told them after its results). */
+  function answerList(id) {
+    send({ type: 'tools', id, tools: calls.list() });
   }
 
   function reportState() {
@@ -293,7 +307,7 @@ export function createRelayClient({
         runCall(message);
         return;
       case 'list':
-        answerList(message.id, message.grant);
+        answerList(message.id);
         return;
       case 'cancel':
         calls.cancel(message.id);
@@ -389,7 +403,7 @@ export function createRelayClient({
 
   function scheduleRetry() {
     if (retryTimer !== null) return;
-    const delay = Math.min(RECONNECT_DELAY_CEILING_MS, RECONNECT_FIRST_MS * 2 ** attempt) * (0.5 + clock.random() / 2);
+    const delay = backoffDelayMs(attempt, { firstMs: RECONNECT_FIRST_MS, ceilingMs: RECONNECT_DELAY_CEILING_MS, random: clock.random });
     attempt += 1;
     retryAt = clock.now() + delay;
     setState('retrying', lastError);
@@ -519,7 +533,7 @@ export function createRelayClient({
     const exact = normalizeConnectCode(code);
     if (exact === null) throw relayError('That is not a connect code: it has eight letters and digits, like ABCD-EFGH.', 'not-a-code');
     if (!wanted) connect();
-    const answer = await request('claim', { code: exact });
+    const answer = await claimAtRelay(exact, secrets.read());
     const approval = Object.freeze({
       code: exact,
       display: formatConnectCode(exact),
@@ -539,6 +553,42 @@ export function createRelayClient({
     try { onApproval(approval); } catch (cause) { console.error('[agent relay] approval listener failed', cause); }
     setState(state, lastError);
     return approval;
+  }
+
+  /**
+   * Ask the relay who asks with `code`, as this browser: the request carries
+   * the relay's approver cookie (`credentials: 'include'`; the relay sets it
+   * with the waiting page, and sends it back only to its own site) and the
+   * tab secret that names this browser's pairing, which alone may then
+   * decide. The relay answers `{ok, value|error}` (a refusal is an answer:
+   * an expired code, one started in another browser); rejects with the
+   * refusal's `{code, message}`.
+   */
+  async function claimAtRelay(code, secret) {
+    const controller = new AbortController();
+    const timer = clock.setTimeout(() => controller.abort(), RELAY_REPLY_WAIT_MS);
+    let response;
+    let body = null;
+    try {
+      response = await fetchImpl(`${relayOrigin}/oauth/claim`, {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, secret }),
+        signal: controller.signal,
+      });
+      body = await response.json().catch(() => null);
+    } catch {
+      throw controller.signal.aborted
+        ? relayError('The Cellucid relay did not answer. Check the connection and try again.', 'relay-unanswered')
+        : relayError('The Cellucid relay cannot be reached.', 'unreachable');
+    } finally {
+      clock.clearTimeout(timer);
+    }
+    if (response.ok && body?.ok === true && typeof body.value?.client === 'object' && body.value.client !== null) return body.value;
+    const error = body?.ok === false ? body.error : body;
+    throw relayError(String(error?.message ?? 'The relay refused it'), String(error?.code ?? 'refused'));
   }
 
   async function decide(code, allow) {

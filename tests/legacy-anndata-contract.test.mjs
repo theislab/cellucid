@@ -9,7 +9,7 @@
  * anndata (`scripts/generate-legacy-anndata-twin.py`). Every reader output the
  * app uses is compared with the twin's, value for value: what the dataset
  * says about itself, every cell field (categories, codes with missing values,
- * order), gene names, every gene, the embeddings and the neighbour graph.
+ * order), gene names, every gene, the embeddings and the neighbor graph.
  */
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';

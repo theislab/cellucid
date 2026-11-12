@@ -95,6 +95,37 @@ test('the sample list names each dataset from its own file, reading its metadata
   assert.equal(source.getStateDescriptor('tiny-ready').sessionUrl, `${BASE}tiny-ready.cellucid-session`);
 });
 
+test('the listing waits for startup\'s dataset: it reads no file before, and takes the opened dataset\'s description from its opening', async t => {
+  // Measured 2026-11-10: the listing, asked for as the interface is built, ran
+  // a millisecond before startup opened the default sample, so it read every
+  // sample's file, the one being opened too, against that first view.
+  quiet(t);
+  const host = serveCatalog(t, CATALOG);
+  const source = new LocalDemoDataSource(BASE, null);
+  let release;
+  source.holdListingUntil(new Promise(resolve => {
+    release = resolve;
+  }));
+  assert.throws(() => source.holdListingUntil(null), /needs a promise/);
+  let listed = null;
+  const listing = source.listDatasets().then(datasets => {
+    listed = datasets;
+    return datasets;
+  });
+  const storeReads = () => host.requests.filter(request => /ready\.zarr\//.test(request.url)).length;
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(listed, null, 'the listing waits');
+  assert.equal(storeReads(), 0, 'no sample file is read before startup\'s dataset');
+  // Startup opens its dataset, then settles: the listing takes the opening's description.
+  const metadata = await source.getMetadata('tiny-ready');
+  const opened = storeReads();
+  assert.ok(opened > 0);
+  release();
+  const datasets = await listing;
+  assert.equal(datasets[0].name, metadata.name);
+  assert.equal(storeReads(), opened, 'the dataset opened is not read a second time for the listing');
+});
+
 test('choosing a sample opens its file once; its default view and AnnData source follow', async t => {
   quiet(t);
   serveCatalog(t, CATALOG);

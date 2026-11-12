@@ -37,6 +37,7 @@ import {
   layoutOfHead,
   layoutsOf,
   openableNamePhrases,
+  openableNamesText,
   readsFromHead,
   titleOfName,
 } from '../assets/js/data/input-formats.js';
@@ -56,7 +57,7 @@ const FIXTURE = path.join(ROOT, 'tests/fixtures/input-formats.json');
  * (`tests/test_input_formats.py`) and cellucid-r
  * (`tests/testthat/test-input-formats.R`) pin the same one.
  */
-const INPUT_FORMATS_SHA256 = 'bd7fa1e23a3fd24794b647c5969ddb1aaad9a7b613b1457261c3b10dd705e2e5';
+const INPUT_FORMATS_SHA256 = '31a4853465dd05ec412f4645f9a9efdfb6a14393f0932b4c26883648ad01f6f9';
 
 /** A dataset's structure for its default id (`defaultDatasetIdOf`), and its pinned digits. */
 const PBMC = Object.freeze({ nObs: 2700, nVars: 3, varNames: Object.freeze(['CD3E', 'MS4A1', 'LYZ']) });
@@ -190,7 +191,9 @@ test('Cellucid\'s own files are named, are no dataset, and say what they are and
     }
   }
   assert.match(cellucidFileOfName('x.cellucid-library').said, /library file.*Session › Open data › My datasets › All… › Import…\.$/);
-  assert.match(cellucidFileOfName('x.cellucid-session').said, /session file.*State › Session › Load… › Open a session file….*cellucid\.read_session\(\).*cellucid_read_session\(\)\.$/);
+  // A session file opens in the web app, its dataset with it (L25-8): no "open its dataset first".
+  assert.match(cellucidFileOfName('x.cellucid-session').said, /session file.*drop it on the page, or choose it with State › Session › Load… › Open a session file…; its dataset opens with it\..*cellucid\.read_session\(\).*cellucid_read_session\(\)\.$/);
+  assert.doesNotMatch(cellucidFileOfName('x.cellucid-session').said, /Open its dataset, then/);
   // Python and R read them from the document.
   assert.deepEqual(JSON.parse(inputFormatsJson()).cellucidFiles, CELLUCID_FILES.map(file => ({ ...file, names: [...file.names] })));
 });
@@ -295,7 +298,7 @@ test('catalogs, drops, the picker and the address bar take exactly the names the
   assert.ok(!filePickerAccept().split(',').includes('.gz'));
   assert.deepEqual(localFileLayout({ name: 'GSM1_seurat.rds.gz' }), 'file');
   assert.deepEqual(openableNamePhrases(), [
-    '.h5ad file', '.loom file', '.h5 file', '.h5mu file', '.rds file', '.rdata file',
+    '.h5ad file', '.loom file', '.h5 file', '.h5mu file', '.rds file', '.rda/.rdata file',
     '.zarr folder', 'Cell Ranger outs/ folder', 'MatrixMarket folder',
     '.zarr.zip archive',
   ]);
@@ -412,4 +415,13 @@ test('a folder on this computer and a listing on a host tell a MatrixMarket matr
     assert.equal(transcoder, local, `${name}: the transcoder and the folder rule`);
     assert.equal(listed, local, `${name}: a listing and the folder rule`);
   }
+});
+
+test('the single files Cellucid opens are named in one sentence, the packages\' too', () => {
+  // cellucid-python's openable_files_text() and cellucid-r's .openable_files_text()
+  // pin the same words: each refuses a file it does not open with them (R9Y-4).
+  assert.equal(
+    openableNamesText({ layouts: ['file', 'zip'] }),
+    'an .h5ad file, a .loom file, an .h5 file, an .h5mu file, an .rds file, an .rda/.rdata file or a .zarr.zip archive'
+  );
 });

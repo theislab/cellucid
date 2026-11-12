@@ -26,6 +26,7 @@ import { pointRasterWorkerScript } from '../../../../workers/scripts.js';
 import { startWorker } from '../../../workers/worker-script.js';
 import { explainWorkerFailure, noteWorkerScript } from '../../../workers/worker-failure.js';
 import { registerIdleWorkers } from '../../../workers/idle-retirement.js';
+import { bytesOfHex } from '../../../utils/hex-color.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const XLINK_NS = 'http://www.w3.org/1999/xlink';
@@ -125,7 +126,7 @@ function dataUrlOf(blob) {
 let colorContext = null;
 
 /**
- * A CSS colour as its 8-bit channels and alpha, as the browser resolves it.
+ * A CSS color as its 8-bit channels and alpha, as the browser resolves it.
  * @param {string} color
  * @returns {{rgb: number[], alpha: number}}
  */
@@ -134,19 +135,14 @@ function parseColor(color) {
   colorContext.fillStyle = '#000000';
   colorContext.fillStyle = String(color);
   const resolved = colorContext.fillStyle;
-  if (resolved.startsWith('#')) {
-    return {
-      rgb: [1, 3, 5].map(at => Number.parseInt(resolved.slice(at, at + 2), 16)),
-      alpha: 1
-    };
-  }
+  if (resolved.startsWith('#')) return { rgb: bytesOfHex(resolved), alpha: 1 };
   const channels = resolved.slice(resolved.indexOf('(') + 1, resolved.indexOf(')')).split(',').map(Number);
   return { rgb: channels.slice(0, 3), alpha: channels.length > 3 ? channels[3] : 1 };
 }
 
 /**
  * The marker as Plotly draws a box point: a circle of radius `size / 2`
- * rounded to two decimals, filled with the marker colour at the marker
+ * rounded to two decimals, filled with the marker color at the marker
  * opacity, without an outline.
  * @param {Object} trace - Plotly's full trace
  */
@@ -236,7 +232,7 @@ const scatterLayers = new WeakMap();
 
 /**
  * Each marker's palette entry, as Plotly's `singlePointStyle` fills a circle:
- * the colour of its value on the marker colour scale (or the marker colour),
+ * the color of its value on the marker color scale (or the marker color),
  * at its own or the marker opacity.
  *
  * @param {Object[]} points - Plotly's calcdata entries
@@ -250,7 +246,7 @@ function scatterColors(points, trace, fns) {
   const colorIndex = points.length > 65535 ? new Uint32Array(points.length) : new Uint16Array(points.length);
   for (let i = 0; i < points.length; i++) {
     const point = points[i];
-    // As Plotly's point style does, a scaled colour is kept on the point.
+    // As Plotly's point style does, a scaled color is kept on the point.
     const color = 'mc' in point ? (point.mcc = fns.markerScale(point.mc)) : (marker.color || marker.colors || 'rgba(0,0,0,0)');
     const opacity = point.mo === undefined ? marker.opacity : point.mo;
     const key = `${color}|${opacity}`;
@@ -354,7 +350,7 @@ export const POINT_LAYER = Object.freeze({
   /**
    * Draw a scatter trace's markers (Plotly calls this from its scatter plot
    * with the points it would draw): circles without an outline, at the axes'
-   * own pixels, in the colours Plotly's point style gives them, one over
+   * own pixels, in the colors Plotly's point style gives them, one over
    * another in order. Each point keeps its marker radius (`mrc`) for hover.
    *
    * @param {Element} node - The trace's `g.points` group
@@ -399,7 +395,7 @@ export const POINT_LAYER = Object.freeze({
   },
 
   /**
-   * Redraw a scatter trace's markers after a style-only change (the colours of
+   * Redraw a scatter trace's markers after a style-only change (the colors of
    * a volcano's genes when its thresholds move).
    *
    * @param {Element} node - The trace's `g.points` group

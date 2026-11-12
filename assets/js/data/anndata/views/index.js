@@ -3,9 +3,15 @@
  * format whose container allows random access (HDF5, Zarr) is presented as
  * an AnnData store root, every array read in place. `open.js` opens the
  * container, then asks each view of the formats that container and layout
- * can hold whether it recognises the root; the first that does presents it.
- * A root no view recognises is the container's AnnData format (`h5ad`,
- * `zarr`), read as it is stored.
+ * can hold whether it recognizes the root; the first that does presents it.
+ * A root no view recognizes is the container's AnnData format (`h5ad`,
+ * `zarr`), read as it is stored, when it bears an AnnData store's marks
+ * (`open.js` `hasAnnDataMarks`); one with none is refused as none of the
+ * formats. A view recognizes its format by what only it writes (Loom's
+ * attribute groups, a 10x matrix's barcodes and features), not by every
+ * part it reads: a file of the format missing one is refused by its view,
+ * as that format (`AnnDataFormatError`), never read as AnnData and refused
+ * for a part AnnData would have.
  *
  * Each view is
  *

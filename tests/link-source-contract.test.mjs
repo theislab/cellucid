@@ -10,6 +10,8 @@ import test from 'node:test';
 
 import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { DataSourceManager } from '../assets/js/data/data-source-manager.js';
+import { DataSourceErrorCode } from '../assets/js/data/data-source.js';
+import { BYTE_SOURCE_FAILURES, ByteSourceError } from '../assets/js/formats/io/byte-source.js';
 import { LinkDataSource } from '../assets/js/data/link-source.js';
 import { parseGitHubPath } from '../assets/js/data/sources/providers/github.js';
 import { serveFixtureHost } from './helpers/fixture-web-host.mjs';
@@ -234,6 +236,31 @@ test('one linked file is its dataset, under the id it states', async t => {
   assert.equal(source.getBaseUrl('tiny-ready'), 'anndata://tiny-ready/');
   assert.equal(source.getStateDescriptor('tiny-ready'), null, 'one file names no default view');
   source.disconnect();
+});
+
+test('a network failure is what the transport labeled one, never a message that names "fetch" or "network" (RCD-1)', async t => {
+  silenceNotifications(t);
+  serveFixtureHost(t, { prefix: WEB, root: FIXTURES });
+  const codeOf = async thrown => {
+    const source = new LinkDataSource();
+    // The opening's reads fail with `thrown` once the file was found.
+    source._load = async () => {
+      throw thrown;
+    };
+    try {
+      await source.connect(`${WEB}ready.h5ad`);
+    } catch (error) {
+      return error.code ?? null;
+    }
+    assert.fail('the opening failed');
+  };
+  // A request the one transport says got no answer: a network failure.
+  const unanswered = new ByteSourceError(BYTE_SOURCE_FAILURES.NETWORK, `${WEB}ready.h5ad: no answer.`, { url: `${WEB}ready.h5ad`, phase: 'answer' });
+  assert.equal(await codeOf(unanswered), DataSourceErrorCode.NETWORK_ERROR);
+  // A body cut short was answered; a reader's own TypeError naming "network" is not the network.
+  assert.notEqual(await codeOf(new ByteSourceError(BYTE_SOURCE_FAILURES.NETWORK, 'cut short', { phase: 'body' })), DataSourceErrorCode.NETWORK_ERROR);
+  assert.notEqual(await codeOf(new TypeError('Cannot read properties of undefined (reading \'network\')')), DataSourceErrorCode.NETWORK_ERROR);
+  assert.notEqual(await codeOf(new TypeError('Failed to fetch the obs column: not a dataframe')), DataSourceErrorCode.NETWORK_ERROR);
 });
 
 test('a link opened again asks its host again: the version it opens is the host\'s now, never an earlier opening\'s', async t => {

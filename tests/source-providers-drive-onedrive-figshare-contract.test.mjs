@@ -14,7 +14,7 @@ import { getProviderRegistry } from '../assets/js/data/sources/registry.js';
 import figshare from '../assets/js/data/sources/providers/figshare.js';
 import { createDriveProvider } from '../assets/js/data/sources/providers/gdrive.js';
 import { createOneDriveProvider, shareIdOf } from '../assets/js/data/sources/providers/onedrive.js';
-import { confirmSourceUnreadable, resolveSourceAccess } from '../assets/js/data/sources/access.js';
+import { confirmSourceUnreadable, onSourceAccessRevoked, resolveSourceAccess, revokeSourceAccess } from '../assets/js/data/sources/access.js';
 import { HEAD_BYTES } from '../assets/js/formats/io/byte-source.js';
 import { openableNamesText } from '../assets/js/data/input-formats.js';
 
@@ -320,6 +320,30 @@ test('Drive: Google\'s per-file download quota and Google documents are refused 
   await assert.rejects(drive.open(DRIVE_ID), /Sheet is a Google document, not a file Cellucid opens/);
   answer = { status: 200, json: { ...DRIVE_ITEM, mimeType: 'application/vnd.google-apps.folder' } };
   await assert.rejects(drive.open(DRIVE_ID), /Google Drive folder/);
+});
+
+test('Drive: a refused file registers no access; one is registered only for a file described (F123, LC-4)', async t => {
+  // The accesses the page holds for Drive, counted by a sign-out's reach.
+  const heldForDrive = () => {
+    let heard = 0;
+    const stop = onSourceAccessRevoked(() => { heard += 1; });
+    revokeSourceAccess('gdrive');
+    stop();
+    return heard;
+  };
+  let answer = { status: 200, json: { ...DRIVE_ITEM, mimeType: 'application/vnd.google-apps.spreadsheet', name: 'Sheet' } };
+  installFetch(t, ({ url }) => (isMetadata(url) ? answer : isMedia(url) ? { status: 206 } : null));
+  const drive = createDriveProvider({ google: fakeGoogle() });
+  const before = heldForDrive();
+  await assert.rejects(drive.open(DRIVE_ID), /Google document/);
+  answer = { status: 200, json: { ...DRIVE_ITEM, mimeType: 'application/vnd.google-apps.folder' } };
+  await assert.rejects(drive.open(DRIVE_ID), /Google Drive folder/);
+  answer = { status: 200, json: { ...DRIVE_ITEM, capabilities: { canDownload: false } } };
+  await assert.rejects(drive.open(DRIVE_ID), /turned off downloading/);
+  assert.equal(heldForDrive(), before, 'no refused file left an access behind');
+  answer = { status: 200, json: DRIVE_ITEM };
+  await drive.open(DRIVE_ID);
+  assert.equal(heldForDrive(), before + 1, 'a described file holds its one access');
 });
 
 test('Drive: not configured on this site says so; a private file without sign-in names why', async t => {

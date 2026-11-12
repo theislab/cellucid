@@ -8,7 +8,7 @@
  * after `deleteBuffer`, and while the vertex array is bound a
  * transform-feedback pass writing it fails ("A transform feedback buffer that
  * would be written to is also bound to a non-transform-feedback target").
- * Kept views of more than one store segment stopped recolouring on Chromium
+ * Kept views of more than one store segment stopped recoloring on Chromium
  * that way. An attribute is released with `releaseVertexAttribute`
  * (`rendering/gl-utils.js`), onto a buffer the vertex array may keep.
  *

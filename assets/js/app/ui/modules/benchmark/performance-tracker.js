@@ -9,6 +9,8 @@
  * @module app/ui/modules/benchmark/performance-tracker
  */
 
+import { formatPercent } from '../../../../utils/format-units.js';
+
 /**
  * Performance Statistics Tracker
  *
@@ -374,8 +376,8 @@ export class PerformanceTracker {
       p99FrameTime: stats.p99FrameTime.toFixed(2),
       stdDev: stats.stdDev.toFixed(2),
       samples: stats.samples,
-      jankPercent: stats.jankPercent.toFixed(1) + '%',
-      overBudgetPercent: stats.overBudgetPercent.toFixed(1) + '%'
+      jankPercent: formatPercent(stats.jankPercent, 1),
+      overBudgetPercent: formatPercent(stats.overBudgetPercent, 1)
     };
   }
 

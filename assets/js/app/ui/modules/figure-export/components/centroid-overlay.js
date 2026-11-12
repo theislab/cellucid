@@ -14,7 +14,7 @@
 import { escapeXml } from '../../../../utils/dom-utils.js';
 import { forEachProjectedPoint } from '../utils/point-projector.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../utils/lod-membership.js';
-import { hexToRgb01 } from '../utils/color-utils.js';
+import { rgb01OfHex } from '../../../../../utils/hex-color.js';
 
 /**
  * @param {any} flags
@@ -43,7 +43,9 @@ function getLabelAtIndex(labelTexts, index) {
  * @param {{ points?: boolean; labels?: boolean }|null} [options.flags]
  * @param {any} options.renderState
  * @param {{ x: number; y: number; width: number; height: number }} options.plotRect
- * @param {number} options.pointRadiusPx - centroid point radius in plot-space px
+ * @param {number} options.pointDiameterViewportPx - the centroids' `u_pointSize`
+ *   (four times the pane's point size): each disc is the sprite the viewer
+ *   draws at its depth (`createViewportPointDiameter`), in plot units
  * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop]
  * @param {string} [options.fontFamily]
  * @param {number} [options.labelFontSizePx]
@@ -58,7 +60,7 @@ export function renderSvgCentroidOverlay({
   flags = null,
   renderState,
   plotRect,
-  pointRadiusPx,
+  pointDiameterViewportPx,
   crop = null,
   fontFamily = 'Arial, Helvetica, sans-serif',
   labelFontSizePx = 12,
@@ -70,10 +72,9 @@ export function renderSvgCentroidOverlay({
 
   const labelSize = Math.max(6, Math.round(Number(labelFontSizePx) || 12));
   const haloW = Math.max(1.5, Math.round(labelSize * 0.28));
-  const strokeW = Math.max(0.5, Math.min(2.5, Number(pointRadiusPx || 1) * 0.18));
 
   // The centroid disc outline is the label ink: on a dark figure a near-black
-  // ring around a coloured disc disappears entirely.
+  // ring around a colored disc disappears entirely.
   const outline = escapeXml(labelColor);
 
   const parts = [];
@@ -89,7 +90,7 @@ export function renderSvgCentroidOverlay({
     transparency: null,
     renderState,
     plotRect,
-    radiusPx: Math.max(0.5, Number(pointRadiusPx) || 0.5),
+    pointDiameterViewportPx,
     lodMembership: null,
     crop,
     sortByDepth: false,
@@ -98,6 +99,7 @@ export function renderSvgCentroidOverlay({
 
       if (f.points) {
         const fill = `rgb(${r},${g},${b})`;
+        const strokeW = Math.max(0.5, Math.min(2.5, radius * 0.18));
         if (a >= 0.999) {
           parts.push(
             `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="${fill}" stroke="${outline}" stroke-width="${strokeW.toFixed(2)}"/>`
@@ -141,7 +143,9 @@ export function renderSvgCentroidOverlay({
  * @param {{ points?: boolean; labels?: boolean }|null} [options.flags]
  * @param {any} options.renderState
  * @param {{ x: number; y: number; width: number; height: number }} options.plotRect
- * @param {number} options.pointRadiusPx - centroid point radius in plot-space px
+ * @param {number} options.pointDiameterViewportPx - the centroids' `u_pointSize`
+ *   (four times the pane's point size): each disc is the sprite the viewer
+ *   draws at its depth (`createViewportPointDiameter`), in plot units
  * @param {{ enabled?: boolean; x?: number; y?: number; width?: number; height?: number } | null} [options.crop]
  * @param {string} [options.fontFamily]
  * @param {number} [options.labelFontSizePx]
@@ -156,7 +160,7 @@ export function drawCanvasCentroidOverlay({
   flags = null,
   renderState,
   plotRect,
-  pointRadiusPx,
+  pointDiameterViewportPx,
   crop = null,
   fontFamily = 'Arial, Helvetica, sans-serif',
   labelFontSizePx = 12,
@@ -168,7 +172,7 @@ export function drawCanvasCentroidOverlay({
 
   const labelSize = Math.max(6, Math.round(Number(labelFontSizePx) || 12));
   const strokeW = Math.max(1, Math.round(labelSize * 0.28));
-  const outlineRgb = hexToRgb01(labelColor);
+  const outlineRgb = rgb01OfHex(labelColor);
   const outline255 = outlineRgb === null
     ? [17, 17, 17]
     : outlineRgb.map((channel) => Math.round(channel * 255));
@@ -188,7 +192,7 @@ export function drawCanvasCentroidOverlay({
     transparency: null,
     renderState,
     plotRect,
-    radiusPx: Math.max(0.5, Number(pointRadiusPx) || 0.5),
+    pointDiameterViewportPx,
     lodMembership: null,
     crop,
     sortByDepth: false,

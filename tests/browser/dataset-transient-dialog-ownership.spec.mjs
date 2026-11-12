@@ -15,6 +15,7 @@ import { openDatasetAsAgent } from './helpers/agent-dataset-open.mjs';
 import { dispatchAppDrag } from './helpers/app-drag.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { outOfReach } from './helpers/dialog-keys.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=dataset-transient-ownership-ci`;
@@ -63,13 +64,20 @@ async function replaceFromPicker(page) {
  * confirmation closes, so the page is the person's again.
  */
 async function replaceUnderConfirmation(page) {
-  await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(1);
+  await expect(page.locator('dialog.confirm-dialog')).toHaveCount(1);
   // The premise: the picker is out of the person's reach under the dialog.
-  expect(await isInert(page.locator('#dataset-select'))).toBe(true);
+  expect(await outOfReach(page.locator('#dataset-select'))).toBe(true);
   const priorGeneration = await page.evaluate(
     () => window._cellucidState.getDatasetGeneration(),
   );
-  const opened = await openDatasetAsAgent(page, { name: SAME_FILE_LINK });
+  // An address the agent was not given in this tab is asked of the person first (F121); the question
+  // is answered over the open dialog, never left waiting under it (R9H-16).
+  const opening = openDatasetAsAgent(page, { name: SAME_FILE_LINK });
+  const card = page.locator('#agent-presence .agent-confirm');
+  await expect(card).toHaveAttribute('data-asking', 'unseen-link');
+  expect(await outOfReach(card)).toBe(false);
+  await card.locator('.agent-confirm-allow').click();
+  const opened = await opening;
   expect(opened.outcome).toMatchObject({
     name: 'Current UI fixture',
     kind: 'link',
@@ -81,14 +89,10 @@ async function replaceUnderConfirmation(page) {
   expect(await page.evaluate(
     () => window._cellucidState.getDatasetGeneration(),
   )).toBeGreaterThan(priorGeneration);
-  await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(0);
-  expect(await isInert(page.locator('#dataset-select'))).toBe(false);
+  await expect(page.locator('dialog.confirm-dialog')).toHaveCount(0);
+  expect(await outOfReach(page.locator('#dataset-select'))).toBe(false);
 }
 
-/** Whether an element is inside an inert subtree (out of a person's reach). */
-function isInert(locator) {
-  return locator.evaluate(element => element.closest('[inert]') !== null);
-}
 
 async function selectCellType(page) {
   await page.locator('#categorical-field').selectOption({
@@ -227,7 +231,7 @@ test('dataset replacement retires deleted-field purge confirmation ownership', a
     .locator('button[data-action="purge-field"][data-source="obs"]')
     .click();
   await expect(page.locator('.confirm-dialog-title')).toHaveText(
-    'Confirm deletion',
+    'Delete "score" for good?',
   );
   const staleConfirm = await page
     .locator('.confirm-dialog-confirm')

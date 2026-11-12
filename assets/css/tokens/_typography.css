@@ -31,9 +31,9 @@
      selection bar, view chips, tooltips) takes one of these, never a raw size
      step. The scale is deliberately flat: titles are one step above the
      12px everything else is set in, secondary text one step below, and a
-     badge one further. Hierarchy comes from weight and colour, not from
+     badge one further. Hierarchy comes from weight and color, not from
      size: a title or heading is semibold, a label medium in the secondary
-     text colour, a control's own text regular. Interface text is sentence
+     text color, a control's own text regular. Interface text is sentence
      case, never uppercase or letter-spaced. A coarse pointer raises the
      scale by one step (layouts/_responsive.css). */
   --type-title: var(--text-lg);

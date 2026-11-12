@@ -31,7 +31,9 @@ import {
   DEFERRED_CONTROL_SELECTORS,
   ownDeferredAvailability,
   retireDeferredControls,
+  STARTING_REASON,
 } from '../assets/js/app/ui/core/deferred-control-readiness.js';
+import { unavailableReasonOf } from '../assets/js/app/ui/core/control-availability.js';
 
 const MAIN_URL = new URL('../assets/js/app/main.js', import.meta.url);
 const INDEX_URL = new URL('../index.html', import.meta.url);
@@ -243,21 +245,24 @@ test('admission asks an owner that keeps a control out of service for its own re
   const documentOwner = createDocument();
   const force = documentOwner.controls.get('hp-lod-force');
   let lodOn = false;
-  ownDeferredAvailability(force, () => lodOn);
+  const lodOff = 'Turn Level of detail (LOD) on to force a level.';
+  ownDeferredAvailability(force, () => (lodOn ? null : lodOff));
   const admit = retireDeferredControls(documentOwner);
+  assert.equal(unavailableReasonOf(force), STARTING_REASON, 'retired: says it is starting');
   admit();
   assert.equal(force.disabled, true, 'level of detail off: the forced level stays out of service');
+  assert.equal(unavailableReasonOf(force), lodOff, 'and says why');
   assert.equal(documentOwner.controls.get('hp-lod-enabled').disabled, false);
 
   const again = createDocument();
   lodOn = true;
-  ownDeferredAvailability(again.controls.get('hp-lod-force'), () => lodOn);
+  ownDeferredAvailability(again.controls.get('hp-lod-force'), () => (lodOn ? null : lodOff));
   retireDeferredControls(again)();
   assert.equal(again.controls.get('hp-lod-force').disabled, false, 'level of detail on: offered');
   assert.throws(() => ownDeferredAvailability(force, true), /must be a function/);
   // The owner says so where it is wired.
   assert.match(readFileSync(new URL('../assets/js/app/ui/modules/render-controls.js', import.meta.url), 'utf8'),
-    /ownDeferredAvailability\(hpLodForceInput, \(\) => acceptedLodEnabled\)/);
+    /ownDeferredAvailability\(hpLodForceInput, \(\) => \(acceptedLodEnabled \? null : FORCED_LOD_UNAVAILABLE\)\)/);
 });
 
 test('admission is idempotent', () => {

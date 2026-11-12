@@ -159,7 +159,7 @@ function statisticsOfSorted(sorted) {
  * element per point — 170,000 elements, and a second of main-thread work, for
  * a one-million-cell page. Past a handful of copies a stack is visually
  * complete: each copy is drawn at marker opacity 0.8, so 16 copies leave the
- * stack's interior 0.2^16 short of opaque, far below one 8-bit colour step.
+ * stack's interior 0.2^16 short of opaque, far below one 8-bit color step.
  * Only the anti-aliased rim keeps converging with more copies: a rim pixel a
  * quarter covered is already 97% of the way to its limit. Only identical
  * values are merged — distinct values are never moved or

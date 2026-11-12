@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Write the action catalogue document (`catalogDocument` of every action
+ * Write the action catalog document (`catalogDocument` of every action
  * definition, `assets/js/app/actions/`) as canonical JSON, the one file
  * Python and R generate their viewer methods from:
  *
@@ -13,12 +13,12 @@
  * `tests/test_action_catalog.py`, cellucid-r's
  * `tests/testthat/test-actions.R`).
  *
- * Beside it, the same run writes the catalogue as the tools of a local agent
+ * Beside it, the same run writes the catalog as the tools of a local agent
  * connection (`cellucid mcp`; `app/agent/bridge/local-agents.js`
  * `mcpToolsDocument`: the tools, the instructions, the status tool, the app
  * names) as canonical JSON: `tests/fixtures/mcp-tools.json`,
  * `src/cellucid/mcp_tools.json` and `inst/mcp_tools.json`, made from that
- * catalogue text, so the two stay one pair wherever they are regenerated
+ * catalog text, so the two stay one pair wherever they are regenerated
  * (`tests/mcp-tools-document-contract.test.mjs`, cellucid-python's
  * `tests/test_mcp.py`, cellucid-r's `tests/testthat/test-mcp.R`).
  *
@@ -33,7 +33,7 @@
  * digest in the three tests.
  *
  * Canonical: object keys sorted, two-space indent, one trailing newline, so
- * the bytes depend on the catalogue alone, never on the order a definition
+ * the bytes depend on the catalog alone, never on the order a definition
  * lists its keys in.
  */
 
@@ -65,7 +65,7 @@ export function sortedKeys(value) {
   return value;
 }
 
-/** The catalogue document's canonical text, as this checkout's definitions make it. */
+/** The catalog document's canonical text, as this checkout's definitions make it. */
 export function renderActionCatalog() {
   const document = catalogDocument(createActionCatalog(ACTION_DEFINITIONS));
   return `${JSON.stringify(sortedKeys(document), null, 2)}\n`;
@@ -85,9 +85,9 @@ export const MCP_TOOLS_MIRRORS = Object.freeze([
 ]);
 
 /**
- * The local agent tools document's canonical text, made from a catalogue's
+ * The local agent tools document's canonical text, made from a catalog's
  * canonical text (this checkout's by default): the tools of exactly that
- * catalogue, and its digest.
+ * catalog, and its digest.
  */
 export function renderMcpTools(catalogText = renderActionCatalog()) {
   const document = mcpToolsDocument(JSON.parse(catalogText), actionCatalogDigest(catalogText));

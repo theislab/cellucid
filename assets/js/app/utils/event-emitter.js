@@ -2,10 +2,14 @@
  * @fileoverview Lightweight Event Emitter for app-layer modules.
  *
  * Provides a consistent event-driven communication pattern for the app state
- * and UI layers. This is intentionally minimal and dependency-free.
+ * and UI layers. Each event's listeners are one listener set
+ * (`utils/listener-set.js`): a listener that throws is reported and the
+ * others still hear the event.
  *
  * @module utils/event-emitter
  */
+
+import { createListenerSet } from '../../utils/listener-set.js';
 
 function assertEventName(event) {
   if (
@@ -29,7 +33,7 @@ function assertCallback(callback) {
 
 export class EventEmitter {
   constructor() {
-    /** @type {Map<string, Set<Function>>} */
+    /** @type {Map<string, import('../../utils/listener-set.js').ListenerSet<[unknown]>>} */
     this._listeners = new Map();
   }
 
@@ -42,11 +46,18 @@ export class EventEmitter {
   on(event, callback) {
     const exactEvent = assertEventName(event);
     const exactCallback = assertCallback(callback);
-    if (!this._listeners.has(exactEvent)) {
-      this._listeners.set(exactEvent, new Set());
+    let listeners = this._listeners.get(exactEvent);
+    if (listeners === undefined) {
+      listeners = createListenerSet(`${this.constructor.name} "${exactEvent}"`);
+      this._listeners.set(exactEvent, listeners);
     }
-    this._listeners.get(exactEvent).add(exactCallback);
-    return () => this.off(exactEvent, exactCallback);
+    const unsubscribe = listeners.add(exactCallback);
+    return () => {
+      unsubscribe();
+      if (listeners.size === 0 && this._listeners.get(exactEvent) === listeners) {
+        this._listeners.delete(exactEvent);
+      }
+    };
   }
 
   /**
@@ -84,18 +95,28 @@ export class EventEmitter {
   }
 
   /**
-   * Emit an event to all listeners.
+   * Emit an event to all listeners (one that throws is reported; the others
+   * still hear it).
    * @param {string} event
-  * @param {*} [data]
-  */
+   * @param {*} [data]
+   */
   emit(event, data) {
-    const exactEvent = assertEventName(event);
-    const listeners = this._listeners.get(exactEvent);
-    if (listeners === undefined) return;
+    this._listeners.get(assertEventName(event))?.notify(data);
+  }
 
-    for (const callback of [...listeners]) {
-      callback(data);
-    }
+  /**
+   * Emit an event while `isCurrent()` holds after each listener: one that
+   * makes it stale (it changed what the event tells, and the newer event was
+   * emitted) stops the rest hearing the older. Returns `isCurrent()`.
+   * @param {string} event
+   * @param {*} data
+   * @param {() => boolean} isCurrent
+   * @returns {boolean}
+   */
+  emitWhile(event, data, isCurrent) {
+    const listeners = this._listeners.get(assertEventName(event));
+    if (listeners === undefined) return isCurrent();
+    return listeners.notifyWhile(isCurrent, data);
   }
 
   /**

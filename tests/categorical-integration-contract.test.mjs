@@ -277,7 +277,7 @@ test('lazy observation payloads are evicted by the cache budget, never refused; 
   assert.equal(adapter._obsFieldsMetadata, null);
 });
 
-test('a text column is coded by the reader under the categories found before; labels it had not shown grow them, each keeping its colour', async () => {
+test('a text column is coded by the reader under the categories found before; labels it had not shown grow them, each keeping its color', async () => {
   const asked = [];
   let values = ['b', 'a', null];
   const loader = metadataOnlyLoader(
@@ -294,11 +294,11 @@ test('a text column is coded by the reader under the categories found before; la
   await adapter.initialize();
   const first = await adapter.getObsFieldData('label');
   assert.deepEqual(first.categories, ['a', 'b']);
-  assert.equal(first.palette.length, 2, 'colours named by the labels');
-  const colourOf = new Map(first.categories.map((label, i) => [label, first.palette[i]]));
+  assert.equal(first.palette.length, 2, 'colors named by the labels');
+  const colorOf = new Map(first.categories.map((label, i) => [label, first.palette[i]]));
 
   // The added cells hold 'A' and 'c': the categories grow in label order,
-  // 'a' and 'b' keep their colours.
+  // 'a' and 'b' keep their colors.
   values = ['b', 'a', null, 'c', 'A'];
   const rows = await adapter.getObsFieldRows('label', [3, 3], { categories: first.categories });
   assert.equal(rows.categories, undefined, 'no row, no new label');
@@ -306,7 +306,7 @@ test('a text column is coded by the reader under the categories found before; la
   const grown = await adapter.getObsFieldRows('label', [3, 5], { categories: first.categories });
   assert.deepEqual(grown.categories, ['A', 'a', 'b', 'c']);
   assert.deepEqual(Array.from(grown.codes), [3, 0]);
-  for (const label of ['a', 'b']) assert.deepEqual(grown.palette[grown.categories.indexOf(label)], colourOf.get(label));
+  for (const label of ['a', 'b']) assert.deepEqual(grown.palette[grown.categories.indexOf(label)], colorOf.get(label));
   assert.deepEqual(asked.at(-1), ['a', 'b'], 'the rows are coded under the categories the field was loaded with');
   // A whole load after it codes under the grown categories.
   const again = await adapter.getObsFieldData('label');

@@ -39,27 +39,36 @@ import { outsideActOf } from '../../actions/catalog.js';
 import { SUMMARIES_ONLY_LABEL, SUMMARIES_ONLY_CAVEAT, agentDataStore, dataScopeNow, subscribeDataScope } from '../data-scope.js';
 import { undoAgentTurn } from '../history-link.js';
 import {
-  KIND_LABELS, PERMISSION_CHOICES, PERMISSION_KINDS, PERMISSION_MODES, createPermissionStore, decide, deniedSentence,
+  CHOICE_LABELS, KIND_LABELS, PERMISSION_CHOICES, PERMISSION_KINDS, PERMISSION_MODES, createPermissionStore, decide, deniedSentence,
   estimateText, grantKey, modeOf, permissionFor, permissionsLine, permissionsSummary,
 } from './permissions.js';
-import { wireAppDialog } from '../../ui/components/app-dialog.js';
+import { keepAboveModals, wireAppDialog } from '../../ui/components/app-dialog.js';
+import { ICONS, createButton, createIconButton } from '../../ui/components/controls.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
 import { plainSentence } from '../../actions/targets/names.js';
 import { getCurrentHistory, subscribeCurrentHistory } from '../../history/current.js';
-import { inSentence, parameterFacts } from '../../history/exports/step-text.js';
+import { parameterFacts } from '../../history/exports/step-text.js';
+import { lowerFirst } from '../../../utils/text-case.js';
+import { subjectOf } from '../chat/work.js';
 import { renderFactList, bindDisclosure } from '../../ui/components/controls.js';
 import { createDomId } from '../../ui/components/dom-id.js';
 import { abortReason, cancelled, onAbort } from '../../../utils/abort.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { whileWaitingOnPerson } from '../../../utils/person-wait.js';
+import { sayFailure } from '../../../utils/errors.js';
+import { isTextEntry } from '../../../utils/key-ownership.js';
 
 /** Why the person is asked, by the definition's `confirm`: what the history cannot do about it. */
 export const CONFIRM_REASONS = Object.freeze({
   'writes-file': 'It writes a file to this computer, which the history cannot take back.',
-  'deletes-saved': 'It deletes something saved in this browser, which the history cannot bring back.',
+  // Steps, branches, trackers and squashes go to Recently deleted (restorable); a saved state,
+  // a kept copy and Recently deleted's own entries, emptied, are gone for good.
+  'deletes-saved': 'It deletes something this browser keeps; only what goes to Recently deleted can be brought back.',
   'large-download': 'It downloads a lot of data, which takes time and may cost on a metered connection.',
   publishes: 'It publishes for others to see, which the history cannot take back.',
   'pauses-recording': 'It pauses the history: changes made meanwhile become one step, so no change can be undone on its own.',
+  'unseen-link': 'It fetches an address not typed, pasted or opened in this tab before.',
+  'replaces-unkept': 'It replaces the dataset shown, whose steps this browser is not keeping: they would be gone for good.',
 });
 
 /** Why a kind of action is asked about, in the card (`detail`: what the action says makes it cost). */
@@ -71,25 +80,25 @@ function askedBecause(kind, estimate, detail) {
 }
 
 /**
- * What a confirm card says: who asks, what exactly (the action, and what
- * its step or act will say, `describe(params)`, with its names as the
- * person reads them), why (each kind asked about, with the estimate of the
- * work or the action's own sentence on what it costs, `detail`), and the
- * parameters. The question an agent's own app asks (`questionFor`) is the
- * same words.
+ * What a confirm card says: who asks, what (the action as it would be done:
+ * its title and the names its parameters hold, `subjectOf`, as the chat names
+ * a call not done yet: "Claude asks to export an analysis table: markers"),
+ * why (each kind asked about, with the estimate of the work or the action's
+ * own sentence on what it costs, `detail`), and the parameters. Never the
+ * step's own sentence (`describe`): it says what was done ("Exported …"),
+ * which before an answer would tell of an act that has not happened. The
+ * question an agent's own app asks (`questionFor`) is the same words.
  * @param {{definition: object, params: object, meta: {origin?: string, agent?: string, host?: string}, estimate?: object|null, detail?: string|null, asking?: string[]}} request
  */
 export function confirmTextOf({ definition, params, meta, estimate = null, detail = null, asking = [definition.confirm ?? 'change'] }) {
-  let exactly = null;
-  try {
-    exactly = definition.describe(params, null);
-  } catch (error) {
-    console.error(`[agent presence] describing ${definition.type} failed`, error);
-  }
-  const what = `${actorLabel(meta)} asks to ${inSentence(definition.title)}`;
+  // A parameter given as null names nothing, and is often the whole request
+  // ("color by": no field, the coloring taken away): said as "no <parameter>".
+  const none = Object.entries(params ?? {}).filter(([, value]) => value === null).map(([key]) => `no ${key.replace(/_/g, ' ')}`);
+  const subject = [subjectOf(params, definition.params), ...none].filter(Boolean).join(', ');
+  const what = `${actorLabel(meta)} asks to ${lowerFirst(definition.title)}`;
   return {
     who: meta.agent ?? actorLabel(meta),
-    what: exactly ? `${what}: “${exactly}”.` : `${what}.`,
+    what: subject === '' ? `${what}.` : `${what}: ${subject}.`,
     why: asking.map(kind => askedBecause(kind, estimate, detail)).join(' '),
     facts: parameterFacts(params, definition.params),
   };
@@ -144,13 +153,6 @@ export function initAgentPresence({
   const doc = root.ownerDocument;
   /** Kinds allowed for one chat or connection until the page closes (`grantKey`). */
   const grants = new Set();
-  /** Who hears that what a connection's tool list says may have changed (the settings, or a grant). */
-  const permissionListeners = new Set();
-  function permissionsChanged() {
-    for (const listener of [...permissionListeners]) {
-      try { listener(); } catch (error) { console.error('[agents] a permissions listener failed', error); }
-    }
-  }
   const activity = createAgentActivity({
     titleOf: type => (actions.catalog.has(type) ? actions.catalog.get(type).title : type),
     outsideOf: (type, params, outcome) => (actions.catalog.has(type) ? outsideActOf(actions.catalog.get(type), params, outcome) : null),
@@ -225,22 +227,14 @@ export function initAgentPresence({
     dot.setAttribute('aria-hidden', 'true');
     const text = doc.createElement('span');
     text.className = 'agent-activity-text';
-    const stop = doc.createElement('button');
-    stop.type = 'button';
-    stop.className = 'btn btn-compact agent-activity-stop';
-    stop.textContent = 'Stop';
+    // One line per turn: its actions are quiet, Stop (while it acts) the main one.
+    const stop = createButton({ label: 'Stop', variant: 'quiet-primary', className: 'agent-activity-stop' });
+    // A double click on Stop never also presses Undo turn, shown in its place (`ui/core/press-guard.js`).
+    stop.dataset.singlePress = '';
     stop.addEventListener('click', () => stopTurn(line.key), { signal });
-    const undo = doc.createElement('button');
-    undo.type = 'button';
-    undo.className = 'btn btn-compact agent-activity-undo';
-    undo.textContent = 'Undo turn';
+    const undo = createButton({ label: 'Undo turn', variant: 'quiet', className: 'agent-activity-undo' });
     undo.addEventListener('click', () => void undoTurn(line.key), { signal });
-    const dismiss = doc.createElement('button');
-    dismiss.type = 'button';
-    dismiss.className = 'icon-btn agent-activity-dismiss';
-    dismiss.setAttribute('aria-label', 'Dismiss');
-    dismiss.title = 'Dismiss';
-    dismiss.textContent = '×';
+    const dismiss = createIconButton({ label: 'Dismiss', icon: ICONS.close, className: 'agent-activity-dismiss' });
     dismiss.addEventListener('click', () => {
       activity.dismiss(line.key);
       render();
@@ -297,16 +291,33 @@ export function initAgentPresence({
       if (result.undone) activity.markUndone(key);
       else if (!result.found) notify(`Nothing of ${line.label}'s turn is in the history shown.`);
     } catch (error) {
-      notify(`Undoing ${line.label}'s turn failed: ${error?.message ?? String(error)}`);
+      notify(`Undoing ${line.label}'s turn failed: ${sayFailure(error)}`);
     }
     render();
   }
 
   // ------------------------------------------------------------- Confirm
 
+  /**
+   * While a question waits, the dock it is in is kept over every modal dialog
+   * (`app-dialog.js` `keepAboveModals`): an agent asking while a dialog is
+   * open (a confirmation, a settings window) is answered there, never left
+   * waiting under an inert page (R9H-16). Released when no question waits.
+   */
+  let releaseAboveModals = null;
+  function keepQuestionsReachable() {
+    const dock = root.closest('.agent-dock') ?? root;
+    if (pending.length > 0 && releaseAboveModals === null) releaseAboveModals = keepAboveModals(dock);
+    if (pending.length === 0 && releaseAboveModals !== null) {
+      releaseAboveModals();
+      releaseAboveModals = null;
+    }
+  }
+
   function settle(card) {
     const at = pending.indexOf(card);
     if (at !== -1) pending.splice(at, 1);
+    keepQuestionsReachable();
     // The focus was on the card: it goes to the next question, else back where it was before the card took it.
     const hadFocus = card.element.contains(doc.activeElement);
     card.removeAbort();
@@ -326,8 +337,7 @@ export function initAgentPresence({
   function typingElsewhere() {
     const active = doc.activeElement;
     if (!(active instanceof HTMLElement) || root.closest('.agent-dock')?.contains(active)) return false;
-    return active.isContentEditable || active instanceof HTMLTextAreaElement
-      || (active instanceof HTMLInputElement && !['button', 'checkbox', 'radio', 'range', 'color', 'file', 'submit', 'reset'].includes(active.type));
+    return isTextEntry(active);
   }
 
   function refuse(card, error) {
@@ -418,7 +428,6 @@ export function initAgentPresence({
     }
     if (answer === 'here') {
       for (const kind of card.asking) grants.add(grantKey(card.meta, kind));
-      permissionsChanged();
     }
     if (answer === 'always') permissions.set({ kinds: Object.fromEntries(card.asking.map(kind => [kind, 'allow'])) });
     card.resolve(true);
@@ -434,9 +443,9 @@ export function initAgentPresence({
    * what they ask about waits for the person. Resolves whether it may run;
    * a refusal by the settings is thrown with its sentence.
    */
-  async function confirm({ definition, params, meta, signal = meta.signal, estimate = null, confirm: kind = null, detail = null, stage = 'start', asking = () => {} }) {
+  async function confirm({ definition, params, meta, signal = meta.signal, estimate = null, confirm: kind = null, detail = null, stage = 'start', started = null, asking = () => {} }) {
     if (destroyed) throw new ActionRefused('Cellucid cannot ask the person now; try again.', { code: 'closed', type: definition.type });
-    let ruling = decide({ meta, estimate, confirm: kind, stage }, permissions.get(), grants);
+    let ruling = decide({ meta, estimate, confirm: kind, stage, started }, permissions.get(), grants);
     // Recording is paused (History v2 §3.15.1): an agent's change makes no step, so it cannot be undone
     // on its own; the person is asked whatever the settings allow.
     if (stage === 'start' && ['state', 'view', 'layout'].includes(definition.effect) && history.current()?.active?.paused) {
@@ -463,6 +472,7 @@ export function initAgentPresence({
       // Whoever waits on the call hears the person is asked (the chat says so, the relay tells the agent).
       asking();
       cardsBox.appendChild(card.element);
+      keepQuestionsReachable();
       render();
       // A keyboard user is brought to the question (the first one, while it waits); the focus comes back after.
       if (pending.length === 1 && !typingElsewhere()) {
@@ -536,7 +546,7 @@ export function initAgentPresence({
     const text = doc.createElement('p');
     text.className = 'agent-notice-text';
     text.textContent = 'That is names, counts and summaries, and, when an agent asks, values of cells and pictures of the plot. '
-      + 'The dataset\'s files stay in this browser. Names and summaries only keeps values, extremes and pictures out; it is not anonymisation '
+      + 'The dataset\'s files stay in this browser. Names and summaries only keeps values, extremes and pictures out; it is not anonymization '
       + '(Permissions… changes it later).';
     const actionsRow = doc.createElement('div');
     actionsRow.className = 'agent-notice-actions';
@@ -603,7 +613,7 @@ export function initAgentPresence({
       select.id = id;
       select.dataset.kind = kind;
       select.dataset.focusKey = `kind:${kind}`;
-      for (const choice of PERMISSION_CHOICES) select.appendChild(new Option(choice[0].toUpperCase() + choice.slice(1), choice));
+      for (const choice of PERMISSION_CHOICES) select.appendChild(new Option(CHOICE_LABELS[choice], choice));
       select.value = settings.kinds[kind];
       select.addEventListener('change', () => permissions.set({ kinds: { [kind]: select.value } }), { signal });
       value.appendChild(select);
@@ -621,16 +631,13 @@ export function initAgentPresence({
     grantedText.textContent = grants.size === 0
       ? 'Nothing allowed for one chat or connection.'
       : `${formatCountOf(grants.size, 'kind')} allowed for a chat or connection until this page closes.`;
-    const forget = doc.createElement('button');
-    forget.type = 'button';
-    forget.className = 'btn btn-compact';
-    forget.textContent = 'Forget';
+    // A row of the dialog: its action is quiet.
+    const forget = createButton({ label: 'Forget', variant: 'quiet' });
     forget.dataset.focusKey = 'forget';
     forget.disabled = grants.size === 0;
     forget.addEventListener('click', () => {
       grants.clear();
       drawPermissions();
-      permissionsChanged();
     }, { signal });
     granted.append(grantedText, forget);
     dialog.body.replaceChildren(modes, kinds, granted, datasetBlock(), status);
@@ -680,7 +687,6 @@ export function initAgentPresence({
   }
 
   const unsubscribePermissions = permissions.subscribe(() => {
-    permissionsChanged();
     drawPermissionLines();
     if (dialog.dialog.open) drawPermissions();
   });
@@ -753,7 +759,7 @@ export function initAgentPresence({
     /**
      * What the settings make of a kind of action for one connection, with
      * what the person allowed for it on this page (`permissions.js`
-     * `permissionFor`): what its tool list says.
+     * `permissionFor`): what the agent is told of it (`../bridge/agent-calls.js`).
      * @param {{kind: string, connection: {id: string, kind: string}}} question
      */
     permissionFor: question => permissionFor(question, permissions.get(), grants),
@@ -787,17 +793,6 @@ export function initAgentPresence({
     forgetGrants() {
       grants.clear();
       drawPermissions();
-      permissionsChanged();
-    },
-    /**
-     * Hear when what a connection's tool list says may have changed: the
-     * settings changed, or something was allowed for (or forgotten of) a
-     * chat or connection. Returns the unsubscribe.
-     * @param {() => void} listener
-     */
-    onPermissionsChanged(listener) {
-      permissionListeners.add(listener);
-      return () => permissionListeners.delete(listener);
     },
     /**
      * The question the person is asked about the agent call whose signal is
@@ -836,7 +831,6 @@ export function initAgentPresence({
       destroyed = true;
       actions.setConfirmer(null);
       unsubscribePermissions();
-      permissionListeners.clear();
       settingsDialog.destroy();
       unsubscribeDispatch();
       unsubscribeData();

@@ -1,4 +1,6 @@
 // Color utilities and predefined palettes for categorical and continuous fields.
+import { rgb01OfHex } from '../utils/hex-color.js';
+
 export function rgbToCss(color) {
   const r = Math.round(color[0] * 255);
   const g = Math.round(color[1] * 255);
@@ -339,7 +341,7 @@ const ORANGES_COLORS = [
   [0.498, 0.153, 0.016]
 ];
 
-// Greys - sequential grey
+// Greys - sequential gray
 const GREYS_COLORS = [
   [1.000, 1.000, 1.000],
   [0.941, 0.941, 0.941],
@@ -642,7 +644,7 @@ export function getColormapByteTable(colormap) {
  * @param {string} label
  * @param {number[][]} colors
  * @param {{diverging?: boolean}} [kind] - `diverging`: its middle is a
- *   neutral centre, so data spanning 0 is drawn with 0 there
+ *   neutral center, so data spanning 0 is drawn with 0 there
  *   (`color-manager.js` `computeContinuousDomain`)
  */
 function buildColormap(id, label, colors, { diverging = false } = {}) {
@@ -723,7 +725,9 @@ export function getCssStopsForColormap(id) {
   return getColormap(id).cssStops;
 }
 
-// Vibrant colorblind-friendly palette (PROTAN/DEUTAN safe).
+// Vibrant palette, tuned for distinct hues to normal vision: NOT colorblind-safe
+// (simulated deuteranopia/protanopia makes several pairs look alike, e.g. #0077C8
+// and #7D57C2; `category-palette-color-vision-contract.test.mjs` measures it).
 // Optimized for 3D visualization: high saturation, max adjacent contrast.
 // Sources: Okabe-Ito (boosted), IBM Design, Paul Tol bright.
 const CATEGORY_PALETTE = [
@@ -845,33 +849,15 @@ function hslToRgb01(h, s, l) {
   return [r1 + m, g1 + m, b1 + m];
 }
 
-const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
-
 /**
- * One `#rgb`, `#rrggbb` or `#rrggbbaa` colour as an RGB triplet of 0..1
- * channels (alpha dropped: a category's opacity is the view's), or null for
- * any other text.
+ * The colors a Scanpy palette gives the categories of one field.
  *
- * @param {unknown} text
- * @returns {[number, number, number]|null}
- */
-function hexColorToRgb01(text) {
-  if (typeof text !== 'string' || !HEX_COLOR.test(text)) return null;
-  const digits = text.length === 4
-    ? [...text.slice(1)].map(digit => digit + digit).join('')
-    : text.slice(1, 7);
-  return [0, 2, 4].map(start => parseInt(digits.slice(start, start + 2), 16) / 255);
-}
-
-/**
- * The colours a Scanpy palette gives the categories of one field.
- *
- * `stored` is `uns['<key>_colors']` as the file holds it: one colour per
+ * `stored` is `uns['<key>_colors']` as the file holds it: one color per
  * category, in category order, as `sc.pl.*` writes it. Read as Scanpy reads
  * it: a palette shorter than the categories is not used (Scanpy draws its own
- * colours then), and a longer one gives its first colours. Scanpy writes hex
- * colours; a palette holding anything else among the colours it gives is not
- * used, rather than mixing its colours with Cellucid's. Null when there is no
+ * colors then), and a longer one gives its first colors. Scanpy writes hex
+ * colors; a palette holding anything else among the colors it gives is not
+ * used, rather than mixing its colors with Cellucid's. Null when there is no
  * palette to use.
  *
  * @param {unknown} stored
@@ -880,12 +866,12 @@ function hexColorToRgb01(text) {
  */
 export function scanpyCategoryPalette(stored, categoryCount) {
   if (!Number.isSafeInteger(categoryCount) || categoryCount < 0) {
-    throw new RangeError('A palette colours a non-negative whole number of categories.');
+    throw new RangeError('A palette colors a non-negative whole number of categories.');
   }
   if (!Array.isArray(stored) || categoryCount === 0 || stored.length < categoryCount) return null;
   const colors = [];
   for (let index = 0; index < categoryCount; index++) {
-    const rgb = hexColorToRgb01(stored[index]);
+    const rgb = rgb01OfHex(stored[index]);
     if (rgb === null) return null;
     colors.push(rgb);
   }
@@ -893,15 +879,15 @@ export function scanpyCategoryPalette(stored, categoryCount) {
 }
 
 /**
- * The colours of a categorical's categories when it is coded by the ones its
+ * The colors of a categorical's categories when it is coded by the ones its
  * open cells hold (`AnnDataReader._readPresentCategorical`): `stored` the
- * stored position of each, `colors` the file's colours of them
+ * stored position of each, `colors` the file's colors of them
  * (`uns['<key>_colors']` at those positions, or null). Each category takes
- * the colour it has with every category open -- the file's, when each of
- * the categories found has a hex colour (`scanpyCategoryPalette`), else
+ * the color it has with every category open -- the file's, when each of
+ * the categories found has a hex color (`scanpyCategoryPalette`), else
  * Cellucid's at its stored position (`getCategoryColor`) -- so a share of
  * the cells, or more of them opened later, shows each category in the same
- * colour. A fresh array the caller owns.
+ * color. A fresh array the caller owns.
  *
  * @param {ReadonlyArray<string>|null} colors
  * @param {ArrayLike<number>} stored
@@ -917,11 +903,11 @@ export function presentCategoryPalette(colors, stored) {
 }
 
 /**
- * The colour category `idx` of a categorical field opens with: its file's
+ * The color category `idx` of a categorical field opens with: its file's
  * palette (`field.palette`, `scanpyCategoryPalette`) while that still has one
- * colour per category, else Cellucid's own (`getCategoryColor`). Merging
+ * color per category, else Cellucid's own (`getCategoryColor`). Merging
  * categories changes their count, and a palette written for the file's
- * categories no longer says which colour each one has. A fresh array the
+ * categories no longer says which color each one has. A fresh array the
  * caller owns.
  *
  * @param {{categories: ReadonlyArray<unknown>, palette?: ReadonlyArray<ReadonlyArray<number>>|null}} field
@@ -937,8 +923,8 @@ export function defaultCategoryColor(field, idx) {
 }
 
 /**
- * How many colours of the category sequence (`getCategoryColor`) are the
- * designed palettes, before the sequence fans out around the colour wheel.
+ * How many colors of the category sequence (`getCategoryColor`) are the
+ * designed palettes, before the sequence fans out around the color wheel.
  *
  * @returns {number}
  */

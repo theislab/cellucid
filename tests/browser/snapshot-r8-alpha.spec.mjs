@@ -521,7 +521,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         colorBytesExact:
           snapshot.bufferByteLength === pointCount * 4,
         // The published RGBA array is retained by reference, never copied:
-        // it is the source of the GPU colour gather.
+        // it is the source of the GPU color gather.
         noPerSnapshotColorCopy: snapshot.colors === colors,
         noPerSnapshotFloatAlphaOwner:
           !Object.values(snapshot).some(
@@ -548,6 +548,8 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       const baseParams = {
         autoFog: false,
         cameraDistance: 3,
+        // The sprite cap (rendering/point-sprite.js).
+        pointSizeMax: 160,
         cameraPosition: Float32Array.from([0, 0, 3]),
         dimensionLevel: 2,
         fogColor: Float32Array.from([0, 0, 0]),
@@ -690,7 +692,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       // pooled position owner. It is diagnostic-only, but its exact pixels
       // prove the new RGB+R8 publication preserves the old visual contract.
       // The pooled store holds its points in its tree's draw order, so the
-      // baked colours are laid out in that order too.
+      // baked colors are laid out in that order too.
       const drawOrder = renderer.getViewDrawOrder('snapshot-r8');
       const legacyColors = new Uint8Array(colors.length);
       for (let slot = 0; slot < pointCount; slot++) {
@@ -1114,7 +1116,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
         alphaTexturePreserved:
           snapshot.alphaTexture ===
             alphaTextureBeforePositions,
-        // The colour store survives a position change: drawn again when the
+        // The color store survives a position change: drawn again when the
         // new geometry holds the same draw order, else kept (under its own
         // order) while the view draws a store gathered into the new one.
         colorBufferPreserved:
@@ -1147,7 +1149,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
       const retiredPositionStore = retiredGeometry.positionBuffer;
       const retiredPositionBuffer = retiredPositionStore.segments[0].buffer;
       const lifecycleStart = lifecycle.length;
-      // Colour stores the view kept for other draw orders go with it.
+      // Color stores the view kept for other draw orders go with it.
       const keptColorStores = snapshot.colorCache?.size ?? 0;
       const beforeDelete = captureCounts();
       renderer.deleteSnapshotBuffer('snapshot-r8');
@@ -1306,9 +1308,9 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
     noPointSizedColorScratch: true,
     sharedGeometryPositionBytes: true,
   });
-  // One RGBA8 colour store: a snapshot of the live generation borrows the
+  // One RGBA8 color store: a snapshot of the live generation borrows the
   // live position store instead of uploading a second copy of it. In source
-  // order the colour store is the colours' own bytes, uploaded directly (no
+  // order the color store is the colors' own bytes, uploaded directly (no
   // gather pass, so no transient texture or pass objects). The R8 alpha
   // texture is a linear texture: its storage (counted as texImage2D) and one
   // write of its padded rows (counted as texSubImage2D).
@@ -1481,7 +1483,7 @@ test('snapshot R8 alpha stays exact through every draw and resource lifecycle', 
   });
   expect(proof.deleteDelta.deleteTexture).toBe(1);
   expect(proof.deleteDelta.deleteVertexArray).toBe(1);
-  // The colour buffers only (its own and any it kept for another draw
+  // The color buffers only (its own and any it kept for another draw
   // order): the position buffer is retained.
   expect(proof.deleteDelta.deleteBuffer).toBe(1 + proof.keptColorStores);
   expect(proof.retention).toEqual({

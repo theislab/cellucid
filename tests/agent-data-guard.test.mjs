@@ -1,7 +1,7 @@
 /**
  * What agents are sent of the data, and how text written by others reaches
  * them (`app/agent/data-scope.js`, `app/agent/bridge/data-guard.js`, the
- * data tags of `mcp-content.js`): every read of the catalogue is classified
+ * data tags of `mcp-content.js`): every read of the catalog is classified
  * (a read added later is refused under the switch until it is); with the
  * dataset set to names and summaries only, the one tool call both ways in
  * run refuses values of cells and pictures before they run (and after, when
@@ -72,13 +72,13 @@ test('names and summaries only: values of cells and pictures are refused before 
     defineAction({ type: 'cells.values', title: 'Read values of cells', summary: 'x', group: 'Dataset', params: NO_PARAMS, reads: [], effect: 'read', describe: () => 'x', code: () => 'x' }),
     defineAction({ type: 'view.picture', title: 'Take a picture of a view', summary: 'x', group: 'Views', params: NO_PARAMS, reads: [], effect: 'read', describe: () => 'x', code: () => 'x' }),
     defineAction({ type: 'cells.dump', title: 'Read every cell', summary: 'x', group: 'Dataset', params: NO_PARAMS, reads: [], effect: 'read', describe: () => 'x', code: () => 'x' }),
-    defineAction({ type: 'color.by', title: 'Colour', summary: 'x', group: 'Colours', params: NO_PARAMS, touches: ['colors'], reads: [], effect: 'view', describe: () => 'x', code: () => 'x' }),
+    defineAction({ type: 'color.by', title: 'Color', summary: 'x', group: 'Colors', params: NO_PARAMS, touches: ['colors'], reads: [], effect: 'view', describe: () => 'x', code: () => 'x' }),
   ]);
   const dispatched = [];
   const actions = {
     async dispatch(type) {
       dispatched.push(type);
-      return type === 'color.by' ? { outcome: { by: 'leiden' }, step: { id: 's1', label: 'Coloured' } } : { outcome: { values: [1.5, 2.5] }, step: null };
+      return type === 'color.by' ? { outcome: { by: 'leiden' }, step: { id: 's1', label: 'Colored' } } : { outcome: { values: [1.5, 2.5] }, step: null };
     },
   };
   const tools = toolIndexOf(catalog);
@@ -170,17 +170,26 @@ test('a value summary over groups an agent shaped by naming cells is refused und
   done('field.push', { key: 'pushed' }, { name: 'pushed' });
   done('field.push', { key: 'notebook' }, { name: 'notebook' }, 'host');
   assert.deepEqual(['probe', 'renamed', 'pushed', 'mine', 'notebook'].map(tracker.field), [true, true, true, false, false]);
+  // A column made from a shaped one holds its cells: a grouping, a file's column edited into a new one (L7-1).
+  done('field.group', { field: { source: 'obs', key: 'renamed' }, groups: [{ label: 'G', categories: ['p'] }], rest: null }, { name: 'renamed (grouped)' }, 'user');
+  done('category.merge', { field: { source: 'obs', key: 'pushed' }, category: 'a', into: 'b' }, { name: 'pushed (merged)' }, 'user');
+  done('category.delete', { field: { source: 'obs', key: 'pushed (merged)' }, category: 'a' }, { name: 'pushed (edited)' }, 'user');
+  done('field.group', { field: { source: 'obs', key: 'mine' }, groups: [{ label: 'G', categories: ['m'] }], rest: null }, { name: 'mine (grouped)' }, 'user');
+  assert.deepEqual(['renamed (grouped)', 'pushed (merged)', 'pushed (edited)', 'mine (grouped)'].map(tracker.field), [true, true, true, false]);
   pages.push({ name: 'Probe ∪ Mine', highlightedGroups: [{ id: 'highlight_3', label: 'Union' }] });
   done('highlight.page.combine', { pages: ['Probe', 'Mine'], operation: 'union' }, { page: 'Probe ∪ Mine' }, 'user');
   assert.equal(tracker.page('Probe ∪ Mine'), true);
-  pages.push({ name: 'From field', highlightedGroups: [{ id: 'highlight_4', label: 'renamed: p' }] });
-  done('highlight.category', { field: { source: 'obs', key: 'renamed' }, category: 'p' }, { page: 'From field', group: 'renamed: p' }, 'user');
+  // Several categories in one step: every group it made is marked.
+  pages.push({ name: 'From field', highlightedGroups: [{ id: 'highlight_4', label: 'renamed: p' }, { id: 'highlight_5', label: 'renamed: q' }] });
+  done('highlight.category', { field: { source: 'obs', key: 'renamed' }, categories: ['p', 'q'] }, { page: 'From field', groups: ['renamed: p', 'renamed: q'] }, 'user');
   assert.equal(tracker.page('From field'), true);
+  pages.push({ name: 'Second only', highlightedGroups: [{ id: 'highlight_5', label: 'renamed: q' }] });
+  assert.equal(tracker.page('Second only'), true, 'the second group of the step is marked too');
 
   const catalog = getActionCatalog();
   const scope = { summariesOnly: true, shaped: tracker };
   const summarise = by => shapedRefusal(catalog.get('field.summary'), { field: { source: 'var', key: 'CD3E' }, by: { source: 'obs', key: by } }, scope);
-  assert.match(summarise('renamed'), /it would summarise values over the field <cellucid-data>"renamed"<\/cellucid-data>, whose groups an agent made by naming cells/);
+  assert.match(summarise('renamed'), /it would summarize values over the field <cellucid-data>"renamed"<\/cellucid-data>, whose groups an agent made by naming cells/);
   assert.equal(summarise('mine'), null);
   assert.equal(summarise('cell_type'), null);
   assert.equal(shapedRefusal(catalog.get('field.summary'), { field: { source: 'var', key: 'CD3E' }, by: { source: 'obs', key: 'renamed' } }, { ...scope, summariesOnly: false }), null);

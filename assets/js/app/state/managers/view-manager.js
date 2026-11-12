@@ -12,8 +12,11 @@ import { viewContextViewerSyncMethods } from './view-context-viewer-sync.js';
 import { getNotificationCenter } from '../../notification-center.js';
 import { MappingLoadError } from '../../../data/data-mapping-candidates.js';
 import { PLACES } from '../../ui/place-names.js';
-import { unplacedCellsText } from '../../unplaced-cells-notice.js';
-import { cancelled, isCancellation } from '../../../utils/abort.js';
+import { isAbortSignal } from '../../../utils/abort.js';
+import { stillFieldText, unplacedCellsText } from '../../unplaced-cells-notice.js';
+import { representationOptionText } from '../../../data/representation-names.js';
+import { VELOCITY_STILL_SPEED } from '../../../rendering/overlays/velocity/velocity-shaders.js';
+import { awaitWithSignal, cancelled, throwIfAborted } from '../../../utils/abort.js';
 
 const SUPPORTED_DIMENSIONS = new Set([1, 2, 3]);
 function requireDimensionLevel(level, label = 'Dimension') {
@@ -35,14 +38,15 @@ function requireRepresentationOptions(options) {
     options === null ||
     typeof options !== 'object' ||
     Array.isArray(options) ||
-    Object.keys(options).length !== 1 ||
-    typeof options.followsDefault !== 'boolean'
+    Object.keys(options).some(key => key !== 'followsDefault' && key !== 'signal') ||
+    typeof options.followsDefault !== 'boolean' ||
+    !(options.signal === undefined || options.signal === null || isAbortSignal(options.signal))
   ) {
     throw new TypeError(
-      'Representation options must contain exactly one boolean "followsDefault".'
+      'Representation options must contain exactly one boolean "followsDefault" (and an optional AbortSignal "signal").'
     );
   }
-  return Object.freeze({ followsDefault: options.followsDefault });
+  return Object.freeze({ followsDefault: options.followsDefault, signal: options.signal ?? null });
 }
 
 function requireMethod(owner, methodName, label) {
@@ -411,6 +415,14 @@ export class DataStateViewMethods {
             kind: 'vectors', label: descriptor.label, count: fieldData.unplacedCount, names: fieldData.unplacedNames,
           }), { category: 'data' });
         }
+        // A field too short everywhere to draw shows nothing: say why (R9V-6).
+        if (fieldData.maxMagnitude < VELOCITY_STILL_SPEED) {
+          notifications.info(stillFieldText({
+            label: descriptor.label,
+            embedding: representationOptionText({ name: this.representationNameOf(layout), dimension: level }),
+            longest: fieldData.maxMagnitude,
+          }), { category: 'data' });
+        }
       }
       viewer.setVectorFieldData(fieldId, layoutKey, fieldData);
       return true;
@@ -425,16 +437,10 @@ export class DataStateViewMethods {
       if (terminalError instanceof MappingLoadError) {
         this._markMappingChoiceUnusable('vectorFields', terminalError.key, terminalError.reason);
       }
-      if (notifications !== null && !readReported) {
-        if (isCancellation(terminalError)) {
-          notifications.dismiss(notifId);
-        } else {
-          const message = terminalError instanceof Error
-            ? terminalError.message
-            : `Vector field "${fieldId}" rejected with a non-Error value.`;
-          notifications.fail(notifId, message);
-        }
-      }
+      // The loading notice goes; the caller says the failure once, with its
+      // details ("The vector field could not be shown: …"). Failing the notice
+      // here as well said the same failure twice (R9V-7).
+      if (notifications !== null && !readReported) notifications.dismiss(notifId);
       throw terminalError;
     }
   }
@@ -524,9 +530,10 @@ export class DataStateViewMethods {
    *
    * @param {string} viewId
    * @param {number} level
+   * @param {{signal?: AbortSignal|null}} [how] - What stops the change (`setViewRepresentation`)
    * @returns {Promise<string>} The layout key now shown.
    */
-  async showDefaultRepresentation(viewId, level) {
+  async showDefaultRepresentation(viewId, level, { signal = null } = {}) {
     const dimension = requireDimensionLevel(level);
     requireMethod(this.dimensionManager, 'getOpeningLayout', 'Dimension manager');
     const layoutKey = this.dimensionManager.getOpeningLayout(dimension);
@@ -535,6 +542,7 @@ export class DataStateViewMethods {
     }
     await this.setViewRepresentation(viewId, layoutKey, {
       followsDefault: this.dimensionManager.getDefaultLayout(dimension) === layoutKey,
+      signal,
     });
     return layoutKey;
   }
@@ -546,11 +554,12 @@ export class DataStateViewMethods {
    *
    * @param {string} viewId
    * @param {number} level
+   * @param {{signal?: AbortSignal|null}} [how] - What stops the change (`setViewRepresentation`)
    * @returns {Promise<{layoutKey: string, position: number, count: number}>}
    *   What the view shows now, and its 1-based place among the enabled
    *   representations of that dimension.
    */
-  async cycleRepresentation(viewId, level) {
+  async cycleRepresentation(viewId, level, { signal = null } = {}) {
     const dimension = requireDimensionLevel(level);
     const targetViewId = this._requireKnownView(viewId);
     // The dimension's default first, then its other representations in the
@@ -566,12 +575,13 @@ export class DataStateViewMethods {
     const current = this.getViewLayoutKey(targetViewId);
     let layoutKey;
     if (this.getViewDimensionLevel(targetViewId) !== dimension) {
-      layoutKey = await this.showDefaultRepresentation(targetViewId, dimension);
+      layoutKey = await this.showDefaultRepresentation(targetViewId, dimension, { signal });
     } else {
       const index = choices.indexOf(current);
       layoutKey = choices[(index + 1) % choices.length];
       await this.setViewRepresentation(targetViewId, layoutKey, {
         followsDefault: this.dimensionManager.getDefaultLayout(dimension) === layoutKey,
+        signal,
       });
     }
     return { layoutKey, position: choices.indexOf(layoutKey) + 1, count: choices.length };
@@ -584,12 +594,13 @@ export class DataStateViewMethods {
    *
    * @param {string} viewId
    * @param {{key: string, columns: number[]|null}} ref
+   * @param {{signal?: AbortSignal|null}} [how] - What stops the change (`setViewRepresentation`)
    * @returns {Promise<string>} The layout key now shown.
    */
-  async setViewEmbedding(viewId, ref) {
+  async setViewEmbedding(viewId, ref, { signal = null } = {}) {
     requireMethod(this.dimensionManager, 'resolveRepresentation', 'Dimension manager');
     const layoutKey = this.dimensionManager.resolveRepresentation(ref);
-    await this.setViewRepresentation(viewId, layoutKey, { followsDefault: false });
+    await this.setViewRepresentation(viewId, layoutKey, { followsDefault: false, signal });
     return layoutKey;
   }
 
@@ -604,20 +615,27 @@ export class DataStateViewMethods {
    * `view:representation-changed` `{viewId, layoutKey, dimension,
    * previousLayoutKey}` once it is committed.
    *
+   * `signal` (an action's or a history move's): stopped while it waits
+   * for its turn or for the coordinates, it throws why at once and
+   * nothing is published (the load goes on for whoever else waits for it,
+   * and keeps it for the next asker); once the coordinates are in, the
+   * publication is synchronous and is never cut in half.
+   *
    * @param {string} viewId - Exact target view
    * @param {string} layoutKey - An enabled layout
-   * @param {{followsDefault: boolean}} options
+   * @param {{followsDefault: boolean, signal?: AbortSignal|null}} options
    * @returns {Promise<void>}
    */
   async setViewRepresentation(viewId, layoutKey, options) {
     const targetViewId = requireViewId(viewId);
-    const { followsDefault } = requireRepresentationOptions(options);
+    const { followsDefault, signal } = requireRepresentationOptions(options);
 
     // Serialize layout transactions so their staged coordinates and
     // centroid buffers cannot overlap across an await boundary.
     while (this._dimensionChangeLock) {
-      await this._dimensionChangeLock;
+      await awaitWithSignal(this._dimensionChangeLock, signal);
     }
+    throwIfAborted(signal);
 
     let unlockDimensionChange = null;
     this._dimensionChangeLock = new Promise((resolve) => {
@@ -722,7 +740,7 @@ export class DataStateViewMethods {
       });
       releaseLayoutPin = dimensionManager.pinLayout(nextLayoutKey);
       const nextPositions =
-        await dimensionManager.getPositions(nextLayoutKey);
+        await awaitWithSignal(dimensionManager.getPositions(nextLayoutKey), signal);
       assertCurrentDimensionLoadOwner(this, loadOwner);
       if (
         !(nextPositions instanceof Float32Array) ||

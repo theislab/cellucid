@@ -4,14 +4,14 @@
  * The form is the correlation options schema's
  * (`options/correlation-options.js`): the X and Y variables (an obs field or
  * a gene, the same picker Detailed uses), the pages, Run; the method and the
- * colouring under More options. Computed by
+ * coloring under More options. Computed by
  * `MultiVariableAnalysis.correlationAnalysis`, drawn by the `scatterplot`
  * plot type.
  */
 
-import { formatCount } from '../../../../utils/format-units.js';
+import { formatCount, formatPValue } from '../../../../utils/format-units.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
-import { correlationResultsToCSV, downloadCSV } from '../../shared/analysis-utils.js';
+import { correlationResultsToCSV } from '../../shared/analysis-utils.js';
 import { createVariableSelectorComponent } from '../shared/variable-selector.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
 import { CORRELATION_OPTIONS } from '../../options/correlation-options.js';
@@ -22,7 +22,7 @@ import {
   requireDatasetPages,
   requireDatasetVariable
 } from '../../shared/analysis-result-session.js';
-import { failureText } from '../../../../utils/errors.js';
+import { failureDetails, sayFailure } from '../../../../utils/errors.js';
 
 function requireCorrelationVariable(variable, label) {
   if (
@@ -94,13 +94,13 @@ function requireReadyPageData(pageData, pageIds, variableKey) {
  * Why a page's correlation is undefined: a variable constant in its cells
  * (`computeCorrelation`'s `constant`), named.
  *
- * @param {{constant: 'x'|'y'|'both', xVariable?: string, yVariable?: string}} result
+ * @param {{constant: 'x'|'y'|'both', xLabel: string, yLabel: string}} result - `xLabel`/`yLabel`:
+ *   what each axis's values are (`geneValueLabel`)
  * @returns {string}
  */
 function constantCorrelationReason(result) {
   if (result.constant === 'both') return 'both variables are constant in these cells';
-  const name = result.constant === 'x' ? result.xVariable : result.yVariable;
-  return `${name ?? (result.constant === 'x' ? 'X' : 'Y')} is constant in these cells`;
+  return `${result.constant === 'x' ? result.xLabel : result.yLabel} is constant in these cells`;
 }
 
 
@@ -226,7 +226,8 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     requireCorrelationVariable(options.variableY, 'Correlation Y variable');
     // A first pass correlates each page's cells in the sample.
     const pageIds = sample === null ? [...this._selectedPages] : sample.pageIds([...this._selectedPages]);
-    const customColors = new Map(this._pageSelector?.getCustomColors?.() || []);
+    // Every page in its swatch's color, whatever order the pages were picked in.
+    const pageColors = new Map(this._pageSelector?.getPageColors?.() || []);
     const colorBy = options.colorBy === '' ? null : options.colorBy;
     const readinessRequests = [
       { type: options.variableX.type, variableKey: options.variableX.key, pageIds },
@@ -261,10 +262,8 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
         if (result.pageId) result.pageId = sample.basePageId(result.pageId);
       }
     }
-    if (customColors.size > 0) {
-      for (const result of correlationResults) {
-        if (result.pageId && customColors.has(result.pageId)) result.pageColor = customColors.get(result.pageId);
-      }
+    for (const result of correlationResults) {
+      if (result.pageId && pageColors.has(result.pageId)) result.pageColor = pageColors.get(result.pageId);
     }
     return {
       type: 'correlation',
@@ -277,7 +276,8 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
         colorBy: colorBy === null ? null : { type: 'categorical_obs', key: colorBy }
       },
       title: 'Correlation',
-      subtitle: `${options.variableX.key} vs ${options.variableY.key}`,
+      // What each axis's values are, as read (a gene's with its units).
+      subtitle: `${correlationResults[0].xLabel} vs ${correlationResults[0].yLabel}`,
       metadata: {
         method: options.method,
         variableX: options.variableX,
@@ -331,7 +331,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
       const hasError = !!r?.error;
       const rVal = isFiniteNumber(r?.r) ? r.r.toFixed(4) : (r?.constant ? 'Undefined' : 'N/A');
       const r2Val = isFiniteNumber(r?.rSquared) ? r.rSquared.toFixed(4) : 'N/A';
-      const pVal = isFiniteNumber(r?.pValue) ? r.pValue.toExponential(3) : 'N/A';
+      const pVal = isFiniteNumber(r?.pValue) ? formatPValue(r.pValue) : 'N/A';
       const nVal = typeof r?.n === 'number'
         ? formatCount(r.n)
         : (Array.isArray(r?.xValues) ? formatCount(r.xValues.length) : 'N/A');
@@ -469,9 +469,6 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     container.appendChild(table);
   }
 
-  _exportModalCSV() {
-    this._exportResultsCSV();
-  }
 
   // ===========================================================================
   // Export Helpers
@@ -489,12 +486,11 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     });
   }
 
-  _exportResultsCSV() {
+  /** Every page's correlation: its statistics, the method and the cells. */
+  tableFile() {
     const results = this._lastResult?.data;
-    if (!Array.isArray(results) || results.length === 0) return;
-
-    const csv = correlationResultsToCSV(results, this._lastResult?.metadata || {});
-    downloadCSV(csv, 'correlation_results', this._notifications);
+    if (!Array.isArray(results) || results.length === 0) return null;
+    return { name: 'correlation_results', csv: correlationResultsToCSV(results, this._lastResult?.metadata || {}) };
   }
 
   /**
@@ -530,7 +526,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
 
   /**
    * Restore a result written by `exportResult()`; refused when it names a
-   * variable, cell group or colour category the open dataset lacks.
+   * variable, cell group or color category the open dataset lacks.
    * @param {null|Object} envelope
    * @returns {Promise<void>}
    */
@@ -579,7 +575,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
         for (const label of page.colorValues) {
           if (label !== null && !categories.has(label)) {
             throw new Error(
-              `The correlation result colours by category "${String(label)}", ` +
+              `The correlation result colors by category "${String(label)}", ` +
               `which field "${metadata.colorBy}" lacks`
             );
           }
@@ -615,7 +611,7 @@ export class CorrelationAnalysisUI extends FormBasedAnalysisUI {
     try {
       this._pageSelector?.destroy();
     } catch (error) {
-      this._notifications.error(`Correlation cleanup failed: ${failureText(error)}`, { category: 'analysis' });
+      this._notifications.error(`Correlation cleanup failed: ${sayFailure(error)}`, { ...failureDetails(error), category: 'analysis' });
     }
     this._pageSelector = null;
     this._pageSelectContainer = null;

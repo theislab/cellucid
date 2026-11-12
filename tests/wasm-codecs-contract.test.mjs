@@ -4,7 +4,7 @@
  * release tarballs, `scripts/build-wasm-codecs.mjs`) and fflate 0.8.2
  * (`assets/external/fflate-0.8.2/`).
  *
- * - Each shipped file is pinned by its SHA-256, licences included: a change
+ * - Each shipped file is pinned by its SHA-256, licenses included: a change
  *   to any is a deliberate rebuild or re-vendoring that updates this test.
  * - The module imports nothing (no WASI, no JavaScript glue) and exports the
  *   decoders `formats/io/wasm-codecs.js` calls, and workers find it through
@@ -58,7 +58,7 @@ test('every vendored decoder file is the pinned one, with its licence beside it'
     assert.ok(existsSync(path.join(ROOT, ...file.split('/'))), `${file} is shipped`);
     assert.equal(sha256(read(file)), digest, file);
   }
-  // The licences are the ones the build copies from the pinned sources.
+  // The licenses are the ones the build copies from the pinned sources.
   assert.deepEqual(
     LICENSES.map(({ name }) => `${LICENSES_DIR}/${name}`).sort(),
     Object.keys(PINNED).filter(file => file.startsWith(`${LICENSES_DIR}/`)).sort()

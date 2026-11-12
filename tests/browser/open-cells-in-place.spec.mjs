@@ -4,7 +4,7 @@
  * - Apply with a larger or smaller share of the same method and seed shows
  *   the cells in place: no new dataset is published, the camera, the field
  *   shown, its filter and the highlights stay, the cells open before keep
- *   their positions bit for bit, and the colours and visibility are, byte for
+ *   their positions bit for bit, and the colors and visibility are, byte for
  *   byte, what opening at that share directly shows after the same actions.
  *   A category highlight takes the cells added in its category, as opening
  *   them would; a lasso keeps its cells.
@@ -58,8 +58,15 @@ async function open(page, query) {
   await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(URL_OF_FILE)}${query}`, { waitUntil: 'domcontentloaded' });
 }
 
-/** Colour by `field`, hide its first category, and make a lasso and a category highlight group. */
+/** Color by `field`, hide its first category, and make a lasso and a category highlight group. */
 async function act(page, field = 'cluster') {
+  // The file's own opening is over first: it is colored by its first coloring
+  // (`first-coloring.js`: cluster) before its history begins, and the state
+  // set below through the page's internals takes no place in the dispatcher's
+  // order. Set while the opening was still under way, it was overwritten by
+  // the first coloring landing after it (macOS WebKit, CI run 43120770230:
+  // the field shown was cluster, not the note chosen here).
+  await page.waitForFunction(() => window._cellucidHistories?.current()?.active != null, null, { timeout: 120_000 });
   await page.evaluate(async key => {
     const state = window._cellucidState;
     const index = state.obsData.fields.findIndex(item => item.key === key);
@@ -118,7 +125,7 @@ async function shown(page) {
       digest: state.cellIdentity.digest,
       // What a difference between two pages is made of (Windows Firefox,
       // Web contracts run 41269083996: a page opened at 250 cells directly
-      // held a category group of other cells than its colours; not
+      // held a category group of other cells than its colors; not
       // reproduced elsewhere): the open order's first cells, the shown
       // field's first codes, and how far startup had come.
       evidence: {

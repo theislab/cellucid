@@ -8,6 +8,7 @@
  * @module state/managers/filter-manager
  */
 
+import { categoryVisibilityText } from '../../utils/category-visibility-text.js';
 import { rgbToCss, COLOR_PICKER_PALETTE } from '../../../data/palettes.js';
 import { BaseManager } from '../core/base-manager.js';
 import { requireCategoryCodesInInventory } from './category-codes.js';
@@ -23,7 +24,7 @@ import {
 } from './per-cell-array-ownership.js';
 import { isCategoricalCodes, missingCategoryCode } from '../../../data/categorical-storage-contract.js';
 import { requireOutlierQuantiles } from './color-outliers.js';
-import { formatBound } from '../../../utils/format-units.js';
+import { formatBound, formatPercent } from '../../../utils/format-units.js';
 import { categoryRgbAt, hiddenCategoryCount, withCategoriesVisible, withCategoryChanges, withCategoryColor, withCategoryVisibility } from '../../utils/category-state.js';
 import {
   categoryCellLimitsOf,
@@ -32,6 +33,8 @@ import {
   withoutCategoryCellLimits,
 } from './category-cell-sample.js';
 import { setWorkingSet } from '../../../data/memory-budget.js';
+import { geneValueLabel } from '../../../data/expression-transform.js';
+import { categoryDisplayName } from '../../actions/targets/names.js';
 
 function requireCategoryFieldAndIndex(field, index) {
   if (
@@ -75,10 +78,10 @@ function isContinuousFilterFullRange(filter, stats) {
 }
 
 /*
- * Every filter applies until it is removed, whatever a view is coloured by
+ * Every filter applies until it is removed, whatever a view is colored by
  * (owner decision 2026-10-28): a gene's range filter and a categorical
  * field's outlier filter hide cells exactly as an obs range or category
- * filter does, after the view is coloured by another field. The Active
+ * filter does, after the view is colored by another field. The Active
  * filters list shows each, the visibility pass applies each, and "Visible
  * cells" analyses read that visibility. These three predicates are the one
  * definition of "this field has a filter" every consumer reads.
@@ -124,7 +127,7 @@ export function outlierThresholdOf(field) {
  * a category hidden, the cells without a category hidden (`_missingVisible`),
  * or a category that keeps only some of its cells. All of them read its
  * codes, so its codes stay resident (`field/residency.js`). A field whose
- * every category is shown, however often it was coloured, filters nothing.
+ * every category is shown, however often it was colored, filters nothing.
  *
  * @param {object} field
  * @returns {boolean}
@@ -179,6 +182,16 @@ export function rangeFilteredVarFields(varData) {
 export const MISSING_LABEL = 'Missing';
 
 /**
+ * Whether an open cell of a categorical field has no category: only then do
+ * the legend's Missing row and the filter list name those cells (a field
+ * hidden whole hides "Missing" too, whether or not any cell lacks one).
+ */
+function hasMissingCells(field) {
+  const codes = field.codes;
+  return isCategoricalCodes(codes) && codes.indexOf(missingCategoryCode(codes)) !== -1;
+}
+
+/**
  * A range filter's bounds as the filter list and figure provenance state
  * them: as every range bound is written (`formatBound`), so a bound typed or
  * set by a slider reads exactly as applied.
@@ -215,14 +228,18 @@ function parseExactFilterId(filterId) {
  * a stored view context. Every consumer - the Active filters list, the view
  * label, figure-export provenance - derives from this one definition, so a
  * view's filters never depend on whether it happens to be focused, nor on
- * which field it is coloured by: every range, category, gene and outlier
+ * which field it is colored by: every range, category, gene and outlier
  * filter is listed until it is removed.
  *
  * @param {{obsData: object|null, varData: object|null}} view
- * @param {{geneSampled?: boolean}} [options] - `geneSampled`: genes are read for a
- *   sample of the open cells (`gene-sample.js`), whose others a gene's range keeps
+ * @param {{geneSampled?: boolean, geneValues?: {normalize: boolean, log1p: boolean}|null}} [options] -
+ *   `geneSampled`: genes are read for a sample of the open cells (`gene-sample.js`),
+ *   whose others a gene's range keeps; `geneValues`: what the genes' values are
+ *   in (Data mapping › Expression values, `getShownExpressionTransform`), so a
+ *   gene's range names its units ("Ins1 · log1p(norm.): 1 – 2", `geneValueLabel`);
+ *   a gene made in the app keeps its own values
  */
-export function collectViewFilters(view, { geneSampled = false } = {}) {
+export function collectViewFilters(view, { geneSampled = false, geneValues = null } = {}) {
   if (!view.obsData || !view.obsData.fields) return [];
   const fields = view.obsData.fields;
   const filters = [];
@@ -253,26 +270,25 @@ export function collectViewFilters(view, { geneSampled = false } = {}) {
       const categories = field.categories || [];
       const visible = field._categoryVisible;
       const hiddenNames = [];
-      // Only a field that hides some category is walked.
-      if (visible !== undefined && hiddenCategoryCount(visible) > 0) {
+      const shownNames = [];
+      // Only a field that hides some category, or its cells without one, is walked.
+      const hidesCategory = visible !== undefined && hiddenCategoryCount(visible) > 0;
+      const missingHidden = field._missingVisible === false;
+      if (hidesCategory || missingHidden) {
         for (let i = 0; i < categories.length; i++) {
-          if (visible[i] === 0) hiddenNames.push(String(categories[i]));
+          (visible !== undefined && visible[i] === 0 ? hiddenNames : shownNames).push(categoryDisplayName(categories[i]));
         }
+        // Cells without a category (the legend's Missing row), when there are any.
+        if (hasMissingCells(field)) (missingHidden ? hiddenNames : shownNames).push(MISSING_LABEL);
       }
-      // Cells without a category, hidden by the legend's Missing row.
-      if (field._missingVisible === false) hiddenNames.push(MISSING_LABEL);
       // Categories shown that keep only some of their cells (the legend's count).
       const limits = categoryCellLimitsOf(field).filter(limit => visible === undefined || visible[limit.category] !== 0);
       if (hiddenNames.length > 0 || limits.length > 0) {
         const enabled = field._categoryFilterEnabled !== false; // default true
         const parts = [];
-        if (hiddenNames.length > 0) {
-          const preview = hiddenNames.slice(0, 4).join(', ');
-          const extra = hiddenNames.length > 4 ? ` +${hiddenNames.length - 4} more` : '';
-          parts.push(`hiding ${preview}${extra}`);
-        }
+        if (hiddenNames.length > 0) parts.push(categoryVisibilityText(hiddenNames, shownNames));
         if (limits.length > 0) {
-          const kept = limits.slice(0, 2).map(limit => `${limit.count} of ${String(categories[limit.category])}`).join(', ');
+          const kept = limits.slice(0, 2).map(limit => `${limit.count} of ${categoryDisplayName(categories[limit.category])}`).join(', ');
           parts.push(`keeping ${kept}${limits.length > 2 ? ` +${limits.length - 2} more` : ''}`);
         }
         filters.push({
@@ -290,7 +306,7 @@ export function collectViewFilters(view, { geneSampled = false } = {}) {
       // Outlier filter
       if (hasOutlierFilter(field)) {
         const enabled = field._outlierFilterEnabled !== false; // default true
-        const pct = Math.round(outlierThresholdOf(field) * 100);
+        const pct = outlierThresholdOf(field) * 100;
         filters.push({
           id: `obs-outlier-${fi}`,
           type: 'outlier',
@@ -298,7 +314,7 @@ export function collectViewFilters(view, { geneSampled = false } = {}) {
           fieldIndex: fi,
           fieldKey: key,
           enabled: enabled,
-          text: `${key}: outlier ≤ ${pct}%${disabled(enabled)}`
+          text: `${key}: outlier ≤ ${formatPercent(pct)}${disabled(enabled)}`
         });
       }
     }
@@ -316,7 +332,7 @@ export function collectViewFilters(view, { geneSampled = false } = {}) {
       fieldIndex: index,
       fieldKey: field.key,
       enabled: enabled,
-      text: `${field.key}: ${rangeText(field._continuousFilter)}${geneSampled ? ', cells not read kept' : ''}${disabled(enabled)}`
+      text: `${geneValueLabel(field.key, field._isUserDefined === true ? null : geneValues)}: ${rangeText(field._continuousFilter)}${geneSampled ? ', cells not read kept' : ''}${disabled(enabled)}`
     });
   }
 
@@ -653,7 +669,7 @@ export class DataStateFilterMethods {
     // Categories of a field that keep only some of their cells.
     const sampleFilters = [];
     const continuousFilters = [];
-    // Every categorical field's outlier filter, whatever is coloured.
+    // Every categorical field's outlier filter, whatever is colored.
     const outlierFilters = [];
 
     for (let f = 0; f < fields.length; f++) {
@@ -664,7 +680,7 @@ export class DataStateFilterMethods {
       if (field._isDeleted === true) continue;
 
       // A field released from memory (`loaded: false`: `field/residency.js`)
-      // keeps what was set on it (its colours, every category shown, a full
+      // keeps what was set on it (its colors, every category shown, a full
       // range) and holds no array: it is read again when used, and its filter
       // needs its array only when it narrows, which keeps the array resident.
       // A narrowing filter on a field not read is refused below.
@@ -750,7 +766,7 @@ export class DataStateFilterMethods {
       }
     }
 
-    // Every gene's range filter, whatever is coloured. A filtered gene's
+    // Every gene's range filter, whatever is colored. A filtered gene's
     // values stay resident (`field/residency.js`). A gene read for a sample
     // of the open cells judges those cells only: the others keep showing.
     const geneReadTo = this.getGeneSample?.()?.cells ?? pointCount;
@@ -881,7 +897,7 @@ export class DataStateFilterMethods {
   }
 
   getActiveFiltersStructured() {
-    return collectViewFilters(this, { geneSampled: (this.getGeneSample?.() ?? null) !== null });
+    return collectViewFilters(this, { geneSampled: (this.getGeneSample?.() ?? null) !== null, geneValues: this.getShownExpressionTransform?.() ?? null });
   }
 
   toggleFilterEnabled(filterId, enabled) {
@@ -924,7 +940,7 @@ export class DataStateFilterMethods {
       field._continuousFilter.min = metadata.stats.min;
       field._continuousFilter.max = metadata.stats.max;
       field._filterEnabled = true;
-      // With "rescale colors to filter" on, the colour range tracks the
+      // With "rescale colors to filter" on, the color range tracks the
       // range sliders, which this removal returns to the full data range.
       if (field._useFilterColorRange === true) {
         field._continuousColorRange = {
@@ -968,7 +984,7 @@ export class DataStateFilterMethods {
    * Update color array for a category field without triggering visibility recomputation.
    * Used by batch mode to defer the expensive computeGlobalVisibility() call.
    *
-   * The point colours belong to the active field alone. A filter on another
+   * The point colors belong to the active field alone. A filter on another
    * field (listed in Active filters, edited in batch, restored from a session)
    * changes only visibility, so its palette must never reach the canvas.
    */
@@ -1052,7 +1068,7 @@ export class DataStateFilterMethods {
   }
 
   /**
-   * Several categories' visibility and colours at once (a restored
+   * Several categories' visibility and colors at once (a restored
    * session's): each array copied once (`withCategoryChanges`), the field
    * drawn again once.
    *

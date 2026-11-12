@@ -11,7 +11,7 @@ import { configureStraightAlphaBlending } from '../gl-utils.js';
 
 /**
  * The blend state an opaque point pass draws with (see HP_FS_SCULPTED): the
- * colour replaces what is there, alpha composites "over" what is there (so an
+ * color replaces what is there, alpha composites "over" what is there (so an
  * opaque target stays opaque and a transparent export canvas gains the
  * point's coverage), and with multisampling the fragment's disc coverage
  * becomes its sample mask.

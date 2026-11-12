@@ -3,7 +3,7 @@
  * does not cover. The sidebar owner measures it (computeLeftOcclusionRatio)
  * and the viewer lays every pane out inside it (presented-view-layout.js);
  * applyHorizontalProjectionCenter shifts a pane's projection so its
- * principal point sits at the centre of what the pane presents.
+ * principal point sits at the center of what the pane presents.
  */
 
 import { requirePlainRecord } from '../utils/exact-record.js';

@@ -495,6 +495,13 @@ export class AnalysisUIManager {
     }
   }
 
+  /** The fields changed: every built UI offers the fields there are now (`BaseAnalysisUI.onFieldsChanged`). */
+  onFieldsChanged() {
+    for (const entry of this._uis.values()) {
+      entry.ui?.onFieldsChanged();
+    }
+  }
+
   /** @private */
   _notifyInputChange(kind, notifyActive) {
     for (const [id, entry] of this._uis) {

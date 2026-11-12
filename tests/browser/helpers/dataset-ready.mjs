@@ -27,13 +27,14 @@ export async function waitForDatasetReady(page, cells, { timeout } = {}) {
 
 /**
  * Wait until the page has finished what it started by itself: startup
- * ended (`data-startup-phase` is `ready`, where a startup ran), the gene
+ * ended (`data-startup-phase` is `ready`), the gene
  * list read (`whenGenesListed`), and the viewer at rest: its frame loop
  * settled, which holds while the opening's frame-cost measurement is armed
  * or reads a sample (`getFrameScheduleState().settled`,
  * `rendering/full-detail-frame-cost.js`), and every presented view drawn
  * from its final geometry (`isPresentedGeometrySettled`: no tree still to
- * land, no draw order still to adopt). What a spec does after it lands on a
+ * land, no draw order still to adopt), with the sidebar not sliding (the
+ * panes take their final centers when it stops). What a spec does after it lands on a
  * page that changes nothing by itself until something asks; a poll that
  * times out names what was still under way. A pulsing highlight (the `full`
  * quality's ring) keeps the loop drawing by itself and changes nothing else:
@@ -44,10 +45,14 @@ export async function waitForDatasetReady(page, cells, { timeout } = {}) {
  * @param {{timeout?: number}} [options]
  */
 export async function waitForPageAtRest(page, { timeout } = {}) {
-  const startup = await page.evaluate(() => document.documentElement.dataset.startupPhase ?? null);
-  if (startup !== null) {
-    await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready', timeout === undefined ? undefined : { timeout });
-  }
+  // Every page's startup publishes its phases and ends `ready`
+  // (`app/startup-phase.js`, `main.js`), but only once `main.js` has reached
+  // its first network step, after the viewer exists: a page asked right after
+  // `domcontentloaded` may not have published one yet. A look at the
+  // attribute that skipped the wait when it was absent then read a viewer not
+  // made yet (CI run 42872892254, WebKit, `notification-stack-under-pointer`:
+  // "viewer.getFrameScheduleState" of undefined, startup at `health`).
+  await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready', timeout === undefined ? undefined : { timeout });
   await page.evaluate(() => window._cellucidState?.whenGenesListed?.());
   await expect.poll(() => page.evaluate(() => {
     const viewer = window._cellucidViewer;
@@ -56,6 +61,13 @@ export async function waitForPageAtRest(page, { timeout } = {}) {
       && !schedule.canvasResized && schedule.frameCostPhase === null;
     if (!schedule.settled && !onlyThePulse) return `drawing: ${JSON.stringify({ lastCause: schedule.lastCause, frameCostPhase: schedule.frameCostPhase, animationCause: schedule.animationCause })}`;
     if (!viewer.isPresentedGeometrySettled()) return 'a view awaits its final geometry';
+    // The sidebar's slide counts as shown: the area beside it, and so each
+    // pane's center, is published once it has stopped
+    // (`sidebar-controls.js`). Until then a view is drawn, and picked, around
+    // the center it had before (found 2026-11-12: Firefox answered a hide,
+    // five actions and a pick inside the 200 ms slide, and the pick at the
+    // canvas center missed a cell drawn 145 px beside it).
+    if ((document.getElementById('sidebar')?.getAnimations().length ?? 0) > 0) return 'the sidebar is sliding';
     return 'at rest';
   }), timeout === undefined ? undefined : { timeout }).toBe('at rest');
 }
@@ -76,6 +88,31 @@ export async function whenActionsDone(page) {
     const { getActions } = await import('/assets/js/app/actions/index.js');
     await getActions().idle();
   });
+}
+
+/**
+ * Choose the categorical field a file is colored by through the Color by
+ * control, and wait until the legend it leads to is the one that stays.
+ *
+ * A file opens colored by its first coloring (`first-coloring.js`) before its
+ * history begins, the choice is then applied as an action, and the legend is
+ * built anew by each (and once more as the field's counts arrive): a list
+ * read or scrolled before the last of them is a list the next draw replaces,
+ * detached, so the scroll is lost (WebKit and Firefox on CI, runs 43106620008
+ * and 43120770230; measured: a third draw 130 ms after the list showed). So:
+ * the file's history has begun, the choice is made, and every action is done.
+ *
+ * @param {import('@playwright/test').Page} page
+ * @param {string} datasetName - the name the opened file shows
+ * @param {string} label - the field's label in the control
+ */
+export async function chooseCategoricalField(page, datasetName, label) {
+  await page.waitForFunction(name => {
+    const history = window._cellucidHistories?.current();
+    return history?.dataset?.name === name && history.active != null;
+  }, datasetName);
+  await page.locator('#categorical-field').selectOption({ label });
+  await whenActionsDone(page);
 }
 
 /**

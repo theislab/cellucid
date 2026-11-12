@@ -31,7 +31,7 @@ import { wireNavigationSettings } from './navigation-settings.js';
 import { getActions } from '../../actions/index.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
 import { dispatchFromControl } from '../../actions/control-dispatch.js';
-import { resolveViewName, viewNameOf } from '../../actions/targets/views.js';
+import { resolveViewName, viewLabelOf, viewNameOf, withViewLabel } from '../../actions/targets/views.js';
 import {
   assertNavigationMode,
   createDefaultCameraPose,
@@ -187,9 +187,16 @@ export function initCameraControls({ viewer, dom, callbacks }) {
     viewer.setPointerLockEnabled(checked);
   };
 
+  // Chosen with the pointer, the mode hands the keys back to the plot, so W
+  // moves at once (a dropdown keeps the letters typed in it: they choose its
+  // options, `utils/key-ownership.js`). Chosen from the keyboard, focus stays
+  // where the person is: moving it on a change lost a keyboard user's place.
+  let modeChosenWithPointer = false;
+  listen(navigationModeSelect, 'pointerdown', () => { modeChosenWithPointer = true; });
+  listen(navigationModeSelect, 'keydown', () => { modeChosenWithPointer = false; });
   listen(navigationModeSelect, 'change', () => {
     const mode = navigationModeSelect.value;
-    navigationModeSelect.blur(); // allow WASD immediately
+    if (modeChosenWithPointer) navigationModeSelect.blur();
     void dispatchFromControl(
       'camera.navigation.set',
       { view: viewNameOf(viewer, viewer.getFocusedViewId()), mode },
@@ -252,40 +259,71 @@ export function initCameraControls({ viewer, dom, callbacks }) {
   const withdrawals = [
     actions.provide('camera.navigation.set', ({ view, mode }) => {
       requireLiveControls();
-      setViewNavigation(resolveViewName(viewer, view), mode);
-      return { view, mode };
+      const viewId = resolveViewName(viewer, view);
+      setViewNavigation(viewId, mode);
+      return withViewLabel(viewLabelOf(viewer, viewId), { view, mode });
     }),
     actions.provide('camera.set', ({ view, camera }) => {
       requireLiveControls();
-      setViewCamera(resolveViewName(viewer, view), camera);
-      return { view };
+      const viewId = resolveViewName(viewer, view);
+      setViewCamera(viewId, camera);
+      return withViewLabel(viewLabelOf(viewer, viewId), { view });
     }),
     actions.provide('camera.reset', ({ view }) => {
       requireLiveControls();
-      resetViewCamera(resolveViewName(viewer, view));
-      return { view };
+      const viewId = resolveViewName(viewer, view);
+      resetViewCamera(viewId);
+      return withViewLabel(viewLabelOf(viewer, viewId), { view });
     }),
   ];
 
-  /** Record where `viewId`'s camera is now as the gesture that moved it (`camera.set`, observed). */
-  function recordGesture(viewId) {
+  /**
+   * Record where `viewId`'s camera is now as the gesture that moved it
+   * (`camera.set`, observed), by who moved it (`meta`: the person when left out).
+   */
+  function recordGesture(viewId, meta = {}) {
     try {
       getActions()
         .recordObserved('camera.set', {
           view: viewNameOf(viewer, viewId),
           camera: viewer.getViewCameraState(viewId),
-        })
+        }, meta, withViewLabel(viewLabelOf(viewer, viewId), null))
         .catch(error => console.error('[CameraControls] A camera gesture could not be recorded.', error));
     } catch (error) {
       console.error('[CameraControls] A camera gesture could not be recorded.', error);
     }
   }
 
-  // A camera gesture (a drag, a wheel, keys, a camera path played) ends when
-  // the viewer says the camera settled: one step, synchronously, so a settle a
-  // restore caused is compared with what the history shows and dropped.
+  // While a camera path plays, the path moves the camera, not a gesture
+  // (`setCameraPathPlaying`, from the playback's state): nothing it does is
+  // recorded as the person's camera move, neither a settle on the way (a
+  // hold) nor the camera in motion when a history move or a camera action
+  // ends gestures. An agent's play is its own step; a play the person
+  // started, or a loop, is recorded once where it comes to rest (paused,
+  // stopped or ended). Live (L11-6): each undo or turn during a loop recorded
+  // the moving camera as the person's "Moved the camera" step, and an undo
+  // then undid that step and branched the history on the next.
+  let cameraPathPlaying = false;
+  /**
+   * The meta of the camera path action running now (`camera-path.stop`, the
+   * transport bar's or an agent's), or null: the camera a path comes to rest
+   * under it is that actor's move, so an agent's Stop of its loop is a step of
+   * its turn (Undo turn takes it back), not the person's (L11-6).
+   */
+  let pathActor = null;
+
+  /** The camera path's playback started (true) or came to rest (false). */
+  function setCameraPathPlaying(playing) {
+    if (destroyed || playing === cameraPathPlaying) return;
+    cameraPathPlaying = playing;
+    if (!playing) recordGesture(viewer.getFocusedViewId(), pathActor ?? {});
+  }
+
+  // A camera gesture (a drag, a wheel, keys) ends when the viewer says the
+  // camera settled: one step, synchronously, so a settle a restore caused is
+  // compared with what the history shows and dropped.
   const stopObservingCamera = viewer.onPresentedViewStateChanged(event => {
-    if (destroyed || event.reason !== 'camera-settled') return;
+    if (destroyed || cameraPathPlaying || event.reason !== 'camera-settled') return;
     recordGesture(event.viewId);
   });
 
@@ -297,7 +335,7 @@ export function initCameraControls({ viewer, dom, callbacks }) {
    * happens while the camera is at rest.
    */
   function endGesture() {
-    if (destroyed || !viewer.isCameraInMotion()) return;
+    if (destroyed || cameraPathPlaying || !viewer.isCameraInMotion()) return;
     viewer.stopInertia();
     recordGesture(viewer.getFocusedViewId());
   }
@@ -308,7 +346,12 @@ export function initCameraControls({ viewer, dom, callbacks }) {
   // action's step met a camera moved with no step, a change made outside an
   // action. The history's own re-application of a step is left alone.
   const stopSettlingBeforeActions = getActions().subscribe(event => {
-    if (destroyed || event.kind !== 'start' || event.meta.internal || event.meta.rewrite !== null) return;
+    if (destroyed) return;
+    if (event.type.startsWith('camera-path.')) {
+      if (event.kind === 'start') pathActor = event.meta.internal || event.meta.rewrite !== null ? null : event.meta;
+      else pathActor = null;
+    }
+    if (event.kind !== 'start' || event.meta.internal || event.meta.rewrite !== null) return;
     if (getActions().catalog.get(event.type).touches.includes('camera')) endGesture();
   });
   // A move of the history (undo pressed right after a drag) ends it too, so
@@ -327,7 +370,7 @@ export function initCameraControls({ viewer, dom, callbacks }) {
         projectileNotificationId = null;
       }
       const generation = ++operationGeneration;
-      const readyNotifId = notifications.loading('Preparing projectile collision system...', { category: 'spatial' });
+      const readyNotifId = notifications.loading('Preparing projectiles…', { category: 'spatial' });
       projectileNotificationId = readyNotifId;
       viewer.setProjectilesEnabled(true, (rawResult) => {
         if (!ownsOperation(generation)) return;
@@ -336,7 +379,7 @@ export function initCameraControls({ viewer, dom, callbacks }) {
         if (result.status === 'ready') {
           notifications.complete(
             readyNotifId,
-            'Projectiles ready! Click to shoot, hold to charge.',
+            'Projectiles are ready: click to shoot, hold to charge.',
             { announce: true }
           );
           return;
@@ -356,13 +399,11 @@ export function initCameraControls({ viewer, dom, callbacks }) {
       }
       viewer.setProjectilesEnabled(enabled);
     }
-    projectilesEnabledCheckbox.blur();
   });
 
   pointerLockCheckbox.checked = false;
   listen(pointerLockCheckbox, 'change', () => {
     applyPointerLock(pointerLockCheckbox.checked);
-    pointerLockCheckbox.blur();
   });
 
   viewer.setPointerLockChangeHandler((active, errorMessage) => {
@@ -448,6 +489,7 @@ export function initCameraControls({ viewer, dom, callbacks }) {
   return {
     toggleNavigationPanels,
     syncNavigationMode,
+    setCameraPathPlaying,
     updateLookSensitivity: navigation.updateLookSensitivity,
     updateMoveSpeed: navigation.updateMoveSpeed,
     updateOrbitKeySpeed: navigation.updateOrbitKeySpeed,

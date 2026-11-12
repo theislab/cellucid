@@ -21,7 +21,7 @@ export function searchByOf(step) {
   });
 }
 
-/** What a step's action changes, as the search names it: its catalogue effect (`state`, `view`, `layout`), or `state`. */
+/** What a step's action changes, as the search names it: its catalog effect (`state`, `view`, `layout`), or `state`. */
 export function searchKindOf(step, effectOf) {
   if (step.type !== null && step.type !== undefined) {
     const effect = effectOf(step.type);

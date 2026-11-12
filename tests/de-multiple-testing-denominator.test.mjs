@@ -341,12 +341,14 @@ test('a DE run reports the family it corrected over: untested genes are not in i
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables: () => Object.keys(columns).map(key => ({ key })),
     async readGeneColumn(gene) {
       return { fieldIndex: 0, values: columns[gene], owned: false };
     },
-    performCacheCleanup() {},
   };
   const { computeDifferentialOfColumns, setTwoGroupContext } = await import('../assets/js/app/analysis/compute/operation-handlers.js');
   analysis._getComputeManager = async () => ({

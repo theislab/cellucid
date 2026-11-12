@@ -221,7 +221,7 @@ test('sign-in steps: a step nobody waits for goes; a final failure ends it; a st
   controller.abort(new DOMException('cancelled', 'AbortError'));
   await assert.rejects(waiting, /cancelled/);
   assert.equal(steps.list().length, 0);
-  const finalError = Object.assign(new Error('Your organisation must approve Cellucid.'), { final: true });
+  const finalError = Object.assign(new Error('Your organization must approve Cellucid.'), { final: true });
   const ended = steps.request({ account: 'microsoft', kind: 'more-access', text: 't', action: 'a', act: () => Promise.reject(finalError) });
   steps.run(steps.list()[0].id);
   await assert.rejects(ended, /must approve/);
@@ -473,7 +473,7 @@ test('Google: a blocked popup and a refused scope are said, and the step stays t
   await new Promise(resolve => setTimeout(resolve, 0));
   steps.run(steps.list()[0].id);
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.match(steps.list()[0].problem, /^Google's sign-in window was closed before it finished\. If Google said "Access blocked", your organisation's administrator does not allow Cellucid/);
+  assert.match(steps.list()[0].problem, /^Google's sign-in window was closed before it finished\. If Google said "Access blocked", your organization's administrator does not allow Cellucid/);
   assert.equal(steps.list()[0].help.url, GOOGLE_ADMIN_HELP.url);
   assert.equal(steps.list()[0].action, 'Sign in to Google');
   assert.equal(steps.list()[0].working, false);
@@ -683,7 +683,7 @@ test('Microsoft: PKCE in a popup, the code redeemed in the page with the verifie
   assert.equal(await microsoft.signOut(), true, 'nothing left to revoke');
 });
 
-test('Microsoft: an organisation that requires an administrator: the step says so, links the steps, and offers another account', async t => {
+test('Microsoft: an organization that requires an administrator: the step says so, links the steps, and offers another account', async t => {
   installSessionStorage(t);
   const steps = new SignInSteps();
   const fake = fakeMicrosoftWindow(t, {
@@ -698,7 +698,7 @@ test('Microsoft: an organisation that requires an administrator: the step says s
   assert.equal(query.prompt, undefined);
   fake.deliver({ state: query.state, error: 'consent_required', errorDescription: 'AADSTS90094: Admin consent is required.' });
   const [step] = await stepsWhen(steps, list => list[0]?.problem != null);
-  assert.match(step.problem, /^Your organisation lets only an administrator approve Cellucid\. Ask your IT administrator to approve it/);
+  assert.match(step.problem, /^Your organization lets only an administrator approve Cellucid\. Ask your IT administrator to approve it/);
   assert.match(step.problem, /or sign in with a personal Microsoft account\.$/);
   // Not the same sign-in again: another account, and where the administrator reads how.
   assert.equal(step.action, 'Use another account');
@@ -721,7 +721,7 @@ test('Microsoft: each sign-in error, from the callback to the message and the ac
     {
       // As Helmholtz Zentrum München's tenant answers (2026-10-25).
       hash: '#error=access_denied&state=STATE&error_description=AADSTS90094%3a+An+administrator+of+Helmholtz+Zentrum+M%c3%bcnchen+has+set+a+policy+that+prevents+you+from+granting+Cellucid+the+permissions+it+is+requesting.',
-      message: /^Your organisation \(Helmholtz Zentrum München\) lets only an administrator approve Cellucid\./, also: ADMIN,
+      message: /^Your organization \(Helmholtz Zentrum München\) lets only an administrator approve Cellucid\./, also: ADMIN,
       action: 'Use another account', help: true, prompt: 'select_account',
     },
     {
@@ -737,12 +737,12 @@ test('Microsoft: each sign-in error, from the callback to the message and the ac
     },
     {
       hash: '#error=access_denied&state=STATE&error_description=AADSTS50105%3a+Your+administrator+has+configured+the+application+Cellucid+to+block+users+unless+they+are+specifically+granted+access.',
-      message: /^Your organisation lets only the people it assigned use Cellucid, and this account is not one of them\./,
+      message: /^Your organization lets only the people it assigned use Cellucid, and this account is not one of them\./,
       action: 'Use another account', help: true, prompt: 'select_account',
     },
     {
       hash: '#error=access_denied&state=STATE&error_description=AADSTS53003%3a+Access+has+been+blocked+by+Conditional+Access+policies.',
-      message: /^Your organisation's sign-in policy does not let this browser or device sign in to Cellucid\./,
+      message: /^Your organization's sign-in policy does not let this browser or device sign in to Cellucid\./,
       action: 'Use another account', help: true, prompt: 'select_account',
     },
     {
@@ -763,7 +763,7 @@ test('Microsoft: each sign-in error, from the callback to the message and the ac
       tokenAnswers: [{ status: 200, json: { access_token: TOKEN, refresh_token: 'R', expires_in: 3600, scope: 'Files.Read' } }],
     });
     const microsoft = createMicrosoftAuth({ config: { clientId: 'app-id', authority: 'common' }, steps, win: fake.win, fetchImpl: fake.fetchImpl });
-    const authorized = microsoft.authorize({ kind: 'sign-in', text: 'OneDrive file: sign in with Microsoft to open it.' });
+    const authorized = microsoft.authorize({ kind: 'sign-in', text: 'OneDrive files open after a sign-in.' });
     // Its outcome is asserted below; a final failure arrives before that.
     authorized.catch(() => {});
     await stepsWhen(steps, readyStep);

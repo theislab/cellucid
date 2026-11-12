@@ -23,6 +23,7 @@
  */
 
 import { capturePointer, releasePointer } from '../ui/pointer-capture.js';
+import { formatPercent } from '../../utils/format-units.js';
 
 /** The phone layout's breakpoint, the same as the full-screen sidebar's. */
 const SHEET_QUERY = '(max-width: 720px)';
@@ -83,7 +84,7 @@ export function createSheetLayout({ floatingRoot, StyleManager, panelFrame, rais
     const grip = frame.querySelector(':scope > .floating-sheet-grip');
     if (grip !== null) {
       grip.setAttribute('aria-valuenow', String(percent));
-      grip.setAttribute('aria-valuetext', `${percent}% of the screen`);
+      grip.setAttribute('aria-valuetext', `${formatPercent(percent)} of the screen`);
     }
   }
 

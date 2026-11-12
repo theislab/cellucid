@@ -3,7 +3,8 @@
  * page shows ("ABCD-EFGH") and the Cellucid tab claims, either from the
  * page's "Open Cellucid to approve" link (`#cellucid_connect=<code>`, taken
  * out of the address by `connect-fragment.js` before any module runs) or
- * typed by the person on another device.
+ * typed by the person in a tab of the browser that shows the page (the relay
+ * lets only that browser claim it).
  *
  * Typed codes are forgiving the way Crockford's base32 is: case, spaces and
  * dashes do not matter, and I/L read as 1, O as 0.

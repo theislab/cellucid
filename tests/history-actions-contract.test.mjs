@@ -1,6 +1,6 @@
 /**
  * The history's actions (`assets/js/app/actions/definitions/history.js`):
- * every operation on the history is one catalogue action, with the effect,
+ * every operation on the history is one catalog action, with the effect,
  * the confirmation and the parameters History v2 fixes, so the State panel,
  * agents, Python and R take one path, and every one has a provider: the
  * history (`history.js`) or its persistence (`persistence-actions.js`). Also
@@ -75,6 +75,8 @@ const EXPECTED = Object.freeze({
   'history.replay': ['history', null],
   'history.share': ['outside', 'writes-file'],
   'history.saved.delete': ['outside', 'deletes-saved'],
+  // Load…'s Open: its dataset first, then its history (a whole-file download asked, F114).
+  'history.saved.open': ['dataset', 'large-download'],
   'history.save': ['outside', null],
   'history.anndata.save': ['outside', 'writes-file'],
   'history.report': ['outside', 'writes-file'],
@@ -90,8 +92,13 @@ const EXPECTED = Object.freeze({
 const PERSISTENCE = Object.freeze(['history.methods', 'history.pseudocode', 'history.saved.list', 'history.saved.delete', 'history.share', 'history.save', 'history.anndata.save']);
 /** The history actions the State panel provides (`ui/modules/state/index.js`: the tour and the report, made by its own code). */
 const PANEL = Object.freeze(['history.report', 'history.tour.start', 'history.tour.stop']);
-/** The actions asked about by their implementation once it knows what it does (a report as text writes no file). */
-const ASKED_BY_HANDLER = Object.freeze(['history.report']);
+/** The history action the dataset opening provides (`ui/modules/dataset-open-action.js`: its download gate and opening). */
+const DATASET_OPENING = Object.freeze(['history.saved.open']);
+/**
+ * The actions asked about by their implementation once it knows what it does
+ * (a report as text writes no file; a saved state's dataset downloaded whole only when its host serves no parts).
+ */
+const ASKED_BY_HANDLER = Object.freeze(['history.report', 'history.saved.open']);
 
 test('every operation on the history is one action, with the effect and the confirmation History v2 fixes', () => {
   const catalog = createActionCatalog(ACTION_DEFINITIONS);
@@ -249,8 +256,8 @@ function page() {
 
 test('every history action has its provider: the history, or its persistence for what writes it down or reads it out', () => {
   const { dispatcher, history } = page();
-  assert.deepEqual(Object.keys(EXPECTED).filter(type => !dispatcher.provided(type)).sort(), [...PERSISTENCE, ...PANEL].sort(),
-    'the history provides every history action but its persistence\'s and the panel\'s');
+  assert.deepEqual(Object.keys(EXPECTED).filter(type => !dispatcher.provided(type)).sort(), [...PERSISTENCE, ...PANEL, ...DATASET_OPENING].sort(),
+    'the history provides every history action but its persistence\'s, the panel\'s and the dataset opening\'s');
   const stop = providePersistenceActions({
     dispatcher, histories: { current: () => history, savedStates: { list: async () => [] } }, serializer: null,
     datasetFacts: () => ({}), citation: async () => null, download: () => {},
@@ -259,8 +266,8 @@ test('every history action has its provider: the history, or its persistence for
     dispatcher, histories: { current: () => history }, serializer: null, state: null, adapter: () => null,
     datasetFacts: () => ({}), createSpool: async () => null, download: () => {}, notifications: { warning: () => {} },
   });
-  assert.deepEqual(dispatcher.unprovided().filter(type => type.startsWith('history.')).sort(), [...PANEL].sort(),
-    'the panel provides the tour and the report on a page (tests/browser/agent-person-features.spec.mjs)');
+  assert.deepEqual(dispatcher.unprovided().filter(type => type.startsWith('history.')).sort(), [...PANEL, ...DATASET_OPENING].sort(),
+    'the panel provides the tour and the report on a page (tests/browser/agent-person-features.spec.mjs); the dataset opening, history.saved.open (tests/dataset-open-action.test.mjs)');
   stopCopy();
   stop();
   history.destroy();

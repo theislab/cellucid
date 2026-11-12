@@ -320,7 +320,7 @@ test('genes asked for in one task go to the worker as one request, each caller o
 
 test('a cancelled read rejects at once and cancels its worker request once no caller wants it', async t => {
   const { client, sent } = await openedClient(t);
-  // One of two genes cancelled: the request goes on for the other.
+  // One of two genes canceled: the request goes on for the other.
   const keep = client.getMatrixColumn('X', 1);
   const dropping = new AbortController();
   const dropped = client.getMatrixColumn('X', 4, { signal: dropping.signal });
@@ -329,7 +329,7 @@ test('a cancelled read rejects at once and cancels its worker request once no ca
   assert.equal((await keep).length, 120);
   assert.equal(sent().filter(message => message.cancel !== undefined).length, 0);
 
-  // Every gene of a request cancelled after it was sent: the worker is told,
+  // Every gene of a request canceled after it was sent: the worker is told,
   // and the reader's read is aborted.
   const original = AnnDataReader.prototype.getMatrixColumns;
   let readerSignal = null;

@@ -9,17 +9,18 @@
  * @module ui/modules/highlight/highlight-pages-ui
  */
 
-import { formatCompactCount } from '../../components/display-format.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
 import { coalesceToFrame } from '../../components/controls.js';
+import { openMenu } from '../../components/menu.js';
 import {
   requireDomElement,
   requireMethods,
   requireSafeInteger,
 } from './exact-contract.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
-import { countNoun } from '../../../../utils/format-units.js';
+import { countNoun, formatCompactCount } from '../../../../utils/format-units.js';
 import { dispatchFromControl } from '../../../actions/control-dispatch.js';
+import { isHexColor } from '../../../../utils/hex-color.js';
 
 /**
  * @param {object} options
@@ -76,7 +77,7 @@ export function initHighlightPagesUI(options) {
   function deletePage(pageId) {
     const name = currentPageName(pageId);
     if (name === null) return Promise.resolve(null);
-    return act('highlight.page.delete', { page: name }, 'Deleting the highlight page failed');
+    return act('highlight.page.delete', { pages: [name] }, 'Deleting the highlight page failed');
   }
 
   /** The tab of `pageId` as drawn now (a redraw replaces tabs). */
@@ -153,7 +154,7 @@ export function initHighlightPagesUI(options) {
     }
     if (
       typeof page.color !== 'string'
-      || !/^#[0-9a-fA-F]{6}$/.test(page.color)
+      || !isHexColor(page.color)
     ) {
       throw new TypeError(`${label} color must be an exact hex RGB value.`);
     }
@@ -180,20 +181,16 @@ export function initHighlightPagesUI(options) {
     return false;
   }
 
-  function showPageCombineMenu({
-    returnFocus = null,
-    sourcePageId,
-    targetPageId = null,
-    x,
-    y
-  }) {
+  /**
+   * The ways to combine a page with another: the shared menu
+   * (`ui/components/menu.js`, its look and keys), under the page's Combine
+   * button, or where a page was dropped on another (`at`, the drop point;
+   * focus returns to the page dropped on).
+   */
+  function showPageCombineMenu({ anchor, sourcePageId, targetPageId = null, at = null }) {
     if (destroyed) return;
-    if (closeActiveCombineMenu !== null) {
-      closeActiveCombineMenu({ restoreFocus: false });
-    }
-    const existingMenu = documentOwner.getElementById('page-combine-menu');
-    if (existingMenu) existingMenu.remove();
-
+    if (closeActiveCombineMenu !== null) closeActiveCombineMenu();
+    closeActiveCombineMenu = null;
     if (sourcePageId === targetPageId) return;
     const currentPages = state.getHighlightPages();
     const sourcePage = currentPages.find(page => page.id === sourcePageId);
@@ -206,16 +203,7 @@ export function initHighlightPagesUI(options) {
       );
     }
 
-    const menu = documentOwner.createElement('div');
-    menu.id = 'page-combine-menu';
-    menu.className = 'page-combine-menu';
-    menu.style.left = `${x}px`;
-    menu.style.top = `${y}px`;
-    menu.setAttribute('aria-label', `Combine ${sourcePage.name}`);
-    menu.setAttribute('role', 'menu');
-
     async function combineWithPage(targetPage, operation) {
-      closeCombineMenu({ restoreFocus: false });
       const sourceName = currentPageName(sourcePageId);
       const targetName = currentPageName(targetPage.id);
       if (sourceName === null || targetName === null) return;
@@ -227,124 +215,27 @@ export function initHighlightPagesUI(options) {
       if (done !== null) focusPageTab(state.getActivePageId());
     }
 
+    const items = [];
     for (const targetPage of targetPages) {
       for (const operation of ['intersection', 'union']) {
-        const operationButton = documentOwner.createElement('button');
         const isIntersection = operation === 'intersection';
-        operationButton.type = 'button';
-        operationButton.className = 'page-combine-option';
-        operationButton.setAttribute('role', 'menuitem');
-        operationButton.textContent =
-          `${isIntersection ? '∩' : '∪'} ` +
-          `${isIntersection ? 'Intersection' : 'Union'} with ` +
-          targetPage.name;
-        operationButton.title = isIntersection
-          ? `Create a page with cells in both ${sourcePage.name} and ${targetPage.name}`
-          : `Create a page with cells in either ${sourcePage.name} or ${targetPage.name}`;
-        listen(operationButton, 'click', () => {
-          void combineWithPage(targetPage, operation);
+        items.push({
+          label: `${isIntersection ? '∩ Intersection' : '∪ Union'} with ${targetPage.name}`,
+          title: isIntersection
+            ? `Create a page with cells in both ${sourcePage.name} and ${targetPage.name}`
+            : `Create a page with cells in either ${sourcePage.name} or ${targetPage.name}`,
+          run: () => {
+            if (!destroyed) void combineWithPage(targetPage, operation);
+          }
         });
-        menu.appendChild(operationButton);
       }
     }
-    documentOwner.body.appendChild(menu);
-    if (returnFocus !== null) {
-      returnFocus.setAttribute('aria-expanded', 'true');
-    }
-
-    const viewportPadding = 8;
-    const viewportWidth = documentOwner.documentElement.clientWidth;
-    const viewportHeight = documentOwner.documentElement.clientHeight;
-    const menuRect = menu.getBoundingClientRect();
-    let menuLeft = x;
-    let menuTop = y;
-    if (menuRect.right > viewportWidth - viewportPadding) {
-      menuLeft = viewportWidth - menuRect.width - viewportPadding;
-    }
-    if (menuRect.bottom > viewportHeight - viewportPadding) {
-      if (returnFocus !== null) {
-        const returnFocusRect = returnFocus.getBoundingClientRect();
-        menuTop = returnFocusRect.top - menuRect.height - 4;
-      } else {
-        menuTop = viewportHeight - menuRect.height - viewportPadding;
-      }
-    }
-    menu.style.left = `${Math.max(viewportPadding, menuLeft)}px`;
-    menu.style.top = `${Math.max(viewportPadding, menuTop)}px`;
-    menu.style.maxHeight =
-      `${Math.max(0, viewportHeight - viewportPadding * 2)}px`;
-
-    const closeMenu = (e) => {
-      if (!menu.contains(e.target)) {
-        closeCombineMenu({ restoreFocus: false });
-      }
-    };
-    const handleMenuKeydown = (e) => {
-      if (!menu.contains(documentOwner.activeElement)) return;
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopPropagation();
-        closeCombineMenu({ restoreFocus: true });
-        return;
-      }
-      const options = [
-        ...menu.querySelectorAll('.page-combine-option')
-      ];
-      const activeIndex = options.indexOf(documentOwner.activeElement);
-      let targetIndex = null;
-      if (e.key === 'ArrowDown') {
-        targetIndex = (activeIndex + 1) % options.length;
-      } else if (e.key === 'ArrowUp') {
-        targetIndex =
-          (activeIndex - 1 + options.length) % options.length;
-      } else if (e.key === 'Home') {
-        targetIndex = 0;
-      } else if (e.key === 'End') {
-        targetIndex = options.length - 1;
-      }
-      if (targetIndex === null) return;
-      e.preventDefault();
-      e.stopPropagation();
-      options[targetIndex].focus();
-    };
-    const handleMenuFocusOut = (e) => {
-      if (
-        e.relatedTarget !== null &&
-        !menu.contains(e.relatedTarget)
-      ) {
-        closeCombineMenu({ restoreFocus: false });
-      }
-    };
-    function closeCombineMenu({ restoreFocus = true } = {}) {
-      if (closeActiveCombineMenu !== closeCombineMenu) return;
-      closeActiveCombineMenu = null;
-      menu.remove();
-      if (returnFocus !== null) {
-        returnFocus.setAttribute('aria-expanded', 'false');
-      }
-      menu.removeEventListener('focusout', handleMenuFocusOut);
-      documentOwner.removeEventListener('mousedown', closeMenu);
-      documentOwner.removeEventListener('keydown', handleMenuKeydown);
-      if (
-        restoreFocus &&
-        returnFocus !== null &&
-        returnFocus.isConnected &&
-        typeof returnFocus.focus === 'function'
-      ) {
-        returnFocus.focus();
-      }
-    }
-    closeActiveCombineMenu = closeCombineMenu;
-    menu.addEventListener('focusout', handleMenuFocusOut);
-    documentOwner.addEventListener('mousedown', closeMenu);
-    documentOwner.addEventListener('keydown', handleMenuKeydown);
-    if (returnFocus !== null) {
-      const firstOption = menu.querySelector('.page-combine-option');
-      if (firstOption === null) {
-        throw new Error('Highlight page combine menu has no operation.');
-      }
-      firstOption.focus();
-    }
+    closeActiveCombineMenu = openMenu({
+      anchor,
+      at,
+      items,
+      label: `Combine ${sourcePage.name}`
+    });
   }
 
   function startPageRename(tabEl, page) {
@@ -409,9 +300,8 @@ export function initHighlightPagesUI(options) {
 
   function renderHighlightPages() {
     if (destroyed) return;
-    if (closeActiveCombineMenu !== null) {
-      closeActiveCombineMenu({ restoreFocus: false });
-    }
+    if (closeActiveCombineMenu !== null) closeActiveCombineMenu();
+    closeActiveCombineMenu = null;
     const focusedElement = documentOwner.activeElement;
     const focusedTab =
       focusedElement && typeof focusedElement.closest === 'function'
@@ -606,10 +496,10 @@ export function initHighlightPagesUI(options) {
         tab.classList.remove('drag-over');
         if (draggedPageId && draggedPageId !== page.id) {
           showPageCombineMenu({
+            anchor: tab.querySelector('.highlight-page-tab-activate'),
             sourcePageId: draggedPageId,
             targetPageId: page.id,
-            x: e.clientX,
-            y: e.clientY
+            at: { x: e.clientX, y: e.clientY }
           });
         }
       });
@@ -633,16 +523,16 @@ export function initHighlightPagesUI(options) {
         `Highlight color for ${page.name}`
       );
 
-      // A colour drag fires an input event per pointer move; each published
-      // colour recolours the highlights and redraws every page tab and the
+      // A color drag fires an input event per pointer move; each published
+      // color recolors the highlights and redraws every page tab and the
       // category builder. The swatch follows every event; the state gets
-      // the latest colour once per frame, and the final one on change. The
+      // the latest color once per frame, and the final one on change. The
       // history keeps one step per page for the whole drag
       // (`highlight.page.recolor` coalesces by page).
       const publishColor = coalesceToFrame(color => {
         const name = destroyed ? null : currentPageName(page.id);
         if (name === null) return;
-        void act('highlight.page.recolor', { page: name, color }, 'Recolouring the highlight page failed');
+        void act('highlight.page.recolor', { page: name, color }, 'Recoloring the highlight page failed');
       });
       listen(colorInput, 'input', () => {
         const newColor = colorInput.value;
@@ -762,7 +652,6 @@ export function initHighlightPagesUI(options) {
         combineBtn.className = 'highlight-page-tab-combine';
         combineBtn.textContent = '⋈';
         combineBtn.title = 'Combine with another page';
-        combineBtn.setAttribute('aria-controls', 'page-combine-menu');
         combineBtn.setAttribute('aria-expanded', 'false');
         combineBtn.setAttribute('aria-haspopup', 'menu');
         combineBtn.setAttribute(
@@ -771,13 +660,7 @@ export function initHighlightPagesUI(options) {
         );
         listen(combineBtn, 'click', (e) => {
           e.stopPropagation();
-          const rect = combineBtn.getBoundingClientRect();
-          showPageCombineMenu({
-            returnFocus: combineBtn,
-            sourcePageId: page.id,
-            x: rect.left,
-            y: rect.bottom + 4
-          });
+          showPageCombineMenu({ anchor: combineBtn, sourcePageId: page.id });
         });
         tab.appendChild(combineBtn);
       }
@@ -828,7 +711,7 @@ export function initHighlightPagesUI(options) {
       const failures = [];
       if (closeActiveCombineMenu !== null) {
         try {
-          closeActiveCombineMenu({ restoreFocus: false });
+          closeActiveCombineMenu();
         } catch (error) {
           failures.push(error);
         }

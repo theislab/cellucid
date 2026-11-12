@@ -6,7 +6,7 @@
  * when the page is first hidden (tab switch, close, navigation) - the point
  * after which the browser may never run this page's code again. INP is the
  * longest observed interaction (event entries of at least 40 ms). FID is not
- * reported: browsers retired it in favour of INP.
+ * reported: browsers retired it in favor of INP.
  *
  * An observer's entries reach its callback in a later task, at the browser's
  * leisure (Chromium runs it at low priority): on the first hide each

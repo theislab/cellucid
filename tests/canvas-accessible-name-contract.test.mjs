@@ -15,6 +15,9 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
+import { SHORTCUT_GROUPS } from '../assets/js/app/ui/onboarding/shortcut-table.js';
+import { NAVIGATION_KEYS, NAVIGATION_KEY_MODES } from '../assets/js/rendering/navigation-keys.js';
+
 const INDEX_URL = new URL('../index.html', import.meta.url);
 const ACCESSIBILITY_CSS_URL = new URL(
   '../assets/css/base/_accessibility.css',
@@ -192,17 +195,8 @@ function clauseNaming(keys) {
 }
 
 test('every key the canvas description names is a key the shortcuts panel lists', () => {
-  const [shortcutsStart, shortcutsEnd] =
-    detailsRanges(indexHtml).find(([start, end]) => {
-      const block = indexHtml.slice(start, end);
-      return /\bid="shortcuts-section"/.test(block);
-    }) ?? [];
-  assert.ok(
-    Number.isInteger(shortcutsStart),
-    'the Keyboard Shortcuts panel must exist'
-  );
-  const shortcuts = indexHtml.slice(shortcutsStart, shortcutsEnd);
-
+  // The panel is drawn from the one shortcut table (`shortcut-table.js`).
+  const listed = new Set(SHORTCUT_GROUPS.flatMap(group => group.rows.flatMap(row => row.combos.flatMap(combo => combo.keys))));
   // Standalone single characters in the description are key names. Anything
   // spoken as a key has to be a key the panel documents, or the two drift.
   const named = keysIn(describedText());
@@ -211,11 +205,7 @@ test('every key the canvas description names is a key the shortcuts panel lists'
     `the description must still name the navigation keys (found ${named.size})`
   );
   for (const key of named) {
-    assert.match(
-      shortcuts,
-      new RegExp(`<kbd>${escapeRegExp(key)}</kbd>`),
-      `the shortcuts panel must document the "${key}" key the canvas announces`
-    );
+    assert.ok(listed.has(key), `the shortcuts panel must document the "${key}" key the canvas announces`);
   }
 });
 
@@ -246,14 +236,12 @@ const freeflyBody = viewerFunctionBody('updateFreefly', 'updateOrbitPlanarKeys')
 
 test('the movement keys are not described as orbit and pan only', () => {
   // Every one of W A S D moves the free-fly camera, so a description that
-  // offers only the orbit and planar behaviours hides a whole navigation mode.
-  for (const code of ['KeyW', 'KeyA', 'KeyS', 'KeyD']) {
-    assert.match(
-      freeflyBody,
-      new RegExp(`activeKeys\\.has\\('${code}'\\)`),
-      `free-fly must still move on ${code}`
-    );
+  // offers only the orbit and planar behaviors hides a whole navigation mode.
+  for (const movement of ['forward', 'left', 'back', 'right']) {
+    assert.ok(NAVIGATION_KEY_MODES[movement].includes('free'), `free-fly must still move on ${movement}`);
+    assert.match(freeflyBody, new RegExp(`keyShare\\('${movement}'\\)`), `free-fly must still read ${movement}`);
   }
+  assert.deepEqual(['forward', 'left', 'back', 'right'].flatMap(movement => NAVIGATION_KEYS[movement]), ['KeyW', 'KeyA', 'KeyS', 'KeyD']);
 
   const clause = clauseNaming(['W', 'A', 'S', 'D']);
   assert.match(
@@ -267,18 +255,15 @@ test('the movement keys are not described as orbit and pan only', () => {
 test('the zoom keys are described as the two modes that answer them', () => {
   // `updateFreefly` reads no zoom key, so an unqualified "= and - zoom" is a
   // gesture the app ignores in one of its three navigation modes.
-  for (const code of ['Equal', 'Minus', 'BracketLeft', 'BracketRight']) {
+  for (const movement of ['zoomIn', 'zoomOut']) {
     assert.doesNotMatch(
       freeflyBody,
-      new RegExp(`activeKeys\\.has\\('${code}'\\)`),
-      `free-fly now reads ${code}: the description may drop its scope clause`
+      new RegExp(`keyShare\\('${movement}'\\)`),
+      `free-fly now reads ${movement}: the description may drop its scope clause`
     );
+    assert.deepEqual(NAVIGATION_KEY_MODES[movement], ['orbit', 'planar']);
   }
-  assert.match(
-    viewerSource,
-    /activeKeys\.has\('Equal'\) \|\| activeKeys\.has\('BracketRight'\)/,
-    'orbit and planar must still zoom in on = and ]'
-  );
+  assert.deepEqual(NAVIGATION_KEYS.zoomIn, ['Equal', 'BracketRight'], 'orbit and planar must still zoom in on = and ]');
 
   const clause = clauseNaming(['=', '-']);
   for (const mode of [/\borbit/i, /\bplanar/i]) {

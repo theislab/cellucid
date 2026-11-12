@@ -34,6 +34,8 @@
  * @module workers/worker-script
  */
 
+import { createListenerSet } from '../utils/listener-set.js';
+
 /**
  * Host names of this machine, as `URL.hostname` spells them. The page's own
  * code follows the same rule (index.html's boot script, written from this set
@@ -67,8 +69,7 @@ export function workerScript(base, source, bundle) {
   return new URL(startsFromBundles() ? bundle : source, base);
 }
 
-/** @type {Set<(event: Event) => void>} */
-const failureListeners = new Set();
+const failureListeners = createListenerSet('a worker\'s script failing');
 
 /**
  * Hear about every worker of this thread whose script fails to load or run
@@ -79,8 +80,7 @@ const failureListeners = new Set();
  * @returns {() => void} removes the listener
  */
 export function onWorkerScriptFailure(listener) {
-  failureListeners.add(listener);
-  return () => failureListeners.delete(listener);
+  return failureListeners.add(listener);
 }
 
 /**
@@ -160,7 +160,7 @@ function withHanded(script) {
 export function startWorker(script, options) {
   const worker = new globalThis.Worker(withHanded(script), options);
   worker.addEventListener('error', event => {
-    for (const listener of failureListeners) listener(event);
+    failureListeners.notify(event);
   });
   return worker;
 }

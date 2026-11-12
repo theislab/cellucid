@@ -1583,14 +1583,15 @@ test('persisting a new GitHub session still fails loudly when storage refuses', 
   const previousFetch = globalThis.fetch;
   try {
     globalThis.sessionStorage = {
-      getItem: () => null,
+      // The sign-in this tab started named this state (`signIn`).
+      getItem: key => (key === 'cellucid:github-app-auth:pending' ? 'S1' : null),
       setItem() { throw new DOMException('quota', 'QuotaExceededError'); },
       removeItem() {},
     };
     globalThis.window = {
       location: {
-        href: `https://example.test/#cellucid_github_auth=1&cellucid_github_token=${'t'.repeat(8)}&cellucid_github_token_expires_in=28800`,
-        hash: `#cellucid_github_auth=1&cellucid_github_token=${'t'.repeat(8)}&cellucid_github_token_expires_in=28800`,
+        href: `https://example.test/#cellucid_github_state=S1&cellucid_github_auth=1&cellucid_github_token=${'t'.repeat(8)}&cellucid_github_token_expires_in=28800`,
+        hash: `#cellucid_github_state=S1&cellucid_github_auth=1&cellucid_github_token=${'t'.repeat(8)}&cellucid_github_token_expires_in=28800`,
         origin: 'https://example.test',
         pathname: '/',
         search: '',
@@ -1871,9 +1872,10 @@ test('GitHub sign-in verifies the exact current Worker before navigation and pre
     );
     const loginUrl = new URL(assignments[0]);
     assert.equal(loginUrl.pathname, '/auth/login');
-    assert.equal(
+    // The rest of the fragment is kept; the sign-in's state (LG-3) is named after it.
+    assert.match(
       loginUrl.searchParams.get('return_to'),
-      'https://app.example/view?dataset=synthetic#view=umap&panel=genes'
+      /^https:\/\/app\.example\/view\?dataset=synthetic#view=umap&panel=genes&cellucid_github_state=[0-9a-f]{32}$/
     );
     assert.equal(assignments[0].includes('stale'), false);
   } finally {
@@ -2001,11 +2003,13 @@ test('OAuth callback proves Worker capabilities before exposing its candidate to
     );
   };
   try {
+    // The sign-in this tab started named this state (`signIn`).
+    values.set('cellucid:github-app-auth:pending', 'S1');
     const auth = new GitHubAuthSession();
     await auth.completeSignInFromRedirect({
       url:
         'https://app.example/' +
-        '#cellucid_github_auth=1&cellucid_github_token=candidate-token&cellucid_github_token_expires_in=28800',
+        '#cellucid_github_state=S1&cellucid_github_auth=1&cellucid_github_token=candidate-token&cellucid_github_token_expires_in=28800',
     });
     assert.deepEqual(requests, [
       { path: '/', authorization: null },
@@ -2293,10 +2297,15 @@ test('GitHub auth generations fence overlapping token adoption and sign-out', as
     );
 
     let emittedUser = null;
+    const refused = [];
     auth.on('changed', (event) => {
       if (event.user === null) return;
       emittedUser = event.user;
-      event.user.login = 'mutated-event';
+      try {
+        event.user.login = 'mutated-event';
+      } catch (error) {
+        refused.push(error);
+      }
     });
     let secondListenerLogin = null;
     auth.on('changed', (event) => {
@@ -2308,7 +2317,10 @@ test('GitHub auth generations fence overlapping token adoption and sign-out', as
       new Response('{"id":404,"login":"user-d"}', { status: 200 })
     );
     await current;
-    assert.equal(emittedUser?.login, 'mutated-event');
+    // The event is a frozen projection: a listener cannot change what the others hear.
+    assert.equal(emittedUser?.login, 'user-d');
+    assert.equal(refused.length, 1);
+    assert.ok(refused[0] instanceof TypeError);
     assert.equal(
       secondListenerLogin,
       'user-d',
@@ -2598,9 +2610,10 @@ test('changed-listener failures are reported without rewriting auth outcome', as
   const listenerFailure = new Error('synthetic changed-listener failure');
   const previousSessionStorage = globalThis.sessionStorage;
   const previousFetch = globalThis.fetch;
-  const previousReportError = globalThis.reportError;
+  const previousConsoleError = console.error;
   globalThis.sessionStorage = storage;
-  globalThis.reportError = (error) => reported.push(error);
+  // One policy for every listener (`utils/listener-set.js`): reported once on the console.
+  console.error = (message, error) => reported.push(error);
   globalThis.fetch = async () =>
     new Response('{"id":202,"login":"user-b"}', { status: 200 });
   try {
@@ -2632,8 +2645,7 @@ test('changed-listener failures are reported without rewriting auth outcome', as
     );
   } finally {
     globalThis.fetch = previousFetch;
-    if (previousReportError === undefined) delete globalThis.reportError;
-    else globalThis.reportError = previousReportError;
+    console.error = previousConsoleError;
     if (previousSessionStorage === undefined) delete globalThis.sessionStorage;
     else globalThis.sessionStorage = previousSessionStorage;
   }

@@ -1,5 +1,5 @@
 /**
- * @fileoverview The page's one action catalogue, dispatcher and state-domain
+ * @fileoverview The page's one action catalog, dispatcher and state-domain
  * registry. Owner modules call `getActions().provide(type, handler)` and
  * `getStateDomains().provide(id, owner)` when they start; controls call
  * `getActions().dispatch(type, params)`.
@@ -16,7 +16,7 @@ let catalog = null;
 let dispatcher = null;
 let domains = null;
 
-/** The catalogue of every action (pure; also what the generated documents come from). */
+/** The catalog of every action (pure; also what the generated documents come from). */
 export function getActionCatalog() {
   catalog ??= createActionCatalog(ACTION_DEFINITIONS);
   return catalog;

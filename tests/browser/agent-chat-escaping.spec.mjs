@@ -51,10 +51,13 @@ test('model text and names an agent writes never run as HTML, in the page or in 
   }));
   expect({ xss: state.xss, images: state.images }).toEqual({ xss: null, images: 0 });
   expect(state.links.every(href => /^https?:\/\//.test(href)), JSON.stringify(state.links)).toBe(true);
-  // The export: raw HTML outside code escaped, the script and data links left as text, code kept.
-  expect(markdown).toContain(`> hi \\${hostile('u1')}`);
-  expect(markdown).toContain(`Plain \\${hostile('t1')}`);
-  expect(markdown).toContain('[js]\\(javascript:window.__xss=1) [data]\\(data:text/html,\\<script>alert(1)\\</script>)');
+  // The export: raw HTML outside code escaped (and every [ that could open a link), the script and
+  // data links left as text, code kept, and the text otherwise as written (window.__xss stays).
+  const escaped = n => `\\${hostile(n).replace('[', '\\[')}`;
+  expect(markdown).toContain(`> hi ${escaped('u1')}`);
+  expect(markdown).toContain(`Plain ${escaped('t1')}`);
+  expect(markdown).toContain(`step "Renamed alpha to ${escaped('cat')} in cell_type"`);
+  expect(markdown).toContain('\\[js](javascript:window.__xss=1) \\[data](data:text/html,\\<script>alert(1)\\</script>)');
   expect(markdown).toContain(`\`\`\`\n${hostile('t4')}\n\`\`\``);
   // Outside code (fenced, or a code span such as a tool's name), no tag is left unescaped.
   const outsideCode = markdown.replace(/```[\s\S]*?```/g, '').replace(/(`+)[^`][\s\S]*?\1/g, '');

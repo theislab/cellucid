@@ -9,7 +9,7 @@
  * a chunk's compressed bytes, with a description of how to decode them, to
  * one of a few decode workers, and gets the decoded bytes back.
  *
- * - **Tasks** are serialisable: a `kind` (`'zarr'`: a Zarr codec list and the
+ * - **Tasks** are serializable: a `kind` (`'zarr'`: a Zarr codec list and the
  *   size each codec must produce; `'hdf5'`: an HDF5 filter pipeline, the
  *   chunk's filter mask and its decoded size) and the compressed bytes. A
  *   task whose caller gives its bytes up (`owned`, a view spanning its whole
@@ -249,7 +249,7 @@ class DecodePool {
     if (task.kind === 'run' && task.size < this.minBytes) return Promise.resolve().then(task.inThread);
     return new Promise((resolve, reject) => {
       const job = { ...task, id: 0, resolve, reject, settled: false, holder: null, transferred: false, stopWaiting: null };
-      // A job cancelled while queued is settled here and dropped when the
+      // A job canceled while queued is settled here and dropped when the
       // queue reaches it.
       if (signal !== null) job.stopWaiting = onAbort(signal, () => this.settle(job, null, abortReason(signal)));
       this.queues[task.background === true ? 1 : 0].push(job);
@@ -296,7 +296,7 @@ class DecodePool {
     );
   }
 
-  /** The next waiting job, foreground first (cancelled ones dropped), or null. */
+  /** The next waiting job, foreground first (canceled ones dropped), or null. */
   peek() {
     for (const queue of this.queues) {
       while (queue.length > 0 && queue[0].settled) queue.shift();
@@ -711,7 +711,7 @@ class DecodePool {
       // thread, without workers).
       size: this.noWorkers ? 1 : this.size,
       running: this.workers.reduce((sum, holder) => sum + [...holder.jobs.values()].flat().filter(job => job.explore !== true).length, 0),
-      // Cancelled jobs stay in the queue until it reaches them; they do not wait.
+      // Canceled jobs stay in the queue until it reaches them; they do not wait.
       queued: this.queues.reduce((count, queue) => count + queue.reduce((n, job) => n + (job.settled ? 0 : 1), 0), 0),
       inThreadOnly: this.noWorkers,
       decodedBytesPerMs,
@@ -766,7 +766,7 @@ function sharedPool() {
  *
  * @param {Object} task
  * @param {'zarr'|'hdf5'} task.kind
- * @param {Object} task.description - Serialisable: how to decode (see decode-worker.js)
+ * @param {Object} task.description - Serializable: how to decode (see decode-worker.js)
  * @param {Uint8Array} task.input - The compressed bytes (never changed; transferred only when `owned`)
  * @param {number} task.size - The decoded size, or the best estimate of it
  * @param {AbortSignal|null} [task.signal]
@@ -794,7 +794,7 @@ export function decodeChunkBytes(task) {
  * @param {Object} task
  * @param {string} task.module - The module's URL
  * @param {string} task.name - The function it exports
- * @param {Object} task.args - Serialisable arguments
+ * @param {Object} task.args - Serializable arguments
  * @param {ArrayBuffer[]} [task.transfer] - Buffers of `args` the caller gives up
  * @param {string|null} [task.context] - A key of `retainDecodeContext`
  * @param {number} task.size - The bytes of work, as a decoded chunk's size: less than a message is worth is done here

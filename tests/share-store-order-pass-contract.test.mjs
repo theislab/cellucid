@@ -1,7 +1,7 @@
 /**
  * The work a spread share's first gene does before and around its one pass
  * in store order, counted: passes, lookups, sorts and lists made, never wall
- * clock. A 50 % uniform share of a 10M-cell CSR `.h5ad` read its first gene
+ * clock. A 50% uniform share of a 10M-cell CSR `.h5ad` read its first gene
  * in 12.55 s against every cell's 11.59 s, the same bytes: the link stood
  * idle while the reader sorted and listed the share's 5M rows several
  * times over before the pass began.
@@ -15,7 +15,7 @@
  *   order is placed in them until something reads the rows in open order
  *   (`RowPointers.runIndexFor`).
  * - **What the gene plan says needs no open-order matrix** when the rest is
- *   one segment in store order (`_segmentProgress`): the plan of a 50 %
+ *   one segment in store order (`_segmentProgress`): the plan of a 50%
  *   share listed its 5M open rows' entries in open order to price a pass
  *   that never reads them.
  * - **The kept values and their chunks are one walk** (`keptValueStats`),

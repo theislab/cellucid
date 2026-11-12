@@ -2,7 +2,7 @@
  * Shows the opening under way (`data/opening-progress.js`) from its first
  * moment, in one of two places:
  *
- * - **The startup overlay**, centred over the empty viewer, while no dataset
+ * - **The startup overlay**, centered over the empty viewer, while no dataset
  *   is shown (the first load, from a link, a sample, a server or a notebook):
  *   what is opened, the step under way, a progress bar, how much has arrived,
  *   how fast and how long is left, and Cancel.
@@ -25,16 +25,28 @@
  * data the page's address names, at startup) stays over the empty viewer:
  * one plain sentence, the failure's own message folded under Details, and
  * its actions (Try again, Open without this link). The app around it works;
- * a newer opening replaces it.
+ * a newer opening replaces it. So does a failure said as a card while a
+ * dataset was shown: the next opening withdraws it as it begins (found
+ * 2026-11-10: a refused file's card stayed through thirteen later openings,
+ * reading as if the dataset shown had failed).
+ *
+ * With no opening shown and no dataset on screen (None chosen, a link opened
+ * without, an opening canceled), the same panel says so and where to open
+ * one, with a button that shows that place (R9E-10: the viewer was a blank
+ * plane that said nothing). `refreshEmptyViewer` re-reads it when the cells
+ * on screen come or go.
  *
  * @module app/opening-progress-view
  */
 
 import { getNotificationCenter } from './notification-center.js';
 import { createButton } from './ui/components/controls.js';
+import { NO_DATASET_LABEL, OPEN_DATASET_PLACE } from './ui/no-dataset.js';
+import { revealInSidebar } from './ui/modules/sidebar-controls.js';
 import { getOpeningProgress } from '../data/opening-progress.js';
 import { describeHostFault, isExplainedFailure } from '../data/data-source.js';
 import { formatBytes, formatDuration } from '../utils/format-units.js';
+import { debounce } from '../utils/debounce.js';
 
 /** Updates are drawn at most this often; a second's tick keeps the elapsed time live. */
 const UPDATE_EVERY_MS = 200;
@@ -145,6 +157,24 @@ function buildOverlay(documentOwner, onCancel) {
  * @param {Object} [options.notifications] - Notification center
  * @returns {() => void} Stop showing openings
  */
+/** The shown view's re-read of the empty viewer (one view per page). */
+let settleEmptyOfView = null;
+
+/**
+ * The cells on screen came or went (a dataset published, None chosen): the
+ * empty viewer's panel is shown or withdrawn to match.
+ */
+export function refreshEmptyViewer() {
+  settleEmptyOfView?.();
+}
+
+/** How long the viewer is empty before it says so: an opening's end and its first cells are not one moment. */
+const EMPTY_AFTER_MS = 250;
+
+/** What the empty viewer says. */
+export const EMPTY_VIEWER_SENTENCE =
+  `Choose a sample, open a file or folder, or paste a link in ${OPEN_DATASET_PLACE}; a file can also be dropped here.`;
+
 export function showOpeningProgress({
   hasDataset,
   documentOwner = document,
@@ -261,6 +291,7 @@ export function showOpeningProgress({
       onClick: () => {
         clearFailure();
         action.run();
+        settleEmpty();
       },
     })));
     overlay.root.hidden = false;
@@ -268,6 +299,56 @@ export function showOpeningProgress({
     const active = documentOwner.activeElement;
     if (active === null || active === documentOwner.body) overlay.actions.firstElementChild?.focus();
   }
+
+  /** Open data, shown and focused: the way on from the empty viewer. */
+  function revealOpenData() {
+    void revealInSidebar(documentOwner, () => {
+      const session = documentOwner.getElementById('session-section');
+      if (session !== null && 'open' in session) session.open = true;
+      const target = documentOwner.getElementById('dataset-select');
+      target?.scrollIntoView?.({ block: 'nearest' });
+      target?.focus?.();
+    });
+  }
+
+  function drawEmpty() {
+    overlay.root.dataset.state = 'empty';
+    overlay.panel.setAttribute('aria-label', NO_DATASET_LABEL);
+    overlay.title.textContent = NO_DATASET_LABEL;
+    overlay.step.textContent = EMPTY_VIEWER_SENTENCE;
+    overlay.actions.replaceChildren(createButton({
+      label: 'Show Open data',
+      variant: 'secondary',
+      className: 'btn-compact',
+      onClick: revealOpenData,
+    }));
+    overlay.root.hidden = false;
+  }
+
+  // The empty viewer's panel is drawn once nothing else showed for EMPTY_AFTER_MS.
+  const drawEmptySoon = debounce(() => {
+    if (shown === null && !hasDataset() && overlay.root.dataset.state === 'running') drawEmpty();
+  }, EMPTY_AFTER_MS);
+  /** Show the empty viewer's panel when nothing else is, withdraw it when a dataset is. */
+  function settleEmpty() {
+    drawEmptySoon.cancel();
+    const state = overlay.root.dataset.state;
+    if (hasDataset()) {
+      if (state === 'empty') clearEmpty();
+      return;
+    }
+    if (shown !== null || state === 'failed' || state === 'choosing' || state === 'empty') return;
+    drawEmptySoon();
+  }
+
+  function clearEmpty() {
+    if (overlay.root.dataset.state !== 'empty') return;
+    overlay.root.dataset.state = 'running';
+    overlay.panel.setAttribute('aria-label', 'Opening data');
+    overlay.actions.replaceChildren();
+    overlay.root.hidden = true;
+  }
+  settleEmptyOfView = settleEmpty;
 
   function clearFailure() {
     if (overlay.root.dataset.state !== 'failed') return;
@@ -322,11 +403,14 @@ export function showOpeningProgress({
         const way = snapshot.actions[0] ?? null;
         if (way !== null) {
           settleNotification(id => notifications.dismiss(id));
-          notifications.error(message, { category: 'data', details, action: { label: way.label, run: way.run } });
+          progress.untilNextOpening(notifications.error(message, { category: 'data', details, action: { label: way.label, run: way.run } }));
           break;
         }
-        if (!settleNotification(id => notifications.fail(id, message, { details }))) {
-          notifications.error(message, { category: 'data', details });
+        const progressCard = shown.notificationId;
+        if (settleNotification(id => notifications.fail(id, message, { details }))) {
+          progress.untilNextOpening(progressCard);
+        } else {
+          progress.untilNextOpening(notifications.error(message, { category: 'data', details }));
         }
         break;
       }
@@ -338,6 +422,7 @@ export function showOpeningProgress({
         settleNotification(id => notifications.dismiss(id));
     }
     shown = null;
+    settleEmpty();
   }
 
   function draw() {
@@ -361,8 +446,13 @@ export function showOpeningProgress({
     }
     if (shown === null) {
       if (snapshot.state !== 'running') return;
-      // A newer opening replaces a failure still shown.
+      // A newer opening replaces a failure still shown, over the viewer or
+      // as a card, and every notice kept until it began (`untilNextOpening`),
+      // and the empty viewer's panel.
       clearFailure();
+      clearEmpty();
+      drawEmptySoon.cancel();
+      for (const id of progress.takeEarlierNotices()) notifications.dismiss(id);
       // From its first moment: the first state is drawn at once.
       shown = { id: snapshot.id, mode: hasDataset() ? 'notification' : 'overlay', notificationId: null };
       tick = setInterval(() => {
@@ -383,7 +473,9 @@ export function showOpeningProgress({
   return () => {
     stop();
     clearTimeout(drawTimer);
+    drawEmptySoon.cancel();
     clearInterval(tick);
+    if (settleEmptyOfView === settleEmpty) settleEmptyOfView = null;
     overlay.root.remove();
   };
 }

@@ -36,7 +36,7 @@ const step = (tracker, id) => tracker.steps.find(s => s.id === id);
 const branch = (tracker, id) => tracker.branches.find(b => b.id === id);
 
 /** Add a step below `parent` on `branch`, as the history appends one. */
-function add(tracker, { parent, branch, type = 'color.by', label = 'Coloured by cell_type', by = PERSON, touches = ['active-field'], at = 10 }) {
+function add(tracker, { parent, branch, type = 'color.by', label = 'Colored by cell_type', by = PERSON, touches = ['active-field'], at = 10 }) {
   const id = idOf('step', tracker.nextStep++);
   const outside = type === OUTSIDE_CHANGE_TYPE;
   const step = createStep({
@@ -604,6 +604,8 @@ test('the sentences the history\'s refusals say', () => {
     'There is no branch "Q"; the branches are "Main", "Without alpha" and "Nested".');
   assert.equal(SENTENCES.noStep({ step: 's9', tracker: 'Tracker 1' }),
     'There is no step "s9" in the tracker "Tracker 1"; history_get lists its steps.');
+  assert.equal(SENTENCES.noTurn({ turn: 'turn-2', tracker: 'Tracker 1', then: 'nothing to undo' }),
+    'The tracker "Tracker 1" has no record of the turn "turn-2": a turn is recorded with its first step, so one that only read or changed nothing has nothing to undo; history_summary lists the turns it has.');
   assert.equal(SENTENCES.noGroup({ ref: 'QC', names: [] }), 'There is no group "QC"; the tracker has no group.');
   assert.equal(SENTENCES.noGroup({ ref: 'Q', names: ['QC', 'Clustering'] }), 'There is no group "Q"; the groups are "QC" and "Clustering".');
   assert.equal(SENTENCES.notConsecutive({ from: 's4', to: 's9' }),

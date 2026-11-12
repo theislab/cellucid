@@ -7,20 +7,23 @@
  *
  * Every change is an action (`app/actions/`): a control dispatches it, and
  * the rows follow the state whoever changed it (`syncRows`: a step undone,
- * an agent's, a notebook's), checkbox, colour and count, in place.
+ * an agent's, a notebook's), checkbox, color and count, in place.
  *
  * @module ui/modules/legend/categorical-legend
  */
 
 import { StyleManager } from '../../../../utils/style-manager.js';
+import { hexOfRgb01, rgb01OfHex } from '../../../../utils/hex-color.js';
+import { setControlAvailability } from '../../core/control-availability.js';
 import { getNotificationCenter } from '../../../notification-center.js';
 import { InlineEditor } from '../../components/inline-editor.js';
 import { showConfirmDialog } from '../../components/confirm-dialog.js';
-import { FieldKind, FieldSource } from '../../../utils/field-constants.js';
+import { FieldKind, FieldSource, UNASSIGNED_LABEL } from '../../../utils/field-constants.js';
 import { StateValidator } from '../../../utils/state-validator.js';
+import { categoryDisplayName, isUnnamedCategory } from '../../../actions/targets/names.js';
 import { getCommunityAnnotationSession } from '../../../community-annotations/session.js';
 import { syncCommunityAnnotationCacheContext } from '../../../community-annotations/runtime-context.js';
-import { annotationCategories, annotationFieldKey } from '../../../community-annotations/field-names.js';
+import { annotationCategories, annotationFieldKey, annotationKeyable } from '../../../community-annotations/field-names.js';
 import {
   getCommunityAnnotationAccessStore,
   isAnnotationRepoConnected
@@ -44,6 +47,7 @@ import { requireExactKeys } from '../../../../utils/exact-record.js';
 import { categoryRgbAt, categoryShownAt } from '../../../utils/category-state.js';
 import { categoryCellLimitAt } from '../../../state/managers/category-cell-sample.js';
 import { createLatestDispatch, dispatchFromControl } from '../../../actions/control-dispatch.js';
+import { undoKeys } from '../state/shared.js';
 
 const CATEGORY_DRAG_MIME = 'application/x-cellucid-category';
 const INIT_KEYS = new Set(['state', 'legendEl', 'dataSourceManager']);
@@ -57,12 +61,6 @@ const REQUIRED_STATE_METHODS = [
   'on',
   'rgbToCss'
 ];
-const CATEGORY_TYPE_ORDER = new Map([
-  ['boolean', 0],
-  ['number', 1],
-  ['string', 2]
-]);
-
 function requireMethod(owner, methodName, label) {
   if (
     owner === null
@@ -101,39 +99,28 @@ function requireTrimmedString(value, label) {
   return value;
 }
 
+/**
+ * A category as the legend shows it and names it to the actions it
+ * dispatches: its display name (`categoryDisplayName`: `(empty)`, `(blank)`,
+ * `" x "` for one with white space at an end), which every step resolves
+ * (`targets/fields.js` `resolveCategory`). An action naming a category by an
+ * empty name was refused ("must have at least 1 character"), so a category
+ * with no name could not be hidden, colored, merged or renamed.
+ */
 function formatCategoryLabel(value) {
   StateValidator.validateCategoryLabel(value);
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number') return value.toString();
-  return value ? 'true' : 'false';
+  return categoryDisplayName(value);
 }
 
-/**
- * Order two category labels. Both have already passed
- * `requireCategoricalLegendModel`, which validates every label once, so the
- * comparison does not validate them again on each of the n log n calls.
- */
-function compareValidatedCategoryLabels(left, right) {
-  const leftType = typeof left;
-  const rightType = typeof right;
-  const typeDifference = (
-    CATEGORY_TYPE_ORDER.get(leftType) - CATEGORY_TYPE_ORDER.get(rightType)
-  );
-  if (typeDifference !== 0) return typeDifference;
-  if (leftType === 'boolean') {
-    return left === right ? 0 : left ? 1 : -1;
-  }
-  if (leftType === 'number') return left - right;
-  return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function computeTopConsensusSummary(session, fieldKey, catIdx) {
+/** The legend's line under a category: its leading label(s) as the consensus ranks them, and their voters up and down. */
+export function computeTopConsensusSummary(session, fieldKey, catIdx) {
   const suggestions = session.getSuggestions(fieldKey, catIdx);
   if (!Array.isArray(suggestions)) {
     throw new TypeError('Community annotation suggestions must be an array');
   }
   if (!suggestions.length) return null;
   let bestNet = null;
+  let bestUp = null;
   for (const s of suggestions) {
     if (
       s === null
@@ -156,7 +143,13 @@ function computeTopConsensusSummary(session, fieldKey, catIdx) {
       requireTrimmedString(user, 'Annotation downvote identity');
     }
     const net = up - down;
-    if (bestNet === null || net > bestNet) bestNet = net;
+    // The consensus's rank (`session.js` `consensusOf`): net votes, then
+    // upvotes; equal on both is a tie (bug hunt R9A-2: by net alone, the
+    // legend named a tie the voting dialog's banner did not).
+    if (bestNet === null || net > bestNet || (net === bestNet && up > bestUp)) {
+      bestNet = net;
+      bestUp = up;
+    }
   }
   if (bestNet === null) {
     throw new Error('Annotation consensus lost its suggestion score');
@@ -169,7 +162,7 @@ function computeTopConsensusSummary(session, fieldKey, catIdx) {
     const up = s.upvotes.length;
     const down = s.downvotes.length;
     const net = up - down;
-    if (net !== bestNet) continue;
+    if (net !== bestNet || up !== bestUp) continue;
     for (const user of s.upvotes) {
       upSet.add(requireTrimmedString(user, 'Annotation upvote identity'));
     }
@@ -188,43 +181,13 @@ function computeTopConsensusSummary(session, fieldKey, catIdx) {
   return { names, up: upSet.size, down: downSet.size };
 }
 
-function rgbToHex(color) {
-  if (
-    !Array.isArray(color)
-    || color.length !== 3
-    || color.some(channel => (
-      !Number.isFinite(channel) || channel < 0 || channel > 1
-    ))
-  ) {
-    throw new TypeError('Legend color must be an exact RGB triplet from 0 through 1');
-  }
-  const toChannel = value => Math.round(value * 255);
-  const r = toChannel(color[0]);
-  const g = toChannel(color[1]);
-  const b = toChannel(color[2]);
-  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
-}
-
-function hexToRgb01(hex) {
-  if (typeof hex !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(hex)) {
-    throw new TypeError('Legend color input must be an exact #RRGGBB value');
-  }
-  const normalized = hex.slice(1);
-  const r = parseInt(normalized.slice(0, 2), 16) / 255;
-  const g = parseInt(normalized.slice(2, 4), 16) / 255;
-  const b = parseInt(normalized.slice(4, 6), 16) / 255;
-  return [r, g, b];
-}
-
+/** A label typed in the rename box: the one rule for a label given now (`validateNewCategoryLabel`). */
 function validateCategoryLabel(nextValue) {
-  if (typeof nextValue !== 'string') return 'Label must be a string';
-  const value = nextValue;
-  if (!value) return 'Label cannot be empty';
   try {
-    StateValidator.validateCategoryLabel(value);
+    StateValidator.validateNewCategoryLabel(nextValue);
   } catch (err) {
     if (!(err instanceof Error)) throw err;
-    return err.message;
+    return `This label cannot be used: ${err.message}.`;
   }
   return true;
 }
@@ -291,11 +254,23 @@ export function describeCountedCells(state, field = null) {
   const open = state.pointCount ?? 0;
   const total = state.cellIdentity?.nOriginal ?? open;
   const cells = total === open ? '' : `Counted on the ${formatOpenCells(open, total)} open.`;
+  // Integers read as their text (identifiers past 2^53): said first, the
+  // reason in full on the line's tooltip (`legendNoteTitle`).
+  const text = typeof field?.asText === 'string' ? AS_TEXT_LINE : '';
   const stored = field?.storedCategoryCount;
   const found = (field?._originalCategories ?? field?.categories ?? []).length;
-  if (!Number.isSafeInteger(stored) || stored <= found) return cells;
-  const among = `${formatCount(found)} of its ${formatCountOf(stored, 'category', 'categories')} are among ${cells === '' ? 'the cells' : 'them'}.`;
-  return cells === '' ? among : `${cells} ${among}`;
+  const among = !Number.isSafeInteger(stored) || stored <= found
+    ? ''
+    : `${formatCount(found)} of its ${formatCountOf(stored, 'category', 'categories')} are among ${cells === '' ? 'the cells' : 'them'}.`;
+  return [text, cells, among].filter(part => part !== '').join(' ');
+}
+
+/** The legend line's short form of a column read as text (`describeCountedCells`). */
+const AS_TEXT_LINE = 'IDs past 2^53, read as text.';
+
+/** The tooltip of the legend's line: why a column is text, in full, or ''. */
+export function legendNoteTitle(field = null) {
+  return typeof field?.asText === 'string' ? field.asText : '';
 }
 
 /** Write text only when it changed, so an unchanged row is not relaid out. */
@@ -304,6 +279,8 @@ function setTextIfChanged(element, text) {
 }
 
 const NO_CELLS_TITLE = 'No cells available in this category after other filters';
+/** Why a category's switch and color are off (`setControlAvailability`). */
+const NO_CELLS_REASON = 'no cell of this category is left after the other filters; loosen them to change it';
 
 /**
  * A legend with more categories than this builds only the rows in view (plus
@@ -357,7 +334,7 @@ function requireCategoricalLegendModel(field, model) {
     || model.kind !== FieldKind.CATEGORY
     || model.categories !== field.categories
     || model.categories.length === 0
-    // Colours and visibility as `utils/category-state.js` holds them (checked
+    // Colors and visibility as `utils/category-state.js` holds them (checked
     // once per array where they are made).
     || !(model.colors instanceof Uint8Array)
     || model.colors.length !== model.categories.length * 3
@@ -771,7 +748,7 @@ export function initCategoricalLegend(options) {
     );
     if (renderedField !== activeField) {
       // The active field changed (another view was selected, or the view was
-      // recoloured) and its legend has not been drawn yet: draw it.
+      // recolored) and its legend has not been drawn yet: draw it.
       renderCategoricalLegend(activeField, model);
       return;
     }
@@ -795,8 +772,8 @@ export function initCategoricalLegend(options) {
         if (renderedAnnotating) annotationAvailabilityChanged = true;
         row.classList.toggle('legend-item-disabled', !hasCells);
         row.title = hasCells ? '' : NO_CELLS_TITLE;
-        entry.checkbox.disabled = !hasCells;
-        entry.colorInput.disabled = !hasCells;
+        setControlAvailability(entry.checkbox, hasCells ? null : NO_CELLS_REASON);
+        setControlAvailability(entry.colorInput, hasCells ? null : NO_CELLS_REASON);
       }
       setTextIfChanged(entry.countSpan, formatCategoryCount(visible, available));
       if (entry.highlightBtn !== null) {
@@ -820,9 +797,19 @@ export function initCategoricalLegend(options) {
     closeTransientInteractions();
     isRendering = true;
     try {
+      // A redraw of the field shown (a rename, a vote, a count, a choice of
+      // the field it is already colored by) keeps the list where the person
+      // scrolled it: every redraw builds the list anew, and a new list starts
+      // at its top (found 2026-11-12: in a 70,000-category legend a redraw a
+      // moment after a scroll to row 65,536 put the list back at row 1).
+      const sameField = renderedField !== null && renderedField.key === field.key
+        && renderedField.categories?.length === field.categories?.length;
+      const scrollTop = sameField
+        ? legendEl.querySelector('.legend-items-container')?.scrollTop ?? 0
+        : 0;
       const { section, rows, annotating, mount, cellsNote, syncMissingRow, syncMissingToggle } = _doRenderCategoricalLegend(field, model);
       legendEl.replaceChildren(section);
-      mount();
+      mount(scrollTop);
       renderedCellsNote = cellsNote;
       renderedMissingRow = syncMissingRow;
       renderedMissingToggle = syncMissingToggle;
@@ -845,6 +832,7 @@ export function initCategoricalLegend(options) {
   function buildCategoryRow({
     catIdx,
     label,
+    unnamed = false,
     color,
     isVisible,
     visibleCount,
@@ -866,19 +854,22 @@ export function initCategoricalLegend(options) {
     const checkbox = ownerDocument.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.className = 'legend-checkbox';
-    checkbox.setAttribute('aria-label', `Show category ${label}`);
+    // `label` is the display name (`formatCategoryLabel`); a category with no
+    // name is drawn quietly.
+    const shown = label;
+    checkbox.setAttribute('aria-label', `Show category ${shown}`);
     // Declared for the same reason as the highlight button below.
     checkbox.dataset.analyticsId = 'legend:toggle-category';
     checkbox.checked = isVisible;
-    checkbox.disabled = !hasCells;
+    setControlAvailability(checkbox, hasCells ? null : NO_CELLS_REASON);
 
     const swatch = ownerDocument.createElement('div');
     swatch.className = 'legend-swatch';
     const colorInput = ownerDocument.createElement('input');
     colorInput.type = 'color';
     colorInput.className = 'legend-color-input';
-    colorInput.setAttribute('aria-label', `Color for category ${label}`);
-    colorInput.disabled = !hasCells;
+    colorInput.setAttribute('aria-label', `Color for category ${shown}`);
+    setControlAvailability(colorInput, hasCells ? null : NO_CELLS_REASON);
     paintSwatch(swatch, colorInput, color);
     swatch.appendChild(colorInput);
 
@@ -886,7 +877,11 @@ export function initCategoricalLegend(options) {
     labelSpan.className = 'legend-label';
     const labelMain = ownerDocument.createElement('div');
     labelMain.className = 'legend-label-main';
-    labelMain.textContent = label;
+    labelMain.textContent = shown;
+    labelMain.classList.toggle('is-unnamed', unnamed);
+    // A name cut to the row shows whole on a click or a tap
+    // (`full-text-reveal.js`); while voting, a click votes.
+    if (!annotating) labelMain.setAttribute('data-full-text', '');
     labelSpan.appendChild(labelMain);
 
     let highlightBtn = null;
@@ -919,15 +914,17 @@ export function initCategoricalLegend(options) {
     const votingHint = hasCells
       ? 'Voting mode enabled: click to vote (labels are locked).'
       : 'Voting unavailable because no cells are currently available.';
+    // Hover names the category whole first: the row may cut it.
     if (originalLabel !== undefined && formatCategoryLabel(originalLabel) !== label) {
       labelSpan.classList.add('is-renamed');
+      const original = formatCategoryLabel(originalLabel);
       labelSpan.title = annotating
-        ? `Original: ${originalLabel} • ${votingHint}`
-        : `Original: ${originalLabel}`;
+        ? `${shown}\nOriginal: ${original} • ${votingHint}`
+        : `${shown}\nOriginal: ${original}`;
     } else {
       labelSpan.title = annotating
-        ? votingHint
-        : 'Double-click to rename • Drag or press Enter to merge into another category';
+        ? `${shown}\n${votingHint}`
+        : `${shown}\nDouble-click to rename • Drag or press Enter to merge into another category`;
     }
 
     labelSpan.draggable = !annotating;
@@ -979,9 +976,9 @@ export function initCategoricalLegend(options) {
 
   /**
    * The rows drawn show the field's state as it is now: each category's
-   * checkbox, colour and count limit, and the Missing row's checkbox (a
+   * checkbox, color and count limit, and the Missing row's checkbox (a
    * change made by an undo, an agent or a notebook reaches the rows here).
-   * A colour picker being used is left alone: it shows what is chosen.
+   * A color picker being used is left alone: it shows what is chosen.
    */
   function syncRows(field, model) {
     for (const [idx, entry] of renderedRows) {
@@ -989,7 +986,7 @@ export function initCategoricalLegend(options) {
       if (entry.checkbox.checked !== shown) entry.checkbox.checked = shown;
       if (ownerDocument.activeElement !== entry.colorInput) {
         const color = categoryRgbAt(field._categoryColors, idx);
-        if (entry.colorInput.value !== rgbToHex(color)) paintSwatch(entry.swatch, entry.colorInput, color);
+        if (entry.colorInput.value !== hexOfRgb01(color)) paintSwatch(entry.swatch, entry.colorInput, color);
       }
       syncCountButton(entry.countSpan, entry.label, categoryCellLimitAt(field, idx), model.counts.available[idx]);
     }
@@ -1002,7 +999,7 @@ export function initCategoricalLegend(options) {
       throw new TypeError('Category RGB conversion must return CSS text');
     }
     StyleManager.setVariable(swatch, '--legend-swatch-color', cssColor);
-    colorInput.value = rgbToHex(color);
+    colorInput.value = hexOfRgb01(color);
   }
 
   function _doRenderCategoricalLegend(field, model) {
@@ -1039,21 +1036,25 @@ export function initCategoricalLegend(options) {
     const cellsNote = ownerDocument.createElement('p');
     cellsNote.className = 'status-line legend-cells-note';
     cellsNote.textContent = describeCountedCells(state, field);
+    cellsNote.title = legendNoteTitle(field);
     catSection.appendChild(cellsNote);
 
     const categories = model.categories;
     const labels = categories.map(formatCategoryLabel);
-    const sortedIndices = categories
-      .map((_category, idx) => idx)
-      .sort((left, right) => (
-        compareValidatedCategoryLabels(categories[left], categories[right])
-      ));
+    // The field's own category order, as the file (Scanpy), the Group
+    // dialog, the figure legend and the analysis plots show it: a trajectory
+    // stays in its order, groups in the order they were typed (F124).
+    const rowIndices = categories.map((_category, idx) => idx);
 
     // Community annotation keys the field and its categories on the
     // dataset's names; a local rename is a display name (`field-names.js`).
+    // A field whose categories the repository cannot key (a blank one, one
+    // with spaces at its ends) is not open to it, and is shown as any other.
     const fieldKey = annotationFieldKey(field);
-    annotationSession.setFieldCategories(fieldKey, annotationCategories(field));
-    const fieldAnnotated = annotationSession.isFieldAnnotated(fieldKey);
+    const repositoryCategories = annotationCategories(field);
+    const keyable = annotationKeyable(repositoryCategories);
+    if (keyable) annotationSession.setFieldCategories(fieldKey, repositoryCategories);
+    const fieldAnnotated = keyable && annotationSession.isFieldAnnotated(fieldKey);
     if (typeof fieldAnnotated !== 'boolean') {
       throw new TypeError('Annotation field state must be boolean');
     }
@@ -1072,7 +1073,7 @@ export function initCategoricalLegend(options) {
 
     const itemsContainer = ownerDocument.createElement('div');
     itemsContainer.className = 'legend-items-container';
-    if (sortedIndices.length > 16) {
+    if (rowIndices.length > 16) {
       itemsContainer.classList.add('legend-items-scrollable');
       // The fade at the bottom edge says there is more; it lifts once the
       // list is scrolled to its end. Read once per frame, written only when
@@ -1097,7 +1098,7 @@ export function initCategoricalLegend(options) {
       remove: createIconButton({
         label: annotating
           ? 'Disabled while voting is enabled'
-          : 'Delete category (merge into unassigned)',
+          : `Delete category (its cells join ${UNASSIGNED_LABEL})`,
         icon: ICONS.delete,
         tone: 'danger',
         className: 'legend-delete-btn'
@@ -1116,7 +1117,7 @@ export function initCategoricalLegend(options) {
       // reads the counts the legend drew last; the rows this render builds
       // read the model it draws.
       const current = !isRendering && renderedField === field && renderedModel !== null ? renderedModel : model;
-      // A row shows each category's colour and visibility as the field
+      // A row shows each category's color and visibility as the field
       // holds them now. A model holds the arrays of the moment it was made:
       // every change makes new ones (`utils/category-state.js`), so a model
       // kept from an earlier draw shows a category as it was then (a filter
@@ -1124,6 +1125,7 @@ export function initCategoricalLegend(options) {
       return buildCategoryRow({
         catIdx,
         label: labels[catIdx],
+        unnamed: isUnnamedCategory(categories[catIdx]),
         color: categoryRgbAt(field._categoryColors, catIdx),
         isVisible: categoryShownAt(field._categoryVisible, catIdx),
         visibleCount: current.counts.visible[catIdx],
@@ -1138,10 +1140,15 @@ export function initCategoricalLegend(options) {
       });
     };
 
-    let mount = () => {};
-    if (sortedIndices.length <= VIRTUAL_LIST_MIN_ROWS) {
+    // Run once the list is in the document, with the scroll position the
+    // list it replaces had (0 for another field's): a redraw of the same
+    // field leaves the person where they were in it.
+    let mount = scrollTop => {
+      if (scrollTop > 0) itemsContainer.scrollTop = scrollTop;
+    };
+    if (rowIndices.length <= VIRTUAL_LIST_MIN_ROWS) {
       const fragment = ownerDocument.createDocumentFragment();
-      for (const catIdx of sortedIndices) {
+      for (const catIdx of rowIndices) {
         const entry = buildEntry(catIdx);
         rows.set(catIdx, entry);
         fragment.appendChild(entry.row);
@@ -1164,7 +1171,7 @@ export function initCategoricalLegend(options) {
       const buildRows = (from, to) => {
         const fragment = ownerDocument.createDocumentFragment();
         for (let position = from; position < to; position++) {
-          const catIdx = sortedIndices[position];
+          const catIdx = rowIndices[position];
           const entry = buildEntry(catIdx);
           rows.set(catIdx, entry);
           fragment.appendChild(entry.row);
@@ -1183,7 +1190,7 @@ export function initCategoricalLegend(options) {
         } else {
           for (let position = windowStart; position < windowEnd; position++) {
             if (position >= first && position < last) continue;
-            const catIdx = sortedIndices[position];
+            const catIdx = rowIndices[position];
             rows.get(catIdx)?.row.remove();
             rows.delete(catIdx);
           }
@@ -1202,7 +1209,7 @@ export function initCategoricalLegend(options) {
           Math.floor(itemsContainer.scrollTop / stride) - VIRTUAL_OVERSCAN_ROWS
         );
         const last = Math.min(
-          sortedIndices.length,
+          rowIndices.length,
           Math.ceil((itemsContainer.scrollTop + viewport) / stride) + VIRTUAL_OVERSCAN_ROWS
         );
         if (first === windowStart && last === windowEnd) return;
@@ -1210,8 +1217,8 @@ export function initCategoricalLegend(options) {
       };
       const scheduleWindow = coalesceToFrame(renderWindow);
       itemsContainer.addEventListener('scroll', () => scheduleWindow(), { passive: true });
-      fillWindow(0, Math.min(sortedIndices.length, VIRTUAL_INITIAL_ROWS));
-      mount = () => {
+      fillWindow(0, Math.min(rowIndices.length, VIRTUAL_INITIAL_ROWS));
+      mount = scrollTop => {
         // The row pitch is measured once the list is in the document: two
         // consecutive rows' offsets, so margins are included.
         const [firstRow, secondRow] = windowEl.children;
@@ -1222,8 +1229,11 @@ export function initCategoricalLegend(options) {
         StyleManager.setVariable(
           spacer,
           '--legend-virtual-height',
-          `${sortedIndices.length * stride}px`
+          `${rowIndices.length * stride}px`
         );
+        // The place the replaced list was scrolled to, taken once the list
+        // has its full height, so the rows built first are the ones there.
+        if (scrollTop > 0) itemsContainer.scrollTop = scrollTop;
         windowStart = -1;
         renderWindow();
       };
@@ -1358,9 +1368,9 @@ export function initCategoricalLegend(options) {
         message:
           `Merge category \"${fromLabel}\" into \"${toLabel}\"?\n\n` +
           (inPlace
-            ? `This edits the current derived column in place.\n` +
-              `To undo, restore the original column from Deleted fields.`
-            : `This creates a new categorical column and moves the previous column to Deleted fields for restore.`),
+            ? `This edits the column in place.`
+            : `This makes a new column; this one moves to Deleted fields.`) +
+          ` Undo (${undoKeys().undo}) takes it back.`,
         confirmText: 'Merge',
         onConfirm: () => {
           const ownsInteraction = retired === false;
@@ -1425,7 +1435,7 @@ export function initCategoricalLegend(options) {
           void dispatchFromControl(
             'category.rename',
             { field: fieldRef, category: currentLabel, name: newLabel },
-            { failure: 'Failed to rename category' }
+            { failure: 'Could not rename the category' }
           ).then(done => {
             if (done?.outcome == null) return;
             getNotificationCenter().success(`Category renamed to \"${newLabel}\"`, { category: 'filter', duration: 2000 });
@@ -1450,7 +1460,8 @@ export function initCategoricalLegend(options) {
       if (annotating) return;
       const { fieldIndex, currentField } = requireCurrentCategoryField(catIdx);
       const currentLabel = formatCategoryLabel(currentField.categories[catIdx]);
-      const unassignedLabel = 'unassigned';
+      // The action's default: the one spelling of cells without a label.
+      const unassignedLabel = UNASSIGNED_LABEL;
       const inPlace = currentField._isUserDefined === true;
       const generation = readDatasetGeneration();
       const capturedCategories = [{
@@ -1464,11 +1475,11 @@ export function initCategoricalLegend(options) {
         title: 'Delete category label',
         message:
           `Delete category \"${currentLabel}\"?\n\n` +
+          `Its cells join \"${unassignedLabel}\"; ` +
           (inPlace
-            ? `This edits the current derived column in place, merging \"${currentLabel}\" into \"${unassignedLabel}\".\n` +
-              `To undo, restore the original column from Deleted fields.`
-            : `This creates a new categorical column where \"${currentLabel}\" is merged into \"${unassignedLabel}\".\n` +
-              `The previous column is moved to Deleted fields for restore.`),
+            ? `this edits the column in place.`
+            : `this makes a new column, and this one moves to Deleted fields.`) +
+          ` Undo (${undoKeys().undo}) takes it back.`,
         confirmText: 'Delete category',
         onConfirm: () => {
           const ownsInteraction = retired === false;
@@ -1519,7 +1530,8 @@ export function initCategoricalLegend(options) {
       }
       void dispatchFromControl('highlight.category', {
         field: { source: 'obs', key: currentField.key },
-        category: currentField.categories[catIdx],
+        // The label as the legend shows it, as every other legend action names a category.
+        categories: [formatCategoryLabel(currentField.categories[catIdx])],
         page,
       }, context);
     };
@@ -1566,12 +1578,12 @@ export function initCategoricalLegend(options) {
       });
     };
 
-    // Dragging a native colour picker fires `input` many times per frame, and
-    // every recolour rebuilds the whole colour buffer: the swatch follows
+    // Dragging a native color picker fires `input` many times per frame, and
+    // every recolor rebuilds the whole color buffer: the swatch follows
     // each event, the state takes at most one per frame (the latest value,
     // `createLatestDispatch`), and the release commits the last one. The
     // drag is one step (`color.category` coalesces).
-    const colorDispatch = createLatestDispatch('color.category', { failure: 'Could not change the colour' });
+    const colorDispatch = createLatestDispatch('color.category', { failure: 'Could not change the color' });
     const applyColor = coalesceToFrame((catIdx, hex) => {
       if (destroyed) return;
       colorDispatch.push({ field: fieldRef, category: labels[catIdx], color: hex });
@@ -1658,7 +1670,8 @@ export function initCategoricalLegend(options) {
       if (!(target instanceof view.HTMLInputElement) || !target.classList.contains('legend-color-input')) return;
       const hit = rowOf(target);
       if (hit === null) return;
-      const rgb = hexToRgb01(target.value);
+      const rgb = rgb01OfHex(target.value);
+      if (rgb === null) throw new TypeError('Legend color input must be an exact #RRGGBB value');
       StyleManager.setVariable(hit.entry.swatch, '--legend-swatch-color', state.rgbToCss(rgb));
       applyColor(hit.catIdx, target.value);
     });
@@ -1800,8 +1813,8 @@ export function initCategoricalLegend(options) {
   }
 
   /**
-   * The rows follow a change of colours or category state that changed no
-   * visibility (a recolour made by an undo, an agent or a notebook).
+   * The rows follow a change of colors or category state that changed no
+   * visibility (a recolor made by an undo, an agent or a notebook).
    */
   function syncCategoryState() {
     if (destroyed || isRendering || renderedField === null) return;

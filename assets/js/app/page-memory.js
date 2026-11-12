@@ -35,6 +35,7 @@ import { getOpeningProgress } from '../data/opening-progress.js';
 import { joinMemoryCensus } from '../data/memory-census.js';
 import { retireIdleWorkers } from '../workers/idle-retirement.js';
 import { PLACES, placePath } from './ui/place-names.js';
+import { webStorage } from '../utils/web-storage.js';
 
 /** The notice of what a refusal made the caches give back. */
 const SHORT_OF_MEMORY_NOTICE = 'memory-short';
@@ -44,11 +45,7 @@ export const OPENING_MARK = 'cellucid:opening-under-way';
 
 /** Session storage, or null where the browser refuses it (a private window may). */
 function sessionStorageOf(windowOwner) {
-  try {
-    return windowOwner.sessionStorage ?? null;
-  } catch {
-    return null;
-  }
+  return webStorage('sessionStorage', windowOwner);
 }
 
 /** `a`, `a and b`, `a, b and c`. */
@@ -73,7 +70,7 @@ export function initPageMemory({ notifications, documentOwner = document, window
       if (on) storage?.setItem(OPENING_MARK, '1');
       else storage?.removeItem(OPENING_MARK);
     } catch {
-      // A browser that keeps nothing for the tab: nothing is learnt.
+      // A browser that keeps nothing for the tab: nothing is learned.
     }
   };
   let interrupted = false;

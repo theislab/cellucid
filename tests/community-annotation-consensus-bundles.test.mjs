@@ -1,5 +1,5 @@
 /**
- * Consensus over bundled suggestions (audit B3 and its neighbours).
+ * Consensus over bundled suggestions (audit B3 and its neighbors).
  *
  * - Equal labels (Unicode NFC, nothing else folded) are one bundle: two
  *   people who propose "T cell" independently agree, they do not tie.
@@ -293,4 +293,28 @@ test('bundle vote info of a suggestion in no bundle is no delegated vote', () =>
     s.getMyBundleVoteInfo('leiden', '0', id(1, 'a')),
     { vote: null, source: 'none', delegatedUp: 0, delegatedDown: 0 },
   );
+});
+
+// Bug hunt R9A-2: the voting dialog listed "Alpha (immature)" (net 1, ▲1) above "Alpha cell"
+// (net 1, ▲2), and the legend named both as tied, while the consensus line named "Alpha cell"
+// the leader. One rank everywhere: net votes, then upvotes; equal on both is a tie.
+test('the leader is listed first and the legend names it alone: net votes, then upvotes, as the consensus ranks', async () => {
+  const { computeTopConsensusSummary } = await import('../assets/js/app/ui/modules/legend/categorical-legend.js');
+  const s = session();
+  s.mergeFromUserFiles([
+    view(1, { suggestions: { 'leiden:0': [sugg(1, 'a', 'Alpha cell')] }, votes: { [id(1, 'a')]: 'up' } }),
+    view(2, { suggestions: { 'leiden:0': [sugg(2, 'b', 'Alpha (immature)')] }, votes: { [id(2, 'b')]: 'up', [id(1, 'a')]: 'down' } }),
+    view(3, { votes: { [id(1, 'a')]: 'up' } }),
+  ]);
+  const c = s.computeConsensus('leiden', '0', SETTINGS);
+  assert.equal(c.label, 'Alpha cell');
+  assert.deepEqual(s.getSuggestions('leiden', '0').map((entry) => entry.label), ['Alpha cell', 'Alpha (immature)']);
+  assert.deepEqual(computeTopConsensusSummary(s, 'leiden', '0'), { names: 'Alpha cell', up: 2, down: 1 });
+  // Equal on both: a tie, named whole, in the order the consensus names it.
+  s.mergeFromUserFiles([
+    view(1, { suggestions: { 'leiden:0': [sugg(1, 'a', 'Alpha cell')] }, votes: { [id(1, 'a')]: 'up' } }),
+    view(2, { suggestions: { 'leiden:0': [sugg(2, 'b', 'Alpha (immature)')] }, votes: { [id(2, 'b')]: 'up' } }),
+  ]);
+  assert.equal(s.computeConsensus('leiden', '0', SETTINGS).label, 'Alpha (immature), Alpha cell');
+  assert.equal(computeTopConsensusSummary(s, 'leiden', '0').names.split(', ').sort().join(', '), 'Alpha (immature), Alpha cell');
 });

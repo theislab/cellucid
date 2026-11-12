@@ -3,7 +3,7 @@
  * `data/anndata/open.js`): what a source is is decided from its content
  * first, then from what the caller was told, then from its name; the
  * container is opened, and a layout view (`views/`) presents a root it
- * recognises (`presentStore`), every other root being AnnData as stored.
+ * recognizes (`presentStore`), every other root being AnnData as stored.
  * Formats that Phase 1 adds plug in here: a registry entry
  * (`input-formats.js`) and a view or a transcoder.
  */
@@ -12,7 +12,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { openDatasetStore, presentStore } from '../assets/js/data/anndata/open.js';
-import { H5AD_FORMAT, ZARR_FORMAT } from '../assets/js/data/anndata/elements.js';
+import { AnnDataFormatError, H5AD_FORMAT, ZARR_FORMAT } from '../assets/js/data/anndata/elements.js';
 import { INPUT_FORMATS } from '../assets/js/data/input-formats.js';
 import { viewGroup } from '../assets/js/data/anndata/views/view-nodes.js';
 
@@ -97,10 +97,23 @@ test('a layout view presents a root it recognises; any other root is the contain
   presented.root.close();
   assert.equal(closed, 1, 'the view closes the real store');
 
-  const plain = viewGroup({ path: '/', attrs: {}, children: new Map() });
+  const plain = viewGroup({ path: '/', attrs: { 'encoding-type': 'anndata', 'encoding-version': '0.1.0' }, children: new Map() });
   const stored = await presentStore(plain, { container: 'hdf5', layout: 'file', name: 'x.h5ad' }, { formats, views });
   assert.deepEqual([stored.format, stored.root, stored.readerFormat], ['h5ad', plain, H5AD_FORMAT]);
   assert.equal((await presentStore(plain, { container: 'zarr', layout: 'zip', name: 'x.zarr.zip' })).format, 'zarr');
+  // A root with no AnnData mark (no encoding, no obs, var or X) is none of
+  // the formats, not AnnData to be refused for a part it lacks (F115).
+  const unmarked = viewGroup({ path: '/', attrs: {}, children: new Map() });
+  await assert.rejects(
+    presentStore(unmarked, { container: 'hdf5', layout: 'file', name: 'x.h5ad' }, { formats, views }),
+    error => error.details?.explained === true && /^x\.h5ad is an HDF5 file, but not in any format Cellucid reads from one \(Test view, AnnData \(\.h5ad\)/.test(error.message)
+  );
+  // A view's refusal is explained as the format it presents, whatever the name.
+  const refusing = { loom: { ...views['test-view'], recognize: () => true, view: () => { throw new AnnDataFormatError('its part is missing'); } } };
+  await assert.rejects(
+    presentStore(real, { container: 'hdf5', layout: 'file', name: 'x.h5' }, { views: refusing }),
+    error => error.details?.explained === true && /^This Loom \(\.loom\) file is not laid out as its format requires: its part is missing\./.test(error.message)
+  );
 
   const leaky = { ...views, 'test-view': { ...views['test-view'], view: () => viewGroup({ path: '/', attrs: {}, children: new Map() }) } };
   await assert.rejects(

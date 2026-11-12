@@ -41,6 +41,8 @@
  * instead of revealing an empty one.
  */
 
+import { setControlAvailability } from './control-availability.js';
+
 /**
  * Controls the bootstrap wires only after it has blocked on something.
  *
@@ -61,11 +63,14 @@ export const DEFERRED_CONTROL_IDS = Object.freeze([
 /** Control groups that exist in more than one copy. */
 export const DEFERRED_CONTROL_SELECTORS = Object.freeze(['.benchmark-preset']);
 
+/** Why a retired control waits (`setControlAvailability`). */
+export const STARTING_REASON = 'Cellucid is still starting; this control works once the viewer has started';
+
 /**
  * Deferred controls whose owner also keeps them unavailable for a reason of
  * its own (the forced LOD level while level of detail is off): control →
- * `() => boolean`, whether the owner offers it now.
- * @type {WeakMap<Element, () => boolean>}
+ * `() => string|null`, why the owner keeps it off now, or null.
+ * @type {WeakMap<Element, () => string|null>}
  */
 const ownerAvailability = new WeakMap();
 
@@ -76,12 +81,13 @@ const ownerAvailability = new WeakMap();
  * the retirement had already set) keeps it out.
  *
  * @param {Element} control
- * @param {() => boolean} isAvailable
+ * @param {() => string|null} unavailableReason - why the owner keeps it
+ *   off now, or null
  */
-export function ownDeferredAvailability(control, isAvailable) {
+export function ownDeferredAvailability(control, unavailableReason) {
   if (control === null || typeof control !== 'object') throw new TypeError('A deferred control must be an element.');
-  if (typeof isAvailable !== 'function') throw new TypeError('A deferred control\'s availability must be a function.');
-  ownerAvailability.set(control, isAvailable);
+  if (typeof unavailableReason !== 'function') throw new TypeError('A deferred control\'s availability must be a function.');
+  ownerAvailability.set(control, unavailableReason);
 }
 
 /**
@@ -104,7 +110,7 @@ export function retireDeferredControls(documentOwner) {
       );
     }
     if (control.disabled) continue;
-    control.disabled = true;
+    setControlAvailability(control, STARTING_REASON);
     retired.push(control);
   }
 
@@ -117,7 +123,7 @@ export function retireDeferredControls(documentOwner) {
     }
     for (const control of controls) {
       if (control.disabled) continue;
-      control.disabled = true;
+      setControlAvailability(control, STARTING_REASON);
       retired.push(control);
     }
   }
@@ -126,6 +132,6 @@ export function retireDeferredControls(documentOwner) {
   return function admitDeferredControls() {
     if (admitted) return;
     admitted = true;
-    for (const control of retired) control.disabled = !(ownerAvailability.get(control)?.() ?? true);
+    for (const control of retired) setControlAvailability(control, ownerAvailability.get(control)?.() ?? null);
   };
 }

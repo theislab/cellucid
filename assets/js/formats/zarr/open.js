@@ -36,7 +36,7 @@ import { deepFreeze, parseJson } from './json.js';
 import { parseV2Array, parseV3Array } from './metadata.js';
 import { createArrayNode } from './array.js';
 import { createGroupNode } from './group.js';
-import { ByteLru } from './cache.js';
+import { ByteCache } from '../io/byte-cache.js';
 import { DecodedBudget } from '../io/decoded-budget.js';
 import { createLimiter } from './stores/common.js';
 import { releaseIdleDecodeWorkers } from '../io/decode-pool.js';
@@ -85,7 +85,7 @@ async function readV2(store, keys, rootFetched, consolidatedWanted, options, sto
     consolidatedBytes = await store.get('.zmetadata', options);
   }
   // Keys compared in one Unicode form (`sameForm`): the documents name a
-  // node as written, a listing may hold it normalised (a ZIP reader's).
+  // node as written, a listing may hold it normalized (a ZIP reader's).
   const listed = keys === null ? null : new Set([...keys].map(sameForm));
   const covered = new Set();
   if (consolidatedWanted && consolidatedBytes) {
@@ -129,7 +129,7 @@ async function readV2(store, keys, rootFetched, consolidatedWanted, options, sto
 /**
  * A store key in one Unicode form (NFC), to compare what the documents name
  * (as written: a column `café` may be decomposed, as macOS writes it) with
- * what a listing holds (a ZIP reader's names are normalised,
+ * what a listing holds (a ZIP reader's names are normalized,
  * `zip/names.js`); the node keeps the documents' own form, which its
  * attributes name it by.
  */
@@ -310,10 +310,10 @@ export async function openZarr(store, {
   if (format !== 2 && format !== 3) throw new TypeError('openZarr: version must be 2 or 3.');
 
   const context = {
-    decoded: new ByteLru(decodedChunkCacheBytes),
+    decoded: new ByteCache(decodedChunkCacheBytes),
     // Shard indexes are the store's structure: kept while it is open, not
     // counted or trimmed as decoded chunks.
-    indexes: new ByteLru(new DecodedBudget(shardIndexCacheBytes, { structure: true })),
+    indexes: new ByteCache(new DecodedBudget(shardIndexCacheBytes, { structure: true })),
     // Chunks and shard indexes being read, shared by every read asking (`SharedWorks`).
     inflight: new SharedWorks(),
     decodeLimit: createLimiter(DECODE_CONCURRENCY),

@@ -3,6 +3,9 @@ import test from 'node:test';
 
 import { RemoteDataSource } from '../assets/js/data/remote-source.js';
 import { isExplainedFailure } from '../assets/js/data/data-source.js';
+import { isUnanswered } from '../assets/js/formats/io/byte-source.js';
+import { realmHosts } from '../assets/js/formats/io/hosts.js';
+import { isCancellation } from '../assets/js/utils/abort.js';
 
 function jsonResponse(value, status = 200) {
   return new Response(
@@ -386,13 +389,18 @@ test('an address that answers but is no Cellucid server says so, and how to open
   }
 });
 
-function streamingResponse(chunks, { failure = null } = {}) {
+function streamingResponse(chunks, { failure = null, signal = null } = {}) {
   const encoder = new TextEncoder();
   return new Response(
     new ReadableStream({
       start(controller) {
         for (const chunk of chunks) {
           controller.enqueue(encoder.encode(chunk));
+        }
+        if (failure === 'hang') {
+          // A body still arriving ends with its request, as fetch's does.
+          signal?.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+          return;
         }
         if (failure === null) {
           controller.close();
@@ -407,7 +415,7 @@ function streamingResponse(chunks, { failure = null } = {}) {
 
 test('a remote body failure is reported by its own cause, never as bad JSON', async t => {
   // A response body can fail in ways that are not the server sending malformed
-  // data: the reader can be cancelled, the connection can drop mid-transfer, or
+  // data: the reader can be canceled, the connection can drop mid-transfer, or
   // the payload can be refused for exceeding its ceiling. Reporting all of them
   // as "must contain valid JSON" tells the user the server is broken when it is
   // not, and hides their own cancellation entirely.
@@ -432,13 +440,13 @@ test('a remote body failure is reported by its own cause, never as bad JSON', as
       ),
     },
     {
+      // The connection closed while the body arrives (the transport reads
+      // it, under the connection's own signal).
       name: 'a cancelled read stays a cancellation',
-      failure: Object.assign(new Error('reader was cancelled'), {
-        name: 'AbortError',
-      }),
+      failure: 'hang',
       chunks: ['{"status": '],
       expect: error => (
-        error.name === 'AbortError' &&
+        isCancellation(error) &&
         !/must contain valid JSON/i.test(error.message)
       ),
     },
@@ -446,21 +454,47 @@ test('a remote body failure is reported by its own cause, never as bad JSON', as
 
   for (const testCase of cases) {
     await t.test(testCase.name, async subTest => {
-      installFetch(subTest, url => {
+      let answered;
+      const asked = new Promise(resolve => {
+        answered = resolve;
+      });
+      installFetch(subTest, (url, options) => {
         if (!url.endsWith('/_cellucid/health')) {
           return jsonResponse({}, 404);
         }
+        answered();
         return streamingResponse(testCase.chunks, {
           failure: testCase.failure,
+          signal: options.signal ?? null,
         });
       });
       const source = new RemoteDataSource();
-      await assert.rejects(
-        source.connect({ url: 'http://127.0.0.1:8765' }),
-        testCase.expect
-      );
+      const connecting = source.connect({ url: 'http://127.0.0.1:8765' });
+      if (testCase.failure === 'hang') {
+        await asked;
+        source.disconnect();
+      }
+      await assert.rejects(connecting, testCase.expect);
     });
   }
+});
+
+test('a server is asked through the one transport: its host\'s book hears it, and no answer is failed as one (RCD-2)', async t => {
+  installCanonicalServer(t, { origin: 'http://127.0.0.1:8781' });
+  const source = new RemoteDataSource();
+  await source.connect({ url: 'http://127.0.0.1:8781' });
+  assert.equal(realmHosts.answeredBefore('http://127.0.0.1:8781/_cellucid/health'), true, 'counted in the book of hosts');
+  source.disconnect();
+
+  // No answer: the transport's failure with its host under the network
+  // error, never the browser's bare TypeError (read as Cellucid's own fault).
+  installFetch(t, () => {
+    throw new TypeError('Failed to fetch');
+  });
+  await assert.rejects(
+    new RemoteDataSource().connect({ url: 'http://127.0.0.1:8782' }),
+    error => error.code === 'NETWORK_ERROR' && isUnanswered(error.details.cause) && error.details.cause.details.host === '127.0.0.1:8782'
+  );
 });
 
 test('disconnected dataset operations fail instead of reporting empty success', async () => {

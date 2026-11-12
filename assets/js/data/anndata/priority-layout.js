@@ -40,7 +40,7 @@
  */
 
 import { isArrayNode, isGroup } from '../../formats/store.js';
-import { child } from './elements.js';
+import { AnnDataFormatError, child } from './elements.js';
 import { readIntegers } from './values.js';
 import { SUBSAMPLE_SPEC_VERSION, rankOf, rankOrder } from '../subsample.js';
 import { formatCountOf } from '../../utils/format-units.js';
@@ -202,7 +202,7 @@ async function verifiedLayout(root, nObs, readOptions) {
     if (stored32 !== null) {
       for (let row = 0; row < stored32.length; row++) {
         if (positions[row] !== stored32[row]) {
-          throw new Error(`obs['${PRIORITY_ORIGINAL_COLUMN}'] row ${row} is ${stored32[row]}, and the file's priority seed places ${positions[row]} there; the file is damaged`);
+          throw new AnnDataFormatError(`obs['${PRIORITY_ORIGINAL_COLUMN}'] row ${row} is ${stored32[row]}, and the file's priority seed places ${positions[row]} there; the file is damaged`);
         }
       }
     }
@@ -229,7 +229,7 @@ export async function readPrefixCounts(root, level, nVars, readOptions = {}, { l
   const node = child(child(root, 'varm'), PREFIX_COUNTS_KEY);
   if (!isArrayNode(node) || node.shape[0] !== nVars) return null;
   if (node.shape.length !== 2 || !(level < node.shape[1])) {
-    throw new Error(`varm['${PREFIX_COUNTS_KEY}'] has no column ${level} for uns['cellucid']['priority']['levels']`);
+    throw new AnnDataFormatError(`varm['${PREFIX_COUNTS_KEY}'] has no column ${level} for uns['cellucid']['priority']['levels']`);
   }
   const read = await node.read([[0, nVars], [level, level + 1]], readOptions);
   const values = allocateTypedArray(Float64Array, read.length, `varm['${PREFIX_COUNTS_KEY}']`);
@@ -239,7 +239,7 @@ export async function readPrefixCounts(root, level, nVars, readOptions = {}, { l
     const limit = Math.min(levelRows ?? Infinity, entryCounts === null ? Infinity : entryCounts(gene));
     if (!(Number.isInteger(count) && count >= 0 && count <= limit)) {
       const rowsOf = levelRows === null ? "the level's rows" : `the first ${formatCountOf(levelRows, 'row')}`;
-      throw new Error(`varm['${PREFIX_COUNTS_KEY}'] counts ${formatCountOf(count, 'value')} of gene ${gene} in ${rowsOf}, more than it can hold; the file is damaged`);
+      throw new AnnDataFormatError(`varm['${PREFIX_COUNTS_KEY}'] counts ${formatCountOf(count, 'value')} of gene ${gene} in ${rowsOf}, more than it can hold; the file is damaged`);
     }
   }
   return values;
@@ -256,6 +256,6 @@ export function requirePrefixRows(rows, read, count, levelRows, gene) {
     ? `its value ${count} is at row ${rows[count - 1]}`
     : read > count && rows[count] < levelRows ? `its value ${count + 1}, at row ${rows[count]}, is below the level too` : null;
   if (fault !== null) {
-    throw new Error(`varm['${PREFIX_COUNTS_KEY}'] counts ${formatCountOf(count, 'value')} of gene ${gene} in the first ${formatCountOf(levelRows, 'row')}, and ${fault}; the file is damaged`);
+    throw new AnnDataFormatError(`varm['${PREFIX_COUNTS_KEY}'] counts ${formatCountOf(count, 'value')} of gene ${gene} in the first ${formatCountOf(levelRows, 'row')}, and ${fault}; the file is damaged`);
   }
 }

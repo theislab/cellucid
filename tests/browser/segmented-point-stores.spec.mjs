@@ -283,7 +283,7 @@ for (const pattern of ['atlas', 'flatumap']) {
     expect(split.cameras[1]).toEqual(split.cameras[0]);
     expect(split.highlightStoreViews[1]).toBe(split.highlightStoreViews[0]);
     expect(split.storeWordDifference, 'first position word that differs').toBe(-1);
-    expect(split.colorWordDifference, 'first colour word that differs').toBe(-1);
+    expect(split.colorWordDifference, 'first color word that differs').toBe(-1);
     const differing = Object.entries(split.frames).filter(([, frame]) => frame.differing.length > 0);
     if (differing.length > 0) {
       // What drew each frame, for a run that differs: the context and

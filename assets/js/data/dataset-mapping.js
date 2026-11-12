@@ -4,7 +4,7 @@
  *
  * A data mapping (see `data-mapping.js`) names, for one dataset, the embeddings
  * it can be shown with and each dimension's default, the vector fields bound
- * to embeddings, the neighbour graph, gene names, expression matrix, each
+ * to embeddings, the neighbor graph, gene names, expression matrix, each
  * matrix's log1p, the highly variable genes, the latent space and, for a
  * multimodal dataset, the modality. It is
  * recorded in every session fingerprint, so a session is restored only onto
@@ -27,6 +27,7 @@ import {
   ANNDATA_KIND,
   DIMENSION_SLOTS,
   compareCodePoints,
+  expressionMatrixName,
   requireMappingModality,
   validateDataMapping,
   validateEmbeddingRef,
@@ -43,7 +44,7 @@ export const UNCHANGEABLE_GROUP_CLAUSE = 'cannot be changed for this dataset';
 
 /** The words every mapping group is named with in a sentence. */
 export const MAPPING_GROUP_LABELS = Object.freeze({
-  knn: 'neighbour graph',
+  knn: 'neighbor graph',
   modality: 'modality',
   geneNames: 'gene names',
   expression: 'expression matrix',
@@ -77,21 +78,17 @@ export function describeMappingGroupValue(group, value) {
     return value === 'index' ? 'the var index' : `var column '${value.slice('column:'.length)}'`;
   }
   if (group === 'expression') {
-    return describeExpressionMatrix(value);
+    return expressionMatrixName(value);
   }
   if (group === 'highlyVariable') return `var column '${value}'`;
   if (group === 'log1p') {
     const matrices = Object.keys(value);
     if (matrices.length === 0) return 'values as stored';
     return `log1p of ${matrices.map(matrix => (
-      `${describeExpressionMatrix(matrix)} (${describeLog1pBase(value[matrix].base)})`
+      `${expressionMatrixName(matrix)} (${describeLog1pBase(value[matrix].base)})`
     )).join(', ')}`;
   }
   return JSON.stringify(value);
-}
-
-function describeExpressionMatrix(value) {
-  return value.startsWith('layer:') ? `layers['${value.slice('layer:'.length)}']` : value;
 }
 
 function describeLog1pBase(base) {
@@ -108,7 +105,7 @@ function describeLog1pBase(base) {
  */
 export function describeLog1pRefuted(refuted) {
   if (refuted.length === 0) return { text: '', detail: '' };
-  const names = refuted.map(entry => describeExpressionMatrix(entry.matrix));
+  const names = refuted.map(entry => expressionMatrixName(entry.matrix));
   const largest = refuted.reduce((a, b) => (b.value > a.value ? b : a));
   const shown = largest.value >= 1000 ? formatCount(Math.round(largest.value)) : formatSignificant(largest.value, 4);
   const total = largest.total === null ? 'more than any number' : `about ${largest.total.toExponential(1)}`;
@@ -277,7 +274,7 @@ export function resolveEmbeddingRefLayout(dimensionManager, ref, dimension, labe
 
 /**
  * Describe one embedding reference the way the person reading a refusal
- * would recognise it.
+ * would recognize it.
  *
  * @param {{key: string, columns: number[]}} ref
  * @returns {string}

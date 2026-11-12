@@ -33,7 +33,7 @@
  *   first, until each has `PROBE_PHASES` phases after it, and the decoder
  *   of the most bytes per busy millisecond over all its phases, the warm-up
  *   included, is kept: a person's reads are short (a gene is a few chunks a
- *   worker), so a decoder fast only once its engine has optimised it (cold
+ *   worker), so a decoder fast only once its engine has optimized it (cold
  *   WebAssembly in Chromium) is charged what it costs cold.
  *   A chunk a person's read sends meanwhile voids the phase under way (its
  *   contention is no longer one decoder's): it is measured again later.
@@ -78,7 +78,7 @@ export const DECODERS = Object.freeze({
  * the pool, LZ4 3,606 against 2,938, Blosc-LZ4 1,935 against 902) and
  * fflate faster than its own DEFLATE stream on small chunks (620 against
  * 115); WebKit runs the references fastest. Chromium (Blink) runs
- * WebAssembly fastest once V8 has optimised it, but a read of a gene finds
+ * WebAssembly fastest once V8 has optimized it, but a read of a gene finds
  * it cold in each decode worker (compiled there, still in its baseline
  * tier): the first gene of a 10M-cell store, same tree, JavaScript against
  * WebAssembly, zstd 175-244 against 386-678 ms, bit-shuffled Blosc-LZ4

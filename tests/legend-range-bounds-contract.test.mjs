@@ -1,7 +1,7 @@
 /**
  * The range filter's slider and number boxes (`ui/modules/legend/range-bounds.js`,
  * audit NS-10): a slider moves in thousandths of its track and sets the
- * shortest decimal that tells its step apart; a log colour scale spaces the
+ * shortest decimal that tells its step apart; a log color scale spaces the
  * track in log units (the zeros at its first step); a typed bound is exact.
  */
 import assert from 'node:assert/strict';

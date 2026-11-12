@@ -1,6 +1,6 @@
 /**
  * The bytes of an R file as one stream: read in order, the compression its
- * first bytes name taken off, the `save()` magic recognised.
+ * first bytes name taken off, the `save()` magic recognized.
  *
  * - gzip (`1f 8b`, `saveRDS` and `save` by default): the platform's
  *   `DecompressionStream`, fed in slices so a highly compressible stretch
@@ -41,7 +41,7 @@ const STREAM_AHEAD = 3;
  * one before, up to `STREAM_PIECE_BYTES`, with as many requests run ahead
  * as pieces have arrived, up to `STREAM_AHEAD`. A reader that needs only a file's
  * start (a MatrixMarket size line, an R object's class, a table's header)
- * stops after one small request (the next, asked as it arrived, cancelled),
+ * stops after one small request (the next, asked as it arrived, canceled),
  * not after `STREAM_AHEAD` large ones; one that reads on reaches full-size
  * pieces within six requests.
  */
@@ -242,7 +242,7 @@ async function* gunzipOnWorker(worker, pieces, signal) {
       if (feedError !== null) throw feedError;
       if (signal?.aborted) throw abortReason(signal);
       if (failure !== null) {
-        throw new RdsFormatError(`The gzip stream could not be decompressed (${failure}); the file is damaged or truncated.`);
+        throw new RdsFormatError(gzipFailureText(failure));
       }
       if (outputs.length === 0) break;
       const batch = outputs.shift();
@@ -258,6 +258,15 @@ async function* gunzipOnWorker(worker, pieces, signal) {
     stopWaking();
     worker.terminate();
   }
+}
+
+/**
+ * A gzip stream that could not be decompressed, with the decompressor's
+ * reason where it names one (a browser's may name none).
+ */
+function gzipFailureText(reason) {
+  const said = String(reason ?? '').trim();
+  return `The gzip stream could not be decompressed${said === '' ? '' : ` (${said})`}; the file is damaged or truncated.`;
 }
 
 /**
@@ -310,7 +319,7 @@ async function* gunzip(pieces, signal, bytes) {
       } catch (error) {
         ended = true;
         if (feedError !== null) throw feedError;
-        throw new RdsFormatError(`The gzip stream could not be decompressed (${error?.message ?? error}); the file is damaged or truncated.`, { cause: error });
+        throw new RdsFormatError(gzipFailureText(error?.message ?? error), { cause: error });
       }
       if (result.done) {
         ended = true;
@@ -324,7 +333,7 @@ async function* gunzip(pieces, signal, bytes) {
     if (feedError !== null) throw feedError;
   } finally {
     // A reader that stops early leaves the read asked for ahead: the stream
-    // is cancelled, which settles it. The reader is dropped, never released
+    // is canceled, which settles it. The reader is dropped, never released
     // (`formats/io/inflate.js` says why).
     if (!ended) await reader.cancel().catch(() => {});
   }

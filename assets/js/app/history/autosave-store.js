@@ -96,39 +96,6 @@ export class SavedStateRecordsGone extends Error {
   }
 }
 
-/**
- * The IndexedDB database Cellucid 0.9.6 kept unsaved highlights in
- * (`app/highlight-draft.js`, removed): saved states replace those drafts, and
- * nothing reads it any more.
- */
-export const RETIRED_HIGHLIGHT_DRAFTS_DATABASE = 'cellucid-highlight-drafts';
-
-/**
- * Delete the retired highlight-drafts database from this browser: dead data
- * that counts against the origin's storage, which saved states share. This
- * deletes, it migrates nothing, and it names that one database exactly (no
- * prefix, no listing). Runs once when the highlight controls start. A 0.9.6
- * page still open in another tab blocks the deletion until it closes; nothing
- * waits for it, and a browser without IndexedDB, or refusing it, starts all
- * the same.
- *
- * @param {IDBFactory|null} [factory] - the page's indexedDB when not given
- * @returns {boolean} whether the deletion was requested
- */
-export function deleteRetiredHighlightDrafts(factory = undefined) {
-  try {
-    // Reading indexedDB itself throws where site data is blocked.
-    factory = factory === undefined ? globalThis.indexedDB : factory;
-    if (!factory || typeof factory.deleteDatabase !== 'function') return false;
-    const request = factory.deleteDatabase(RETIRED_HIGHLIGHT_DRAFTS_DATABASE);
-    // A failure leaves only dead data behind: it is not the page's error.
-    if (request) request.onerror = event => event?.preventDefault?.();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /** The page's store, opened once (null without IndexedDB). */
 let pageStore;
 

@@ -163,3 +163,57 @@ test('every form-based mode publishes through the one result owner', async () =>
   );
   assert.ok(path.basename(owner).length > 0);
 });
+
+test('a preview\'s Expand opens only its published result: disabled while the result is drawn, enabled once published', async t => {
+  // Found 2026-11-10 on Suo (DE of 562k cells): the preview and its Expand were drawn, the result
+  // was published after the rest of the drawing, and Expand clicked in between said "Expanded
+  // analysis view requires a completed analysis result".
+  // The few DOM calls `_renderPreviewExpandAction` makes, on plain objects (this suite runs without a DOM).
+  const element = tag => {
+    const el = { tagName: tag, children: [], disabled: false, title: '', className: '', parentElement: null,
+      appendChild(child) { child.parentElement = el; el.children.push(child); return child; },
+      querySelector() { return null; } };
+    return el;
+  };
+  globalThis.document = { createElement: element };
+  globalThis.HTMLElement = Object;
+  t.after(() => {
+    delete globalThis.document;
+    delete globalThis.HTMLElement;
+  });
+  const ui = publisher();
+  ui._showCellChoice = () => {};
+  ui._openCells = () => null;
+  ui._resultGeneSample = () => null;
+  ui._publishDerivedResultsSafely = () => {};
+  ui._createExpandButton = () => document.createElement('button');
+  ui._resultContainer = document.createElement('div');
+  const button = ui._renderPreviewExpandAction(RESULT_A);
+  assert.equal(button.disabled, true, 'drawn before its result is published: not yet');
+  await ui._publishAnalysisResult(RESULT_A);
+  assert.equal(button.disabled, false, 'published: it opens');
+  // A preview drawn again for the published result (new plot options) is live at once.
+  assert.equal(ui._renderPreviewExpandAction(RESULT_A).disabled, false);
+});
+
+test('every mode draws its preview from the result itself, so its Expand opens once that result is published', async () => {
+  // Found 2026-11-10: composition drew its preview from a copy (`{...result, options}`, to leave the
+  // legend out), so the Expand drawn for the copy never matched the published result and stayed
+  // disabled ("Opens once the result is drawn"). Other plot options go in `plotOptions`.
+  const offenders = [];
+  const walk = async (directory, prefix) => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const relative = prefix + entry.name;
+      if (entry.isDirectory()) {
+        await walk(new URL(`${entry.name}/`, directory), `${relative}/`);
+        continue;
+      }
+      if (!entry.name.endsWith('.js')) continue;
+      const source = await readFile(new URL(entry.name, directory), 'utf8');
+      const copies = source.match(/_render(?:PreviewPlot\(\{\s*result:\s*\{|PreviewExpandAction\(\s*\{)/g) ?? [];
+      if (copies.length > 0) offenders.push(`${relative} (${copies.length})`);
+    }
+  };
+  await walk(ANALYSIS_TYPES_DIR, '');
+  assert.deepEqual(offenders, [], 'pass the result itself, and other plot options as `plotOptions`');
+});

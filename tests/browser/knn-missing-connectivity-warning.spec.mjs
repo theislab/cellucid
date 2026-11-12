@@ -8,7 +8,7 @@ import { openCollapsedPanels } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
 
 /**
- * A dataset either ships a neighbour graph or it does not, and that fact
+ * A dataset either ships a neighbor graph or it does not, and that fact
  * cannot change while the dataset is published. The renderer asks main.js for
  * KNN edges whenever KNN mode is entered and again on every Alt+drag, so the
  * absence has to be announced once per dataset generation — not once per
@@ -19,7 +19,7 @@ const PREPARED_DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
   + '&dataset=current-ui&acceptance=knn-missing-connectivity-warning-ci';
 
-const MISSING_GRAPH_MESSAGE = 'No neighbor graph available for this dataset';
+const MISSING_GRAPH_MESSAGE = 'This dataset has no neighbor graph, so KNN drag cannot select by neighbors; use Proximity drag or Lasso.';
 
 const h5adFixturePath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -30,7 +30,7 @@ const h5adFixturePath = path.join(
 /**
  * Record every warning the app publishes, so the assertions below count
  * emissions rather than surviving DOM nodes. Toasts auto-dismiss after five
- * seconds and the centre caps itself at five visible items, so a live-DOM
+ * seconds and the center caps itself at five visible items, so a live-DOM
  * count alone would hide exactly the stacking this test exists to catch.
  */
 async function recordPublishedWarnings(page) {

@@ -1,6 +1,7 @@
 // @ts-check
 
 import { StyleManager } from '../../../utils/style-manager.js';
+import { bytesOfHex } from '../../../utils/hex-color.js';
 
 /**
  * @typedef {Object} PlotTheme
@@ -121,19 +122,12 @@ function withAlpha(color, alpha) {
   }
 
   const hex = color.trim();
-  const hexMatch = hex.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
-  if (!hexMatch) {
+  // `#rgb` or `#rrggbb` (a theme's colors carry no alpha of their own).
+  const bytes = hex.length === 9 ? null : bytesOfHex(hex);
+  if (bytes === null) {
     throw new TypeError(`Unsupported Plot theme color: ${color}`);
   }
-
-  const hexBody = hexMatch[1];
-  const full = hexBody.length === 3
-    ? hexBody.split('').map((c) => c + c).join('')
-    : hexBody;
-
-  const r = Number.parseInt(full.slice(0, 2), 16);
-  const g = Number.parseInt(full.slice(2, 4), 16);
-  const b = Number.parseInt(full.slice(4, 6), 16);
+  const [r, g, b] = bytes;
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 

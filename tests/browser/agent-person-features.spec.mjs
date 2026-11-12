@@ -13,7 +13,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { expectDownloadNamed } from './helpers/downloads.mjs';
 import {
-  CELL_TYPE, agentRequests, installScriptedModel, observeProductErrors, openAgentDataset, openChat, queueReplies,
+  CELL_TYPE, SCORE, agentRequests, installScriptedModel, observeProductErrors, openAgentDataset, openChat, queueReplies,
   resultJson, waitForTurnEnd,
 } from './helpers/agent-chat.mjs';
 
@@ -49,14 +49,17 @@ async function callTool(page, name, args, { asks = null, answer = 'allow' } = {}
   return lastResult(page, name);
 }
 
-/** The person's own steps, so the tour and the report have something to show. */
+/**
+ * The person's own steps, so the tour and the report have something to show
+ * (the dataset opens colored by cell_type, its first coloring: score is a step).
+ */
 async function makeSteps(page) {
   await page.evaluate(async field => {
     const { getActions } = await import('/assets/js/app/actions/index.js');
     const actions = getActions();
     await actions.dispatch('color.by', { field });
     await actions.dispatch('highlight.cells', { cells: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] });
-  }, CELL_TYPE);
+  }, SCORE);
 }
 
 async function setSummariesOnly(page, on) {
@@ -211,7 +214,7 @@ test.describe('agent: what a person does', () => {
     expect(suggestions.isError).toBe(true);
     expect(suggestions.text).toContain('Community annotation is not connected for the dataset shown');
     // A vote is asked about once it is known to publish something (`confirmAt: 'handler'`): refused first, nothing asked.
-    const vote = await callTool(page, 'annotation_vote', { field: CELL_TYPE, category: 'T cells', suggestion: 'CD4+ T cell', vote: 'up' });
+    const vote = await callTool(page, 'annotation_publish', { votes: [{ field: CELL_TYPE, category: 'T cells', suggestion: 'CD4+ T cell', vote: 'up' }] });
     expect(vote.isError).toBe(true);
     expect(vote.text).toContain('Community annotation is not connected for the dataset shown');
     expect(errors).toEqual([]);

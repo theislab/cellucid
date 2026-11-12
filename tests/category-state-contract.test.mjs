@@ -1,5 +1,5 @@
 /**
- * Per-category state (K-13): a categorical field's colours and visibility are
+ * Per-category state (K-13): a categorical field's colors and visibility are
  * typed arrays never written in place (`app/utils/category-state.js`), so
  * kept views share them until one changes them, and each array (and each
  * category list) is checked once, not on every action.
@@ -57,13 +57,13 @@ test('a kept view shares its source\'s category arrays until either changes one,
   assert.deepEqual(Array.from(hiddenCategoryBytes(kept._categoryVisible)), [1, 0, 0, 0, 0]);
   withCategoriesVisible(kept, false, index => index > 2);
   assert.deepEqual(Array.from(kept._categoryVisible), [0, 1, 1, 0, 0]);
-  // Carried to another list by position: a new category opens shown, in its colour.
+  // Carried to another list by position: a new category opens shown, in its color.
   const carried = carriedCategoryState({ colors: kept._categoryColors, visible: kept._categoryVisible }, 2, index => (index === 0 ? 3 : -1), () => [0, 1, 0]);
   assert.deepEqual(Array.from(carried.visible), [0, 1]);
   assert.deepEqual(Array.from(carried.colors.subarray(3, 6)), [0, 255, 0]);
 });
 
-test('a field of a million categories is checked once: a later colouring, a view and a toggle cost no pass over its categories', async () => {
+test('a field of a million categories is checked once: a later coloring, a view and a toggle cost no pass over its categories', async () => {
   const color = Object.create(DataStateColorMethods.prototype);
   const field = categoryField(1_000_000);
   color.ensureCategoryMetadata(field);
@@ -91,7 +91,7 @@ test('a category list renamed in place is checked again; a wrong state is refuse
   assert.throws(() => color.ensureCategoryMetadata({ ...categoryField(2), _categoryColors: new Uint8Array(3) }), /one RGB triplet per category/);
 });
 
-test('no module writes a category colour or visibility in place', async () => {
+test('no module writes a category color or visibility in place', async () => {
   const offenders = [];
   const walk = async directory => {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -107,7 +107,7 @@ test('no module writes a category colour or visibility in place', async () => {
   assert.deepEqual(offenders, []);
 });
 
-test('a category is read through one set of accessors: its colour as channels or CSS, whether it is shown', () => {
+test('a category is read through one set of accessors: its color as channels or CSS, whether it is shown', () => {
   const color = Object.create(DataStateColorMethods.prototype);
   const field = categoryField(3);
   color.ensureCategoryMetadata(field);
@@ -117,7 +117,7 @@ test('a category is read through one set of accessors: its colour as channels or
   assert.equal(categoryCssAt(field._categoryColors, 1), 'rgb(255,128,0)');
   assert.equal(fieldCategoryCss(field, 1), 'rgb(255,128,0)');
   assert.deepEqual([0, 1, 2].map(index => categoryShownAt(field._categoryVisible, index)), [true, true, false]);
-  // A field no view has coloured is read in the colour it opens with, and
+  // A field no view has colored is read in the color it opens with, and
   // the read makes no state for it.
   const fresh = categoryField(2);
   const opening = defaultCategoryColors(fresh);
@@ -125,8 +125,8 @@ test('a category is read through one set of accessors: its colour as channels or
   assert.equal(fresh._categoryColors, undefined);
 });
 
-test('nothing reads category colours or visibility in a shape they no longer have, the browser specs included', async () => {
-  // Colours are RGB bytes, three a category, and visibility a byte a
+test('nothing reads category colors or visibility in a shape they no longer have, the browser specs included', async () => {
+  // Colors are RGB bytes, three a category, and visibility a byte a
   // category (1 shown): an element is never an array, never a boolean, and
   // the arrays are never tested as plain arrays. A browser spec reads them
   // through the state (`getColorForCategory`, `getLegendModel`), not the

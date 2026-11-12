@@ -1,5 +1,5 @@
 /**
- * Category colours and visibility as the app holds them
+ * Category colors and visibility as the app holds them
  * (`assets/js/app/utils/category-state.js`: RGB bytes, three a category, and
  * a byte a category, 1 shown), made from and read back as the lists a test
  * writes.
@@ -20,13 +20,13 @@ export function visibleOf(flags) {
   return Uint8Array.from(list, flag => (flag ? 1 : 0));
 }
 
-/** A field's colours as `[r, g, b]` triplets, channels from 0 to 1 (bytes over 255). */
+/** A field's colors as `[r, g, b]` triplets, channels from 0 to 1 (bytes over 255). */
 export function rgbListOf(field) {
   const colors = field._categoryColors;
   return Array.from({ length: colors.length / 3 }, (_, index) => [colors[index * 3] / 255, colors[index * 3 + 1] / 255, colors[index * 3 + 2] / 255]);
 }
 
-/** A field's colours as byte triplets. */
+/** A field's colors as byte triplets. */
 export function byteListOf(field) {
   const colors = field._categoryColors;
   return Array.from({ length: colors.length / 3 }, (_, index) => [colors[index * 3], colors[index * 3 + 1], colors[index * 3 + 2]]);
@@ -37,7 +37,7 @@ export function visibleListOf(field) {
   return Array.from(field._categoryVisible, flag => flag === 1);
 }
 
-/** Category `index`'s colour of `field`, channels from 0 to 1 (its bytes over 255). */
+/** Category `index`'s color of `field`, channels from 0 to 1 (its bytes over 255). */
 export function rgbAt(field, index) {
   return rgbListOf(field)[index];
 }

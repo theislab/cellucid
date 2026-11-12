@@ -14,7 +14,10 @@
  */
 
 import assert from 'node:assert/strict';
+import { readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { createDomId } from '../assets/js/app/ui/components/dom-id.js';
 
@@ -124,4 +127,71 @@ test('there is exactly one DOM id generator in the tree', async () => {
     [],
     'DOM ids come from components/dom-id.js'
   );
+});
+
+// A minted id is recognized by its form, so the page keeps nothing per id it
+// mints (F123, LC-5: a set of every minted id grew for the page's life).
+
+test('a minted id holds the reserved separator, and is recognised by it with nothing kept', async () => {
+  const { isGeneratedDomId, MINTED_ID_SEPARATOR } = await import('../assets/js/app/ui/components/dom-id.js');
+  assert.equal(MINTED_ID_SEPARATOR, '--');
+  const id = createDomId('legend-range');
+  assert.match(id, /^legend-range--[0-9a-z]+$/);
+  assert.equal(isGeneratedDomId(id), true);
+  // Made from a minted id: names nothing on another page either.
+  assert.equal(isGeneratedDomId(`${id}-trigger`), true);
+  assert.equal(isGeneratedDomId(`${id}-method-x`), true);
+  // Written by hand: never.
+  for (const authored of ['dataset-select', 'hp-antialias', 'categorical-field', 'a-b-c', '']) {
+    assert.equal(isGeneratedDomId(authored), false, authored);
+  }
+  assert.equal(isGeneratedDomId(null), false);
+  // No prefix may forge the separator.
+  assert.throws(() => createDomId('a--b'), /prefix/);
+  assert.throws(() => createDomId('trailing-'), /prefix/);
+  const source = readFileSync(new URL('../assets/js/app/ui/components/dom-id.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /new (?:Set|Map|WeakMap|WeakSet)\b/, 'nothing is kept per minted id');
+});
+
+/** Every file under `dir` whose name ends with one of `extensions`. */
+function filesUnder(dir, extensions) {
+  const out = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+      out.push(...filesUnder(full, extensions));
+    } else if (extensions.some(extension => entry.name.endsWith(extension))) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+test('no id written by hand holds the minted separator, so only a minted id is taken for one', () => {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const pages = readdirSync(root).filter(name => name.endsWith('.html')).map(name => path.join(root, name));
+  const sources = filesUnder(path.join(root, 'assets', 'js'), ['.js', '.mjs']);
+  // An id as a literal: an HTML attribute, a property, a record field, an
+  // attribute set, or an id looked up by name.
+  const literal = [
+    /\bid\s*=\s*"([^"$]*)"/g,
+    /\bid\s*=\s*'([^'$]*)'/g,
+    /\.id\s*=\s*['"`]([^'"`$]*)['"`]/g,
+    /\bid:\s*['"`]([^'"`$]*)['"`]/g,
+    /setAttribute\(\s*['"]id['"]\s*,\s*['"`]([^'"`$]*)['"`]/g,
+    /getElementById\(\s*['"`]([^'"`$]*)['"`]/g,
+    /querySelector(?:All)?\(\s*['"`]#([\w-]+)/g,
+  ];
+  const offenders = [];
+  for (const file of [...pages, ...sources]) {
+    const text = readFileSync(file, 'utf8');
+    for (const pattern of literal) {
+      for (const match of text.matchAll(pattern)) {
+        if (match[1].includes('--')) offenders.push(`${path.relative(root, file)}: ${match[1]}`);
+      }
+    }
+  }
+  assert.ok(pages.includes(path.join(root, 'index.html')));
+  assert.deepEqual(offenders, []);
 });

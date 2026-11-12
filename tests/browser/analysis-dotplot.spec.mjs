@@ -16,10 +16,11 @@ const CELLS = 300;
 const GENES = ['CD3E', 'CD8A', 'MS4A1', 'CD79A', 'LYZ', 'NKG7'];
 const GROUPS = ['T', 'B', 'Mono'];
 
-function fixture() {
-  const group = Int8Array.from({ length: CELLS }, (_, cell) => cell % 3);
-  const X = new Float32Array(CELLS * GENES.length);
-  for (let cell = 0; cell < CELLS; cell++) {
+function fixture(groups = GROUPS) {
+  const cells = Math.max(CELLS, groups.length * 10);
+  const group = Int8Array.from({ length: cells }, (_, cell) => cell % groups.length);
+  const X = new Float32Array(cells * GENES.length);
+  for (let cell = 0; cell < cells; cell++) {
     for (let gene = 0; gene < GENES.length; gene++) {
       const marker = Math.floor(gene / 2) === group[cell];
       X[cell * GENES.length + gene] = marker
@@ -28,13 +29,13 @@ function fixture() {
     }
   }
   return anndataZarrZip({
-    cells: CELLS,
+    cells,
     genes: [...GENES],
     X,
-    obs: { cluster: { categories: [...GROUPS], codes: group } },
+    obs: { cluster: { categories: [...groups], codes: group } },
     obsm: {
       X_umap: {
-        data: Float32Array.from({ length: CELLS * 2 }, (_, index) => Math.cos(index * 0.41) * 3),
+        data: Float32Array.from({ length: cells * 2 }, (_, index) => Math.cos(index * 0.41) * 3),
         columns: 2,
       },
     },
@@ -42,8 +43,8 @@ function fixture() {
   });
 }
 
-async function serve(page) {
-  const bytes = fixture();
+async function serve(page, groups) {
+  const bytes = fixture(groups);
   const file = `${DATASET}.zarr.zip`;
   const catalog = JSON.stringify({ schema: 2, default: DATASET, datasets: [{ id: DATASET, path: file }] });
   const prefix = new URL(ROOT).pathname;
@@ -70,11 +71,11 @@ function observeProductErrors(page) {
   return errors;
 }
 
-async function openDotplot(page) {
-  await serve(page);
+async function openDotplot(page, groups = GROUPS) {
+  await serve(page, groups);
   await page.goto(`/?sampleCatalog=${encodeURIComponent(ROOT)}&dataset=${DATASET}`, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
-  await page.waitForFunction(count => window._comparisonModule?.state?.pointCount === count, CELLS);
+  await page.waitForFunction(count => window._comparisonModule?.state?.pointCount === count, Math.max(CELLS, groups.length * 10));
   await page.evaluate(() => { document.getElementById('page-analysis-section').open = true; });
   const header = page.locator('#analysis-header-dotplot');
   await header.scrollIntoViewIfNeeded();
@@ -127,7 +128,7 @@ test('genes in sets, brackets, a not-found chip, display without reading, dendro
   await expect(panel.locator('.analysis-chip', { hasText: '1 not found' })).toBeVisible();
   // T markers are highest in T: fraction 0.75 (one cell in four is zero).
   expect(first.fraction[0 * 3 + 0]).toBeCloseTo(0.75, 10);
-  // Three sets: three brackets of three lines each, labelled.
+  // Three sets: three brackets of three lines each, labeled.
   // The size legend's five dots are shapes too (circles), beside the brackets.
   const shapes = await panel.locator('.js-plotly-plot').evaluate(element => element.layout.shapes.map(shape => shape.type));
   expect(shapes.filter(type => type === 'line')).toHaveLength(9);
@@ -196,3 +197,79 @@ test('matrix plot draws the same means as cells', async ({ page }) => {
   await expect(panel.locator('.analysis-stale-chip')).toHaveCount(0);
   expect(errors).toEqual([]);
 });
+
+/**
+ * The drawn names of a dot plot: the genes across (tick labels) and the
+ * groups down (annotations), each with its box on the page, and whether any
+ * two of a kind overlap.
+ */
+function drawnNames(plot, groups) {
+  return plot.evaluate((element, names) => {
+    const box = node => {
+      const rect = node.getBoundingClientRect();
+      return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+    };
+    const across = [...element.querySelectorAll('.xtick text')].map(node => ({ text: node.textContent, ...box(node) }));
+    const down = [...element.querySelectorAll('.annotation-text')]
+      .filter(node => names.includes(node.textContent))
+      .map(node => ({ text: node.textContent, ...box(node) }));
+    const overlapping = (list, start, end) => {
+      const sorted = [...list].sort((a, b) => a[start] - b[start]);
+      return sorted.slice(1).filter((item, index) => item[start] < sorted[index][end] - 0.5).map(item => item.text);
+    };
+    return {
+      across: across.map(item => item.text),
+      down: down.map(item => item.text),
+      acrossOverlapping: overlapping(across, 'left', 'right'),
+      downOverlapping: overlapping(down, 'top', 'bottom'),
+    };
+  }, groups);
+}
+
+test('every gene and group is named without one name on another, in the panel and the expanded view', async ({ page }) => {
+  const errors = observeProductErrors(page);
+  // 64 groups with long names: more rows than either view is tall.
+  const groups = Array.from({ length: 64 }, (_, index) => `Cluster ${String(index).padStart(2, '0')} progenitor`);
+  const panel = await openDotplot(page, groups);
+  await page.evaluate(() => window._comparisonModule.openAnalysis('dotplot', {
+    options: { groupBy: 'cluster', geneSets: [{ name: 'Set 1', genes: ['CD3E', 'CD8A', 'MS4A1', 'CD79A', 'LYZ', 'NKG7'] }] },
+  }));
+  await panel.getByRole('button', { name: 'Run dot plot' }).click();
+  const preview = panel.locator('.dotplot-result-container .js-plotly-plot');
+  await expect(preview).toBeVisible();
+  const shown = await drawnNames(preview, groups);
+  expect(shown.across).toEqual(GENES);
+  expect(shown.down).toHaveLength(groups.length);
+  expect(shown.acrossOverlapping).toEqual([]);
+  expect(shown.downOverlapping).toEqual([]);
+
+  await expect(panel.getByRole('button', { name: /Expand/ })).toBeEnabled();
+  await panel.getByRole('button', { name: /Expand/ }).click();
+  const modal = page.locator('.analysis-modal.open');
+  const full = modal.locator('.analysis-modal-plot .js-plotly-plot');
+  await expect(full).toBeVisible();
+  const expanded = await drawnNames(full, groups);
+  expect(expanded.across).toEqual(GENES);
+  expect(expanded.down).toHaveLength(groups.length);
+  expect(expanded.downOverlapping).toEqual([]);
+  // The window is shorter than the rows need: its plot section scrolls.
+  const section = await modal.locator('.analysis-modal-plot-section').evaluate(element => ({
+    scrolls: element.scrollHeight > element.clientHeight,
+    overflow: getComputedStyle(element).overflowY,
+  }));
+  expect(section).toEqual({ scrolls: true, overflow: 'auto' });
+
+  // The display options are in the expanded view, and drive the analysis's options.
+  const options = modal.locator('.analysis-modal-options');
+  await expect(options.getByText('No customization options available.')).toHaveCount(0);
+  await options.locator('select[name="scale"]').selectOption('var');
+  await expect.poll(() => page.evaluate(() => window._comparisonModule.getUI('dotplot')._options.scale)).toBe('var');
+  await expect.poll(async () => Math.max(...(await lastResult(page)).color)).toBeCloseTo(1, 12);
+  await expect(panel.locator('select[name="scale"]')).toHaveValue('var');
+  // "Largest dot" applies to dots only: hidden for the matrix plot.
+  await options.locator('select[name="plot"]').selectOption('matrix');
+  await expect.poll(async () => (await lastResult(page)).layout).toBe('matrix');
+  await expect(modal.locator('.analysis-modal-options select[name="maxDotSize"]')).toBeHidden();
+  expect(errors).toEqual([]);
+});
+

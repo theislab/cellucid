@@ -1,6 +1,6 @@
 /**
  * @fileoverview Every action definition, one module per area. Adding an area
- * is one import and one spread here; the catalogue, the agent tools, the
+ * is one import and one spread here; the catalog, the agent tools, the
  * protocol document, Python, R and the docs follow from it.
  *
  * @module app/actions/definitions

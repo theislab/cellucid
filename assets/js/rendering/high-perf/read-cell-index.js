@@ -13,7 +13,7 @@
  * in any other draw.
  *
  * The list follows the store's order (`StoreOrder`, a new one at every step
- * of an adoption), its segments and the colours (which cells are read); it
+ * of an adoption), its segments and the colors (which cells are read); it
  * is made again when any of them changes.
  *
  * @module rendering/high-perf/read-cell-index
@@ -43,12 +43,12 @@ export function readCellSlots(colors, sources, segments, readCount) {
     for (let local = 0; local < count; local++) {
       const cell = sources === null ? first + local : sources[first + local];
       if (colors[cell * 4 + 3] !== UNREAD_ALPHA_BYTE) {
-        if (at === readCount) throw new RangeError(`A store holds more than the ${readCount} read cells its colours name.`);
+        if (at === readCount) throw new RangeError(`A store holds more than the ${readCount} read cells its colors name.`);
         slots[at++] = local;
       }
     }
   }
-  if (at !== readCount) throw new RangeError(`A store holds ${at} of the ${readCount} read cells its colours name.`);
+  if (at !== readCount) throw new RangeError(`A store holds ${at} of the ${readCount} read cells its colors name.`);
   starts[segments.length] = at;
   return { slots, starts };
 }
@@ -62,7 +62,7 @@ export class ReadCellIndex {
     this.byteLength = 0;
     /** @type {Uint32Array|null} */
     this.starts = null;
-    // What the list was made for: the colours' layer record, the order, the segments.
+    // What the list was made for: the colors' layer record, the order, the segments.
     this._layers = null;
     this._order = undefined;
     this._segments = null;
@@ -78,7 +78,7 @@ export class ReadCellIndex {
    *
    * @param {Object} store
    * @param {Uint8Array} store.colors
-   * @param {Readonly<{layered: boolean, unread: number}>} store.layers - `colorLayersOf(colors)`, one record per colours generation.
+   * @param {Readonly<{layered: boolean, unread: number}>} store.layers - `colorLayersOf(colors)`, one record per colors generation.
    * @param {import('./store-order.js').StoreOrder|null} store.order
    * @param {ReadonlyArray<{first: number, count: number}>} store.segments
    * @param {(bytes: number, write: () => void) => void} store.allocate - Runs a GPU allocation (the renderer's `_allocateGpu`).

@@ -19,8 +19,8 @@
  * The button takes the step inside the click, so a sign-in popup opens. It
  * waits while the provider's script loads (Google's), and a step whose
  * attempt did not finish (a window closed, a pop-up blocked) says why and
- * offers the button again: labelled for what the next attempt does ("Use
- * another account" where this account's organisation lets only an
+ * offers the button again: labeled for what the next attempt does ("Use
+ * another account" where this account's organization lets only an
  * administrator approve Cellucid), with a link to what to do about it
  * (`help`) beside the line's text.
  *

@@ -1,45 +1,42 @@
 /**
- * LRU Cache - Least Recently Used Cache Implementation
+ * LRU Cache - a least-recently-used cache bounded by a byte budget
  *
- * A generic LRU cache with support for:
- * - Configurable maximum size, in entries and optionally in bytes
- * - Optional time-based expiration (maxAge)
- * - Eviction callbacks
- * - Cache statistics
+ * The budget is the one bound: what the held values weigh against a share of
+ * the device's memory (`data/memory-budget.js`). There is no entry count and
+ * no age: a count cap evicted small results while memory was free, and an age
+ * let go of results nothing had made stale (F123). An evicted result is
+ * computed again.
+ *
+ * It keeps hit, miss and eviction statistics.
  *
  * @module shared/lru-cache
  */
 
+import { requireObjectKeys } from '../../../utils/exact-record.js';
+
 /**
  * @typedef {Object} LRUCacheOptions
- * @property {number} [maxSize=100] - Maximum number of entries
- * @property {number} [maxAge=0] - Maximum age in milliseconds (0 = no expiration)
- * @property {number|(() => number)} [maxBytes=0] - Maximum total `sizeOf` of the
- *   held values (0 = unbounded), or a function read at every `set` (a
- *   residency share of the device, `data/memory-budget.js`, which lowers
- *   after a refused allocation). A value larger than the whole budget is
- *   not cached.
- * @property {(value: *) => number} [sizeOf] - Byte size of one value; required
- *   with `maxBytes`
+ * @property {number|(() => number)} maxBytes - Maximum total `sizeOf` of the
+ *   held values (positive), or a function read at every `set` (a residency
+ *   share of the device, `data/memory-budget.js`, which lowers after a
+ *   refused allocation). A value larger than the whole budget is not cached.
+ * @property {(value: *) => number} sizeOf - Byte size of one value
  * @property {() => number} [heldBytes] - Bytes the owner holds beside the
  *   entries that count against the same budget (arrays the entries share,
  *   counted once); the entries take what is left
- * @property {Function} [onEvict] - Callback when entry is evicted: (key, value) => void
  */
 
 /**
  * @typedef {Object} CacheEntry
  * @property {*} value - The cached value
- * @property {number} timestamp - When the entry was created/updated
- * @property {number} bytes - `sizeOf(value)` when the cache has a byte budget
+ * @property {number} bytes - `sizeOf(value)`
  */
 
 /**
  * @typedef {Object} CacheStats
  * @property {number} size - Current number of entries
- * @property {number} maxSize - Maximum allowed entries
  * @property {number} bytes - Total `sizeOf` of the held values
- * @property {number} maxBytes - Byte budget (0 = unbounded)
+ * @property {number} maxBytes - Byte budget
  * @property {number} hits - Number of cache hits
  * @property {number} misses - Number of cache misses
  * @property {number} evictions - Number of evictions
@@ -53,64 +50,39 @@
  * LRU behavior when we delete and re-insert on access.
  *
  * @example
- * // Basic usage
- * const cache = new LRUCache({ maxSize: 100 });
- * cache.set('key1', 'value1');
- * const value = cache.get('key1'); // 'value1'
- *
- * @example
- * // With time-based expiration
- * const cache = new LRUCache({
- *   maxSize: 50,
- *   maxAge: 5 * 60 * 1000, // 5 minutes
- *   onEvict: (key, value) => console.log(`Evicted: ${key}`)
- * });
+ * const cache = new LRUCache({ maxBytes: () => share, sizeOf: value => value.byteLength });
+ * cache.set('key1', new Float32Array(8));
+ * const value = cache.get('key1');
  */
 export class LRUCache {
   /**
    * Create a new LRU cache
-   * @param {LRUCacheOptions} [options={}] - Cache configuration options
+   * @param {LRUCacheOptions} options - Cache configuration options
    */
-  constructor(options = {}) {
-    const {
-      maxSize = 100,
-      maxAge = 0,
-      maxBytes = 0,
-      sizeOf = null,
-      heldBytes = null,
-      onEvict = null
-    } = options;
-    const budgeted = typeof maxBytes === 'function' || maxBytes > 0;
-    if (typeof maxBytes !== 'function' && (!Number.isFinite(maxBytes) || maxBytes < 0)) {
-      throw new RangeError('LRUCache maxBytes must be a non-negative finite number or a function');
+  constructor(options) {
+    requireObjectKeys(options, ['maxBytes', 'sizeOf'], ['heldBytes'], 'LRUCache options');
+    const { maxBytes, sizeOf, heldBytes = null } = options;
+    if (typeof maxBytes !== 'function' && (!Number.isFinite(maxBytes) || maxBytes <= 0)) {
+      throw new RangeError('LRUCache maxBytes must be a positive finite number or a function');
     }
-    if (budgeted && typeof sizeOf !== 'function') {
+    if (typeof sizeOf !== 'function') {
       throw new TypeError('LRUCache maxBytes requires a sizeOf function');
     }
-    if (heldBytes !== null && (!budgeted || typeof heldBytes !== 'function')) {
-      throw new TypeError('LRUCache heldBytes is a function, with maxBytes');
+    if (heldBytes !== null && typeof heldBytes !== 'function') {
+      throw new TypeError('LRUCache heldBytes is a function');
     }
 
-    /** @type {number} Maximum cache size */
-    this.maxSize = maxSize;
-
-    /** @type {number} Maximum age in ms (0 = no expiration) */
-    this.maxAge = maxAge;
-
-    /** @private @type {number|(() => number)} Byte budget (0 = unbounded) */
+    /** @private @type {number|(() => number)} Byte budget */
     this._maxBytes = maxBytes;
 
-    /** @type {Function|null} Value byte size, used with maxBytes */
-    this._sizeOf = budgeted ? sizeOf : null;
+    /** @private @type {Function} Value byte size */
+    this._sizeOf = sizeOf;
 
     /** @private @type {(() => number)|null} Bytes held beside the entries */
     this._heldBytes = heldBytes;
 
     /** @type {number} Total byte size of the held values */
     this._bytes = 0;
-
-    /** @type {Function|null} Eviction callback */
-    this.onEvict = onEvict;
 
     /** @type {Map<string, CacheEntry>} Internal cache storage */
     this._cache = new Map();
@@ -125,31 +97,15 @@ export class LRUCache {
   }
 
   /**
-   * Get a value from the cache
-   *
-   * If the key exists and hasn't expired, returns the value and
-   * moves the entry to the end (most recently used).
+   * Get a value from the cache, and make it the most recently used.
    *
    * @param {string} key - Cache key
-   * @returns {*} The cached value, or undefined if not found/expired
-   *
-   * @example
-   * const value = cache.get('myKey');
-   * if (value !== undefined) {
-   *   // Use cached value
-   * }
+   * @returns {*} The cached value, or undefined if not found
    */
   get(key) {
     const entry = this._cache.get(key);
 
     if (!entry) {
-      this._misses++;
-      return undefined;
-    }
-
-    // Check expiration
-    if (this.maxAge > 0 && (Date.now() - entry.timestamp) >= this.maxAge) {
-      this._evict(key, entry.value);
       this._misses++;
       return undefined;
     }
@@ -163,22 +119,7 @@ export class LRUCache {
   }
 
   /**
-   * Set a value in the cache
-   *
-   * If the key already exists, updates the value and moves it to
-   * most recently used. If at capacity, evicts the least recently
-   * used entry first.
-   *
-   * @param {string} key - Cache key
-   * @param {*} value - Value to cache
-   * @returns {LRUCache} Returns this for chaining
-   *
-   * @example
-   * cache.set('user:123', userData)
-   *      .set('user:456', otherData);
-   */
-  /**
-   * The byte budget now (0 = unbounded).
+   * The byte budget now.
    * @returns {number}
    */
   get maxBytes() {
@@ -202,43 +143,37 @@ export class LRUCache {
     return this.maxBytes - held;
   }
 
+  /**
+   * Set a value in the cache, as the most recently used. The least recently
+   * used entries go until it fits the budget; a value larger than the whole
+   * budget is not kept.
+   *
+   * @param {string} key - Cache key
+   * @param {*} value - Value to cache
+   * @returns {LRUCache} Returns this for chaining
+   */
   set(key, value) {
     // If key exists, delete it first (will be re-added at end)
     this._remove(key);
 
-    const bytes = this._sizeOf === null ? 0 : this._sizeOf(value);
-    const budget = this._sizeOf === null ? Infinity : this._entryBudget();
-    if (this._sizeOf !== null) {
-      if (!Number.isFinite(bytes) || bytes < 0) {
-        throw new RangeError('LRUCache sizeOf must return a non-negative finite number');
-      }
-      // A value that alone exceeds the budget would evict everything else and
-      // still overrun it, so it is simply not kept.
-      if (bytes > budget) {
-        this.trim();
-        return this;
-      }
+    const bytes = this._sizeOf(value);
+    if (!Number.isFinite(bytes) || bytes < 0) {
+      throw new RangeError('LRUCache sizeOf must return a non-negative finite number');
+    }
+    const budget = this._entryBudget();
+    // A value that alone exceeds the budget would evict everything else and
+    // still overrun it, so it is simply not kept.
+    if (bytes > budget) {
+      this.trim();
+      return this;
     }
 
-    // Evict oldest while at capacity, in entries or in bytes
-    while (
-      this._cache.size > 0 &&
-      (
-        this._cache.size >= this.maxSize ||
-        this._bytes + bytes > budget
-      )
-    ) {
+    while (this._cache.size > 0 && this._bytes + bytes > budget) {
       const oldestKey = this._cache.keys().next().value;
-      const oldestEntry = this._cache.get(oldestKey);
-      this._evict(oldestKey, oldestEntry?.value);
+      this._evict(oldestKey);
     }
 
-    // Add new entry
-    this._cache.set(key, {
-      value,
-      timestamp: Date.now(),
-      bytes
-    });
+    this._cache.set(key, { value, bytes });
     this._bytes += bytes;
 
     return this;
@@ -251,12 +186,11 @@ export class LRUCache {
    * @returns {number} Entries evicted
    */
   trim() {
-    if (this._sizeOf === null) return 0;
     const budget = this._entryBudget();
     let evicted = 0;
     while (this._cache.size > 0 && this._bytes > budget) {
       const oldestKey = this._cache.keys().next().value;
-      this._evict(oldestKey, this._cache.get(oldestKey)?.value);
+      this._evict(oldestKey);
       evicted++;
     }
     return evicted;
@@ -279,26 +213,11 @@ export class LRUCache {
   /**
    * Check if a key exists in the cache (without affecting LRU order)
    *
-   * Note: Does not check expiration or update access order.
-   * Use get() if you want to retrieve the value.
-   *
    * @param {string} key - Cache key
    * @returns {boolean} True if key exists
    */
   has(key) {
-    if (!this._cache.has(key)) {
-      return false;
-    }
-
-    // Optionally check expiration without updating LRU order
-    if (this.maxAge > 0) {
-      const entry = this._cache.get(key);
-      if ((Date.now() - entry.timestamp) >= this.maxAge) {
-        return false;
-      }
-    }
-
-    return true;
+    return this._cache.has(key);
   }
 
   /**
@@ -308,21 +227,11 @@ export class LRUCache {
    * @returns {boolean} True if the key was deleted
    */
   delete(key) {
-    // Note: Not calling onEvict for explicit deletes
     return this._remove(key);
   }
 
-  /**
-   * Clear all entries from the cache
-   *
-   * @param {boolean} [callOnEvict=false] - Whether to call onEvict for each entry
-   */
-  clear(callOnEvict = false) {
-    if (callOnEvict && this.onEvict) {
-      for (const [key, entry] of this._cache) {
-        this.onEvict(key, entry.value);
-      }
-    }
+  /** Clear all entries from the cache. */
+  clear() {
     this._cache.clear();
     this._bytes = 0;
   }
@@ -344,19 +253,6 @@ export class LRUCache {
   }
 
   /**
-   * Get all values in the cache (from least to most recently used)
-   * @returns {IterableIterator<*>} Iterator of values
-   */
-  values() {
-    const self = this;
-    return (function* () {
-      for (const entry of self._cache.values()) {
-        yield entry.value;
-      }
-    })();
-  }
-
-  /**
    * Get all entries in the cache (from least to most recently used)
    * @returns {IterableIterator<[string, *]>} Iterator of [key, value] pairs
    */
@@ -370,42 +266,6 @@ export class LRUCache {
   }
 
   /**
-   * Iterate over cache entries
-   * @param {Function} callback - Function to call for each entry: (value, key, cache) => void
-   */
-  forEach(callback) {
-    for (const [key, entry] of this._cache) {
-      callback(entry.value, key, this);
-    }
-  }
-
-  /**
-   * Remove expired entries from the cache
-   *
-   * Only useful when maxAge is set. Returns the number of
-   * entries removed.
-   *
-   * @returns {number} Number of expired entries removed
-   */
-  prune() {
-    if (this.maxAge === 0) {
-      return 0;
-    }
-
-    const now = Date.now();
-    let pruned = 0;
-
-    for (const [key, entry] of this._cache) {
-      if ((now - entry.timestamp) >= this.maxAge) {
-        this._evict(key, entry.value);
-        pruned++;
-      }
-    }
-
-    return pruned;
-  }
-
-  /**
    * Get cache statistics
    * @returns {CacheStats} Cache statistics object
    */
@@ -413,7 +273,6 @@ export class LRUCache {
     const total = this._hits + this._misses;
     return {
       size: this._cache.size,
-      maxSize: this.maxSize,
       bytes: this._bytes,
       maxBytes: this.maxBytes,
       hits: this._hits,
@@ -424,77 +283,12 @@ export class LRUCache {
   }
 
   /**
-   * Reset cache statistics
-   */
-  resetStats() {
-    this._hits = 0;
-    this._misses = 0;
-    this._evictions = 0;
-  }
-
-  /**
-   * Get the age of a cached entry in milliseconds
-   * @param {string} key - Cache key
-   * @returns {number|null} Age in ms, or null if not found
-   */
-  getAge(key) {
-    const entry = this._cache.get(key);
-    if (!entry) {
-      return null;
-    }
-    return Date.now() - entry.timestamp;
-  }
-
-  /**
-   * Peek at a value without affecting LRU order
-   * @param {string} key - Cache key
-   * @returns {*} The cached value, or undefined if not found
-   */
-  peek(key) {
-    const entry = this._cache.get(key);
-    if (!entry) {
-      return undefined;
-    }
-
-    // Check expiration
-    if (this.maxAge > 0 && (Date.now() - entry.timestamp) >= this.maxAge) {
-      return undefined;
-    }
-
-    return entry.value;
-  }
-
-  /**
-   * Update maxSize and evict entries if necessary
-   * @param {number} newMaxSize - New maximum size
-   */
-  setMaxSize(newMaxSize) {
-    this.maxSize = newMaxSize;
-
-    // Evict if over new limit
-    while (this._cache.size > this.maxSize) {
-      const oldestKey = this._cache.keys().next().value;
-      const oldestEntry = this._cache.get(oldestKey);
-      this._evict(oldestKey, oldestEntry?.value);
-    }
-  }
-
-  /**
-   * Internal method to evict an entry
+   * Evict one entry for room, counting it.
    * @param {string} key - Key to evict
-   * @param {*} value - Value being evicted
    * @private
    */
-  _evict(key, value) {
+  _evict(key) {
     this._remove(key);
     this._evictions++;
-
-    if (this.onEvict) {
-      try {
-        this.onEvict(key, value);
-      } catch (err) {
-        console.warn('[LRUCache] onEvict callback error:', err);
-      }
-    }
   }
 }

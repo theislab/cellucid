@@ -39,7 +39,7 @@ non-zero) and ``EMPTY`` nowhere. ``var``: the index is Ensembl-style ids
 which the viewer shows once Data mapping names the genes by it: an id crosses
 every boundary, the symbol beside it. ``obsm``: ``X_umap`` (2-D), ``X_pca``
 (8-D, the latent space, outlier quantiles stored for it), ``velocity_umap``
-(a vector field). ``obsp['connectivities']``: five neighbours a cell,
+(a vector field). ``obsp['connectivities']``: five neighbors a cell,
 symmetrised.
 
 The openings (``OPENINGS``): every cell of each file; uniform at the file's
@@ -191,7 +191,7 @@ def synthetic_adata():
     rows = np.repeat(np.arange(N_CELLS), 5)
     weights = (1.0 / (1.0 + np.sqrt(distances[rows, neighbours.ravel()]))).astype(np.float32)
     graph = sparse.csr_matrix((weights, (rows, neighbours.ravel())), shape=(N_CELLS, N_CELLS))
-    # Symmetric, as a neighbour graph is stored: the larger weight of a pair.
+    # Symmetric, as a neighbor graph is stored: the larger weight of a pair.
     graph = graph.maximum(graph.T).tocsr()
     adata = ad.AnnData(X=X, obs=obs, var=pd.DataFrame({"feature_name": GENES}, index=GENE_IDS))
     adata.obsm["X_umap"] = umap
@@ -416,7 +416,7 @@ def signature_reference(adata, cells):
 
 
 def graph_reference(adata, cells):
-    """The neighbour graph on the kept cells (the induced subgraph): its
+    """The neighbor graph on the kept cells (the induced subgraph): its
     undirected edges as pairs of original positions, ``p < q``, one
     ``p,q`` line each in ascending order, by SHA-256; and its largest weight."""
     graph = adata.obsp["connectivities"].tocoo()

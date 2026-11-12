@@ -16,7 +16,7 @@ import { domainName } from '../../../actions/domains.js';
 import { renderFactList } from '../../components/controls.js';
 import { wireAppDialog } from '../../components/app-dialog.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
-import { failureText } from '../../../../utils/errors.js';
+import { joinFailure, sayFailure } from '../../../../utils/errors.js';
 
 /**
  * @param {object} options
@@ -93,7 +93,7 @@ export function createDiffDialog({ dialog, from, to, status, list, view, read })
       })));
     } catch (error) {
       if (run !== generation) return;
-      status.textContent = `These steps cannot be compared: ${failureText(error)}`;
+      status.textContent = `${joinFailure(`These steps cannot be compared`, sayFailure(error))}`;
       status.dataset.tone = 'danger';
       reportHistoryFailure('Comparing the steps', error);
     }

@@ -5,7 +5,7 @@
  * as its own sentence, any other failure after what was being done; a choice
  * a newer one replaced, or one stopped, is not a failure.
  *
- * A drag (a slider, a colour picker) dispatches the latest value only: while
+ * A drag (a slider, a color picker) dispatches the latest value only: while
  * one dispatch runs, newer values replace each other and the last one is
  * dispatched next (`createLatestDispatch`), so a fast drag never queues one
  * step per frame; the action's `coalesce` makes the drag one step.
@@ -16,32 +16,45 @@
 import { getActions } from './index.js';
 import { ActionRefused } from './dispatcher.js';
 import { getNotificationCenter } from '../notification-center.js';
+import { getOpeningProgress } from '../../data/opening-progress.js';
 import { isCancellation } from '../../utils/abort.js';
+import { failureDetails, failureSentence, isReported, sayFailure } from '../../utils/errors.js';
 
-/** A failure nobody needs to hear of: superseded by a newer choice, or stopped. */
+/**
+ * A failure nobody needs to hear of (again): superseded by a newer choice,
+ * stopped, or already said by the surface that met it (`markReported`).
+ */
 export function isQuietFailure(error) {
-  return isCancellation(error) || (error instanceof ActionRefused && error.code === 'superseded');
+  return isCancellation(error) || isReported(error) || (error instanceof ActionRefused && error.code === 'superseded');
 }
 
-/** The words a failure is said with. */
-export function failureWords(error, failure = null) {
-  const message = error instanceof Error ? error.message : String(error);
-  if (error instanceof ActionRefused || failure === null) return message;
-  return `${failure}: ${message}`;
+/**
+ * The words a failure is said with: a refusal's own sentence; anything else
+ * after what was being done, a broken invariant as one (`sayFailure`, its
+ * own words under Details).
+ */
+function sayDispatchFailure(error, failure = null) {
+  if (error instanceof ActionRefused || failure === null) return failureSentence(error);
+  return `${failure}: ${sayFailure(error)}`;
 }
 
 /**
  * Say a dispatch's failure (`failure`: what was being done, said before
- * anything but a refusal); nothing for a quiet one.
+ * anything but a refusal); nothing for a quiet one. It is about what was
+ * open when the control was used, so the next opening withdraws it
+ * (`untilNextOpening`; R9U-13: a field's failure stayed through three
+ * datasets opened after it).
  */
 export function reportActionFailure(error, { failure = null, category = 'filter' } = {}) {
   if (isQuietFailure(error)) return;
   if (!(error instanceof ActionRefused)) console.error(error);
   try {
-    getNotificationCenter().error(failureWords(error, failure), { category });
+    getOpeningProgress().untilNextOpening(
+      getNotificationCenter().error(sayDispatchFailure(error, failure), { category, ...failureDetails(error) })
+    );
   } catch (notificationError) {
     // A page being torn down has nowhere to say it; the console has it.
-    console.error(`[actions] ${failureWords(error, failure)}`, notificationError);
+    console.error(`[actions] ${sayDispatchFailure(error, failure)}`, notificationError);
   }
 }
 

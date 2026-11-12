@@ -23,6 +23,8 @@ import {
   createStatusLine,
   ICONS,
 } from '../../components/controls.js';
+import { setControlAvailability } from '../../core/control-availability.js';
+import { openADatasetTo } from '../../no-dataset.js';
 
 const AXES = Object.freeze(['x', 'y', 'z']);
 
@@ -45,7 +47,7 @@ function element(ownerDocument, tag, className, text) {
  */
 export function buildDataMappingPanel(ownerDocument, { expanded, onToggle, groupSections }) {
   const root = element(ownerDocument, 'div', 'data-mapping');
-  const emptyState = createEmptyState('Load a dataset to choose its data mapping.');
+  const emptyState = createEmptyState(openADatasetTo('choose its data mapping'));
 
   const body = element(ownerDocument, 'div', 'data-mapping-body');
   const list = element(ownerDocument, 'div', 'disclosure-list');
@@ -235,7 +237,8 @@ export function createRepresentationRow(ownerDocument, { usable, configurable })
     axesLabel = element(ownerDocument, 'label', 'data-mapping-field-label', 'Dimension');
     const axesField = element(ownerDocument, 'div', 'data-mapping-field data-mapping-dimension-field');
     axesField.append(axesLabel, axesSelect);
-    add = createButton({ label: 'Add columns', className: 'btn-compact data-mapping-add' });
+    // Inside an array's row: quiet, as every action nested in a row.
+    add = createButton({ label: 'Add columns', variant: 'quiet', className: 'data-mapping-add' });
     add.dataset.analyticsId = 'data-mapping:add-columns';
     grid.append(axesField, add);
     axisFields = AXES.map((axis, position) => {
@@ -263,9 +266,10 @@ export function createRepresentationRow(ownerDocument, { usable, configurable })
     const disabledReason = !row.usable
       ? row.reason
       : (row.busy ? 'Applying the data mapping…' : row.lockedReason);
-    checkbox.disabled = disabledReason !== null;
-    checkbox.title = disabledReason
-      ?? (row.enabled ? `Stop offering ${row.name} to views` : `Offer ${row.name} to views`);
+    setControlAvailability(checkbox, disabledReason);
+    if (disabledReason === null) {
+      checkbox.title = row.enabled ? `Stop offering ${row.name} to views` : `Offer ${row.name} to views`;
+    }
     label.htmlFor = checkbox.id;
     setText(label, row.name);
     label.title = row.title;
@@ -327,8 +331,7 @@ export function createRepresentationRow(ownerDocument, { usable, configurable })
       axesSelect.replaceChildren(...options);
     }
     axesSelect.value = String(row.dimension);
-    axesSelect.disabled = row.busy;
-    setTitle(axesSelect, row.busy ? 'Applying the data mapping…' : null);
+    setControlAvailability(axesSelect, row.busy ? 'Applying the data mapping…' : null);
     axesLabel.htmlFor = axesSelect.id;
     axisFields.forEach(({ field, label: axisLabel, select }, position) => {
       field.hidden = position >= row.dimension;
@@ -336,8 +339,7 @@ export function createRepresentationRow(ownerDocument, { usable, configurable })
       axisLabel.htmlFor = select.id;
       fillColumnOptions(ownerDocument, select, width);
       if (position < row.dimension) select.value = String(row.columns.selected[position]);
-      select.disabled = row.busy;
-      setTitle(select, row.busy ? 'Applying the data mapping…' : null);
+      setControlAvailability(select, row.busy ? 'Applying the data mapping…' : null);
     });
     add.hidden = row.add === null;
     if (row.add !== null) {

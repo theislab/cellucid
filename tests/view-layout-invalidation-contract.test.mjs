@@ -479,6 +479,7 @@ test('vector bindings belong to exactly the embeddings their mapping names', asy
     dimensionLevel: 2,
     frameId: 1,
     layoutKey: 'X_tsne',
+    reducedMotion: false,
     viewId: 'live',
   });
   assert.deepEqual(released, [

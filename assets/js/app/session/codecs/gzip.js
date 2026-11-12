@@ -17,20 +17,7 @@ import {
 import { createSlicedInputStream } from '../../../formats/io/inflate.js';
 import { requireExactKeys } from '../../../utils/exact-record.js';
 import { formatCountOf } from '../../../utils/format-units.js';
-import { throwIfAborted } from '../../../utils/abort.js';
-
-function assertSignal(signal, context) {
-  if (
-    signal !== null
-    && (
-      typeof signal !== 'object'
-      || typeof signal.aborted !== 'boolean'
-    )
-  ) {
-    throw new TypeError(`${context} must be an AbortSignal or null.`);
-  }
-  return signal;
-}
+import { throwIfAborted, requireSignalOrNull } from '../../../utils/abort.js';
 
 const GZIP_FIXED_HEADER_BYTES = 10;
 const GZIP_TRAILER_BYTES = 8;
@@ -111,7 +98,7 @@ async function streamToUint8Array(stream, options) {
   const maxBytes = options.maxBytes === null
     ? null
     : assertSafeInteger(options.maxBytes, 'Gzip maximum output bytes');
-  const signal = assertSignal(options.signal, 'Gzip stream signal');
+  const signal = requireSignalOrNull(options.signal, 'Gzip stream signal');
 
   /** @type {Uint8Array[]} */
   const unboundedChunks = [];
@@ -212,7 +199,7 @@ async function streamToUint8Array(stream, options) {
  * `maxOutputBytes` is both the hard allocation ceiling and the exact
  * manifest-owned output length. Under- and over-declared chunks are terminal:
  * a trailer ISIZE that disagrees is rejected before inflation, and a stream
- * that inflates past the limit is cancelled within one input slice.
+ * that inflates past the limit is canceled within one input slice.
  *
  * @param {Uint8Array} compressed
  * @param {{ maxOutputBytes: number, signal: AbortSignal | null }} options
@@ -227,7 +214,7 @@ export async function gzipDecompress(compressed, options) {
     ['maxOutputBytes', 'signal'],
     'Gzip decompression options'
   );
-  const signal = assertSignal(options.signal, 'Gzip decompression signal');
+  const signal = requireSignalOrNull(options.signal, 'Gzip decompression signal');
   throwIfAborted(signal);
 
   const maxOutputBytes = assertSafeInteger(
@@ -273,7 +260,7 @@ export async function gzipCompress(uncompressed, options) {
     throw new TypeError('Gzip uncompressed input must be a Uint8Array.');
   }
   requireExactKeys(options, ['signal'], 'Gzip compression options');
-  const signal = assertSignal(options.signal, 'Gzip compression signal');
+  const signal = requireSignalOrNull(options.signal, 'Gzip compression signal');
   throwIfAborted(signal);
 
   if (typeof CompressionStream === 'undefined') {

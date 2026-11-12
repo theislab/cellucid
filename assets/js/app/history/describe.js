@@ -9,9 +9,9 @@
  * @module app/history/describe
  */
 
-import { domainName } from '../actions/domains.js';
 import { idNumber } from './model.js';
 import { depthOf, isOnPath, pathTo, stepOf } from './tree.js';
+import { staleReasons } from './provenance.js';
 import { parameterFacts } from './exports/step-text.js';
 
 import { HISTORY_PAGE_STEPS as DEFAULT_PAGE_STEPS } from '../actions/definitions/history.js';
@@ -30,8 +30,12 @@ export function noteResult(note) {
 
 /**
  * `history.summary`: trackers, branches (fork step, tip, own steps, flags),
- * groups, bookmarks, turns with their summaries, the recording switch, the
- * pending branch, stale results and Recently deleted, without the steps.
+ * groups, bookmarks, turns, the recording switch, the pending branch, stale
+ * results and Recently deleted, without the steps; the notes on the tracker,
+ * each branch, group and turn in full (a turn's first is its summary). Only
+ * counts once: a colleague's agent opening a shared session read "notes: 1"
+ * on each branch and no read gave their text, so it said the donor check the
+ * notes reported "is not recorded" (live-7 L25-9).
  */
 export function historySummary(tracker, { trackers, active, pending, stale }) {
   const own = new Map([...tracker.branches.keys()].map(id => [id, 0]));
@@ -54,6 +58,7 @@ export function historySummary(tracker, { trackers, active, pending, stale }) {
   }
   return {
     tracker: idName(tracker),
+    notes: tracker.notes.map(noteResult),
     trackers: trackers.map(each => ({
       id: each.id, name: each.name, active: each === active, steps: each.steps.size, start: each.start.kind,
     })),
@@ -66,23 +71,23 @@ export function historySummary(tracker, { trackers, active, pending, stale }) {
     branches: [...tracker.branches.values()].sort((a, b) => idNumber(a.id) - idNumber(b.id)).map(branch => ({
       id: branch.id, name: branch.name, base: branch.base, tip: branch.tip, steps: own.get(branch.id) ?? 0,
       main: branch.id === tracker.mainBranch, locked: branch.locked, archived: branch.archived,
-      active: branch.id === tracker.activeBranch, notes: branch.notes.length,
+      active: branch.id === tracker.activeBranch, notes: branch.notes.map(noteResult),
     })),
     groups: [...tracker.groups.values()].sort((a, b) => idNumber(a.id) - idNumber(b.id)).map(group => {
       const facts = groups.get(group.id);
-      return { id: group.id, name: group.name, branch: facts.branch, first: facts.first, last: facts.last, steps: facts.steps, notes: group.notes.length };
+      return { id: group.id, name: group.name, branch: facts.branch, first: facts.first, last: facts.last, steps: facts.steps, notes: group.notes.map(noteResult) };
     }),
     bookmarks: bookmarks.sort((a, b) => idNumber(a.step) - idNumber(b.step)),
     turns: [...tracker.turns.values()].map(turn => ({
       id: turn.id, label: turn.label, by: byResult(turn.by), steps: turnSteps.get(turn.id) ?? 0, branch: turn.branch,
-      summary: turn.notes[0]?.text ?? null,
+      notes: turn.notes.map(noteResult),
     })),
     stale,
     recently_deleted: tracker.journal.filter(entry => !entry.purged).length,
   };
 }
 
-/** One step as `history.get` lists it (the catalogue's step row). */
+/** One step as `history.get` lists it (the catalog's step row). */
 function stepRow(step, shown) {
   return {
     id: step.id,
@@ -199,7 +204,7 @@ export function describeStep(tracker, step, { catalog, stale, onPath }) {
     replay_of: step.replayOf === null ? null : { tracker: step.replayOf.tracker, step: step.replayOf.step },
     stale: stale === null ? null : {
       cause: stale.cause === null ? null : { step: stale.cause.id, label: stale.cause.label },
-      reasons: stale.inputs.map(input => (input === 'history' ? 'The branch it shows has changed since.' : `${domainName(input)} changed since.`)),
+      reasons: staleReasons(stale),
     },
     shown: onPath,
   };

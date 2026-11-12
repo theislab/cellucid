@@ -310,7 +310,7 @@ export function createHighlightsDomain({ state, refreshUi }) {
           continue;
         }
         if (was.name !== page.name) lines.push(`Highlight page "${was.name}" renamed "${page.name}"`);
-        if (was.color !== page.color) lines.push(`Highlight page "${page.name}" recoloured`);
+        if (was.color !== page.color) lines.push(`Highlight page "${page.name}" recolored`);
         const groupsA = new Map(was.groups.map(group => [group.id, group]));
         const groupsB = new Map(page.groups.map(group => [group.id, group]));
         for (const [groupId, group] of groupsB) {

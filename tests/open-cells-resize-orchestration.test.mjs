@@ -133,7 +133,7 @@ function harness(n0, { growth = null, live = 'X_umap', rows = null } = {}) {
       retireKeptViews() {},
       retireSelections: () => { counts.retireSelections++; },
       keptViews: null,
-      connectivity: { getConnectivityGraph: () => ({ summary: null, url: null }) },
+      connectivity: { getConnectivityGraph: () => ({ summary: null, url: null }), retireGraphKeepingChoices: () => {} },
       invalidateAnalysisData() {},
       loadMappingCandidates: async () => ({}),
       completeMappingCandidates: () => {},
@@ -291,7 +291,7 @@ test('growing keeps a selection under way; cutting retires it', async () => {
 test('a resize is not an opening: it records no cost of showing a cell', async () => {
   resetShownCells();
   const { source, resizer } = harness(100);
-  // Grown (the GPU takes only the cells added, every open cell's colours
+  // Grown (the GPU takes only the cells added, every open cell's colors
   // are made again), cut, and grown again: none is what an opening of its
   // cells costs (`data/opening-cost.js`).
   await resizer.resize({ annData: source, cellSubset: { mode: 'subsample', method: 'uniform', seed: 1, k: 400 } });
@@ -306,11 +306,11 @@ test('what could not stay is said once, by what happened to it', async () => {
   assert.equal(
     describeOutcome({ droppedGroups: ['late'], resetRanges: ['the filter of score'], extended: ['label'] }),
     'The highlight group "late" has no cell open now and was removed. No cell open now lies in the filter of score: it was reset. '
-      + 'The cells added hold categories "label" had not shown: shown beside the others, which keep their colours.'
+      + 'The cells added hold categories "label" had not shown: shown beside the others, which keep their colors.'
   );
   assert.equal(
     describeOutcome({ droppedGroups: ['a', 'b'], resetRanges: [], extended: ['x', 'y'] }),
-    '2 highlight groups have no cell open now and were removed: "a", "b". The cells added hold categories "x", "y" had not shown: shown beside the others, which keep their colours.'
+    '2 highlight groups have no cell open now and were removed: "a", "b". The cells added hold categories "x", "y" had not shown: shown beside the others, which keep their colors.'
   );
 });
 

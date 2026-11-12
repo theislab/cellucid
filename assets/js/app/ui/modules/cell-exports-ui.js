@@ -16,7 +16,7 @@ import { geneSampleCostText } from '../../../data/gene-read-plan.js';
 import { useOpenCells } from '../../../data/open-cells-work.js';
 import { formatBytes, formatCountOf, formatRemaining } from '../../../utils/format-units.js';
 import { cancel, isCancellation, onAbort, throwIfAborted } from '../../../utils/abort.js';
-import { failureText } from '../../../utils/errors.js';
+import { failureDetails, sayFailure } from '../../../utils/errors.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
 import { resolveField } from '../../actions/targets/fields.js';
 import { resolvePage } from '../../actions/targets/pages.js';
@@ -83,10 +83,10 @@ export function initCellExportsUi({ state, dom, getAnnDataSource, notifications,
     // Its own stop: the card's Cancel, or the controls going away, or the action's caller.
     const job = new AbortController();
     const stopWithControls = onAbort(signal, () => cancel(job, 'closed', 'The export controls were closed.'));
-    const stopWithCaller = caller === null ? () => {} : onAbort(caller, () => cancel(job, 'user', `${label} was cancelled.`));
+    const stopWithCaller = caller === null ? () => {} : onAbort(caller, () => cancel(job, 'user', `${label} was canceled.`));
     const progress = notifications.progress(`${label}…`, 0, {
       category: 'download',
-      onCancel: () => cancel(job, 'user', `${label} was cancelled.`),
+      onCancel: () => cancel(job, 'user', `${label} was canceled.`),
     });
     try {
       // A file's size is said as soon as it is known (a CSV's after its
@@ -122,7 +122,7 @@ export function initCellExportsUi({ state, dom, getAnnDataSource, notifications,
         if (notifications.hasNotification?.(progress) ?? true) notifications.dismiss(progress);
       } else {
         console.error(`[Exports] ${label} failed:`, error);
-        notifications.fail(progress, `${label} failed: ${failureText(error)}`);
+        notifications.fail(progress, `${label} failed: ${sayFailure(error)}`, failureDetails(error));
       }
       if (forAction) throw error;
       return null;
@@ -249,7 +249,7 @@ export function initCellExportsUi({ state, dom, getAnnDataSource, notifications,
     state.on('highlight:changed', refreshHighlights),
     state.on('page:changed', refreshHighlights),
     state.on('field:changed', refreshFields),
-    // A field chosen in code (a session, the notebook) recolours the cells.
+    // A field chosen in code (a session, the notebook) recolors the cells.
     state.on('visibility:changed', refreshFields),
   ];
   refreshHighlights();

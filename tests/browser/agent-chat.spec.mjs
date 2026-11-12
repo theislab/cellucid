@@ -2,7 +2,7 @@
  * The chat bar and the agent presence (`assets/js/app/agent/`) on a real
  * page, with the scripted model (`providers/scripted.js`) so every run is the
  * same: a turn streams its reply, its tool calls run as the page's own
- * actions and become history steps labelled with the agent and the turn,
+ * actions and become history steps labeled with the agent and the turn,
  * Undo turn puts every state domain back (the state fingerprint), Stop ends
  * a turn mid-reply, a provider that asks to slow down is waited out, the
  * conversation is kept with the history and comes back with a session file
@@ -19,10 +19,11 @@ import { closePageWithApplicationRetirement, expect, test } from './helpers/test
 import { openPhoneSheet } from './helpers/panels.mjs';
 import { sessionManifest } from './helpers/session-files.mjs';
 import {
-  CELL_TYPE, COLOR_BY_CELL_TYPE, fingerprint, installScriptedModel, observeProductErrors, openAgentDataset as openDataset,
+  CELL_TYPE, COLOR_BY_SCORE, SCORE, fingerprint, installScriptedModel, observeProductErrors, openAgentDataset as openDataset,
   openChat, queueReplies, resultJson, say, stepFacts, waitForHold, waitForTurnEnd,
 } from './helpers/agent-chat.mjs';
 import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
+import { continueWhereLeftOff } from './helpers/welcome.mjs';
 
 test.describe('agent chat', () => {
   test.beforeEach(async ({ page }) => {
@@ -35,17 +36,19 @@ test.describe('agent chat', () => {
     await openChat(page);
     const before = await fingerprint(page);
     await queueReplies(page, [
-      { text: 'Let me look.', calls: [{ name: 'fields_list', args: {} }, COLOR_BY_CELL_TYPE] },
-      { text: 'I coloured the cells by **cell_type**: each type has its own colour.', chunks: 6, delayMs: 20 },
+      { text: 'Let me look.', calls: [{ name: 'fields_list', args: {} }, COLOR_BY_SCORE] },
+      { text: 'I colored the cells by **score**: from low to high.', chunks: 6, delayMs: 20 },
     ]);
-    await say(page, 'Colour the cells by cell type');
+    // The dataset opens colored by cell_type (its first coloring): score is a change, so a step.
+    await say(page, 'Color the cells by score');
 
     const log = page.locator('#agent-chat-log');
-    await expect(log.locator('.agent-msg-user .agent-msg-text')).toHaveText('Colour the cells by cell type');
+    await expect(log.locator('.agent-msg-user .agent-msg-text')).toHaveText('Color the cells by score');
     await expect(log.locator('.agent-tool[data-tool="fields_list"]')).toHaveAttribute('data-state', 'read');
+    await expect(log.locator('.agent-tool[data-tool="fields_list"] .agent-tool-label')).toHaveText('Listed the fields');
     await expect(log.locator('.agent-tool[data-tool="color_by"]')).toHaveAttribute('data-state', 'step');
-    await expect(log.locator('.agent-tool[data-tool="color_by"] .agent-tool-label')).toHaveText('Coloured by cell_type');
-    await expect(log.locator('.agent-msg-agent').last().locator('strong')).toHaveText('cell_type');
+    await expect(log.locator('.agent-tool[data-tool="color_by"] .agent-tool-label')).toHaveText('Colored by score');
+    await expect(log.locator('.agent-msg-agent').last().locator('strong')).toHaveText('score');
 
     // The step is the agent's, in the turn of the person's message.
     const turn = await log.locator('.agent-msg-user').getAttribute('data-turn');
@@ -55,18 +58,18 @@ test.describe('agent chat', () => {
     // The graph shows the turn as one row under the agent's name.
     await expect(page.locator(`#history-graph .hg-row[data-kind="turn"][data-key^="t:${turn}@"]`)).toHaveCount(1);
 
-    // The model was sent the catalogue's tools, and the tool results.
+    // The model was sent the catalog's tools, and the tool results.
     const requests = await page.evaluate(() => window.__agentRequests);
     expect(requests).toHaveLength(2);
-    // The catalogue's tools and the chat's own question with choices (`ask_person`).
+    // The catalog's tools and the chat's own question with choices (`ask_person`).
     expect(requests[0].tools).toBe(await page.evaluate(async () => (await import('/assets/js/app/actions/index.js')).getActionCatalog().list().length) + 1);
     expect(requests[1].messages.at(-1).role).toBe('tool');
     expect(requests[1].messages.at(-1).results.map(result => [result.name, result.isError])).toEqual([['fields_list', false], ['color_by', false]]);
 
     // The tool row opens to what was asked and answered.
     await log.locator('.agent-tool[data-tool="color_by"] .agent-tool-head').click();
-    await expect(log.locator('.agent-tool[data-tool="color_by"] .agent-tool-args')).toContainText('"key": "cell_type"');
-    await expect(log.locator('.agent-tool[data-tool="color_by"] .agent-tool-result')).toContainText('Coloured by cell_type');
+    await expect(log.locator('.agent-tool[data-tool="color_by"] .agent-tool-args')).toContainText('"key": "score"');
+    await expect(log.locator('.agent-tool[data-tool="color_by"] .agent-tool-result')).toContainText('Colored by score');
 
     // Undo turn: every domain as before the turn.
     const foot = log.locator(`.agent-turn-foot[data-turn="${turn}"]`);
@@ -82,13 +85,13 @@ test.describe('agent chat', () => {
     const errors = observeProductErrors(page);
     await openDataset(page);
     await openChat(page);
-    await queueReplies(page, [{ calls: [COLOR_BY_CELL_TYPE] }, { text: 'Coloured.' }]);
-    await say(page, 'Colour by cell type');
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'Colored.' }]);
+    await say(page, 'Color by score');
     // The person hides a category themselves.
     await page.evaluate(async field => {
       const { getActions } = await import('/assets/js/app/actions/index.js');
       await getActions().dispatch('filter.category.visibility', { field, categories: ['beta'], visible: false });
-    }, COLOR_BY_CELL_TYPE.args.field);
+    }, CELL_TYPE);
     // Asked to undo its last change, the agent reads the history first (as its instructions say).
     await queueReplies(page, [{ calls: [{ name: 'history_get', args: {} }] }, { text: 'The last step is yours; use Undo turn for mine.' }]);
     await say(page, 'Please undo your last change');
@@ -110,8 +113,8 @@ test.describe('agent chat', () => {
     const errors = observeProductErrors(page);
     await openDataset(page);
     await openChat(page);
-    await queueReplies(page, [{ text: 'Colouring.', calls: [COLOR_BY_CELL_TYPE] }, { text: 'Coloured.' }]);
-    await say(page, 'Colour by cell type');
+    await queueReplies(page, [{ text: 'Coloring.', calls: [COLOR_BY_SCORE] }, { text: 'Colored.' }]);
+    await say(page, 'Color by score');
     await page.locator('#agent-chat-log .agent-tool-head').click();
     await page.evaluate(() => {
       const log = document.getElementById('agent-chat-log');
@@ -138,7 +141,7 @@ test.describe('agent chat', () => {
     await openDataset(page);
     await openChat(page);
     // The model writes, then is still answering (held) when the person stops it, its call not made yet.
-    await queueReplies(page, [{ text: 'Reading the clusters one by one, then I will colour them. '.repeat(8), chunks: 8, hold: 'mid-reply', calls: [COLOR_BY_CELL_TYPE] }]);
+    await queueReplies(page, [{ text: 'Reading the clusters one by one, then I will color them. '.repeat(8), chunks: 8, hold: 'mid-reply', calls: [COLOR_BY_SCORE] }]);
     await page.locator('#agent-chat-input').fill('Annotate the clusters');
     await page.locator('#agent-chat-input').press('Enter');
     await waitForHold(page, 'mid-reply');
@@ -182,8 +185,8 @@ test.describe('agent chat', () => {
     const errors = observeProductErrors(page);
     await openDataset(page);
     await openChat(page);
-    await queueReplies(page, [{ calls: [COLOR_BY_CELL_TYPE] }, { text: 'Coloured by cell type.' }]);
-    await say(page, 'Colour by cell type please');
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'Colored by score.' }]);
+    await say(page, 'Color by score please');
     const kept = await page.evaluate(() => {
       const history = window._cellucidHistories.current();
       return history.chatsOf(history.active.id).map(([, transcript]) => transcript.messages.map(message => message.role));
@@ -220,7 +223,7 @@ test.describe('agent chat', () => {
     const chooserPromise = page.waitForEvent('filechooser');
     await clickLoadSession(page);
     await (await chooserPromise).setFiles(sessionPath);
-    await expect(page.locator('#agent-chat-log .agent-msg-user .agent-msg-text')).toHaveText('Colour by cell type please');
+    await expect(page.locator('#agent-chat-log .agent-msg-user .agent-msg-text')).toHaveText('Color by score please');
     await expect(page.locator('#agent-chat-log .agent-tool[data-tool="color_by"]')).toHaveAttribute('data-state', 'step');
     await expect(page.locator('#agent-chat-log .agent-turn-foot .agent-turn-undo')).toHaveText('Undo turn');
     expect(errors).toEqual([]);
@@ -230,8 +233,8 @@ test.describe('agent chat', () => {
     const errors = observeProductErrors(page);
     await openDataset(page);
     await openChat(page);
-    await queueReplies(page, [{ calls: [COLOR_BY_CELL_TYPE] }, { text: 'Coloured by cell type.' }]);
-    await say(page, 'Colour by cell type');
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'Colored by score.' }]);
+    await say(page, 'Color by score');
     await page.evaluate(() => window._cellucidHistories.flush());
 
     const reopened = await context.newPage();
@@ -239,12 +242,11 @@ test.describe('agent chat', () => {
     await reopened.addInitScript(installScriptedModel);
     await closePageWithApplicationRetirement(page);
     await openDataset(reopened);
-    const offer = reopened.locator('.notification').filter({ hasText: 'Continue where you left off?' });
-    await offer.getByRole('button', { name: 'Continue' }).click();
+    await continueWhereLeftOff(reopened);
     // The chat was open and the scripted model chosen: this browser remembers both.
     await expect(reopened.locator('#agent-chat-panel')).toBeVisible();
-    await expect(reopened.locator('#agent-chat-log .agent-msg-user .agent-msg-text')).toHaveText('Colour by cell type');
-    await expect(reopened.locator('#agent-chat-log .agent-msg-agent').last()).toContainText('Coloured by cell type.');
+    await expect(reopened.locator('#agent-chat-log .agent-msg-user .agent-msg-text')).toHaveText('Color by score');
+    await expect(reopened.locator('#agent-chat-log .agent-msg-agent').last()).toContainText('Colored by score.');
     await expect(reopened.locator('#agent-chat-log .agent-turn-foot .agent-turn-steps')).toHaveText('1 step ↗');
     // It goes on: the next turn is sent the kept conversation (its words; no reasoning was kept).
     await queueReplies(reopened, [{ text: 'Still here.' }]);
@@ -277,7 +279,7 @@ test.describe('agent chat', () => {
 
     await page.evaluate(() => { window.__ask(null); });
     await expect(card).toHaveCount(1);
-    await expect(card.locator('.agent-confirm-title')).toHaveText(/^ChatGPT asks to write a report file: “Wrote .+”\.$/);
+    await expect(card.locator('.agent-confirm-title')).toHaveText(/^ChatGPT asks to write a report file(: [^“”]+)?\.$/);
     await expect(card.locator('.agent-confirm-why')).toHaveText('It writes a file to this computer, which the history cannot take back.');
     await card.locator('.disclosure-header').click();
     await expect(card.locator('dl')).toContainText('cells.csv');
@@ -315,10 +317,10 @@ test.describe('agent chat', () => {
     await page.evaluate(async field => {
       const { getActions } = await import('/assets/js/app/actions/index.js');
       await getActions().dispatch('color.by', { field }, { origin: 'agent', agent: 'ChatGPT', turn: 'turn-connector' });
-    }, CELL_TYPE);
+    }, SCORE);
     const line = page.locator('#agent-presence .agent-activity[data-agent="ChatGPT"]');
     await expect(line).toHaveAttribute('data-state', 'done');
-    await expect(line.locator('.agent-activity-text')).toHaveText('ChatGPT · 1 step · Coloured by cell_type');
+    await expect(line.locator('.agent-activity-text')).toHaveText('ChatGPT · 1 step · Colored by score');
     await expect(line.locator('.agent-activity-stop')).toBeHidden();
     await line.locator('.agent-activity-undo').click();
     await expect(line).toHaveAttribute('data-state', 'undone');
@@ -335,7 +337,7 @@ test.describe('agent chat', () => {
       const { getActions } = await import('/assets/js/app/actions/index.js');
       await getActions().dispatch('color.by', { field }, { origin: 'agent', agent: 'ChatGPT', turn: 'turn-connector-2' });
       await getActions().dispatch('color.by', { field: null });
-    }, CELL_TYPE);
+    }, SCORE);
     await expect(page.locator('#agent-presence')).toBeHidden();
     expect(errors).toEqual([]);
   });
@@ -357,8 +359,8 @@ test.describe('agent chat', () => {
     const before = await fingerprint(page);
     await page.evaluate(async field => {
       const { getActions } = await import('/assets/js/app/actions/index.js');
-      await getActions().dispatch('color.by', { field }, { origin: 'agent', agent: 'ChatGPT', turn: 'turn-outside', connection: { id: 'g1', kind: 'connector', client: 'ChatGPT', host: 'chatgpt.com' } });
-    }, CELL_TYPE);
+      await getActions().dispatch('color.by', { field }, { origin: 'agent', agent: 'ChatGPT', turn: 'turn-outside', connection: { id: 'g1', kind: 'connector', client: 'ChatGPT', host: 'chatgpt.com', known: true } });
+    }, SCORE);
     const line = page.locator('#agent-presence .agent-activity[data-agent="ChatGPT"]');
     await expect(line).toHaveAttribute('data-state', 'done');
     await line.locator('.agent-activity-undo').click();
@@ -485,6 +487,30 @@ test.describe('agent chat', () => {
     expect(panel.y + panel.height).toBeLessThanOrEqual(bar.y);
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
     await expect(page.locator('#agent-chat-log table')).toBeVisible();
+
+    // A result table as a model writes one (He, Opus): a long first column
+    // and five of numbers. Every word of every cell stays on one line (it
+    // read "Adjuste|d p" and "0.04|%"), and the table fits the log.
+    await queueReplies(page, [{ text: '| Share of epithelium (mean of 4 donors) | Early | Mid | Late | Adjusted p |\n|---|---|---|---|---|\n| Ciliated cells | 0.04% | 40% | **66%** | 5×10⁻⁴ |\n| Airway progenitors | **38%** | 3.3% | 1.9% | 0.001 |' }]);
+    await say(page, 'Which epithelial types change with age?');
+    await expect(page.locator('#agent-chat-log table')).toHaveCount(2);
+    const split = await page.locator('#agent-chat-log table').last().evaluate(table => {
+      const broken = [];
+      for (const cell of table.querySelectorAll('th, td')) {
+        const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
+        for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+          for (const match of node.data.matchAll(/\S+/g)) {
+            const range = document.createRange();
+            range.setStart(node, match.index);
+            range.setEnd(node, match.index + match[0].length);
+            const lines = new Set([...range.getClientRects()].map(rect => Math.round(rect.top)));
+            if (lines.size > 1) broken.push(match[0]);
+          }
+        }
+      }
+      return { broken, fits: table.getBoundingClientRect().right <= table.closest('#agent-chat-log').getBoundingClientRect().right + 0.5 };
+    });
+    expect(split).toEqual({ broken: [], fits: true });
     expect(errors).toEqual([]);
   });
 });

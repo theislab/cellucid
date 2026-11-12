@@ -53,7 +53,7 @@ and one with `X_umap`, `X_tsne`, `X_pca` and a vector field bound to `X_umap`.
 holds twelve embeddings with no default UMAP, as a segmentation export has
 them: three 2-column `X_umap_scale*_latents`, two 3-column arrays, an integer
 4-column `coordinates` and six wide latent and PCA arrays, plus a layer, a
-neighbour graph and Scanpy's colours for `cell_type`
+neighbor graph and Scanpy's colors for `cell_type`
 (`uns['cell_type_colors']`); the sidebar layout, the dimension choice of a
 narrow array and the sidebar's scroll position are tested on it, and
 `tests/browser/dataset-switch-opening-view.spec.mjs` opens it after another
@@ -62,7 +62,7 @@ dataset (the embedding, camera, point size and palette it opens with). The 12,00
 ZIP) are described in the generator. Every array is drawn from a seeded
 generator, so a second run writes the same bytes.
 `data-mapping-full.expected.json` is what the browser must read from the full
-fixture -- each neighbour graph's edges or its refusal, every gene list's names
+fixture -- each neighbor graph's edges or its refusal, every gene list's names
 and values, the outlier quantiles of every latent space and categorical field,
 and every bound vector payload -- computed by the generator with numpy,
 independently of the browser's code, which the `data-mapping-*-contract` and
@@ -107,6 +107,11 @@ python scripts/generate-browser-catalog-fixtures.py
 - `uint32-categories.h5ad` is the current-ui cells with a 70,000-category
   `cell_type`: gamma at code 0, alpha at 65,536 and beta at 69,999, so a
   16-bit copy of a code names another category; five gamma cells are missing.
+- `integer-identifiers.h5ad` ("Integer identifiers") is the current-ui cells
+  with `donor_id`, unsigned 64-bit integers four of whose five values are past
+  2^53 (read as their exact text, F116), and `n_counts`, 64-bit integers within
+  2^53 (numbers), and `tissue` with an empty and a blank category (shown
+  `(empty)` and `(blank)`); `integer-identifiers.spec.mjs` opens it.
 - `replay-other.h5ad` ("Replay fixture") is the current-ui cells as another
   sample, for a history recorded on current-ui replayed on it
   (`history-replay-other-dataset.spec.mjs`): its `cell_type` shares only

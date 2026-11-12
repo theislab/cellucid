@@ -17,6 +17,7 @@ import { decodeAnnDataBoolean, decodeAnnDataBooleanFlags } from '../anndata-valu
 import { geneNameText } from '../gene-names.js';
 import { StoreNotLoadedError, isGroup } from '../../formats/store.js';
 import {
+  AnnDataFormatError,
   NULLABLE_ENCODINGS,
   child,
   encodingType,
@@ -29,7 +30,7 @@ import {
   validateOneDimensional,
   valueKind,
 } from './elements.js';
-import { readContinuous, readInt32, readStored } from './values.js';
+import { UNSAFE_INTEGERS_AS_TEXT, holdsUnsafeIntegers, readContinuous, readExactIntegers, readInt32, readStored, stores64BitIntegers } from './values.js';
 import { allocateTypedArray } from '../sparse-column-index.js';
 
 /**
@@ -43,14 +44,14 @@ export function resolveCategoricalColumn(frame, key, format) {
   if (!isGroup(item) || encodingType(item) !== 'categorical') return null;
   const ordered = requireCategoricalOrdered(item, `Categorical field '${key}'`);
   if (!item.has('codes') || !item.has('categories')) {
-    throw new Error(`Categorical field '${key}' must contain codes and categories`);
+    throw new AnnDataFormatError(`Categorical field '${key}' must contain codes and categories`);
   }
   const codes = item.get('codes');
   const categories = item.get('categories');
   validateArrayEncoding(codes, format, `Categorical codes for '${key}'`, 'array');
   if (isGroup(categories)) {
     if (encodingType(categories) !== 'nullable-string-array') {
-      throw new Error(
+      throw new AnnDataFormatError(
         `Categorical categories for '${key}' must use a current array or nullable-string-array encoding`
       );
     }
@@ -73,7 +74,7 @@ export function validateColumnEncoding(item, format, label) {
     requireEncoding(item, declared, '0.1.0', label);
     return declared;
   }
-  throw new Error(`${label} uses unsupported encoding '${declared || 'unknown'}'`);
+  throw new AnnDataFormatError(`${label} uses unsupported encoding '${declared || 'unknown'}'`);
 }
 
 /**
@@ -82,10 +83,10 @@ export function validateColumnEncoding(item, format, label) {
  * @returns {{maskArray: Object, valuesArray: Object, valuesKind: string, valuesLength: number}}
  */
 export function nullableContract(item, key, declared, format, expectedLength = null) {
-  if (!isGroup(item)) throw new Error(`Nullable field '${key}' must be a ${format.storage} group`);
+  if (!isGroup(item)) throw new AnnDataFormatError(`Nullable field '${key}' must be a ${format.storage} group`);
   requireEncoding(item, declared, '0.1.0', `Nullable field '${key}'`);
   if (!item.has('values') || !item.has('mask')) {
-    throw new Error(`Nullable field '${key}' must contain values and mask datasets`);
+    throw new AnnDataFormatError(`Nullable field '${key}' must contain values and mask datasets`);
   }
   const valuesArray = item.get('values');
   const maskArray = item.get('mask');
@@ -98,20 +99,20 @@ export function nullableContract(item, key, declared, format, expectedLength = n
   validateArrayEncoding(maskArray, format, `Nullable mask for '${key}'`, 'array');
   const valuesLength = validateOneDimensional(valuesArray, format, `Nullable values for '${key}'`, expectedLength);
   const maskLength = validateOneDimensional(maskArray, format, `Nullable mask for '${key}'`, expectedLength ?? valuesLength);
-  if (valuesLength !== maskLength) throw new Error(`Nullable values and mask lengths differ for '${key}'`);
+  if (valuesLength !== maskLength) throw new AnnDataFormatError(`Nullable values and mask lengths differ for '${key}'`);
   const valuesKind = valueKind(valuesArray);
-  if (valueKind(maskArray) !== 'bool') throw new Error(`Nullable mask for '${key}' must use a boolean dtype`);
+  if (valueKind(maskArray) !== 'bool') throw new AnnDataFormatError(`Nullable mask for '${key}' must use a boolean dtype`);
   if (declared === 'nullable-integer' && valuesKind !== 'int' && valuesKind !== 'uint') {
-    throw new Error(`Nullable integer values for '${key}' must use an integer dtype`);
+    throw new AnnDataFormatError(`Nullable integer values for '${key}' must use an integer dtype`);
   }
   if (declared === 'nullable-boolean' && valuesKind !== 'bool') {
-    throw new Error(`Nullable boolean values for '${key}' must use a boolean dtype`);
+    throw new AnnDataFormatError(`Nullable boolean values for '${key}' must use a boolean dtype`);
   }
   if (declared === 'nullable-string-array' && valuesKind !== 'string') {
-    throw new Error(`Nullable string values for '${key}' must use a string dtype`);
+    throw new AnnDataFormatError(`Nullable string values for '${key}' must use a string dtype`);
   }
   if (!NULLABLE_ENCODINGS.has(declared)) {
-    throw new Error(`Unsupported nullable encoding-type '${declared}' for '${key}'`);
+    throw new AnnDataFormatError(`Unsupported nullable encoding-type '${declared}' for '${key}'`);
   }
   return { maskArray, valuesArray, valuesKind, valuesLength };
 }
@@ -137,7 +138,7 @@ export async function readBooleanMask(maskArray, length, label, options, range =
  * where missing. `range` (`{start, end}`) reads only those rows; every row
  * by default.
  */
-export async function readNullableValues(item, key, declared, format, expectedLength = null, contract = null, options = {}, range = null) {
+export async function readNullableValues(item, key, declared, format, expectedLength = null, contract = null, options = {}, range = null, integers = 'decide') {
   const { maskArray, valuesArray, valuesKind, valuesLength: storedLength } =
     contract ?? nullableContract(item, key, declared, format, expectedLength);
   const { start, end } = range ?? { start: 0, end: storedLength };
@@ -145,7 +146,14 @@ export async function readNullableValues(item, key, declared, format, expectedLe
   if (declared === 'nullable-integer') {
     // Only present values are checked: what a writer leaves under the mask
     // is not data. Integers stay exact: float64 where float32 cannot hold
-    // them (`readContinuous`, 64-bit ones through their words).
+    // them (`readContinuous`), and 64-bit ones past 2^53 as their decimal
+    // text (`readExactIntegers`: identifiers, `asText` says so).
+    if (stores64BitIntegers(valuesArray)) {
+      const mask = await readBooleanMask(maskArray, storedLength, `Nullable mask for '${key}'`, options, { start, end });
+      const read = await readExactIntegers(valuesArray, start, end, `Nullable values for '${key}'`, options, mask, integers);
+      if (read.text !== undefined) return { dtype: 'string', values: read.text, asText: UNSAFE_INTEGERS_AS_TEXT };
+      return { dtype: valuesKind === 'uint' ? 'uint' : 'int', values: read.values };
+    }
     const [mask, values] = await Promise.all([
       readBooleanMask(maskArray, storedLength, `Nullable mask for '${key}'`, options, { start, end }),
       readContinuous(valuesArray, start, end, `Nullable values for '${key}'`, options),
@@ -173,7 +181,7 @@ async function readNames(array, length, label, options) {
   const names = new Array(length);
   for (let i = 0; i < length; i++) {
     const value = raw[i];
-    if (value === null || value === undefined) throw new Error(`${label} cannot contain missing names`);
+    if (value === null || value === undefined) throw new AnnDataFormatError(`${label} cannot contain missing names`);
     names[i] = typeof value === 'string' ? value : String(value);
   }
   return names;
@@ -189,11 +197,11 @@ export async function readDataFrameIndex(indexNode, format, label, expectedLengt
     await indexNode.load([''], options);
     const declared = encodingType(indexNode);
     if (declared !== 'nullable-string-array') {
-      throw new Error(`${label} group uses unsupported encoding '${declared || 'unknown'}'`);
+      throw new AnnDataFormatError(`${label} group uses unsupported encoding '${declared || 'unknown'}'`);
     }
     const contract = nullableContract(indexNode, label, declared, format, expectedLength);
     const mask = await readBooleanMask(contract.maskArray, contract.valuesLength, `Nullable mask for '${label}'`, options);
-    if (mask.some(value => value !== 0)) throw new Error(`${label} cannot contain missing names`);
+    if (mask.some(value => value !== 0)) throw new AnnDataFormatError(`${label} cannot contain missing names`);
     return {
       length: contract.valuesLength,
       values: materialize ? await readNames(contract.valuesArray, contract.valuesLength, label, options) : null,
@@ -201,7 +209,7 @@ export async function readDataFrameIndex(indexNode, format, label, expectedLengt
   }
   validateArrayEncoding(indexNode, format, label, 'string-array');
   const length = validateOneDimensional(indexNode, format, label, expectedLength);
-  if (valueKind(indexNode) !== 'string') throw new Error(`${label} must use a string dtype`);
+  if (valueKind(indexNode) !== 'string') throw new AnnDataFormatError(`${label} must use a string dtype`);
   return { length, values: materialize ? await readNames(indexNode, length, label, options) : null };
 }
 
@@ -210,12 +218,12 @@ function freezeUniqueCategories(categories, key) {
   for (const category of categories) {
     const type = typeof category;
     if (type !== 'string' && type !== 'number' && type !== 'boolean') {
-      throw new Error(`Categorical categories for '${key}' contain an unsupported label type`);
+      throw new AnnDataFormatError(`Categorical categories for '${key}' contain an unsupported label type`);
     }
     if (type === 'number' && !Number.isFinite(category)) {
-      throw new Error(`Categorical categories for '${key}' contain a non-finite numeric label`);
+      throw new AnnDataFormatError(`Categorical categories for '${key}' contain a non-finite numeric label`);
     }
-    if (seen.has(category)) throw new Error(`Categorical categories for '${key}' contain a duplicate label`);
+    if (seen.has(category)) throw new AnnDataFormatError(`Categorical categories for '${key}' contain a duplicate label`);
     seen.add(category);
   }
   return Object.freeze(categories);
@@ -226,7 +234,7 @@ export function categoryCount(categories, key, format) {
   if (isGroup(categories)) {
     const declared = encodingType(categories);
     if (declared !== 'nullable-string-array') {
-      throw new Error(`Categorical categories for '${key}' use unsupported encoding '${declared}'`);
+      throw new AnnDataFormatError(`Categorical categories for '${key}' use unsupported encoding '${declared}'`);
     }
     const contract = nullableContract(categories, `${key}' categories`, declared, format, null);
     return requireCategoricalCategoryCount(contract.valuesLength, `Categorical observation field "${key}"`);
@@ -235,7 +243,7 @@ export function categoryCount(categories, key, format) {
   const length = validateOneDimensional(categories, format, `Categorical categories for '${key}'`);
   requireCategoricalCategoryCount(length, `Categorical observation field "${key}"`);
   if (valueKind(categories) === 'unknown') {
-    throw new Error(`Categorical categories for '${key}' must use a numeric, boolean, or string dtype`);
+    throw new AnnDataFormatError(`Categorical categories for '${key}' must use a numeric, boolean, or string dtype`);
   }
   return length;
 }
@@ -245,14 +253,14 @@ export async function readCategories(categories, key, format, options = {}) {
   if (isGroup(categories)) {
     const declared = encodingType(categories);
     if (declared !== 'nullable-string-array') {
-      throw new Error(`Categorical categories for '${key}' use unsupported encoding '${declared}'`);
+      throw new AnnDataFormatError(`Categorical categories for '${key}' use unsupported encoding '${declared}'`);
     }
     const nullableKey = `${key}' categories`;
     const contract = nullableContract(categories, nullableKey, declared, format, null);
     requireCategoricalCategoryCount(contract.valuesLength, `Categorical observation field "${key}"`);
     const result = await readNullableValues(categories, nullableKey, declared, format, null, contract, options);
     if (result.values.some(value => value === null)) {
-      throw new Error(`Categorical categories for '${key}' cannot contain missing labels`);
+      throw new AnnDataFormatError(`Categorical categories for '${key}' cannot contain missing labels`);
     }
     return freezeUniqueCategories(result.values, key);
   }
@@ -301,14 +309,13 @@ function categoryLabels(raw, kind, key) {
     ));
   }
   // Labels are names: a 64-bit integer label beyond 2^53 has no exact
-  // number, so such labels are all given as their exact decimal text.
-  if (Array.prototype.some.call(raw, value => typeof value === 'bigint' && (value > 9007199254740991n || value < -9007199254740991n))) {
-    return Array.from(raw, value => String(value));
-  }
+  // number, so such labels are all given as their exact decimal text, as an
+  // obs column of such integers is read (`holdsUnsafeIntegers`).
+  if (holdsUnsafeIntegers(raw)) return Array.from(raw, value => String(value));
   return Array.from(raw, value => {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) {
-      throw new Error(`Categorical categories for '${key}' cannot contain non-finite numeric labels`);
+      throw new AnnDataFormatError(`Categorical categories for '${key}' cannot contain non-finite numeric labels`);
     }
     return numeric;
   });
@@ -323,7 +330,7 @@ export function validateCodes(codes, key, format, nRows) {
   validateArrayEncoding(codes, format, `Categorical codes for '${key}'`, 'array');
   const length = validateOneDimensional(codes, format, `Categorical codes for '${key}'`, nRows);
   const kind = valueKind(codes);
-  if (kind !== 'int' && kind !== 'uint') throw new Error(`Categorical codes for '${key}' must use an integer dtype`);
+  if (kind !== 'int' && kind !== 'uint') throw new AnnDataFormatError(`Categorical codes for '${key}' must use an integer dtype`);
   return length;
 }
 
@@ -338,7 +345,7 @@ export async function readCodes(codes, nCategories, key, format, nRows, options 
   for (let i = 0; i < values.length; i++) {
     const code = values[i];
     if (code < -1 || code >= nCategories) {
-      throw new Error(`Categorical code ${code} for '${key}' is outside missing-or-category bounds`);
+      throw new AnnDataFormatError(`Categorical code ${code} for '${key}' is outside missing-or-category bounds`);
     }
   }
   return values;
@@ -354,7 +361,7 @@ export async function readCodes(codes, nCategories, key, format, nRows, options 
  * which refuses a column whose parts are wrong with the same words.
  */
 export function validateColumnAxis(frame, key, format, frameLabel, expectedLength) {
-  if (!frame.has(key)) throw new Error(`${frameLabel} declared column '${key}' was not found`);
+  if (!frame.has(key)) throw new AnnDataFormatError(`${frameLabel} declared column '${key}' was not found`);
   const item = frame.get(key);
   const label = `${frameLabel} column '${key}'`;
   validateColumnEncoding(item, format, label);

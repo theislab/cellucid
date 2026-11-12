@@ -40,7 +40,10 @@ export const OperationType = {
   COMPOSITION_COUNTS: 'COMPOSITION_COUNTS',
   GROUP_SUMMARY_SET_CONTEXT: 'GROUP_SUMMARY_SET_CONTEXT',
   GROUP_SUMMARY_COMPUTE_GENES: 'GROUP_SUMMARY_COMPUTE_GENES',
-  GROUP_SUMMARY_CLEAR_CONTEXT: 'GROUP_SUMMARY_CLEAR_CONTEXT'
+  GROUP_SUMMARY_CLEAR_CONTEXT: 'GROUP_SUMMARY_CLEAR_CONTEXT',
+  // --- a run's values: its cells' factors (task-values.js) ---
+  SET_CELL_SCALE: 'SET_CELL_SCALE',
+  CLEAR_CELL_SCALE: 'CLEAR_CELL_SCALE'
 };
 
 // ============================================================================
@@ -228,6 +231,20 @@ const Operations = {
     id: OperationType.GROUP_SUMMARY_CLEAR_CONTEXT,
     name: 'Clear Group Summary Context',
     description: 'Release the groups of a dot plot run',
+    workerCapable: true,
+    cpuCapable: true
+  },
+  [OperationType.SET_CELL_SCALE]: {
+    id: OperationType.SET_CELL_SCALE,
+    name: 'Set Cell Scale',
+    description: 'Hold a run\'s per-cell library-size factors, which its tasks that name them normalize their delivered genes by',
+    workerCapable: true,
+    cpuCapable: true
+  },
+  [OperationType.CLEAR_CELL_SCALE]: {
+    id: OperationType.CLEAR_CELL_SCALE,
+    name: 'Clear Cell Scale',
+    description: 'Release a run\'s per-cell library-size factors',
     workerCapable: true,
     cpuCapable: true
   }

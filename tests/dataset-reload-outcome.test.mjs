@@ -679,6 +679,35 @@ test('a change that may not touch the dataset never overrides a later action', a
   assert.throws(() => changes.beginIfNoActionSince(1.5), TypeError);
 });
 
+test('the startup opening is no choice of the person\'s: a connection asked for before it began still replaces it (R9V-2)', async () => {
+  const { createLatestDatasetReloadCoordinator } =
+    await import(outcomeModuleUrl);
+  const changes = createLatestDatasetReloadCoordinator(() => ({
+    baseUrl: null,
+    datasetId: null,
+    selectionIdentity: null,
+    source: null
+  }));
+  // A link is typed while startup still resolves its default sample.
+  const atClick = changes.actionSequence;
+  // The default sample then begins opening: it yields to the person's link.
+  const startup = changes.beginStartup();
+  assert.equal(changes.actionSequence, atClick, 'the startup opening records no action');
+  assert.equal(startup.isLatest(), true);
+  // The link's server answers with one dataset: it replaces the sample.
+  const link = changes.beginIfNoActionSince(atClick);
+  assert.notEqual(link, null, 'the person\'s link is opened');
+  assert.equal(startup.signal.aborted, true, 'the startup opening is superseded');
+  assert.throws(() => startup.assertCurrent(), isCancellation);
+  link.finish();
+  // A choice of the person's still records one: a connection clicked before it loses to it.
+  const beforeChoice = changes.actionSequence;
+  const choice = changes.begin();
+  assert.equal(changes.actionSequence, beforeChoice + 1);
+  assert.equal(changes.beginIfNoActionSince(beforeChoice), null);
+  choice.finish();
+});
+
 test('retiring the changes stops the one in flight and admits no other', async () => {
   const { createLatestDatasetReloadCoordinator } =
     await import(outcomeModuleUrl);
@@ -1830,7 +1859,7 @@ test('in-place reload stages one generation before reversible publication', asyn
     managerCommitIndex
   );
   const publicationContinuationIndex = reloadSource.indexOf(
-    'let managerListenerError = null;',
+    'let managerPublicationError = null;',
     runtimeCommitIndex
   );
   const managerPublishIndex = reloadSource.indexOf(
@@ -2048,7 +2077,7 @@ test(
       /settlePublishedDatasetStateOutcome\(\{[\s\S]*transaction:\s*publication/
     );
     const reloadPublishedContinuation = reload.slice(
-      reload.indexOf('let managerListenerError = null;')
+      reload.indexOf('let managerPublicationError = null;')
     );
     assert.doesNotMatch(
       reloadPublishedContinuation,
@@ -2095,7 +2124,7 @@ test(
       'None publication must keep its previous source alive until field interaction settlement, then finalize it before stale exit'
     );
     const clearPublishedContinuation = clear.slice(
-      clear.indexOf('let managerListenerError = null;')
+      clear.indexOf('let managerPublicationError = null;')
     );
     assert.doesNotMatch(
       clearPublishedContinuation,
@@ -2307,7 +2336,7 @@ test('connectivity edge publication has one abortable generation owner', async (
   // dataset's own graph (`obsp`) or a mapped graph's (`obsp/{p}`).
   assert.match(
     connectivitySource,
-    /loadEdges\(\s*owner\.url,\s*owner\.summary,\s*\{ signal: owner\.controller\.signal \}/s
+    /loadEdges\(\s*owner\.url,\s*owner\.summary,\s*\{ signal: owner\.controller\.signal, readKey \}/s
   );
   assert.match(connectivitySource, /url: connectivityUrl/);
   assert.match(connectivitySource, /owner\.url !== connectivityUrl/);
@@ -2570,7 +2599,7 @@ test('isolated local dataset candidates publish one truthful terminal outcome', 
       terminal.map(event => event.kind),
       ['complete']
     );
-    assert.match(terminal[0].message, /ready.*2 cells/i);
+    assert.match(terminal[0].message, /^Opened .+: 2 cells$/);
     assert.equal(result.populateCalls, 1);
     assert.equal(result.candidate.disconnectCalls, 0);
     assert.equal(activations.length, 1);

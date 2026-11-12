@@ -148,7 +148,7 @@ function captureNotifications(t) {
   };
   notifications.error = (message, options = {}) => {
     const id = options.id ?? `connection-${++nextId}`;
-    events.push({ id, kind: 'error', message });
+    events.push({ id, kind: 'error', message, details: options.details ?? '' });
     return id;
   };
   notifications.fail = (id, message) => {
@@ -868,7 +868,7 @@ test('a typed address the source cannot read is refused before any connection st
     ['remote', '', /^Type an address first: /],
     ['remote', 'localhost:99999', /^99999 is not a port: a port is a number from 1 to 65535, as in localhost:8765\.$/],
     ['link', '   ', /^Type an address first: /],
-    ['link', 'not a repo', /^Cellucid does not recognise "not a repo"\./],
+    ['link', 'not a repo', /^Cellucid does not recognize "not a repo"\./],
   ];
   for (const [type, value, expected] of cases) {
     await t.test(`${type} ${JSON.stringify(value)}`, async t => {
@@ -1042,7 +1042,7 @@ test('multi-dataset cleanup failure retains the published candidate', async t =>
       assert.equal(terminal[0].kind, 'fail');
       assert.match(
         terminal[0].message,
-        /connected.*prior connection could not be released/i
+        /connected.*earlier connection could not be released/i
       );
     });
   }
@@ -1272,8 +1272,9 @@ test('disconnect failures are contained in a deterministic blocked state', async
       harness.notifications.some(
         event =>
           event.kind === 'error' &&
-          /disconnect could not finish safely.*catalog refresh rejected/i
-            .test(event.message)
+          // What happened and what to do in the sentence; the cause under Details.
+          /disconnect could not finish safely\. Reload the page before reconnecting\.$/.test(event.message) &&
+          /catalog refresh rejected/.test(event.details)
       ),
       true
     );
@@ -1299,7 +1300,7 @@ test('connection teardown disables DOM owners', async t => {
 test('the address bar ships the label it keeps', async () => {
   // `index.html` paints the bar long before `initUI` runs, so whatever the
   // markup says is on screen for the whole of startup. Its Open button is
-  // never relabelled: a connection is shown on its own line under the bar.
+  // never relabeled: a connection is shown on its own line under the bar.
   const [indexHtml, connectionsSource] = await Promise.all([
     readFile(new URL('../index.html', import.meta.url), 'utf8'),
     readFile(

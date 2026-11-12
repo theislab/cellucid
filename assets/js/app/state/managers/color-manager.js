@@ -33,6 +33,7 @@ import {
   writeContinuousColors,
 } from './continuous-colors.js';
 import { BaseManager } from '../core/base-manager.js';
+import { RAW_VALUES, isRawValues } from '../../../data/expression-transform.js';
 import { colorOutlierMethods } from './color-outliers.js';
 import {
   writableColors,
@@ -79,6 +80,11 @@ function geneSampleOfLegend(sample) {
   return sample === null ? null : Object.freeze({ cells: sample.cells, of: sample.of });
 }
 
+/** A transform shown, as a legend model keeps it: null for the values as stored. */
+function shownValuesOrNull(transform) {
+  return isRawValues(transform) ? null : transform;
+}
+
 /** The legend's gray for zero (`updateLegendState`). */
 function zeroGrayOfLegend(field, stats, gene, scale) {
   const applies = gene && stats.min >= 0;
@@ -94,11 +100,11 @@ function requireBoolean(value, context) {
 }
 
 /**
- * A continuous field as colours and statistics read it: its values a
+ * A continuous field as colors and statistics read it: its values a
  * Float32Array or Float64Array (a field's own values always are,
  * `field/loading.js`), or, for a gene shown on the cells read so far, the
  * sparse form of those cells (`showPartialVarField`, `data/column-forms.js`):
- * the colour kernels read either.
+ * the color kernels read either.
  */
 function requireContinuousField(field) {
   if (
@@ -189,10 +195,10 @@ function requireCategoryField(field) {
 }
 
 /**
- * The colour domain of a continuous field: its values' range, or the colour
+ * The color domain of a continuous field: its values' range, or the color
  * range when it follows the filter; on a log scale the positive part of it.
  * A diverging colormap (RdBu, Seismic, …) on a linear scale whose domain
- * spans 0 is centred there, `±max(|min|, |max|)`, so its neutral middle is
+ * spans 0 is centered there, `±max(|min|, |max|)`, so its neutral middle is
  * 0 and not the midpoint of the range (`centered`).
  */
 function computeContinuousDomain(field, meta, useLog) {
@@ -212,7 +218,7 @@ function computeContinuousDomain(field, meta, useLog) {
     if (domainMin > domainMax) {
       // A slider-tracked range can lie entirely at or below zero (Max dragged
       // under the smallest positive value). Every cell in it is non-positive
-      // and draws grey under a log scale, so the domain collapses onto the
+      // and draws gray under a log scale, so the domain collapses onto the
       // smallest positive value instead of refusing a legitimate UI state.
       domainMin = positive.min;
       domainMax = positive.min;
@@ -261,11 +267,11 @@ export class DataStateColorMethods {
    * a property of the field being described, not of the viewer.
    *
    * This read `activeFieldSource`, which is what the viewer is *currently*
-   * coloured by. That is right only when the field being validated is also the
+   * colored by. That is right only when the field being validated is also the
    * active one, and three of the callers are the opposite case:
    * `computeGlobalVisibility()` walks every obs field carrying a filter, and
    * `toggleFilterEnabled` / `removeFilter` validate one obs field by name. While
-   * a gene was coloured, `activeFieldSource` was `'var'` for all of them, so an
+   * a gene was colored, `activeFieldSource` was `'var'` for all of them, so an
    * `obs` column that could not be drawn was reported as a gene and handed the
    * reader `adata.X` repair advice for a column that is not in `adata.X`.
    *
@@ -460,16 +466,16 @@ export class DataStateColorMethods {
    * colormap and domain, opaque, in one pass (visibility is the
    * transparency's alone).
    *
-   * A gene's 0 is a value: by default it takes the colour scale's lowest
-   * colour, as every other value takes its own. With gray for zero on
+   * A gene's 0 is a value: by default it takes the color scale's lowest
+   * color, as every other value takes its own. With gray for zero on
    * (`_zeroGray`, `setContinuousZeroGray`), a gene's cells that do not
    * express it -- its zeros, most cells of most genes -- are drawn in the
-   * neutral no-value gray instead, beneath the coloured cells, so the
+   * neutral no-value gray instead, beneath the colored cells, so the
    * colormap shows only where it is expressed. That floor is the gene's
-   * zero, from the data, never the colour range: a range moved up (to
+   * zero, from the data, never the color range: a range moved up (to
    * follow a filter of "≥ 1") clamps the cells at and below its minimum to
-   * the lowest colour, as scanpy's `vmin` does, so the expressing cells at
-   * the bound keep their colour. It applies to genes with no negative value
+   * the lowest color, as scanpy's `vmin` does, so the expressing cells at
+   * the bound keep their color. It applies to genes with no negative value
    * only (`_zeroGrayApplies`). On a log scale a 0 has no logarithm and is
    * gray either way.
    *
@@ -509,8 +515,8 @@ export class DataStateColorMethods {
   }
 
   /**
-   * Make a categorical field's colours, visibility and filter switch where
-   * it has none (its default colours, every category shown, filtering on),
+   * Make a categorical field's colors, visibility and filter switch where
+   * it has none (its default colors, every category shown, filtering on),
    * and check them: each array once (`category-state.js`).
    */
   ensureCategoryMetadata(field) {
@@ -546,7 +552,7 @@ export class DataStateColorMethods {
 
   /**
    * Write every cell's category color (hidden categories in gray), opaque but
-   * for the missing value's grey, drawn beneath (`BENEATH_ALPHA_BYTE`).
+   * for the missing value's gray, drawn beneath (`BENEATH_ALPHA_BYTE`).
    * Visibility is not written: every caller recomputes it next
    * (`computeGlobalVisibility`), which publishes the transparency from the
    * mask and every filter, so a transparency written here would be
@@ -574,7 +580,7 @@ export class DataStateColorMethods {
     const rgbaBytes = new Uint8Array((numCats + 1) * 4);
     for (let code = 0; code <= numCats; code++) {
       let r, g, b;
-      // A missing value's grey is drawn beneath the categorized cells.
+      // A missing value's gray is drawn beneath the categorized cells.
       let layer = 255;
       if (code === numCats) {
         r = NEUTRAL_GRAY_UINT8; g = NEUTRAL_GRAY_UINT8; b = NEUTRAL_GRAY_UINT8;
@@ -780,7 +786,7 @@ export class DataStateColorMethods {
         || !Number.isSafeInteger(centroid.n_points)
         || centroid.n_points < 1
       ) {
-        // A centroid is the centre of the cells of a category that holds
+        // A centroid is the center of the cells of a category that holds
         // some; a category no cell holds has none.
         throw new TypeError(
           `Centroid ${centroidIndex} must contain an exact ${currentDim}D position and a positive point count.`
@@ -880,7 +886,7 @@ export class DataStateColorMethods {
       this.centroidPositions[3 * i + 2] = nativeDim >= 3 ? pos[2] : 0;
 
       const idx = catIndexByName.get(c.category);
-      // RGBA bytes: the category's colour, opaque.
+      // RGBA bytes: the category's color, opaque.
       const colBase = i * 4;
       this.centroidColors[colBase] = catColors[idx * 3];
       this.centroidColors[colBase + 1] = catColors[idx * 3 + 1];
@@ -956,6 +962,13 @@ export class DataStateColorMethods {
         // A gene read for a sample of the open cells (`field/gene-sample.js`):
         // the others are gray, not read; a legend (and a figure's) says so.
         geneSample: this._isGeneField(field) ? geneSampleOfLegend(this.getGeneSample?.() ?? null) : null,
+        // What a gene's values are in (Data mapping › Expression values):
+        // the transform shown, `{normalize, log1p}`; null as stored, for an
+        // obs field, and for a gene made in the app (it keeps its values).
+        // The legend names them with `geneValueLabel` / `transformUnits`.
+        values: this._isGeneField(field) && field._isUserDefined !== true
+          ? shownValuesOrNull(this.getShownExpressionTransform?.() ?? RAW_VALUES)
+          : null,
         // Gray for zero: the switch (`enabled`), whether it changes this
         // field (`applies`: a gene with no negative value), and whether its
         // zeros are drawn gray now (`drawn`: the switch on a linear scale,
@@ -1063,7 +1076,7 @@ export class DataStateColorMethods {
   /**
    * Gray for zero on or off for a continuous field (the legend's switch):
    * on, a gene's zeros are drawn in the theme's gray beneath the expressing
-   * cells; off (the default), in the colour scale's lowest colour
+   * cells; off (the default), in the color scale's lowest color
    * (`updateColorsContinuous`).
    *
    * @param {number} fieldIndex
@@ -1098,7 +1111,7 @@ export class DataStateColorMethods {
   }
 
   /**
-   * A field's colours changed (a category recoloured, a colour scale set):
+   * A field's colors changed (a category recolored, a color scale set):
    * what draws them (the legend) follows, whoever changed them (a control,
    * an undo, an agent, a notebook).
    *

@@ -27,7 +27,7 @@
  *   kept as values; resuming adds one squashed step for what differs.
  * - `Branch`: an object with a unique name, a fork step (`base`, null for
  *   the branch that holds the root), its last step (`tip`), who made it, a
- *   colour slot (`lane`), and the flags `locked` and `archived`. Which branch
+ *   color slot (`lane`), and the flags `locked` and `archived`. Which branch
  *   is main is the tracker's `mainBranch`.
  * - `Group`: a named folder over consecutive steps of one branch, metadata
  *   only (§3.15.2). Each step names its group (`Step.group`); the group holds
@@ -76,11 +76,12 @@
  */
 
 import { DOMAIN_IDS } from '../actions/domains.js';
-import { ACTION_ORIGINS } from '../actions/dispatcher.js';
+import { ACTION_HOSTS, ACTION_ORIGINS } from '../actions/dispatcher.js';
 import { ACTION_READ_INPUTS } from '../actions/catalog.js';
 import { isPlainRecord } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
 import { plainSentence, quoteName } from '../actions/targets/names.js';
+import { lowerFirst } from '../../utils/text-case.js';
 
 /** The version of the description (`historyModelDocument`); bumped with any change to it. */
 export const HISTORY_MODEL_VERSION = 2;
@@ -111,7 +112,7 @@ export const OUTSIDE_CHANGE_TYPE = 'history.outside-change';
 
 /**
  * What a step is: the tracker's `root` (no action), an `action` of the
- * catalogue, a change made `outside` an action (`OUTSIDE_CHANGE_TYPE`), or a
+ * catalog, a change made `outside` an action (`OUTSIDE_CHANGE_TYPE`), or a
  * `squashed` step (no action of its own: the net change of several, `Squash`).
  */
 export const STEP_KINDS = Object.freeze(['root', 'action', 'outside', 'squashed']);
@@ -135,9 +136,6 @@ export const FRESH_START_BRANCH_NAME = 'Fresh start';
  * (written only by the history itself).
  */
 export const BY_ORIGINS = Object.freeze([...ACTION_ORIGINS, 'outside']);
-
-/** The notebook hosts, by language. */
-export const HISTORY_HOSTS = Object.freeze(['python', 'r']);
 
 export const STEP_STATUSES = Object.freeze(['applied', 'unapplicable']);
 
@@ -185,7 +183,7 @@ export const JOURNAL_OPS = Object.freeze([
 /** The tracker fields a journal entry may put back. */
 export const TRACKER_PATCH_FIELDS = Object.freeze(['name', 'headId', 'activeBranch', 'mainBranch', 'notes', 'removed']);
 
-/** The branch colour slots (`--history-lane-0` … `--history-lane-7`); a branch keeps its slot. */
+/** The branch color slots (`--history-lane-0` … `--history-lane-7`); a branch keeps its slot. */
 export const HISTORY_LANE_COUNT = 8;
 
 /**
@@ -201,10 +199,14 @@ export const SHARE_RESULTS = Object.freeze(['include', 'recompute']);
 export const SHARE_TIMES = Object.freeze(['exact', 'dates', 'none']);
 export const SHARE_SOURCES = Object.freeze(['full', 'name']);
 
-/** Rows of an apply plan (Python, R and the browser's AnnData copy plan alike). */
+/**
+ * Rows of an apply plan (Python, R and the browser's AnnData copy plan alike).
+ * `column-colors`: a dataset column the session recolored, written with the
+ * colors it is shown in (`uns['<column>_colors']`).
+ */
 export const APPLY_ROW_KINDS = Object.freeze([
   'user-field', 'highlight', 'column-renamed', 'categories-renamed', 'categories-merged', 'field-deleted',
-  'gene-set', 'presentation',
+  'gene-set', 'column-colors', 'presentation',
 ]);
 export const APPLY_ROW_STATUSES = Object.freeze(['write', 'replace', 'unchanged', 'not-applied']);
 export const APPLY_PACKAGES = Object.freeze(['python', 'r', 'web']);
@@ -234,7 +236,7 @@ export function idOf(kind, number) {
   return `${prefix}${number}`;
 }
 
-/** A branch's colour slot from its number. */
+/** A branch's color slot from its number. */
 export function laneOf(branchId) {
   return idNumber(branchId) % HISTORY_LANE_COUNT;
 }
@@ -362,7 +364,16 @@ export const HISTORY_SENTENCES = Object.freeze({
   restoreConflict: ({ label }) => `${quoteName(label)} was changed since; it is restored as new objects instead.`,
   noBranch: ({ ref, names }) => `There is no branch ${quoteName(ref)}; the branches are ${quotedList(names)}.`,
   noTracker: ({ ref, names }) => `There is no tracker ${quoteName(ref)}; the trackers are ${quotedList(names)}.`,
+  // Said to agents and to a notebook's viewer actions (history_get, viewer.history_get(),
+  // cellucid_history_get()); the packages' session readers name their own call instead
+  // (cellucid-python `Tracker.steps`, cellucid-r `cellucid_steps(tracker)`).
   noStep: ({ step, tracker }) => `There is no step ${quoteName(step)} in the tracker ${quoteName(tracker)}; history_get lists its steps.`,
+  /**
+   * A turn the tracker has no record of: a turn is recorded with its first
+   * step (or act outside the state), so one that only read or changed
+   * nothing has none. `then`: what that means for the action ("nothing to undo").
+   */
+  noTurn: ({ turn, tracker, then }) => `The tracker ${quoteName(tracker)} has no record of the turn ${quoteName(turn)}: a turn is recorded with its first step, so one that only read or changed nothing has ${then}; history_summary lists the turns it has.`,
   noGroup: ({ ref, names }) => (names.length === 0
     ? `There is no group ${quoteName(ref)}; the tracker has no group.`
     : `There is no group ${quoteName(ref)}; the groups are ${quotedList(names)}.`),
@@ -370,12 +381,14 @@ export const HISTORY_SENTENCES = Object.freeze({
   notConsecutive: ({ from, to }) => `Steps ${idNumber(from)} to ${idNumber(to)} are not consecutive steps of one branch; group or squash a run of one branch's own steps.`,
   /** A group would hold part of a turn: `from`, `to` widened to whole turns. */
   splitsTurn: ({ label, from, to }) => `That would split the turn ${quoteName(label)}; a group holds whole turns: steps ${idNumber(from)} to ${idNumber(to)}.`,
+  /** A group is extended to a step it holds already (a turn's later steps join its group, `history.js`). */
+  alreadyInGroup: ({ step, name }) => `Step ${idNumber(step)} is in the group ${quoteName(name)} already: a turn's later steps join its group; extend it to a step after it.`,
   /** A step of the range is in another group already (one level of groups). */
   inGroup: ({ step, name }) => `Step ${idNumber(step)} is in the group ${quoteName(name)} already; extend it, or ungroup it first.`,
   /** A squash would cut a group: it stays inside one group or covers whole groups. */
   cutsGroup: ({ name }) => `That would cut the group ${quoteName(name)}; squash inside it, or all of its steps.`,
   /** Branches start inside a range to squash; `upTo`: the last step a squash may reach, or null. */
-  forksInside: ({ names, upTo }) => `${names.length === 1 ? `The branch ${quotedList(names)} starts inside` : `${names.length} branches start inside (${quotedList(names)})`}: group instead${upTo === null ? '' : `, or squash up to step ${idNumber(upTo)}`}.`,
+  forksInside: ({ names, upTo }) => `${names.length === 1 ? `The branch ${quotedList(names)} starts inside` : `${formatCountOf(names.length, 'branch', 'branches')} start inside (${quotedList(names)})`}: group instead${upTo === null ? '' : `, or squash up to step ${idNumber(upTo)}`}.`,
   /** An agent squashes only its own turn's steps. */
   notOwnSteps: () => 'An agent squashes only its own turn\'s steps; ask the person to squash the others.',
 });
@@ -438,7 +451,7 @@ const RECORDS = {
       origin: about(oneOf(BY_ORIGINS), 'Who acted.'),
       agent: about(nullable(T.text), 'The agent (Claude, ChatGPT, …) when the origin is agent.'),
       model: about(nullable(T.text), 'The agent\'s model when known (claude-sonnet-4-6, …).'),
-      host: about(nullable(oneOf(HISTORY_HOSTS)), 'The notebook language when the origin is host.'),
+      host: about(nullable(oneOf(ACTION_HOSTS)), 'The notebook language when the origin is host.'),
       person: about(nullable(T.text), 'The person\'s display name, only when they chose to record it.'),
       turn: about(nullable(T.text), 'The agent or notebook turn it belongs to.'),
     },
@@ -463,7 +476,7 @@ const RECORDS = {
       tip: about(id('step'), 'Its last step, one of its own.'),
       createdAt: about(T.time, 'When its first step was made.'),
       by: about(record('By'), 'Who made it.'),
-      lane: about(integer(0, HISTORY_LANE_COUNT - 1), 'Its colour slot (--history-lane-<lane>).'),
+      lane: about(integer(0, HISTORY_LANE_COUNT - 1), 'Its color slot (--history-lane-<lane>).'),
       locked: about(T.boolean, 'No new step, rename, delete or compaction until unlocked.'),
       archived: about(T.boolean, 'Hidden from the graph and the pickers; kept.'),
       notes: about(list(record('Note')), 'Its notes, oldest first.'),
@@ -555,7 +568,7 @@ const RECORDS = {
       kind: about(oneOf(STEP_KINDS), 'root, action, outside (a change made outside an action) or squashed (several merged into one, or what changed while paused).'),
       type: about(nullable(T.text), 'The action (history.outside-change for a change made outside one); null for the root and a squashed step.'),
       params: about(nullable(T.object), 'The action\'s parameters, by name (cells by original position); null for the root and a squashed step.'),
-      v: about(nullable(integer(1)), 'The version of the action\'s parameters it was recorded with (the catalogue\'s version); null but for an action.'),
+      v: about(nullable(integer(1)), 'The version of the action\'s parameters it was recorded with (the catalog\'s version); null but for an action.'),
       code: about(nullable(T.text), 'Its pseudocode line as recorded; null for the root, an outside change and a squashed step.'),
       label: about(T.text, 'What it did, in a sentence.'),
       by: about(record('By'), 'Who took it.'),
@@ -581,8 +594,8 @@ const RECORDS = {
   OutsideAct: {
     description: 'What a turn did outside the state that no undo takes back (a vote published, a file written): no step records it.',
     fields: {
-      type: about(T.text, 'The action (annotation.vote, figure.export, …).'),
-      label: about(T.text, 'What it did, as its step would be labelled.'),
+      type: about(T.text, 'The action (annotation.publish, figure.export, …).'),
+      label: about(T.text, 'What it did, as its step would be labeled.'),
       at: about(T.time, 'When it was done.'),
     },
   },
@@ -771,7 +784,7 @@ const RECORDS = {
     description: 'What wrote a session file.',
     fields: {
       version: about(T.text, 'The Cellucid version.'),
-      catalog: about(T.hash, 'The SHA-256 of the action catalogue document it was written with.'),
+      catalog: about(T.hash, 'The SHA-256 of the action catalog document it was written with.'),
     },
   },
   ActionStamp: {
@@ -779,7 +792,7 @@ const RECORDS = {
     fields: {
       type: about(T.text, 'The action.'),
       version: about(integer(1), 'The version of its parameters the steps were recorded with (Step.v).'),
-      params: about(nullable(T.hash), 'SHA-256 of the shape of that version\'s params schema (actionParamsShape, canonical JSON) when the writer\'s catalogue is at that version; null for an earlier version, whose upgraders take it forward.'),
+      params: about(nullable(T.hash), 'SHA-256 of the shape of that version\'s params schema (actionParamsShape, canonical JSON) when the writer\'s catalog is at that version; null for an earlier version, whose upgraders take it forward.'),
     },
   },
   ScopeBranches: {
@@ -857,6 +870,13 @@ const RECORDS = {
     description: 'One change an apply did not make.',
     fields: { kind: about(oneOf(APPLY_ROW_KINDS), 'What it is.'), name: about(T.text, 'Its name.'), note: about(T.text, 'Why.') },
   },
+  ExpressionValues: {
+    description: 'The expression values the genes were shown and analyzed in at a step (its `expression` value: the Data mapping\'s Expression values): the transform asked, which never changes the values an object stores.',
+    fields: {
+      normalize: about(T.boolean, 'Each cell scaled to 10,000 total counts (scanpy\'s normalize_total(target_sum=1e4)).'),
+      log1p: about(T.boolean, 'Then ln(1 + x) (scanpy\'s log1p); both false: the values as stored.'),
+    },
+  },
   Provenance: {
     description: 'One apply, recorded in uns[\'cellucid\'][\'history_applied\'] (misc / metadata in R).',
     fields: {
@@ -870,6 +890,7 @@ const RECORDS = {
       columns: about(list(T.text), 'The columns it owns (replaced only with overwrite).'),
       renamed: about(list(record('Renamed')), 'What it renamed.'),
       skipped: about(list(record('Skipped')), 'What it did not apply.'),
+      expression: about(nullable(record('ExpressionValues')), 'The expression values of the step applied (what the person looked at the genes in), recorded, never applied: X keeps its values. Null when the session holds none (a session from before them: the values as stored).'),
       session: about(nullable(T.text), 'The session file itself, base64, when kept to rebuild the history.'),
     },
   },
@@ -1217,6 +1238,57 @@ function checkUniqueNames(items, kind, label, nameOf, path) {
 }
 
 /**
+ * A tracker record as this version holds it, and the state domains it held
+ * that this version does not have (F164): a history written by another
+ * version of Cellucid (a domain since added, renamed or removed). Each
+ * step's `touches`, `before`, `after` and `reads` (every journal entry's
+ * steps too) and a paused draft keep this version's domains only; a step
+ * that changed only such a domain stays, changing nothing here. The record
+ * is copied where it changes; a field of a shape the model refuses is left
+ * for `validateTracker` to refuse.
+ * @param {object} tracker - a tracker record as read
+ * @returns {{tracker: object, unknown: string[]}}
+ */
+export function knownDomainsOnly(tracker) {
+  if (!isPlainRecord(tracker)) return { tracker, unknown: [] };
+  const unknown = new Set();
+  const isUnknown = (key, keep) => typeof key === 'string' && !DOMAIN_IDS.includes(key) && key !== keep;
+  const known = (values, keep = null) => (isPlainRecord(values)
+    ? Object.fromEntries(Object.entries(values).filter(([key]) => !isUnknown(key, keep)))
+    : values);
+  const step = record => (isPlainRecord(record) ? {
+    ...record,
+    touches: Array.isArray(record.touches) ? record.touches.filter(id => !isUnknown(id)) : record.touches,
+    before: known(record.before), after: known(record.after), reads: known(record.reads, 'history'),
+  } : record);
+  const steps = list => (Array.isArray(list) ? list.filter(isPlainRecord) : []);
+  const journalSteps = Array.isArray(tracker.journal)
+    ? tracker.journal.flatMap(entry => [entry?.before?.steps, entry?.after?.steps].flatMap(steps))
+    : [];
+  for (const record of [...steps(tracker.steps), ...journalSteps]) {
+    for (const id of Array.isArray(record.touches) ? record.touches : []) if (isUnknown(id)) unknown.add(id);
+    for (const [values, keep] of [[record.before], [record.after], [record.reads, 'history']]) {
+      if (isPlainRecord(values)) for (const key of Object.keys(values)) if (isUnknown(key, keep)) unknown.add(key);
+    }
+  }
+  const draft = isPlainRecord(tracker.paused) ? tracker.paused.draft : null;
+  if (isPlainRecord(draft)) for (const key of Object.keys(draft)) if (isUnknown(key)) unknown.add(key);
+  if (unknown.size === 0) return { tracker, unknown: [] };
+  const side = patch => (isPlainRecord(patch) && Array.isArray(patch.steps) ? { ...patch, steps: patch.steps.map(step) } : patch);
+  return {
+    tracker: {
+      ...tracker,
+      steps: Array.isArray(tracker.steps) ? tracker.steps.map(step) : tracker.steps,
+      journal: Array.isArray(tracker.journal)
+        ? tracker.journal.map(entry => (isPlainRecord(entry) ? { ...entry, before: side(entry.before), after: side(entry.after) } : entry))
+        : tracker.journal,
+      paused: isPlainRecord(draft) ? { ...tracker.paused, draft: known(draft) } : tracker.paused,
+    },
+    unknown: [...unknown].sort(),
+  };
+}
+
+/**
  * Check one tracker whole: every record's shape and rules, and the tree's.
  * @param {object} tracker
  * @param {string} [path]
@@ -1346,7 +1418,7 @@ function checkTrackerRules(tracker, path) {
     }
   }
   // A group never cuts a run of one turn's consecutive steps on its branch: a
-  // grouped step's neighbour on the line (its parent, its child on the same
+  // grouped step's neighbor on the line (its parent, its child on the same
   // branch) of the same turn is in the same group. A turn that acts again
   // after someone else's step starts a new run, which the group need not hold.
   for (const step of tracker.steps) {
@@ -1410,10 +1482,17 @@ function checkTrackerRules(tracker, path) {
   return tracker;
 }
 
-function checkTrackers(trackers, activeTracker, path) {
-  const ids = new Set();
+/**
+ * The trackers together: each one's rules (`rules`: false when each was
+ * checked whole already), distinct ids and names, and the active one held
+ * and not removed. `others`: the ids of trackers left out as unreadable
+ * (`validateSession`'s `unreadable`), which count as held: the active one
+ * may be one of them.
+ */
+function checkTrackers(trackers, activeTracker, path, { rules = true, others = [] } = {}) {
+  const ids = new Set(others);
   trackers.forEach(tracker => {
-    checkTrackerRules(tracker, 'tracker');
+    if (rules) checkTrackerRules(tracker, 'tracker');
     if (ids.has(tracker.id)) fail(`${path} holds the tracker "${tracker.id}" twice`);
     ids.add(tracker.id);
   });
@@ -1421,6 +1500,7 @@ function checkTrackers(trackers, activeTracker, path) {
     trackers.filter(tracker => tracker.removed === null), 'tracker', tracker => `tracker "${tracker.id}"`,
     tracker => tracker.name, path,
   );
+  if (others.includes(activeTracker)) return;
   const active = trackers.find(tracker => tracker.id === activeTracker);
   if (active === undefined) fail(`${path}'s active tracker is not one of its trackers`);
   if (active.removed !== null) fail(`${path}'s active tracker cannot be removed`);
@@ -1439,15 +1519,45 @@ export function validateHistory(history) {
 /**
  * Check a session file as read: its header records and every tracker, and
  * that its scope names exactly the trackers it holds.
+ *
+ * `unreadable` (a reader's list, F164): given, a tracker whose own records
+ * or rules this version refuses (`validateTracker`: one another version of
+ * the model wrote) is listed `{id, name, error}` (its id and name as read,
+ * null when not text) and left out of the checks that span trackers, which
+ * the others still pass: the reader restores the others (`history.js`
+ * `readSaved` says which was left out). The header, and how the trackers
+ * agree with each other and with the scope, are checked whole. Not given
+ * (a writer), one tracker refused refuses the session.
  * @param {object} session
+ * @param {{unreadable?: Array<{id: string|null, name: string|null, error: HistoryModelError}>|null}} [options]
  */
-export function validateSession(session) {
-  checkRecord('Session', session, 'session');
-  checkTrackers(session.trackers, session.activeTracker, 'session');
-  const held = session.trackers.map(tracker => tracker.id);
+export function validateSession(session, { unreadable = null } = {}) {
+  let trackers = session?.trackers;
+  if (unreadable === null) {
+    checkRecord('Session', session, 'session');
+    checkTrackers(trackers, session.activeTracker, 'session');
+  } else {
+    if (!Array.isArray(trackers)) fail('session.trackers must be a list');
+    checkRecord('Session', { ...session, trackers: [] }, 'session');
+    const textOrNull = value => (typeof value === 'string' ? value : null);
+    trackers = trackers.filter((tracker, index) => {
+      try {
+        validateTracker(tracker, `session.trackers[${index}]`);
+        return true;
+      } catch (error) {
+        if (!(error instanceof HistoryModelError)) throw error;
+        unreadable.push({ id: textOrNull(tracker?.id), name: textOrNull(tracker?.name), error });
+        return false;
+      }
+    });
+    checkTrackers(trackers, session.activeTracker, 'session', { rules: false, others: unreadable.map(each => each.id) });
+  }
+  const held = session.trackers.map(tracker => tracker?.id);
   if (JSON.stringify(session.scope.trackers) !== JSON.stringify(held)) fail('session.scope must name exactly the trackers it holds, in order');
+  const left = new Set((unreadable ?? []).map(each => each.id));
   for (const entry of session.scope.branches) {
-    const tracker = session.trackers.find(candidate => candidate.id === entry.tracker);
+    if (left.has(entry.tracker)) continue;
+    const tracker = trackers.find(candidate => candidate.id === entry.tracker);
     if (tracker === undefined) fail(`session.scope names branches of a tracker it does not hold ("${entry.tracker}")`);
     const known = new Set(tracker.branches.map(branch => branch.id));
     if (entry.branches.some(branch => !known.has(branch))) fail(`session.scope names a branch the tracker "${entry.tracker}" does not hold`);
@@ -1458,7 +1568,7 @@ export function validateSession(session) {
     fail('session.actions must be sorted by type then version, each pair once');
   }
   const used = new Set();
-  for (const tracker of session.trackers) {
+  for (const tracker of trackers) {
     const steps = [...tracker.steps, ...tracker.journal.flatMap(entry => (entry.purged ? [] : [...entry.before.steps, ...entry.after.steps]))];
     for (const step of steps) if (step.kind === 'action') used.add(`${step.type}@${step.v}`);
     if (tracker.paused !== null && tracker.paused.draft !== null) {
@@ -1466,10 +1576,11 @@ export function validateSession(session) {
     }
   }
   const stamped = stamps.map(([type, version]) => `${type}@${version}`);
-  if (stamped.length !== used.size || stamped.some(stamp => !used.has(stamp))) {
+  // With a tracker left out, the actions its steps use are not known: the others' must be stamped.
+  if ([...used].some(stamp => !stamped.includes(stamp)) || (left.size === 0 && stamped.length !== used.size)) {
     fail('session.actions must stamp exactly each action and version its steps use');
   }
-  checkScopeHolds(session.scope, session.trackers);
+  checkScopeHolds(session.scope, trackers);
   return session;
 }
 
@@ -1512,7 +1623,7 @@ function checkScopeHolds(scope, trackers) {
  * @param {unknown} value
  * @param {string} [path]
  */
-export function validateRecord(name, value, path = name.charAt(0).toLowerCase() + name.slice(1)) {
+export function validateRecord(name, value, path = lowerFirst(name)) {
   if (!Object.hasOwn(RECORDS, name)) fail(`There is no history record "${name}"`);
   if (name === 'Tracker') return validateTracker(value, path);
   if (name === 'History') return validateHistory(value);

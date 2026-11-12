@@ -234,11 +234,11 @@ Hdf5Tree.prototype.nodeAs = function nodeAs(node, path) {
  * no part is to come (`end`); each part is decoded as soon as its own
  * collections are in. While requests queue (six a host over HTTP/1.1, a
  * host whose request budget binds), what arrives meanwhile is gathered: a
- * plan of more collections joins neighbours that one a part could not, and
+ * plan of more collections joins neighbors that one a part could not, and
  * costs no time, since its requests would have waited anyway. While the link
  * has room (a multiplexed link, an idle one), each part's collections are
  * loaded as it arrives: nothing waits for a batch to fill. Measured on a
- * CSR `.h5ad`'s obs index of strings (a lane measurement, 1 % uniform):
+ * CSR `.h5ad`'s obs index of strings (a lane measurement, 1% uniform):
  * every part's collections loaded as they arrived took 85.8 s at 10M over
  * 150 ms HTTP/1.1 (2,067 requests) and 71.8 s at 100M over 20 ms HTTP/2;
  * one union after every part 68.8 s and 87.7 s (a barrier: the link idle
@@ -531,7 +531,7 @@ export class Hdf5Array extends Hdf5Node {
   /**
    * The rows `runs` names of a column of variable-length elements, one run
    * after another (`formats/store.js`, `readRows`): their references, read
-   * a stored chunk (or, unchunked or unfiltered, a box of neighbouring runs)
+   * a stored chunk (or, unchunked or unfiltered, a box of neighboring runs)
    * at a time, the rows' own picked out as each arrives, and then the global
    * heap objects of those rows alone, decoded as their collections arrive
    * (`HeapStream`). What a part reads and holds is that part's: the
@@ -572,7 +572,7 @@ export class Hdf5Array extends Hdf5Node {
     let outstanding = 0;
     let wake = null;
     // Box j's references while a part still uses them: its own, and its
-    // neighbours' (they name the objects before the rows' own: one
+    // neighbors' (they name the objects before the rows' own: one
     // collection holds the end of a chunk's strings and the start of the
     // next's). Let go once all three have.
     const references = new Array(boxes.length);
@@ -615,7 +615,7 @@ export class Hdf5Array extends Hdf5Node {
       read.catch(() => {});
       references[k] = read;
       asked[k]?.resolve();
-      // The neighbours' references, once in (one that failed names nothing).
+      // The neighbors' references, once in (one that failed names nothing).
       const beside = Promise.all([k - 1, k + 1].map(j => {
         if (j < 0 || j >= boxes.length) return null;
         return untilAsked(j).then(() => references[j].then(
@@ -625,7 +625,7 @@ export class Hdf5Array extends Hdf5Node {
       })).then(found => found.filter(other => other !== null));
       const part = read.then(async chunk => {
         // What of each collection the rows need, measured from every
-        // reference of the box, and of its neighbours when the box's own do
+        // reference of the box, and of its neighbors when the box's own do
         // not name every object before the rows' (the collection the
         // previous chunk's strings began): waited for then only.
         const rows = box.pieces.map(row => row - box.start);
@@ -661,7 +661,7 @@ export class Hdf5Array extends Hdf5Node {
    * `rows` of those, from output row `at`. A filtered chunk is decoded whole
    * whatever part of it is read, so a box is a whole chunk (read whole, it is
    * not kept in the file's cache as a chunk used in part would be).
-   * Unfiltered or unchunked references are read by their bytes: neighbouring
+   * Unfiltered or unchunked references are read by their bytes: neighboring
    * runs share a box while the rows between cost less than a request (the
    * link's merge gap) and the box stays within a chunk group.
    */

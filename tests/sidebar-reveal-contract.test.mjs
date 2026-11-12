@@ -6,25 +6,50 @@
  * On a phone the panel starts as its peek bar. Until the sidebar controls
  * take that state over it is only the root's mark (`viewport-init.js`): the
  * toggle has no listener yet, so clicking it would do nothing. The mark is
- * dropped instead, so the panel starts open. Afterwards the toggle opens it.
+ * dropped instead, so the panel starts open. Afterwards the toggle opens it,
+ * through an action, so the sidebar opens later: the promise resolves once it
+ * is shown, when a control in it can take focus (`?` focused nothing with the
+ * sidebar hidden, lens-a11y LF-4).
  */
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { revealSidebar } from '../assets/js/app/ui/modules/sidebar-controls.js';
+import { revealInSidebar, revealSidebar } from '../assets/js/app/ui/modules/sidebar-controls.js';
 
 function fakeDocument({ peek, hidden }) {
   const stored = new Map();
   const clicks = [];
-  const sidebar = { classList: { contains: name => name === 'hidden' && hidden } };
+  const observers = [];
+  const sidebar = {
+    hidden,
+    classList: { contains: name => name === 'hidden' && sidebar.hidden },
+  };
+  // The toggle asks through an action: the sidebar opens later (`show()`).
   const toggle = { click: () => clicks.push('sidebar-toggle') };
+  class FakeMutationObserver {
+    constructor(callback) { this.callback = callback; this.on = false; }
+    observe(target, options) {
+      assert.equal(target, sidebar);
+      assert.deepEqual(options, { attributes: true, attributeFilter: ['class'] });
+      this.on = true;
+      observers.push(this);
+    }
+    disconnect() { this.on = false; }
+  }
   const documentOwner = {
     documentElement: { dataset: peek ? { phoneSheet: 'peek' } : {} },
-    defaultView: { sessionStorage: { setItem: (key, value) => stored.set(key, value) } },
+    defaultView: {
+      sessionStorage: { getItem: key => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, value) },
+      MutationObserver: FakeMutationObserver,
+    },
     getElementById: id => ({ sidebar, 'sidebar-toggle': toggle })[id] ?? null,
   };
-  return { documentOwner, stored, clicks };
+  const show = () => {
+    sidebar.hidden = false;
+    for (const observer of observers.filter(each => each.on)) observer.callback([]);
+  };
+  return { documentOwner, stored, clicks, observers, show };
 }
 
 test('before the sidebar controls are wired, a phone panel starts open instead of as its peek bar', () => {
@@ -36,19 +61,46 @@ test('before the sidebar controls are wired, a phone panel starts open instead o
   assert.deepEqual(clicks, []);
 });
 
-test('once wired, a closed sidebar opens through its toggle, and an open one is left alone', () => {
+test('once wired, a closed sidebar opens through its toggle, and an open one is left alone', async () => {
   const closed = fakeDocument({ peek: false, hidden: true });
-  revealSidebar(closed.documentOwner);
+  let resolved = false;
+  const shown = revealSidebar(closed.documentOwner).then(() => { resolved = true; });
   assert.deepEqual(closed.clicks, ['sidebar-toggle']);
   assert.equal(closed.stored.size, 0);
+  // A second reveal while the first waits shares it: one toggle press.
+  void revealSidebar(closed.documentOwner);
+  assert.deepEqual(closed.clicks, ['sidebar-toggle']);
 
   const open = fakeDocument({ peek: false, hidden: false });
-  revealSidebar(open.documentOwner);
+  await revealSidebar(open.documentOwner);
   assert.deepEqual(open.clicks, []);
+
+  // The reveal resolves only once the sidebar is shown (until then it is
+  // inert and nothing in it can take focus), and stops watching then.
+  await Promise.resolve();
+  assert.equal(resolved, false);
+  closed.show();
+  await shown;
+  assert.equal(resolved, true);
+  assert.deepEqual(closed.observers.map(observer => observer.on), [false]);
 });
 
-test('Data mapping opens the sidebar through revealSidebar, not a toggle click of its own', async () => {
-  const source = await readFile(new URL('../assets/js/app/ui/modules/data-mapping-controls.js', import.meta.url), 'utf8');
-  assert.match(source, /revealSidebar\(ownerDocument\)/);
-  assert.doesNotMatch(source, /getElementById\('sidebar-toggle'\)\?\.click\(\)/);
+test('every way into the sidebar opens it first and its sections after, through revealInSidebar (R9K-2)', async () => {
+  for (const file of ['ui/modules/data-mapping-controls.js', 'ui/modules/gene-read-control.js', 'ui/onboarding/keyboard-shortcuts.js']) {
+    const source = await readFile(new URL(`../assets/js/app/${file}`, import.meta.url), 'utf8');
+    assert.match(source, /revealInSidebar\(ownerDocument, /, file);
+    assert.doesNotMatch(source, /revealSidebar\(/, `${file} opens nothing before the sidebar is shown`);
+    assert.doesNotMatch(source, /getElementById\('sidebar-toggle'\)\?\.click\(\)/, file);
+  }
+});
+
+test('revealInSidebar opens what it is given only once the sidebar is shown', async () => {
+  const closed = fakeDocument({ peek: false, hidden: true });
+  const order = [];
+  const done = revealInSidebar(closed.documentOwner, () => { order.push('opened'); return 'focused'; });
+  await Promise.resolve();
+  assert.deepEqual(order, [], 'nothing opens while the sidebar action is starting');
+  closed.show();
+  assert.equal(await done, 'focused');
+  assert.deepEqual(order, ['opened']);
 });

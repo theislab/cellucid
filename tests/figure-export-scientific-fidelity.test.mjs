@@ -5,7 +5,7 @@
  * 1. Exporting while the viewer draws volumetric smoke, producing a point
  *    cloud stamped with metadata that says it is the active view.
  * 2. Exporting a legend that describes categories the figure does not draw, or
- *    a logarithmic colorbar labelled only with its endpoints.
+ *    a logarithmic colorbar labeled only with its endpoints.
  * 3. Exporting a multi-panel grid with no legend at all, and stamping the
  *    whole file with the active panel's field and filters.
  *
@@ -19,8 +19,11 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
+  HIDDEN_LEGEND_ENTRY_SUFFIX,
   buildColorScaleNote,
   drawCanvasLegend,
+  legendEntries,
+  planLegend,
   renderSvgLegend,
   resolveSharedGridLegend,
 } from '../assets/js/app/ui/modules/figure-export/components/legend-builder.js';
@@ -32,15 +35,23 @@ import {
   confirmExportFidelityWarnings,
 } from '../assets/js/app/ui/modules/figure-export/components/fidelity-warning-dialog.js';
 import {
-  computeGridPaneLayout,
+  computeFigureLayout,
+  computeGridFigureLayout,
   computeSingleViewLayout,
 } from '../assets/js/app/ui/modules/figure-export/utils/layout.js';
+
+/** What a flat 2-D plot's axes show (`AxesSpec`). */
+const AXES = { bounds: { minX: -8, maxX: 12, minY: -6, maxY: 9 }, xLabel: 'UMAP 1', yLabel: 'UMAP 2', tickFontPx: 12, labelFontPx: 12 };
 import {
   renderFigureToSvgBlob,
 } from '../assets/js/app/ui/modules/figure-export/renderers/svg-renderer.js';
 import {
   buildPngTextMetadata,
+  renderFigureToPngBlob,
 } from '../assets/js/app/ui/modules/figure-export/renderers/png-renderer.js';
+import {
+  estimateTextWidth,
+} from '../assets/js/app/ui/modules/figure-export/utils/text-measure.js';
 import {
   buildProvenanceDescription,
 } from '../assets/js/app/ui/modules/figure-export/utils/figure-provenance.js';
@@ -150,6 +161,30 @@ function continuousModel(overrides = {}) {
 
 const WIDE_RECT = { x: 0, y: 0, width: 420, height: 300 };
 
+/** Deterministic stand-in for font metrics, as `recordingContext` measures. */
+const measure7 = (text) => String(text).length * 7;
+
+/** The plan a layout makes for a legend standing in `legendRect`. */
+function planIn(legendRect, fieldKey, model) {
+  return planLegend({
+    model,
+    fieldKey,
+    fontPx: 12,
+    measureText: measure7,
+    placement: 'beside',
+    extentPx: legendRect.height,
+    minWidth: legendRect.width,
+  });
+}
+
+function svgLegend({ legendRect, fieldKey, model }) {
+  return renderSvgLegend({ legendRect, legendPlan: planIn(legendRect, fieldKey, model), model });
+}
+
+function canvasLegend({ ctx, legendRect, fieldKey, model }) {
+  drawCanvasLegend({ ctx, legendRect, legendPlan: planIn(legendRect, fieldKey, model), model });
+}
+
 // ---------------------------------------------------------------------------
 // CEL-AUDIT-0024 - volumetric render mode must block the export
 // ---------------------------------------------------------------------------
@@ -242,7 +277,7 @@ test('the export path feeds the render mode into the fidelity gate', async () =>
 // ---------------------------------------------------------------------------
 
 test('SVG legend never gives a hidden category a colored swatch', () => {
-  const { svg } = renderSvgLegend({
+  const { svg } = svgLegend({
     legendRect: WIDE_RECT,
     fieldKey: 'cell_type',
     model: categoryModel(),
@@ -265,7 +300,7 @@ test('SVG legend never gives a hidden category a colored swatch', () => {
 
 test('Canvas legend never gives a hidden category a colored swatch', () => {
   const { ctx, record } = recordingContext();
-  drawCanvasLegend({
+  canvasLegend({
     ctx,
     legendRect: WIDE_RECT,
     fieldKey: 'cell_type',
@@ -290,20 +325,27 @@ test('Canvas legend never gives a hidden category a colored swatch', () => {
   );
 });
 
-test('a checked category that other filters leave without cells is marked hidden', () => {
-  // On screen this row is disabled ("No cells available in this category
-  // after other filters"): the figure draws none of its points either.
+test('a category other filters leave without cells is not listed; one the person hid is marked (F113)', () => {
+  // On screen a category emptied by a filter on another field is a disabled
+  // row ("No cells available in this category after other filters"); the
+  // figure has none of its cells to hide, so it lists only what it draws and
+  // what the person hid. It said "(hidden)" of 30 of He's 41 LVL2 types after
+  // a filter kept the epithelial cells (L12-6).
   const model = categoryModel({
-    visible: visibleOf({ 0: true, 1: true, 2: true }),
+    categories: ['B cell', 'T cell', 'Macrophage', 'NK cell'],
+    colors: colorsOf([[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 0]]),
+    // T cell ticked but emptied; NK cell hidden and emptied; Macrophage hidden with cells.
+    visible: visibleOf({ 0: true, 1: true, 2: false, 3: false }),
     counts: {
-      available: [4, 0, 2],
+      available: [4, 0, 2, 0],
       availableTotal: 6,
-      total: [5, 3, 2],
-      visible: [4, 0, 2],
-      visibleTotal: 6,
+      total: [5, 3, 2, 1],
+      visible: [4, 0, 0, 0],
+      visibleTotal: 4,
     },
   });
-  const { svg } = renderSvgLegend({
+  assert.deepEqual(legendEntries(model), [{ category: 0, hidden: false }, { category: 2, hidden: true }]);
+  const { svg } = svgLegend({
     legendRect: WIDE_RECT,
     fieldKey: 'cell_type',
     model,
@@ -311,36 +353,39 @@ test('a checked category that other filters leave without cells is marked hidden
   assert.deepEqual(svgTexts(svg), [
     'cell_type',
     'B cell',
-    'T cell (hidden)',
-    'Macrophage',
+    'Macrophage (hidden)',
   ]);
-  assert.doesNotMatch(svg, /rgb\(0,255,0\)/);
+  assert.doesNotMatch(svg, /rgb\(0,255,0\)|rgb\(255,255,0\)/);
 
   const { ctx, record } = recordingContext();
-  drawCanvasLegend({
+  canvasLegend({
     ctx,
     legendRect: WIDE_RECT,
     fieldKey: 'cell_type',
     model,
   });
+  // Each entry keeps its category's color: B cell red; Macrophage hollow.
   assert.deepEqual(
     record.filledRects
       .filter((entry) => entry.w === 10 && entry.h === 10)
       .map((entry) => entry.style),
-    ['rgb(255,0,0)', 'rgb(0,0,255)']
+    ['rgb(255,0,0)']
   );
-  assert.ok(record.texts.map((entry) => entry.text).includes('T cell (hidden)'));
+  assert.deepEqual(record.texts.map((entry) => entry.text), ['cell_type', 'B cell', 'Macrophage (hidden)']);
+
+  // Without counts (nothing says which have cells), every category is listed.
+  assert.deepEqual(legendEntries(categoryModel()).map(entry => entry.category), [0, 1, 2]);
 });
 
 test('SVG and Canvas legends publish identical category text', () => {
   const model = categoryModel();
-  const { svg } = renderSvgLegend({
+  const { svg } = svgLegend({
     legendRect: WIDE_RECT,
     fieldKey: 'cell_type',
     model,
   });
   const { ctx, record } = recordingContext();
-  drawCanvasLegend({
+  canvasLegend({
     ctx,
     legendRect: WIDE_RECT,
     fieldKey: 'cell_type',
@@ -359,30 +404,55 @@ test('SVG and Canvas legends publish identical category text', () => {
   ]);
 });
 
-test('a narrow legend truncates the name, never the hidden marker', () => {
+test('a legend never shortens a name: its column is as wide as its longest entry, marker included', () => {
   const model = categoryModel({
     categories: ['Plasmacytoid dendritic cell', 'Erythroid progenitor'],
     colors: colorsOf([[1, 0, 0], [0, 1, 0]]),
     visible: visibleOf({ 0: true, 1: false }),
   });
-  const narrow = { x: 0, y: 0, width: 96, height: 200 };
-
-  const { svg } = renderSvgLegend({
-    legendRect: narrow,
-    fieldKey: 'cell_type',
+  // Planned beside a short plot: one row per column, so each entry decides
+  // its own column's width.
+  const plan = planLegend({
     model,
+    fieldKey: 'cell_type',
+    fontPx: 12,
+    measureText: measure7,
+    placement: 'beside',
+    extentPx: 40,
   });
-  const { ctx, record } = recordingContext();
-  drawCanvasLegend({ ctx, legendRect: narrow, fieldKey: 'cell_type', model });
+  assert.deepEqual(plan.entries.map(entry => entry.label), ['Plasmacytoid dendritic cell', 'Erythroid progenitor (hidden)']);
+  assert.equal(plan.rowsPerColumn, 1);
+  assert.equal(plan.columns, 2);
+  const longest = Math.max(...plan.entries.map(entry => measure7(entry.label)));
+  assert.ok(plan.columnWidth >= 10 + 6 + longest, `column ${plan.columnWidth} px for a ${longest} px label`);
+  assert.ok(plan.width >= 2 * 8 + plan.columns * plan.columnWidth);
 
-  const svgHidden = svgTexts(svg).at(-1);
-  const canvasHidden = record.texts.at(-1).text;
-  assert.ok(svgHidden.endsWith(' (hidden)'), `SVG label was "${svgHidden}"`);
-  assert.ok(
-    canvasHidden.endsWith(' (hidden)'),
-    `Canvas label was "${canvasHidden}"`
-  );
-  assert.ok(svgHidden.length < 'Erythroid progenitor (hidden)'.length);
+  const legendRect = { x: 0, y: 0, width: plan.width, height: plan.height };
+  const { svg } = renderSvgLegend({ legendRect, legendPlan: plan, model });
+  const { ctx, record } = recordingContext();
+  let measured = 0;
+  ctx.measureText = (text) => {
+    measured += 1;
+    return { width: measure7(text) };
+  };
+  drawCanvasLegend({ ctx, legendRect, legendPlan: plan, model });
+  // Nothing is measured inside the builders: they draw the plan.
+  assert.equal(measured, 0);
+  for (const drawn of [svgTexts(svg), record.texts.map(entry => entry.text)]) {
+    assert.deepEqual(drawn, ['cell_type', 'Plasmacytoid dendritic cell', 'Erythroid progenitor (hidden)']);
+  }
+  // The builders draw the plan's columns: the second entry starts one column
+  // width to the right of the first.
+  const xs = [...svg.matchAll(/<text x="([\d.]+)" y="[\d.]+" fill=/g)].map(match => Number(match[1]));
+  assert.deepEqual(xs, [8 + 10 + 6, 8 + plan.columnWidth + 10 + 6]);
+  assert.doesNotMatch(svg, /…/);
+});
+
+test('a legend cannot be drawn from another model\'s plan', () => {
+  const model = categoryModel();
+  const plan = planIn(WIDE_RECT, 'cell_type', categoryModel({ categories: ['only one'] }));
+  assert.throws(() => renderSvgLegend({ legendRect: WIDE_RECT, legendPlan: plan, model }), /must list the entries of its model/);
+  assert.throws(() => renderSvgLegend({ legendRect: WIDE_RECT, legendPlan: null, model }), /planLegend/);
 });
 
 test('a logarithmic colorbar says so and names its true midpoint', () => {
@@ -399,7 +469,7 @@ test('a logarithmic colorbar says so and names its true midpoint', () => {
     'Log10 color scale (midpoint 31.6)'
   );
 
-  const { svg } = renderSvgLegend({
+  const { svg } = svgLegend({
     legendRect: WIDE_RECT,
     fieldKey: 'CD19',
     model,
@@ -407,7 +477,7 @@ test('a logarithmic colorbar says so and names its true midpoint', () => {
   assert.ok(svgTexts(svg).includes('Log10 color scale (midpoint 31.6)'));
 
   const { ctx, record } = recordingContext();
-  drawCanvasLegend({ ctx, legendRect: WIDE_RECT, fieldKey: 'CD19', model });
+  canvasLegend({ ctx, legendRect: WIDE_RECT, fieldKey: 'CD19', model });
   assert.deepEqual(
     svgTexts(svg),
     record.texts.map((entry) => entry.text)
@@ -418,7 +488,7 @@ test('a linear colorbar carries no logarithmic claim', () => {
   const model = continuousModel();
   assert.equal(buildColorScaleNote(model, 1, 1000), null);
 
-  const { svg } = renderSvgLegend({
+  const { svg } = svgLegend({
     legendRect: WIDE_RECT,
     fieldKey: 'CD19',
     model,
@@ -426,7 +496,7 @@ test('a linear colorbar carries no logarithmic claim', () => {
   assert.doesNotMatch(svg, /Log10/);
 
   const { ctx, record } = recordingContext();
-  drawCanvasLegend({ ctx, legendRect: WIDE_RECT, fieldKey: 'CD19', model });
+  canvasLegend({ ctx, legendRect: WIDE_RECT, fieldKey: 'CD19', model });
   assert.ok(!record.texts.some((entry) => /Log10/.test(entry.text)));
 });
 
@@ -442,8 +512,9 @@ test('legend sizing reserves room for the hidden marker', () => {
   const dimensions = (visible) => computeSingleViewLayout({
     width: 800,
     height: 600,
+    plotAspect: 800 / 600,
     title: '',
-    includeAxes: false,
+    axes: null,
     includeLegend: true,
     legendPosition: 'right',
     legendModel: { kind: 'category', categories, colors, visible },
@@ -456,24 +527,189 @@ test('legend sizing reserves room for the hidden marker', () => {
   );
 });
 
-test('a legend of a million categories is never larger than the plot it describes', () => {
-  const categories = Array.from({ length: 1_000_000 }, (_, i) => `bg ${i}`);
-  const colors = Array.from({ length: categories.length }, () => [0.2, 0.4, 0.6]);
-  const layout = position => computeSingleViewLayout({
+/** 69 long cell-type names, as Suo's `cell_type` (found 2026-11-10 cut with "…"). */
+function longCellTypeModel(count = 69) {
+  const categories = Array.from({ length: count }, (_, index) =>
+    `Proliferating double-negative thymocyte ${String.fromCharCode(65 + (index % 26))}${index}`);
+  const visible = new Uint8Array(count).fill(1);
+  visible[3] = 0;
+  return {
+    kind: 'category',
+    categories,
+    colors: new Uint8Array(count * 3).fill(128),
+    visible,
+    picker: [],
+    counts: null,
+  };
+}
+
+/** Every entry an SVG legend wrote, as text. */
+/** A legend's entry labels: the text written right after each swatch. */
+function svgEntryTexts(svg) {
+  return [...svg.matchAll(/<rect [^>]*width="10" height="10"[^>]*\/><text [^>]*>([^<]*)<\/text>/g)].map(match => match[1]);
+}
+
+test('a single-view legend of 69 long names grows the figure and cuts none of them', () => {
+  const model = longCellTypeModel();
+  const expected = model.categories.map((name, index) => (index === 3 ? `${name}${HIDDEN_LEGEND_ENTRY_SUFFIX}` : name));
+  for (const legendPosition of ['right', 'bottom']) {
+    const layout = computeSingleViewLayout({
+      width: 720,
+      height: 500,
+      plotAspect: 720 / 500,
+      title: '',
+      axes: AXES,
+      includeLegend: true,
+      legendPosition,
+      legendModel: model,
+      legendFieldKey: 'cell_type',
+      legendFontSizePx: 12,
+      fontFamily: 'Arial, sans-serif',
+      measureText: estimateTextWidth,
+    });
+    const { legendRect, legendPlan: plan, plotRect } = layout;
+    assert.deepEqual(plan.entries.map(entry => entry.label), expected, `${legendPosition}: every label whole`);
+    const longest = Math.max(...plan.entries.map(entry => estimateTextWidth(entry.label, 12)));
+    assert.ok(plan.columnWidth >= 10 + 6 + longest, `${legendPosition}: column ${plan.columnWidth} px < ${longest} px label`);
+    assert.ok(legendRect.width >= 16 + plan.columns * plan.columnWidth, `${legendPosition}: box narrower than its columns`);
+    assert.ok(legendRect.height >= plan.height);
+    assert.equal(plan.columns * plan.rowsPerColumn >= model.categories.length, true);
+    // The plot keeps its size; the figure grows around the legend.
+    assert.equal(plotRect.width, 720);
+    assert.equal(plotRect.height, 500);
+    assert.ok(legendRect.x + legendRect.width <= layout.totalWidth);
+    assert.ok(legendRect.y + legendRect.height <= layout.totalHeight);
+    if (legendPosition === 'right') {
+      assert.ok(legendRect.width > plotRect.width, 'the legend is wider than the plot, and that is allowed');
+      assert.ok(legendRect.x >= plotRect.x + plotRect.width);
+    } else {
+      // Below the x axis and its label, not on top of them.
+      assert.ok(legendRect.y >= plotRect.y + plotRect.height + layout.axes.margins.bottom);
+    }
+
+    const { svg } = renderSvgLegend({ legendRect, legendPlan: plan, model });
+    assert.deepEqual(svgEntryTexts(svg), expected);
+    assert.doesNotMatch(svg, /…/);
+    const { ctx, record } = recordingContext();
+    drawCanvasLegend({ ctx, legendRect, legendPlan: plan, model });
+    assert.deepEqual(record.texts.slice(1).map(entry => entry.text), expected);
+  }
+});
+
+test('the layout reserves what the builders draw, measured by one source', () => {
+  // Capitals are wider than the old 0.62 em average: a width estimated from
+  // the character count reserved less than the canvas then drew.
+  const model = categoryModel({
+    categories: ['MMMMMMMMMMMMMMMMMMMM', 'WWWWWWWWWWWWWWWWWWWW'],
+    colors: colorsOf([[1, 0, 0], [0, 1, 0]]),
+    visible: visibleOf({ 0: true, 1: true }),
+  });
+  const wide = (text, fontPx, weight = 400) => String(text).length * fontPx * (weight >= 600 ? 1.1 : 0.95);
+  const layout = computeSingleViewLayout({
+    width: 400,
+    height: 300,
+    plotAspect: 400 / 300,
+    axes: null,
+    legendModel: model,
+    legendFieldKey: 'f',
+    measureText: wide,
+  });
+  assert.ok(layout.legendPlan.columnWidth >= 10 + 6 + 20 * 12 * 0.95);
+  assert.ok(layout.legendRect.width >= 16 + layout.legendPlan.columnWidth);
+});
+
+test('a legend of a million categories is laid out whole: nothing caps it at the plot', () => {
+  const count = 1_000_000;
+  const categories = Array.from({ length: count }, (_, i) => `bg ${i}`);
+  const layout = computeSingleViewLayout({
     width: 800,
     height: 600,
-    title: '',
-    includeAxes: false,
-    includeLegend: true,
-    legendPosition: position,
-    legendModel: { kind: 'category', categories, colors },
-    legendFontSizePx: 12,
+    plotAspect: 800 / 600,
+    axes: null,
+    legendModel: { kind: 'category', categories, colors: new Uint8Array(count * 3) },
+    legendFieldKey: 'barcode',
+    measureText: measure7,
   });
-  const right = layout('right');
-  assert.ok(right.legendRect.width <= right.plotRect.width, `legend ${right.legendRect.width} px wide`);
-  assert.ok(right.totalWidth <= 2 * right.plotRect.width + 200, `figure ${right.totalWidth} px wide`);
-  const bottom = layout('bottom');
-  assert.ok(bottom.legendRect.height <= bottom.plotRect.height, `legend ${bottom.legendRect.height} px tall`);
+  assert.equal(layout.legendPlan.entries.length, count);
+  assert.ok(layout.legendPlan.columns * layout.legendPlan.rowsPerColumn >= count);
+  // Far larger than any browser canvas: the PNG export refuses it (below).
+  assert.ok(layout.totalWidth > 1_000_000, `figure ${layout.totalWidth} px wide`);
+});
+
+/**
+ * A document whose canvases draw only up to `maxSide` device pixels a side,
+ * as a browser past its canvas limit does: the context is handed out, and
+ * drawing past the limit silently leaves nothing.
+ */
+function limitedCanvasDocument(maxSide, allocations) {
+  return {
+    createElement(tag) {
+      assert.equal(tag, 'canvas');
+      const canvas = {
+        width: 300,
+        height: 150,
+        getContext() {
+          const fits = () => canvas.width <= maxSide && canvas.height <= maxSide;
+          let lastFill = false;
+          return {
+            fillStyle: '#000',
+            fillRect() { lastFill = fits(); },
+            clearRect() {},
+            getImageData() { return { data: Uint8ClampedArray.from([0, 0, 0, lastFill ? 255 : 0]) }; },
+          };
+        },
+      };
+      allocations.push(canvas);
+      return canvas;
+    },
+  };
+}
+
+test('a PNG whose legend is larger than the browser can draw is refused with one sentence, never cut', async () => {
+  const view = gridView({
+    id: 'live',
+    label: 'Live',
+    fieldKey: 'cell_type',
+    fieldKind: 'category',
+    legendModel: longCellTypeModel(4000),
+  });
+  const payload = gridPayload([view], { format: 'png' });
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  const allocations = [];
+  // The 1200 × 900 plot at 300 DPI without its legend is 4,100 × 3,163 px:
+  // within this browser's 6,000 px; with 4,000 categories beside it, far past it.
+  globalThis.document = limitedCanvasDocument(6000, allocations);
+  try {
+    await assert.rejects(
+      renderFigureToPngBlob({ payload }),
+      (error) => {
+        assert.match(
+          error.message,
+          /^The legend of 4,000 categories needs a [\d,]+×[\d,]+ px figure, more than this browser can draw; turn the legend off or show fewer categories\.$/
+        );
+        return true;
+      }
+    );
+    // The canvases it tried were released, and no worker work began.
+    assert.ok(allocations.length >= 2);
+    for (const canvas of allocations) assert.equal(canvas.width * canvas.height, 0);
+
+    // Too large without any legend: the remedy is the size or the DPI.
+    globalThis.document = limitedCanvasDocument(2000, []);
+    await assert.rejects(
+      renderFigureToPngBlob({ payload }),
+      (error) => {
+        assert.match(
+          error.message,
+          /^This figure is [\d,]+×[\d,]+ px, more than this browser can draw; choose a smaller size or a lower DPI\.$/
+        );
+        return true;
+      }
+    );
+  } finally {
+    if (previous === undefined) delete globalThis.document;
+    else Object.defineProperty(globalThis, 'document', previous);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -521,6 +757,8 @@ function gridRenderState() {
     },
     bgColor: Float32Array.from([1, 1, 1]),
     cameraDistance: 3,
+    // The sprite cap (rendering/point-sprite.js).
+    pointSizeMax: 160,
     cameraPosition: [0, 0, 3],
     far: 100,
     fogColor: Float32Array.from([1, 1, 1]),
@@ -543,13 +781,14 @@ function gridRenderState() {
   };
 }
 
-/** One panel of a grid export, coloured by its own field with its own filters. */
-function gridView({ id, label, fieldKey, fieldKind, legendModel, filters = [] }) {
+/** One panel of a grid export, colored by its own field with its own filters. */
+function gridView({ id, label, name = null, fieldKey, fieldKind, legendModel, filters = [] }) {
   return {
     cameraState: gridCameraState(),
     data: {
       centroidColors: null,
       centroidFlags: { labels: false, points: false },
+      vectorField: null,
       centroidLabelTexts: [],
       centroidPositions: null,
       colors: Uint8Array.from([255, 0, 0, 255]),
@@ -559,6 +798,7 @@ function gridView({ id, label, fieldKey, fieldKind, legendModel, filters = [] })
     },
     id,
     label,
+    name,
     renderState: gridRenderState(),
     scientificState: {
       datasetGeneration: 7,
@@ -584,6 +824,7 @@ function gridPayload(views, { format = 'svg', legendPosition = 'right' } = {}) {
     dpi: format === 'png' ? 300 : null,
     format,
     height,
+    gridColumns: views.length <= 3 ? views.length : Math.ceil(views.length / 2),
     meta: {
       datasetName: 'Suo',
       datasetId: 'suo-2022',
@@ -595,6 +836,8 @@ function gridPayload(views, { format = 'svg', legendPosition = 'right' } = {}) {
         filters: [...view.scientificState.filters],
         id: view.id,
         label: view.label,
+        name: view.name,
+        vectorField: null,
       })),
     },
     options: {
@@ -624,7 +867,7 @@ function gridPayload(views, { format = 'svg', legendPosition = 'right' } = {}) {
       xLabel: 'UMAP 1',
       yLabel: 'UMAP 2',
     },
-    selection: { highlightArray: null, totalCount: 0, visibleCount: 0 },
+    selection: { highlightArray: null, pageName: null, totalCount: 0, visibleCount: 0 },
     title: '',
     views,
     width,
@@ -730,11 +973,11 @@ test('a grid whose panels disagree still explains every panel', async () => {
     await renderFigureToSvgBlob({ payload: gridPayload(views) })
   ).text();
 
-  // Before this fix the grid emitted no legend whatsoever: four coloured
+  // Before this fix the grid emitted no legend whatsoever: four colored
   // panels a reader could not decode at all.
   assert.deepEqual(legendTitles(svg), ['leiden', 'CD3E', 'MS4A1', 'sample']);
 
-  // Each categorical panel shows its own categories, with its own colours.
+  // Each categorical panel shows its own categories, with its own colors.
   for (const entry of ['T cell', 'B cell', 'Donor 1', 'Donor 2']) {
     assert.equal(
       [...svg.matchAll(new RegExp(`>${entry}</text>`, 'g'))].length,
@@ -805,68 +1048,182 @@ test('a grid whose panels agree is still explained once, not four times', async 
   );
 });
 
-test('a panel legend takes room from the plot instead of covering it', () => {
-  const cell = {
-    cellX: 40,
-    cellY: 60,
-    cellWidth: 560,
-    cellHeight: 420,
-    includeAxes: true,
+function overlaps(a, b) {
+  return a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+}
+
+/** Every rectangle of a grid layout is disjoint from every other, and inside the figure. */
+function assertDisjointGrid(layout) {
+  const rects = [];
+  layout.panes.forEach((pane, index) => {
+    rects.push([`plot ${index}`, pane.plotRect]);
+    if (pane.legendRect) rects.push([`legend ${index}`, pane.legendRect]);
+    // The label row sits above the plot and the panel legend.
+    assert.ok(pane.plotRect.y >= pane.labelY, `pane ${index}: plot under its label`);
+    if (pane.legendRect) {
+      assert.ok(pane.legendRect.y >= pane.labelY, `pane ${index}: legend under its label`);
+      const { panelRect, legendRect } = pane;
+      assert.ok(legendRect.x >= panelRect.x && legendRect.y >= panelRect.y);
+      assert.ok(legendRect.x + legendRect.width <= panelRect.x + panelRect.width + 1);
+      assert.ok(legendRect.y + legendRect.height <= panelRect.y + panelRect.height + 1);
+    }
+  });
+  if (layout.sharedLegendRect) rects.push(['shared legend', layout.sharedLegendRect]);
+  for (let i = 0; i < rects.length; i++) {
+    const [name, rect] = rects[i];
+    assert.ok(rect.x >= 0 && rect.y >= 0, `${name} inside the figure`);
+    assert.ok(rect.x + rect.width <= layout.totalWidth && rect.y + rect.height <= layout.totalHeight, `${name} inside the figure`);
+    for (let j = i + 1; j < rects.length; j++) {
+      assert.equal(overlaps(rect, rects[j][1]), false, `${name} overlaps ${rects[j][0]}`);
+    }
+  }
+}
+
+test('a panel legend takes room beside or below its plot, never over it', () => {
+  const views = [
+    gridView({ id: 'live', label: 'Live', fieldKey: 'leiden', fieldKind: 'category', legendModel: clusterModel() }),
+    gridView({ id: 'snap', label: 'Snap', fieldKey: 'sample', fieldKind: 'category', legendModel: sampleModel() }),
+  ];
+  // The legend takes room on the side that limits the fitted plot: a wide
+  // view beside a legend on the right, a tall one above a legend below.
+  const aspectFor = (legendPosition) => (legendPosition === 'right' ? 3 : 1 / 3);
+  const grid = (legendPosition, includeLegend = true) => computeGridFigureLayout({ columns: views.length <= 3 ? views.length : Math.ceil(Math.sqrt(views.length)), 
+    width: 1200,
+    height: 900,
+    views,
+    plotAspects: views.map(() => aspectFor(legendPosition)),
+    panelAxes: views.map(() => AXES),
+    includeLegend,
+    legendPosition,
     fontSize: 12,
     legendFontSizePx: 12,
-  };
-  const bare = computeGridPaneLayout({ ...cell, legendModel: null });
-  assert.equal(bare.legendRect, null);
-
+    measureText: measure7,
+  });
   for (const legendPosition of ['right', 'bottom']) {
-    const withLegend = computeGridPaneLayout({
-      ...cell,
-      legendModel: clusterModel(),
-      legendPosition,
-    });
-    const { legendRect, plotRect, panelRect, labelY } = withLegend;
-    assert.ok(legendRect, `${legendPosition} legend must be placed`);
-
-    // Disjoint from the plot: no legend entry can sit on top of a data point.
-    const overlaps =
-      legendRect.x < plotRect.x + plotRect.width &&
-      plotRect.x < legendRect.x + legendRect.width &&
-      legendRect.y < plotRect.y + plotRect.height &&
-      plotRect.y < legendRect.y + legendRect.height;
-    assert.equal(overlaps, false, `${legendPosition} legend overlaps the plot`);
-
-    // Below the panel label ("A. Live"), and inside the panel.
-    assert.ok(legendRect.y >= labelY, `${legendPosition} legend hits the label`);
-    assert.ok(legendRect.x >= panelRect.x);
-    assert.ok(legendRect.y >= panelRect.y);
-    assert.ok(
-      legendRect.x + legendRect.width <= panelRect.x + panelRect.width + 1
-    );
-    assert.ok(
-      legendRect.y + legendRect.height <= panelRect.y + panelRect.height + 1
-    );
-
-    // The plot pays for the legend rather than the legend being dropped.
-    const shrunk = legendPosition === 'right'
-      ? plotRect.width < bare.plotRect.width
-      : plotRect.height < bare.plotRect.height;
-    assert.ok(shrunk, `${legendPosition} legend must reserve its own space`);
+    const bare = grid(legendPosition, false);
+    assert.ok(bare.panes.every(pane => pane.legendRect === null));
+    const layout = grid(legendPosition);
+    assertDisjointGrid(layout);
+    for (const [index, pane] of layout.panes.entries()) {
+      assert.ok(pane.legendRect, `${legendPosition} legend must be placed`);
+      assert.equal(pane.legendSide, legendPosition === 'right' ? 'right' : 'below');
+      // The plot pays for a short legend rather than the legend being dropped.
+      const shrunk = legendPosition === 'right'
+        ? pane.plotRect.width < bare.panes[index].plotRect.width
+        : pane.plotRect.height < bare.panes[index].plotRect.height;
+      assert.ok(shrunk, `${legendPosition} legend must reserve its own space`);
+    }
+    // Two short legends fit the requested box, and the figure is its
+    // composition: one side reaches the box, nothing pads the other.
+    assert.ok(layout.totalWidth <= 1200 && layout.totalHeight <= 900, `${layout.totalWidth} × ${layout.totalHeight}`);
+    assert.ok(layout.totalWidth >= 1198 || layout.totalHeight >= 898, `${layout.totalWidth} × ${layout.totalHeight}`);
   }
 
-  // A cell with no room for a readable legend says so instead of drawing an
-  // unreadable one on top of the data.
-  assert.equal(
-    computeGridPaneLayout({
-      cellX: 0,
-      cellY: 0,
-      cellWidth: 90,
-      cellHeight: 70,
-      includeAxes: false,
+  // A cell too small for a legend does not drop it: the figure grows.
+  const tiny = computeGridFigureLayout({ columns: views.length <= 3 ? views.length : Math.ceil(Math.sqrt(views.length)), 
+    width: 90,
+    height: 70,
+    views,
+    plotAspects: views.map(() => 16 / 10),
+    panelAxes: views.map(() => null),
+    legendPosition: 'right',
+    fontSize: 12,
+    measureText: measure7,
+  });
+  assertDisjointGrid(tiny);
+  assert.ok(tiny.panes.every(pane => pane.legendRect !== null));
+  assert.ok(tiny.totalWidth > 90 && tiny.totalHeight > 70);
+});
+
+test('a grid of two disagreeing panels names every entry whole, its long legend below its plot', async () => {
+  // Found 2026-11-10: UMAP colored by cell_type (69) beside PCA colored by
+  // organ drew panel A's legend as swatches followed by "…".
+  const cellType = longCellTypeModel();
+  const organ = {
+    kind: 'category',
+    categories: ['Blood', 'Bone marrow', 'Gut', 'Kidney', 'Liver', 'Skin', 'Spleen', 'Thymus', 'Yolk sac'],
+    colors: new Uint8Array(27).fill(64),
+    visible: new Uint8Array(9).fill(1),
+    picker: [],
+    counts: null,
+  };
+  const views = [
+    gridView({ id: 'live', label: 'UMAP', fieldKey: 'cell_type', fieldKind: 'category', legendModel: cellType }),
+    gridView({ id: 'pca', label: 'PCA', fieldKey: 'organ', fieldKind: 'category', legendModel: organ }),
+  ];
+  for (const legendPosition of ['right', 'bottom']) {
+    const payload = gridPayload(views, { legendPosition });
+    payload.width = 720;
+    payload.height = 500;
+    payload.options.width = 720;
+    payload.options.height = 500;
+    // The payload's layout, as both renderers lay it out: each panel's view
+    // shape (a 320 × 240 pane), axes where they are rulers (none on 3-D).
+    const { grid: layout } = computeFigureLayout(payload);
+    assertDisjointGrid(layout);
+    const [a, b] = layout.panes;
+    // Panel A's names, beside its plot, would be wider than the plot: it moves below.
+    assert.equal(a.legendSide, 'below');
+    if (legendPosition === 'bottom') assert.equal(b.legendSide, 'below');
+    for (const pane of layout.panes) {
+      const longest = Math.max(...pane.legendPlan.entries.map(entry => estimateTextWidth(entry.label, 12)));
+      assert.ok(pane.legendPlan.columnWidth >= 10 + 6 + longest);
+      assert.ok(pane.legendRect.width >= 16 + pane.legendPlan.columns * pane.legendPlan.columnWidth);
+      assert.ok(pane.legendRect.height >= pane.legendPlan.height);
+      assert.ok(pane.plotRect.width >= 80 && pane.plotRect.height >= 64, 'a readable plot');
+    }
+    // The panels of a row line up: their plots start at one height, each
+    // with its own view's aspect.
+    assert.equal(a.plotRect.y, b.plotRect.y);
+    for (const pane of layout.panes) {
+      assert.ok(Math.abs(pane.plotRect.width / pane.plotRect.height - 4 / 3) < 1e-9);
+    }
+    assert.ok(layout.totalHeight > 500, `figure ${layout.totalHeight} px tall`);
+
+    const svg = await (await renderFigureToSvgBlob({ payload })).text();
+    // The figure in figure pixels (1/96 inch), its printed size in millimetres (F271).
+    const [, mmWidth, mmHeight, svgWidth, svgHeight] = svg.match(/^<svg[^>]* width="([\d.]+)mm" height="([\d.]+)mm" viewBox="0 0 (\d+) (\d+)"/);
+    assert.equal(Number(svgWidth), layout.totalWidth);
+    assert.equal(Number(svgHeight), layout.totalHeight);
+    assert.ok(Math.abs(Number(mmWidth) - layout.totalWidth * 25.4 / 96) < 1e-3);
+    assert.ok(Math.abs(Number(mmHeight) - layout.totalHeight * 25.4 / 96) < 1e-3);
+    const entries = svgEntryTexts(svg);
+    for (const name of [...cellType.categories.filter((_, index) => index !== 3), `${cellType.categories[3]} (hidden)`, ...organ.categories]) {
+      assert.ok(entries.includes(name), `${name} drawn whole`);
+    }
+    assert.doesNotMatch(svg, /…/);
+  }
+});
+
+test('the shared grid legend is sized to its entries, and the grid grows to keep it', () => {
+  const model = longCellTypeModel();
+  const views = [
+    gridView({ id: 'a', label: 'A', fieldKey: 'cell_type', fieldKind: 'category', legendModel: model }),
+    gridView({ id: 'b', label: 'B', fieldKey: 'cell_type', fieldKind: 'category', legendModel: structuredClone(model) }),
+  ];
+  for (const legendPosition of ['right', 'bottom']) {
+    const layout = computeGridFigureLayout({ columns: views.length <= 3 ? views.length : Math.ceil(Math.sqrt(views.length)), 
+      width: 720,
+      height: 500,
+      views,
+      plotAspects: views.map(() => 16 / 10),
+      panelAxes: views.map(() => AXES),
+      legendPosition,
       fontSize: 12,
-      legendModel: clusterModel(),
-    }).legendRect,
-    null
-  );
+      measureText: estimateTextWidth,
+    });
+    assertDisjointGrid(layout);
+    assert.ok(layout.sharedLegendRect);
+    assert.ok(layout.panes.every(pane => pane.legendRect === null));
+    const plan = layout.sharedLegendPlan;
+    assert.equal(plan.entries.length, 69);
+    const longest = Math.max(...plan.entries.map(entry => estimateTextWidth(entry.label, 12)));
+    assert.ok(plan.columnWidth >= 16 + longest);
+    assert.ok(layout.sharedLegendRect.width >= 16 + plan.columns * plan.columnWidth);
+    assert.ok(layout.sharedLegendRect.height >= plan.height);
+    for (const pane of layout.panes) assert.ok(pane.plotRect.width >= 80 && pane.plotRect.height >= 64);
+    assert.ok(layout.totalWidth > 720 || layout.totalHeight > 500);
+  }
 });
 
 test('grid provenance describes every panel, never one panel four times', async () => {
@@ -886,7 +1243,7 @@ test('grid provenance describes every panel, never one panel four times', async 
     'D. Sample view (Field: sample; Filters: none) • Source: /data/suo'
   );
 
-  // No single colour field may be claimed for the whole figure.
+  // No single color field may be claimed for the whole figure.
   assert.doesNotMatch(svg, /<cellucid:colorField>/);
 
   const json = svgProvenanceJson(svg);
@@ -897,29 +1254,37 @@ test('grid provenance describes every panel, never one panel four times', async 
         panel: 'A',
         id: 'live',
         label: 'Live',
+        name: null,
         field: { key: 'leiden', kind: 'category' },
         filters: ['cell_type: hiding B cell'],
+        vectorField: null,
       },
       {
         panel: 'B',
         id: 'snapshot-cd3e',
         label: 'CD3E view',
+        name: null,
         field: { key: 'CD3E', kind: 'continuous' },
         filters: [],
+        vectorField: null,
       },
       {
         panel: 'C',
         id: 'snapshot-ms4a1',
         label: 'MS4A1 view',
+        name: null,
         field: { key: 'MS4A1', kind: 'continuous' },
         filters: [],
+        vectorField: null,
       },
       {
         panel: 'D',
         id: 'snapshot-sample',
         label: 'Sample view',
+        name: null,
         field: { key: 'sample', kind: 'category' },
         filters: [],
+        vectorField: null,
       },
     ]
   );
@@ -1014,6 +1379,7 @@ test('each panel counts its own selection instead of copying the active one', as
   payload.options.emphasizeSelection = true;
   payload.selection = {
     highlightArray: Uint8Array.from([255, 255]),
+    pageName: 'Page 1',
     totalCount: 2,
     visibleCount: 2,
   };
@@ -1066,18 +1432,18 @@ test('both renderers place panel legends through the one shared layout', async (
     // renderers drifting apart is what a shared layout module prevents.
     assert.doesNotMatch(
       rendererSource,
-      /function computeGridPaneLayout/,
-      `${name} renderer must not own a private grid pane layout`
+      /function computeGrid|computeGridDims|cellW\b|Math\.min\(240|Math\.min\(140/,
+      `${name} renderer must not own a private grid geometry`
     );
     assert.match(
       rendererSource,
-      /legendModel: panelLegendModel,\s*\n\s*legendPosition,/,
-      `${name} renderer must feed the panel legend into the shared layout`
+      /computeFigureLayout\(payload/,
+      `${name} renderer must take the figure's layout from the shared layout`
     );
     assert.match(
       rendererSource,
-      /rendersPanelLegends = includeLegend && !rendersSharedLegend/,
-      `${name} renderer must fall back to per-panel legends`
+      /legendPlan: panelLegendPlan,/,
+      `${name} renderer must draw each panel legend as the layout planned it`
     );
     assert.match(
       rendererSource,
@@ -1093,7 +1459,7 @@ test('both renderers place panel legends through the one shared layout', async (
 });
 
 test('SVG text from the data cannot carry characters XML forbids', async () => {
-  const { svg } = renderSvgLegend({
+  const { svg } = svgLegend({
     legendRect: WIDE_RECT,
     fieldKey: 'cell\u0007type',
     model: categoryModel({
@@ -1155,11 +1521,11 @@ test('a figure of a subsample says so: its cells, the dataset\'s, how they were 
   await assert.rejects(renderFigureToSvgBlob({ payload }), /describe a subsample/);
 });
 
-test('a colour bar of the colormaps\' bare stops is drawn, and a gene sample\'s note wraps within the bar', () => {
-  // `getCssStopsForColormap` gives bare colours (no positions), spaces inside.
+test('a color bar of the colormaps\' bare stops is drawn, and a gene sample\'s note wraps within the bar', () => {
+  // `getCssStopsForColormap` gives bare colors (no positions), spaces inside.
   const model = { ...geneModel(['rgb(68, 1, 84)', 'rgb(33, 145, 140)', 'rgb(253, 231, 37)']), geneSample: { cells: 1_759, of: 2_282_447 }, zeroGray: { enabled: true, applies: true, drawn: true } };
   const narrow = { x: 0, y: 0, width: 220, height: 160 };
-  const { svg, defs } = renderSvgLegend({ legendRect: narrow, fieldKey: 'G', model });
+  const { svg, defs } = svgLegend({ legendRect: narrow, fieldKey: 'G', model });
   assert.deepEqual(
     [...defs.matchAll(/<stop offset="([^"]+)" stop-color="([^"]+)"\/>/g)].map(match => [match[1], match[2]]),
     [['0%', 'rgb(68, 1, 84)'], ['50%', 'rgb(33, 145, 140)'], ['100%', 'rgb(253, 231, 37)']],

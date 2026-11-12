@@ -16,9 +16,9 @@ import { getNotificationCenter } from '../assets/js/app/notification-center.js';
 import { getActions } from '../assets/js/app/actions/index.js';
 import {
   initRepresentationControls,
-  representationOptionText,
   representationOptionTitle,
 } from '../assets/js/app/ui/modules/representation-controls.js';
+import { representationOptionText } from '../assets/js/data/representation-names.js';
 
 function createDeferred() {
   let reject;
@@ -41,6 +41,7 @@ const REPRESENTATIONS = Object.freeze([
 const VIEWER = Object.freeze({
   getLiveViewHidden: () => false,
   getSnapshotViews: () => [{ id: 'snap_1' }],
+  getViewName: () => null,
 });
 
 /** Every action dispatched in a test, with its exact params. */
@@ -287,7 +288,7 @@ test('choosing a representation is the view.embedding.set action of the selected
   fireChange('X_tsne');
   // While the view loads, the picker cannot start a second switch.
   assert.equal(dom.select.disabled, true);
-  assert.equal(dom.select.title, 'Switching…');
+  assert.equal(dom.select.title, 'another embedding is being shown; try again once it is');
   await settle();
   assert.deepEqual(dispatched, [
     ['view.embedding.set', { view: 'View 2', embedding: { key: 'X_tsne', columns: [0, 1] } }],
@@ -364,7 +365,8 @@ test('agents and replays name the view and the embedding; unknown names are refu
   const actions = getActions();
 
   const set = await actions.dispatch('view.embedding.set', { view: 'View 1', embedding: { key: 'X_pca', columns: [0, 1] } });
-  assert.deepEqual(set.outcome, { view: 'View 1' });
+  // Named as the picker names it, so the step says which (two embeddings may share a name).
+  assert.deepEqual(set.outcome, { view: 'View 1', embedding: 'PCA (unintegrated) · 2D' });
   assert.equal(state.layouts.get('live'), 'X_pca');
   const shown = await actions.dispatch('view.embedding.default', { view: 'View 2', dimension: 3 });
   assert.deepEqual(shown.outcome, { view: 'View 2', embedding: 'UMAP' });

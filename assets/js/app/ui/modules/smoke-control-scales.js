@@ -13,8 +13,8 @@
 import {
   formatDecimal,
   formatMultiplier,
-  formatPercent,
 } from '../components/display-format.js';
+import { formatPercent } from '../../../utils/format-units.js';
 import {
   SMOKE_GRID_SIZES,
   SMOKE_NOISE_RESOLUTIONS,
@@ -111,7 +111,7 @@ export function smokeAbsorptionScale(position) {
   return { value: lightAbsorption, readout: formatDecimal(lightAbsorption, 1) };
 }
 
-/** `Light scattering` — forward-scattering glow towards the light, 0 to 2. */
+/** `Light scattering` — forward-scattering glow toward the light, 0 to 2. */
 export function smokeScatterScale(position) {
   const scatterStrength = requirePosition(position, 'Smoke light scattering') * 2;
   return { value: scatterStrength, readout: formatDecimal(scatterStrength, 1) };

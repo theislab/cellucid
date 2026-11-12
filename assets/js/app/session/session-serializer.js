@@ -37,13 +37,16 @@
  */
 
 import { NO_PAGE_CHROME, openHistoryFile, readHistoryFileManifest } from './history-file.js';
+import { HistoryModelError } from '../history/model.js';
 import { SAVE_DEFAULTS, writeSharedHistory } from './share-scope.js';
 import { readReplayPlan } from '../history/replay.js';
 import { recomputeLeftOutResults, recomputeSentences } from './recompute-results.js';
 import { getActionCatalog } from '../actions/index.js';
-import { createOpaqueId } from '../utils/opaque-id.js';
+import { domainName } from '../actions/domains.js';
+import { writtenByOtherVersion } from './app-stamp.js';
+import { createOpaqueId } from '../../utils/opaque-id.js';
 import { pageVersion } from '../utils/page-version.js';
-import { assertPublishedDefaultProfile, assertPublishedDefaultRoot } from './published-default.js';
+import { assertPublishedDefaultProfile, assertPublishedDefaultRoot, keepShownControls } from './published-default.js';
 import { captureDatasetSourceRecord } from './dataset-source-record.js';
 import {
   captureCellSubsetRecord, captureGeneSampleRecord, decodeCellSubsetRecord, decodeGeneSampleRecord,
@@ -58,8 +61,10 @@ import { sameJson } from '../utils/same-json.js';
 import { getNotificationCenter } from '../notification-center.js';
 import { useOpenCells } from '../../data/open-cells-work.js';
 import { requireExactKeys } from '../../utils/exact-record.js';
-import { abortReason, cancellationKind, cancelled, isCancellation, onAbort, throwIfAborted } from '../../utils/abort.js';
-import { failureText, markReported } from '../../utils/errors.js';
+import { abortReason, awaitWithSignal, cancellationKind, cancelled, isCancellation, onAbort, throwIfAborted, requireSignal } from '../../utils/abort.js';
+import {
+  failureDetails, failureDetailsText, failureText, isDamagedFile, isInternalFailure, joinFailure, markReported, sayFailure,
+} from '../../utils/errors.js';
 import { heldCategoriesOf } from '../state/managers/field/pending-categories.js';
 import { formatCountOf } from '../../utils/format-units.js';
 
@@ -78,9 +83,101 @@ import { formatCountOf } from '../../utils/format-units.js';
  * @property {(reason: unknown) => Promise<void>} cancel
  */
 
-function failureMessage(error) {
-  if (!(error instanceof Error)) return 'The session could not be loaded.';
-  return error.message.length > 0 ? error.message : error.name;
+/**
+ * A history's load (a session file, a saved state, Continue) that failed, as
+ * the person reads it, after the name of what was loaded: one sentence saying
+ * what happened and that the history shown is as it was, and the failure's
+ * own words (the trackers, steps and groups it names) under Details. A
+ * refusal or a reader's sentence is said as it is.
+ *
+ * @param {unknown} error
+ * @returns {{message: string, details: string}} `message` follows the name ("name: …")
+ */
+export function describeLoadFailure(error) {
+  const unchanged = 'so it was not opened; the history shown is unchanged.';
+  const other = error !== null && typeof error === 'object' ? WRITTEN_BY.get(error) : undefined;
+  // A history another version wrote that this one cannot read is said as that, never as damaged or a problem inside (F155).
+  if (other !== undefined && (isDamagedFile(error) || isInternalFailure(error) || modelFailure(error))) {
+    return { message: `${otherVersionWords(other)}, which this version cannot read, ${unchanged}`, details: failureDetailsText(error) };
+  }
+  if (isDamagedFile(error)) return { message: `the file is damaged, ${unchanged}`, details: failureText(error) };
+  if (modelFailure(error)) return { message: `it does not hold together as a history, ${unchanged}`, details: failureText(error) };
+  return { message: sayFailure(error), details: failureDetails(error).details ?? '' };
+}
+
+/** Whether `error` (or what caused it) is the history model's refusal of a record. */
+function modelFailure(error) {
+  for (let at = error, depth = 0; at !== null && typeof at === 'object' && depth < 8; at = at.cause, depth++) {
+    if (at instanceof HistoryModelError) return true;
+  }
+  return false;
+}
+
+/**
+ * The failures of loads of a history another version of Cellucid wrote
+ * (`writtenByOtherVersion`: `{when: 'earlier'|'newer', version}`), so
+ * `describeLoadFailure` says that instead of a damaged file or a problem
+ * inside Cellucid, wherever the error goes next (the session controls, an
+ * agent's `history.saved.open`).
+ */
+const WRITTEN_BY = new WeakMap();
+
+/** "it was saved by an earlier version of Cellucid (0.9.7)" */
+function otherVersionWords({ when, version }) {
+  return `it was saved by ${when === 'newer' ? 'a newer' : 'an earlier'} version of Cellucid${typeof version === 'string' && version !== '' ? ` (${version})` : ''}`;
+}
+
+/**
+ * What a load could not restore (`history.load` / `importTrackers`
+ * `unrestored`, F155), one sentence per part, each saying what that part is
+ * and what became of it, and the words of each failure for Details. A part
+ * of a history another version wrote (`other`) that this version refused is
+ * said as saved by that version, which this one cannot read; any other
+ * failure as `sayFailure` says it. `continued`: the saved state of this
+ * browser it came from is kept as it was (the history goes on as a new one
+ * beside it).
+ *
+ * A part of the state this version does not have (`unknown-domain`, F164)
+ * is said once for all such parts: their changes are left out of every
+ * step. `subject`: what was restored ("Session", "Starting view").
+ *
+ * @param {Array<{part: 'domain', domain: string, error: unknown}|{part: 'unknown-domain', domain: string}|{part: 'tracker', tracker: {id: string, name: string}, active: boolean, error: unknown}>} unrestored
+ * @param {{other?: {when: 'earlier'|'newer', version: string}|null, savedState?: boolean, subject?: string}} [options]
+ * @returns {{message: string, details: string}}
+ */
+export function describeUnrestored(unrestored, { other = null, savedState = false, subject = 'Session' } = {}) {
+  const partReasonOf = error => {
+    if (other !== null && (isInternalFailure(error) || isDamagedFile(error) || modelFailure(error))) {
+      return `${otherVersionWords(other)}, and this version cannot read this part.`;
+    }
+    return sayFailure(error);
+  };
+  const ended = text => (/[.!?]$/.test(text) ? text : `${text}.`);
+  const absent = unrestored.filter(part => part.part === 'unknown-domain').map(part => `"${part.domain}"`);
+  const absentSentence = absent.length === 0 ? [] : [
+    `${absent.length === 1 ? 'A part of the state' : 'Parts of the state'} this version of Cellucid does not have (${absent.join(', ')}) `
+    + `${absent.length === 1 ? 'is' : 'are'} left out${other === null ? '' : `: ${otherVersionWords(other)}`}.`,
+  ];
+  const sentences = [...absentSentence, ...unrestored.filter(part => part.part !== 'unknown-domain').map(part => {
+    if (part.part === 'domain') {
+      return `${ended(joinFailure(`${domainName(part.domain)} could not be restored`, partReasonOf(part.error)))} It is left as it was shown.`;
+    }
+    const name = `The history "${part.tracker.name}"`;
+    const then = part.active
+      ? 'What it showed is restored, as the start of a new history of that name with its conversations.'
+      : 'It is left out; the other histories are restored.';
+    return `${ended(joinFailure(`${name} (its steps) could not be read`, partReasonOf(part.error)))} ${then}`;
+  })];
+  const what = formatCountOf(unrestored.length, 'part');
+  const kept = savedState ? ' The saved state is kept as it was; this history goes on beside it.' : '';
+  const detailOf = part => {
+    if (part.part === 'unknown-domain') return `State part "${part.domain}": not a part of the state in this version of Cellucid; its changes are left out of every step.`;
+    return `${part.part === 'domain' ? domainName(part.domain) : `History "${part.tracker.name}"`}: ${failureDetailsText(part.error)}`;
+  };
+  return {
+    message: `${subject} restored but for ${what}. ${sentences.join(' ')}${kept}`,
+    details: unrestored.map(detailOf).join('\n'),
+  };
 }
 
 function isDismissal(error, signal) {
@@ -110,7 +207,7 @@ function describeMissingFields(state, header) {
 /**
  * What the person is told of a field the loaded state names categories of
  * that no open cell holds (a text or boolean column on a subsample: its
- * categories are those its open cells hold): their filters and colours are
+ * categories are those its open cells hold): their filters and colors are
  * held by label and applied when cells holding them open
  * (`state/managers/field/pending-categories.js`).
  *
@@ -145,7 +242,7 @@ export class SessionSerializer {
    * }} options - `getHistory`: the open dataset's history, or null while none is
    *   open; `onLoaded`: a session file, saved state or starting view is shown (the
    *   camera path saved with Autoplay on starts, `cinematic-camera` `startAutoplay`);
-   *   `catalog`: the action catalogue files are stamped with (the page's);
+   *   `catalog`: the action catalog files are stamped with (the page's);
    *   `version`: the Cellucid version that writes (the page's `<meta name="cellucid-version">`);
    *   `chrome`: the page chrome sessions carry outside the history (the pressed selection tool,
    *   CEL-0249): taken at a save, put back once a load shows its head
@@ -200,11 +297,27 @@ export class SessionSerializer {
     this._restoreSettlement = settle;
   }
 
-  /** One operation on the session at a time; a failure does not stop the next. */
-  _exclusive(operation) {
-    const task = this._operationTail.then(operation);
+  /**
+   * One operation on the session at a time; a failure does not stop the
+   * next. `signal`: stopped while it waits for its turn, it never runs and
+   * its caller hears so at once (as the history's `exclusive`, L20-2); once
+   * running, the operation watches the signal itself.
+   */
+  _exclusive(operation, { signal = null } = {}) {
+    let started = false;
+    const task = this._operationTail.then(() => {
+      throwIfAborted(signal);
+      started = true;
+      return operation();
+    });
     this._operationTail = task.then(() => {}, () => {});
-    return task;
+    if (signal === null) return task;
+    return new Promise((resolve, reject) => {
+      const stopWaiting = onAbort(signal, () => {
+        if (!started) reject(abortReason(signal));
+      });
+      task.then(value => { stopWaiting(); resolve(value); }, error => { stopWaiting(); reject(error); });
+    });
   }
 
   async _withSettlement(settle, operation) {
@@ -291,12 +404,16 @@ export class SessionSerializer {
    * `createSessionBundle`, with what the file holds (`share-scope.js`
    * `shareHistory`'s answer: its trackers and scope), for `history.share`.
    *
-   * @param {{choice?: object}} [options]
+   * `signal` (the `history.share` dispatch's, an agent's Stop): the waits
+   * before the file is written (its turn, the actions still running) end at
+   * once when it is stopped; they change nothing (L20-2).
+   *
+   * @param {{choice?: object, signal?: AbortSignal|null}} [options]
    * @returns {Promise<{blob: Blob, shared: object}>}
    */
-  writeShare({ choice = SAVE_DEFAULTS } = {}) {
+  writeShare({ choice = SAVE_DEFAULTS, signal = null } = {}) {
     return this._exclusive(() => this._withSettlement(this._captureSettlement, async () => {
-      await this._dispatcher.idle();
+      await awaitWithSignal(this._dispatcher.idle(), signal);
       const history = this._requireHistory();
       // What is shown is what is saved: a paused period's changes and a change made outside an action become steps.
       await history.settlePaused({ origin: 'session' });
@@ -320,7 +437,7 @@ export class SessionSerializer {
       } finally {
         unhold();
       }
-    }));
+    }), { signal });
   }
 
   /**
@@ -348,18 +465,21 @@ export class SessionSerializer {
   }
 
   /**
-   * Show a file picker and load the chosen session file into the history.
-   * `beforeRestore(file)` runs once a file is chosen, before anything is
-   * read from it; resolving false abandons the load (the session controls
-   * open the session's dataset there first).
+   * Load a session file into the history: `file` (dropped on the page,
+   * chosen in Open… › File…), or, when null, the one the person chooses in
+   * a file picker now. `beforeRestore(file)` runs once there is a file,
+   * before anything is read from it; resolving false abandons the load (the
+   * session controls open the session's dataset there first).
    *
-   * @param {{beforeRestore: (file: File) => Promise<boolean>}} options
+   * @param {{beforeRestore: (file: File) => Promise<boolean>, file: File|null}} options
    * @returns {Promise<boolean>} whether a file was chosen and loaded
    */
   async loadSessionFromFile(options) {
-    requireExactKeys(options, ['beforeRestore'], 'Session file load options');
+    requireExactKeys(options, ['beforeRestore', 'file'], 'Session file load options');
     if (typeof options.beforeRestore !== 'function') throw new TypeError('Session file load beforeRestore must be a function.');
-    const file = await this.pickSessionFile();
+    if (options.file !== null && !(options.file instanceof Blob)) throw new TypeError('Session file load file must be a File, or null to choose one.');
+    // A file given (dropped on the page, chosen in Open… › File…), else the one the person chooses now.
+    const file = options.file ?? await this.pickSessionFile();
     if (file === null) return false;
     const proceed = await options.beforeRestore(file);
     if (typeof proceed !== 'boolean') throw new TypeError('Session file load beforeRestore must resolve a boolean.');
@@ -390,7 +510,11 @@ export class SessionSerializer {
         onProgress: loaded => this._progress?.(loaded),
       });
       return { ...opened, ...sourceFacts(opened.manifest) };
-    }, { label: 'Session file', totalBytes, signal: null, importFile: file });
+    }, {
+      label: 'Session file', totalBytes, signal: null, importFile: file,
+      // What wrote it, for a failure before the file was read whole (`describeLoadFailure`).
+      stampOf: async () => (await readHistoryFileManifest(blob)).app,
+    });
   }
 
   /**
@@ -398,12 +522,15 @@ export class SessionSerializer {
    * autosave) into the open dataset's history, verified like a file.
    *
    * @param {() => Promise<SavedHistorySource>} open
-   * @param {{label: string, signal?: AbortSignal|null}} options
-   * @returns {Promise<void>}
+   * @param {{label: string, signal?: AbortSignal|null, heavy?: ((estimate: Object) => Promise<void>)|null}} options -
+   *   `heavy`: an action's `ctx.heavy` (an agent's `history.saved.open`), asked before the values it
+   *   restores sum cells' totals (normalized values)
+   * @returns {Promise<{notRestored: string|null}|undefined>} `notRestored`: the parts it could not
+   *   restore, as the person was told (`describeUnrestored`), or null when every part was
    */
-  loadSavedHistory(open, { label, signal = null }) {
+  loadSavedHistory(open, { label, signal = null, heavy = null }) {
     assertNonEmptyString(label, 'Saved history label');
-    return this._runOwnedRestore(() => open(), { label, totalBytes: null, signal });
+    return this._runOwnedRestore(() => open(), { label, totalBytes: null, signal, heavy });
   }
 
   /**
@@ -418,7 +545,7 @@ export class SessionSerializer {
   restorePublishedDefaultState(blob, options) {
     if (!(blob instanceof Blob)) throw new TypeError('Published default session restore source must be a Blob.');
     requireExactKeys(options, ['signal', 'refreshUi'], 'Published default session restore options');
-    if (!(options.signal instanceof AbortSignal)) throw new TypeError('Published default session restore signal must be an AbortSignal.');
+    requireSignal(options.signal, 'Published default session restore signal');
     throwIfAborted(options.signal);
     if (typeof options.refreshUi !== 'function') throw new TypeError('Published default session restore refreshUi must be a function.');
     return this._runOwnedRestore(async controller => {
@@ -481,7 +608,9 @@ export class SessionSerializer {
    * restore settlement, shows its progress, verifies, loads, and reports.
    * @private
    */
-  _runOwnedRestore(openSource, { label, totalBytes, signal, startingView = false, refreshUi = null, importFile = null }) {
+  _runOwnedRestore(openSource, {
+    label, totalBytes, signal, startingView = false, refreshUi = null, importFile = null, heavy = null, stampOf = null,
+  }) {
     const previous = this._activeRestoreTask;
     this._activeRestoreAbort?.abort(cancelled('superseded', 'Session restore was superseded by a newer restore.'));
     const controller = new AbortController();
@@ -489,8 +618,8 @@ export class SessionSerializer {
     const task = this._exclusive(async () => {
       if (previous !== null) await previous.catch(() => {});
       throwIfAborted(controller.signal);
-      await this._withSettlement(this._restoreSettlement, () => this._restore(openSource, {
-        label, totalBytes, controller, startingView, refreshUi, importFile,
+      return this._withSettlement(this._restoreSettlement, () => this._restore(openSource, {
+        label, totalBytes, controller, startingView, refreshUi, importFile, heavy, stampOf,
       }));
     });
     this._activeRestoreAbort = controller;
@@ -507,44 +636,63 @@ export class SessionSerializer {
   }
 
   /**
-   * After trackers were loaded beside the person's: one notice whose Undo
-   * removes them to Recently deleted (each load is journaled, `load`; undoing
-   * it is `history.journal.undo`, so it is undoable and restorable as any edit).
+   * After trackers were loaded beside the person's: what the load's notice
+   * says of them (its title), and its Undo (`run`), which removes them to Recently deleted (each
+   * load is journaled, `load`; undoing it is `history.journal.undo`, so it is
+   * undoable and restorable as any edit). Null when there is nothing to undo
+   * (no tracker of the person's beside them: the only trackers cannot go).
    * @private
    */
-  _offerUndoLoad(added, file) {
+  _undoLoadOf(added) {
     const undoable = added.filter(tracker => tracker.journal !== null);
-    // Only beside trackers of the person's: the only trackers cannot be removed.
     const own = this._getHistory()?.trackers().filter(tracker => !undoable.some(each => each.id === tracker.id)).length ?? 0;
-    if (undoable.length === 0 || own === 0 || !this._dispatcher) return;
+    if (undoable.length === 0 || own === 0 || !this._dispatcher) return null;
     const notifications = getNotificationCenter();
     const what = undoable.length === 1 ? `"${undoable[0].name}"` : formatCountOf(undoable.length, 'tracker');
-    const id = notifications.show({
-      type: 'success',
-      category: 'session',
-      message: `Loaded ${what} from ${file} beside yours.`,
-      duration: 10_000,
-      action: {
-        label: 'Undo',
-        run: () => {
-          notifications.dismiss(id);
-          void (async () => {
-            for (const tracker of undoable) {
-              await this._dispatcher.dispatch('history.journal.undo', { tracker: tracker.id, entry: tracker.journal }, { origin: 'user' });
-            }
-          })().catch(error => notifications.error(`The load could not be undone: ${failureText(error)}`, { category: 'session' }));
-        },
+    return {
+      title: `Loaded ${what} beside yours`,
+      run: () => {
+        void (async () => {
+          for (const tracker of undoable) {
+            await this._dispatcher.dispatch('history.journal.undo', { tracker: tracker.id, entry: tracker.journal }, { origin: 'user' });
+          }
+        })().catch(error => notifications.error(`${joinFailure(`The load could not be undone`, sayFailure(error))}`, { ...failureDetails(error), category: 'session' }));
       },
-    });
+    };
   }
 
   /** @private */
-  async _restore(openSource, { label, totalBytes, controller, startingView, refreshUi, importFile }) {
+  /**
+   * Whether `app` (a history's stamp) names another version than this page
+   * (`writtenByOtherVersion`): `{when, version}`, or null.
+   * @private
+   */
+  async _writtenBy(app) {
+    let version = null;
+    try {
+      version = this._version();
+    } catch {
+      // A page that names no version compares the catalog alone.
+    }
+    const when = await writtenByOtherVersion(app, { catalog: this._catalog, version });
+    return when === null ? null : { when, version: app.version };
+  }
+
+  /** @private */
+  async _restore(openSource, { label, totalBytes, controller, startingView, refreshUi, importFile, heavy = null, stampOf = null }) {
     const notifications = getNotificationCenter();
-    const downloadId = notifications.startDownload(label, totalBytes, {
+    const line = restoreLine(notifications, {
+      label, totalBytes, startingView,
       onCancel: () => controller.abort(cancelled('user', 'Session restore was canceled by the user.')),
     });
-    this._progress = loaded => notifications.updateDownload(downloadId, loaded, totalBytes);
+    this._progress = loaded => line.progress(loaded);
+    // Heavy work the load finds once its file is read (the cells' totals a normalized restore or a
+    // replayed step sums, F167): an agent's load asks first (`heavy`); every load names it on its
+    // own progress line, with its Cancel, in the words the work gives (`estimate.doing`).
+    const loadHeavy = async estimate => {
+      if (heavy !== null) await heavy(estimate);
+      if (typeof estimate?.doing === 'string' && estimate.doing !== '') line.phase(estimate.doing);
+    };
     let source = null;
     let applied = false;
     try {
@@ -570,9 +718,9 @@ export class SessionSerializer {
         // Steps only: no values to show, a plan to replay here (its fingerprint matched: the same dataset).
         const plan = await readReplayPlan(source, { signal: controller.signal });
         await history.settlePaused({ origin: 'session' });
-        await history.replay(plan, { signal: controller.signal });
+        await history.replay(plan, { signal: controller.signal, heavy: loadHeavy });
         chrome?.apply();
-        notifications.completeDownload(downloadId, 'Session steps replayed.');
+        line.complete('Session steps replayed.');
         for (const note of chrome?.notes ?? []) notifications.info(note);
         this._onLoaded();
         return;
@@ -585,13 +733,21 @@ export class SessionSerializer {
         const [root] = tracker.steps;
         assertPublishedDefaultRoot(root);
         const values = Object.fromEntries(Object.entries(root.after).map(([id, hash]) => [id, eager.values.get(hash)]));
-        await history.showValues(values);
+        const { leftOut } = await history.showValues(values, keepShownControls, { heavy: loadHeavy });
         // The starting view's page chrome (its selection tool, CEL-0249).
         chrome?.apply();
         applied = true;
         throwIfAborted(controller.signal);
         await refreshUi({ phase: 'commit' });
-        notifications.dismissDownload(downloadId);
+        line.dismiss();
+        if (leftOut.length > 0) {
+          // A part another version of Cellucid has and this one does not is left out, the rest shown (F164).
+          const partial = describeUnrestored(leftOut.map(domain => ({ part: 'unknown-domain', domain })), {
+            other: await this._writtenBy(source.stamps?.app).catch(() => null), subject: 'Starting view',
+          });
+          console.warn(`[session] ${partial.message}\n${partial.details}`);
+          notifications.show({ type: 'warning', category: 'session', message: partial.message, duration: 0, details: partial.details });
+        }
         tellHeldCategories(this._state, label, notifications);
         this._onLoaded();
         return;
@@ -605,20 +761,41 @@ export class SessionSerializer {
       // Changes made while recording was paused are kept as one step before anything else is shown.
       await history.settlePaused({ origin: 'session' });
       let loaded = null;
+      let unrestored;
       if (importFile === null) {
-        await history.load(eager.history, { values: eager.values, signal: controller.signal, rest });
+        ({ unrestored } = await history.load(eager.history, { values: eager.values, signal: controller.signal, rest, heavy: loadHeavy }));
       } else {
-        loaded = await history.importTrackers(eager.history, { file: importFile, values: eager.values, signal: controller.signal, rest });
+        loaded = await history.importTrackers(eager.history, { file: importFile, values: eager.values, signal: controller.signal, rest, heavy: loadHeavy });
+        ({ unrestored } = loaded);
       }
       chrome?.apply();
-      notifications.completeDownload(downloadId, 'Session fully restored.');
-      if (loaded !== null) this._offerUndoLoad(loaded.trackers, importFile);
+      // One notice says how the load ended, and, when it added trackers beside the person's, which, with
+      // Undo: a progress notice keeps the action it was made with (its Cancel), so it gives way to that one.
+      // A load that could not restore every part names each part it could not, with its words under Details (F155).
+      const undo = loaded === null ? null : this._undoLoadOf(loaded.trackers);
+      const partial = unrestored.length === 0 ? null : describeUnrestored(unrestored, {
+        other: await this._writtenBy(source.stamps?.app), savedState: importFile === null,
+      });
+      if (partial !== null) console.warn(`[session] ${partial.message}\n${partial.details}`);
+      if (undo === null && partial === null) {
+        line.complete('Session fully restored.');
+      } else {
+        line.dismiss();
+        const shown = notifications.show({
+          type: partial === null ? 'success' : 'warning', category: 'session',
+          ...(undo === null ? {} : { title: undo.title }),
+          message: partial === null ? 'Session fully restored.' : partial.message,
+          ...(partial === null ? { duration: 10_000 } : { duration: 0, details: partial.details }),
+          ...(undo === null ? {} : { action: { label: 'Undo', run: () => { notifications.dismiss(shown); undo.run(); } } }),
+        });
+      }
       for (const note of chrome?.notes ?? []) notifications.info(note);
       // Analysis results the file left out are computed again, as steps (`recompute-results.js`).
       const recomputed = await recomputeLeftOutResults({ history, dispatcher: this._dispatcher, signal: controller.signal });
       for (const { tone, text } of recomputeSentences(recomputed)) notifications[tone](text, { category: 'session' });
       tellHeldCategories(this._state, label, notifications);
       this._onLoaded();
+      return { notRestored: partial === null ? null : partial.message };
     } catch (err) {
       if (source !== null) await source.cancel(err).catch(() => {});
       if (startingView && applied) {
@@ -628,15 +805,20 @@ export class SessionSerializer {
         try { await refreshUi({ phase: 'rollback' }); } catch { /* the failure above is the one reported */ }
       }
       if (isDismissal(err, controller.signal) || (startingView && isCancellation(err) && controller.signal.aborted)) {
-        notifications.dismissDownload(downloadId);
+        line.dismiss();
       } else if (startingView && !isCancellation(err)) {
         // Its caller says that the sample view could not be applied.
-        notifications.dismissDownload(downloadId);
+        line.dismiss();
       } else if (isCancellation(err)) {
-        notifications.failDownload(downloadId, 'Session restore canceled.');
+        line.fail('Session restore canceled.');
         markReported(err);
       } else {
-        notifications.failDownload(downloadId, failureMessage(err));
+        // Written by another version: said as that (`describeLoadFailure`), wherever the error is said next.
+        const app = source?.stamps?.app ?? (stampOf === null ? null : await stampOf().catch(() => null));
+        const other = await this._writtenBy(app).catch(() => null);
+        if (other !== null && err !== null && typeof err === 'object') WRITTEN_BY.set(err, other);
+        const { message, details } = describeLoadFailure(err);
+        line.fail(message, { details });
         markReported(err);
       }
       throw controller.signal.aborted && isDismissal(err, controller.signal) ? controller.signal.reason : err;
@@ -644,6 +826,29 @@ export class SessionSerializer {
       this._progress = null;
     }
   }
+}
+
+/**
+ * The line a load shows while it runs (round 9 close, RCA-7). A session file
+ * or a saved state of this browser: a loading line with its Cancel (its bytes
+ * as they are read, and their speed once measured: `download-tracking.js`). A
+ * starting view: none. It is a part of its dataset's opening, whose card says
+ * what is happening; a line of its own read "Loading Starting view 0 B/s" at
+ * every sample's start, a transfer that was none (its file is in the page).
+ * Its failure is said by its caller ("the sample view could not be applied").
+ */
+function restoreLine(notifications, { label, totalBytes, startingView, onCancel }) {
+  if (startingView) {
+    return Object.freeze({ progress() {}, phase() {}, complete() {}, dismiss() {}, fail() {} });
+  }
+  const id = notifications.startDownload(label, totalBytes, { onCancel });
+  return Object.freeze({
+    progress: loaded => notifications.updateDownload(id, loaded, totalBytes),
+    phase: doing => notifications.phaseDownload(id, doing),
+    complete: message => notifications.completeDownload(id, message),
+    dismiss: () => notifications.dismissDownload(id),
+    fail: (message, options = {}) => notifications.failDownload(id, message, options),
+  });
 }
 
 /** What a session file says beside its history, as a `SavedHistorySource` gives it. */

@@ -147,7 +147,7 @@ test('the default sweep spans the renderer LOD selection domain', () => {
 
 test('the path pans the orbit target away from the data centre', () => {
   // Frustum culling only does work when geometry leaves the view. A path that
-  // orbits a fixed centre keeps the whole cloud on screen at every angle.
+  // orbits a fixed center keeps the whole cloud on screen at every angle.
   const path = new BenchmarkCameraPath({ baseRadius: BASE_RADIUS, seed: 9 });
   const state = createMutableCameraState();
   let maxOffset = 0;

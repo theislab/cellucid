@@ -223,7 +223,7 @@ test('a 70,000-category field draws one point and one label per category with ce
   assert.equal(state.centroidCount, 3);
   assert.equal(result.centroidInfo, ' • Centroids: 3');
 
-  // Each point sits at its category's mean and wears its category's colour,
+  // Each point sits at its category's mean and wears its category's color,
   // looked up by identity: the third centroid is category 69,999, not 2.
   const shown = drawn(state, layer);
   assert.deepEqual(shown.map(c => c.label), ['gamma', 'alpha', 'beta']);

@@ -32,9 +32,10 @@
  */
 
 import { coalesceToFrame } from '../components/controls.js';
-import { formatPercent } from '../components/display-format.js';
+import { setControlAvailability } from '../core/control-availability.js';
+import { defineControlReadout } from '../core/control-readout.js';
 import { describePlanBytes } from '../../state/managers/outlier-quantiles.js';
-import { formatCountOf } from '../../../utils/format-units.js';
+import { formatCountOf, formatPercent } from '../../../utils/format-units.js';
 import { createLatestDispatch } from '../../actions/control-dispatch.js';
 
 /** Join names as people list them: `a`, `a or b`, `a, b or c`. */
@@ -159,12 +160,20 @@ function percentOf(status) {
  */
 export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {} }) {
   const { container, input, display, note, progress, progressBar, action } = dom;
+  // Its readout of any position, for the history as for the row (`core/control-readout.js`).
+  if (input) defineControlReadout(input, value => formatPercent(parseFloat(value)));
   const lifecycle = new AbortController();
   let destroyed = false;
   let field = null;
   let shownAction = null;
   // The thumb under a pointer is the person's; a render leaves it there.
   let dragging = false;
+  // So is a value given and not committed yet (an `input` whose `change` has
+  // not come: keys, a typed value, assistive technology): a render between
+  // the two put the thumb back at the threshold in effect, and the commit
+  // then read that old value and filtered nothing (found 2026-11-12: a
+  // legend redrawn a moment after the field was shown, WebKit, 1 run in 5).
+  let editing = false;
 
   function activeFieldOf(candidate) {
     return Boolean(candidate)
@@ -186,9 +195,17 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
     const sliderRow = input?.closest?.('.slider-row') ?? null;
     if (sliderRow) sliderRow.hidden = described !== null && !described.slider;
     if (input) {
-      input.disabled = !usable;
-      // The thumb is left alone while it is being dragged.
-      if (!dragging || !usable) {
+      setControlAvailability(input, usable ? null
+        : status.state === 'no-latent'
+          ? 'this file has no latent space to measure outliers in; use Choose latent space beside it'
+          : `no category has ${formatCountOf(status.minPoints, 'cell')}, the fewest the filter measures`);
+      // The thumb is left alone while it is being dragged, holds a value not
+      // committed yet, or a committed value is still being applied (its
+      // action waits behind another, a coloring: drawn then, the thumb
+      // jumped back to the threshold still in effect, and a second commit
+      // read that one; measured 2026-11-12, WebKit: the redraw 20 ms after
+      // the commit, the action 30 ms later). `onSettled` draws it once done.
+      if (!(dragging || editing || thresholdDispatch.pending) || !usable) {
         const pct = usable ? Math.round((field._outlierThreshold ?? 1) * 100) : 100;
         input.value = String(pct);
         if (display) display.textContent = formatPercent(pct);
@@ -231,7 +248,7 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
     if (destroyed || input === null || field === null) return;
     const pct = parseFloat(input.value);
     if (display) display.textContent = formatPercent(pct);
-    // The first move below 100% gets the field's quantiles; a cancelled or
+    // The first move below 100% gets the field's quantiles; a canceled or
     // failed attempt is told by the status line.
     thresholdDispatch.push({ field: { source: 'obs', key: field.key }, threshold: pct / 100 });
   };
@@ -248,12 +265,22 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
     input.ownerDocument?.defaultView?.addEventListener?.('pointerup', release, { signal: lifecycle.signal });
     input.ownerDocument?.defaultView?.addEventListener?.('pointercancel', release, { signal: lifecycle.signal });
     input.addEventListener('input', () => {
-      if (!destroyed) frame();
+      if (destroyed) return;
+      editing = true;
+      frame();
     }, { signal: lifecycle.signal });
     input.addEventListener('change', () => {
       if (destroyed) return;
+      editing = false;
       frame.cancel();
       applyThreshold();
+    }, { signal: lifecycle.signal });
+    // A value left without a commit (focus taken away) is given up: the
+    // control shows the threshold in effect again.
+    input.addEventListener('blur', () => {
+      if (destroyed || !editing) return;
+      editing = false;
+      render();
     }, { signal: lifecycle.signal });
   }
   if (action) {
@@ -270,7 +297,7 @@ export function initOutlierFilterControl({ state, dom, onChooseLatent = () => {}
   // A threshold set elsewhere (an undo, an agent, a notebook) is shown; the
   // thumb being dragged is left alone.
   const unsubscribeVisibility = state.on('visibility:changed', () => {
-    if (destroyed || dragging || thresholdDispatch.pending || field === null || input === null) return;
+    if (destroyed || dragging || editing || thresholdDispatch.pending || field === null || input === null) return;
     if (String(Math.round((field._outlierThreshold ?? 1) * 100)) !== input.value) render();
   });
 

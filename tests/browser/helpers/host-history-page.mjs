@@ -2,7 +2,7 @@
  * The page side of the live-history specs (`viewer-history.spec.mjs`,
  * `r-viewer-history.spec.mjs`): the viewer channel (`data/viewer-host-source.js`),
  * the command handler (`app/viewer-host/command-handler.js`), the app's own
- * action dispatcher and catalogue, and a real history (`app/history/history.js`)
+ * action dispatcher and catalog, and a real history (`app/history/history.js`)
  * recording each step, with `app/viewer-host/history-events.js` telling the
  * host every change of it -- the modules the app wires in `app/main.js`.
  *
@@ -66,8 +66,7 @@ export async function openHostHistoryPage(page, config) {
     let loads = 0;
     const handlers = createViewerHostCommandHandlers({
       getShownHostDataset: () => source.getShownHostDataset(),
-      getHostLabel: () => source.getHostLabel(),
-      getHostLanguage: () => source.getHostLanguage(),
+      getHostRuntime: () => source.getHostRuntime(),
       actions: dispatcher,
       loadSession: async file => {
         if (++loads > 1) throw new Error('This page loads one session.');

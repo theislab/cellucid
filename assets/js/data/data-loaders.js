@@ -3,12 +3,12 @@
 // from the AnnData adapter that owns it
 // (`anndata-provider.js`), and check them into the runtime shapes DataState
 // uses: the dataset identity, the obs and var field descriptors, field
-// values, cell positions, and the neighbour graph.
+// values, cell positions, and the neighbor graph.
 //
 // Every part has a route under the base, named for the AnnData element it
 // reads. The dataset's own parts are the base itself (its identity), `obs`
 // (the obs field list), `var` (the gene list it opens with; gene `g` at
-// `var/{g}`) and `obsp` (the neighbour graph it opens with); the parts a
+// `var/{g}`) and `obsp` (the neighbor graph it opens with); the parts a
 // data mapping chooses have the routes of `data-mapping-candidates.js`
 // (`obsm/...`, `vectors/...`, `obsp/{p}`, `var/{axis}/{names}`,
 // `outliers/...`). The adapter answers each route
@@ -30,7 +30,7 @@ import {
   getMetadataLoadSignal,
 } from './metadata-load-contract.js';
 import { requirePriority } from './fetch-scheduler.js';
-import { onAbort, throwIfAborted, awaitWithSignal } from '../utils/abort.js';
+import { onAbort, throwIfAborted, awaitWithSignal, requireSignalOrNull } from '../utils/abort.js';
 import {
   isAnnDataUrl,
   anndataCellOrderDigest,
@@ -49,6 +49,7 @@ import {
   anndataDeliverGeneColumns,
   anndataDeliverGeneCellSubset,
   anndataLinkMeasurement,
+  anndataStoredTotals,
   anndataGeneReadPlan,
   anndataGeneSample,
   anndataGeneSampleOf,
@@ -492,7 +493,7 @@ function requireCategoryPalette(palette, categories, key) {
     ))
   ) {
     throw new Error(
-      `Invalid obs field "${key}": palette must be null or one RGB colour (0 to 1) per category`
+      `Invalid obs field "${key}": palette must be null or one RGB color (0 to 1) per category`
     );
   }
 }
@@ -506,7 +507,7 @@ function requireCategoryPalette(palette, categories, key) {
  * categories (and code width) null when they are found on first load,
  * `discovered` whether they are the labels its open cells hold (a text or
  * boolean column, `discovered-categories.js`) rather than a stored
- * dictionary, its palette the RGB colour
+ * dictionary, its palette the RGB color
  * (0..1 channels) of each category the file stores one for (Scanpy's
  * `uns['<key>_colors']`) or null, and its outlier route null when the dataset
  * opens with no latent space. Centroids are computed in the browser, never
@@ -606,6 +607,38 @@ export function checkObsFields(list) {
   };
 }
 
+/**
+ * The descriptor of a column listed as numbers and found, on its first load,
+ * to be identifiers read as text (`readExactIntegers`): a text column's, as
+ * `checkObsFields` checks one, of the same key and place.
+ */
+function textColumnDescriptor(descriptor, field) {
+  requireExactObjectKeys(descriptor, [
+    'key',
+    'kind',
+    'fieldIndex',
+    'categories',
+    'codesDtype',
+    'codesMissingValue',
+    'palette',
+    'discovered',
+    'outlierQuantilesPath',
+  ], 'text obs field');
+  if (
+    descriptor.kind !== 'category' || descriptor.key !== field.key || descriptor.fieldIndex !== field.fieldIndex ||
+    descriptor.discovered !== true || descriptor.categories !== null || descriptor.palette !== null
+  ) {
+    throw new Error(`Invalid field "${field.key}": a column read as text is listed as a text column of the same place`);
+  }
+  if (
+    descriptor.outlierQuantilesPath !== null &&
+    parseMappingLatentPath(descriptor.outlierQuantilesPath)?.fieldIndex !== descriptor.fieldIndex
+  ) {
+    throw new Error(`Invalid obs field "${field.key}": outlierQuantilesPath must be null or this field's outlier route`);
+  }
+  return Object.freeze({ ...descriptor });
+}
+
 function requireCategoricalDescriptor(field, label) {
   if (
     !isObjectRecord(field) ||
@@ -671,7 +704,7 @@ export async function loadGeneList(url, options = {}) {
 }
 
 /**
- * Load the neighbour-graph summary of one dataset (its own graph,
+ * Load the neighbor-graph summary of one dataset (its own graph,
  * `<base>obsp`, or a mapped `obsp` entry's, `<base>obsp/{p}`), or exact
  * null when it has none.
  *
@@ -870,6 +903,19 @@ export async function loadObsFieldData(obsUrl, field, options = {}) {
   const data = await anndataLoadObsField(obsUrl, field.key, { signal });
   throwIfAborted(signal);
   const outputs = { loaded: true };
+  // A text column: its reason, said with it; a column listed as numbers
+  // that its first load found to hold identifiers past 2^53 is a text
+  // column from now on, under the descriptor it is listed with now.
+  if (data.asText !== undefined) {
+    if (data.kind !== 'category' || typeof data.asText !== 'string' || data.asText.length === 0) {
+      throw new Error(`Invalid field "${field.key}": only a text column says why it is text`);
+    }
+    outputs.asText = data.asText;
+  }
+  const adopted = !isCategorical && data.kind === 'category' && outputs.asText !== undefined
+    ? textColumnDescriptor(data.descriptor, field)
+    : field;
+  if (adopted !== field) outputs.descriptor = adopted;
 
   if (!isCategorical && data.kind === 'continuous') {
     if (!(data.data instanceof ArrayBuffer) || (data.dtype !== 'float32' && data.dtype !== 'float64')) {
@@ -878,7 +924,7 @@ export async function loadObsFieldData(obsUrl, field, options = {}) {
     // float64 for an integer column float32 cannot hold exactly (`continuous-values.js`).
     const ArrayType = data.dtype === 'float64' ? Float64Array : Float32Array;
     outputs.values = new ArrayType(data.data);
-  } else if (isCategorical && data.kind === 'category') {
+  } else if (adopted.kind === 'category' && data.kind === 'category') {
     const codesDtype = validateCategoricalCodesDtype(data.dtype, field.key);
     validateCategoricalStorage({
       categories: data.categories,
@@ -887,12 +933,12 @@ export async function loadObsFieldData(obsUrl, field, options = {}) {
       fieldKey: field.key,
     });
     const foundOnLoad = categoriesFoundOnLoad({
-      categories: field.categories,
-      dtype: field.codesDtype,
-      missingValue: field.codesMissingValue,
+      categories: adopted.categories,
+      dtype: adopted.codesDtype,
+      missingValue: adopted.codesMissingValue,
     });
     if (foundOnLoad) {
-      // The categories this column has, found by reading it, and the colours
+      // The categories this column has, found by reading it, and the colors
       // its file stores for them: the field adopts both (field/loading.js).
       const palette = data.palette ?? null;
       requireCategoryPalette(palette, data.categories, field.key);
@@ -909,10 +955,10 @@ export async function loadObsFieldData(obsUrl, field, options = {}) {
         outputs.storedCategoryCount = data.storedCategoryCount;
       }
     } else if (
-      codesDtype !== field.codesDtype ||
-      data.missingValue !== field.codesMissingValue ||
-      data.categories.length !== field.categories.length ||
-      data.categories.some((category, index) => category !== field.categories[index])
+      codesDtype !== adopted.codesDtype ||
+      data.missingValue !== adopted.codesMissingValue ||
+      data.categories.length !== adopted.categories.length ||
+      data.categories.some((category, index) => category !== adopted.categories[index])
     ) {
       throw new Error(
         `Invalid categorical payload for field "${field.key}": ` +
@@ -927,7 +973,7 @@ export async function loadObsFieldData(obsUrl, field, options = {}) {
       `Categorical field "${field.key}"`
     );
     const codes = new TypedArrayClass(data.data);
-    // The proof is kept per array (`category-codes.js`), so colouring and
+    // The proof is kept per array (`category-codes.js`), so coloring and
     // filtering by this field do not scan its codes again.
     requireCategoryCodesInInventory(
       codes,
@@ -987,13 +1033,9 @@ export async function loadVarFieldData(geneListUrl, field, options = {}) {
 
 function mergeFieldLoaderOptions(baseOptions, runtimeOptions) {
   const runtimeSignal = runtimeOptions?.signal ?? null;
-  if (runtimeSignal !== null && !(runtimeSignal instanceof AbortSignal)) {
-    throw new TypeError('Field loader runtime signal must be an AbortSignal or null.');
-  }
+  requireSignalOrNull(runtimeSignal, 'Field loader runtime signal');
   const configuredSignal = baseOptions.signal ?? null;
-  if (configuredSignal !== null && !(configuredSignal instanceof AbortSignal)) {
-    throw new TypeError('Field loader configured signal must be an AbortSignal or null.');
-  }
+  requireSignalOrNull(configuredSignal, 'Field loader configured signal');
   const signals = [configuredSignal, runtimeSignal].filter(
     (signal, index, owners) => signal !== null && owners.indexOf(signal) === index
   );
@@ -1048,7 +1090,7 @@ export function createObsFieldLoader(obsUrl, options = {}) {
    * Rows `[start, end)` of one loaded field's values (`anndataLoadRows`,
    * `obs`): a categorical one coded under `categories`, the ones it was
    * loaded with; a text column whose rows hold another label answers its
-   * grown categories and their colours too (`getObsFieldRows`).
+   * grown categories and their colors too (`getObsFieldRows`).
    */
   loader.readRows = (field, rows, { signal = null, categories = null } = {}) => (
     anndataLoadRows('obs', obsUrl, rows, { signal, key: field.key, categories })
@@ -1198,6 +1240,9 @@ export function createVarFieldLoader(geneListUrl, options = {}) {
   // The link the genes are read over, as last measured, or null (work that
   // tunes itself to the link reads it here).
   loader.linkMeasurement = () => anndataLinkMeasurement(geneListUrl);
+  // The obs fields the file names as its cells' totals, by modality (the
+  // expression transform's library sizes, `data/library-sizes.js`).
+  loader.storedTotals = () => anndataStoredTotals(geneListUrl);
   // What reading one gene costs now, before it is read (`geneReadPlan`).
   loader.readPlan = field => {
     requireGeneDescriptor(field, `var field "${field.key}"`);
@@ -1222,11 +1267,11 @@ export function createVarFieldLoader(geneListUrl, options = {}) {
 }
 
 // ============================================================================
-// NEIGHBOUR GRAPH
+// NEIGHBOR GRAPH
 // ============================================================================
 
 /**
- * Load the edges of one neighbour graph (`ConnectivityEdges`,
+ * Load the edges of one neighbor graph (`ConnectivityEdges`,
  * `data/connectivity-edges.js`): unique undirected pairs (`source < destination`),
  * their render strengths and the k-NN adjacency, built and checked from the
  * file's `obsp` matrix in the reader worker. The page checks only the
@@ -1238,7 +1283,12 @@ export function createVarFieldLoader(geneListUrl, options = {}) {
  * @returns {Promise<import('./connectivity-edges.js').ConnectivityEdges>}
  */
 export async function loadEdges(graphUrl, summary, options) {
-  const signal = getMetadataLoadSignal(options, 'Connectivity edge loader');
+  // `readKey`: the key the graph's read is told under (R9F-9).
+  // Anything but a plain record is refused as the options contract says.
+  const plain = options !== null && typeof options === 'object' && !Array.isArray(options);
+  if (!plain) getMetadataLoadSignal(options, 'Connectivity edge loader');
+  const { readKey = null, ...signalOptions } = options;
+  const signal = getMetadataLoadSignal(signalOptions, 'Connectivity edge loader');
   if (signal === null) {
     throw new TypeError('Connectivity edge loader options.signal is required');
   }
@@ -1246,11 +1296,11 @@ export async function loadEdges(graphUrl, summary, options) {
   throwIfAborted(signal);
   const validated = validateConnectivitySummary(summary);
   if (validated === null) {
-    throw new Error('This dataset has no neighbour graph to load.');
+    throw new Error('This dataset has no neighbor graph to load.');
   }
-  const edgeData = await anndataLoadConnectivity(graphUrl, { signal });
+  const edgeData = await anndataLoadConnectivity(graphUrl, { signal, readKey });
   if (edgeData === null) {
-    throw new Error('The neighbour graph is absent despite its summary.');
+    throw new Error('The neighbor graph is absent despite its summary.');
   }
   validateConnectivityEdgeData(edgeData, validated);
   throwIfAborted(signal);
@@ -1258,7 +1308,7 @@ export async function loadEdges(graphUrl, summary, options) {
 }
 
 /**
- * Some open cells' neighbours in the graph at `graphUrl`, read from its file
+ * Some open cells' neighbors in the graph at `graphUrl`, read from its file
  * by row (`anndataLoadConnectivityRows`): what the k-NN tool expands through.
  *
  * @param {string} graphUrl - The graph's route (as `loadEdges`)
@@ -1278,7 +1328,7 @@ export async function loadConnectivityRows(graphUrl, cells, options) {
     !(rows.offsets instanceof Uint32Array) || rows.offsets.length !== cells.length + 1 ||
     !(rows.neighbors instanceof Uint32Array) || rows.offsets[cells.length] !== rows.neighbors.length
   ) {
-    throw new TypeError('Connectivity rows must be Uint32 offsets (one a cell, plus one) over Uint32 neighbours.');
+    throw new TypeError('Connectivity rows must be Uint32 offsets (one a cell, plus one) over Uint32 neighbors.');
   }
   return rows;
 }

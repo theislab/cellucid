@@ -1,12 +1,12 @@
 /**
  * Gray for zero (the legend's switch, `DataState.setContinuousZeroGray`):
- * off by default, a gene's 0 is drawn in the colour scale's lowest colour,
+ * off by default, a gene's 0 is drawn in the color scale's lowest color,
  * opaque, like any value; on, its zeros are the no-value gray drawn
  * beneath the expressing cells (`BENEATH_ALPHA_BYTE`). The switch is
  * offered for a gene with no negative value only, sits above Log color
  * scale, and is saved in the session and restored. The Session panel's
  * Subsampling and Data mapping sections start collapsed, with a summary,
- * and stay as this viewer left them across a reload. The colour rules are
+ * and stay as this viewer left them across a reload. The color rules are
  * held by `tests/legend-continuous-filter-independence.test.mjs`; this is
  * the app, in each engine.
  */
@@ -42,7 +42,7 @@ async function chooseGene(page, name) {
   }, name)).toBe(true);
 }
 
-/** The alpha byte (the layer) of each zero cell of the live view's colours. */
+/** The alpha byte (the layer) of each zero cell of the live view's colors. */
 function zeroLayers(page) {
   return page.evaluate(cells => {
     const colors = window._cellucidState.colorsArray;
@@ -76,9 +76,9 @@ test('gray for zero: off by default, on draws zeros gray beneath, offered for co
   // Above Log color scale and Rescale to range, in that order.
   const order = await page.locator('#legend .switch .switch-label').allTextContents();
   expect(order.slice(0, 3)).toEqual(['Gray for zero', 'Log color scale', 'Rescale to range']);
-  // No sentence about gray under the colour bar.
+  // No sentence about gray under the color bar.
   await expect(page.locator('#legend')).not.toContainText('not expressed');
-  // Off: the zeros are coloured, opaque.
+  // Off: the zeros are colored, opaque.
   expect(await zeroLayers(page)).toEqual([255]);
   await zeroSwitch.click();
   await expect(zeroSwitch).toHaveAttribute('aria-checked', 'true');
@@ -137,7 +137,7 @@ test('the Session panel: Stored above Subsampling and Data mapping, collapsed wi
   // Collapsed, each says what it holds.
   for (const toggle of ['#reading-toggle', '#data-mapping-toggle']) await expect(page.locator(toggle)).toHaveAttribute('aria-expanded', 'false');
   await expect(page.locator('#subsample-slider')).toBeHidden();
-  await expect(page.locator('#reading-summary')).toHaveText('100 % cells');
+  await expect(page.locator('#reading-summary')).toHaveText('100% cells');
   await expect(page.locator('#data-mapping-summary')).toHaveText(/^1 embedding · /);
   // Opened, its summary is the content's to say.
   await page.locator('#reading-toggle').click();

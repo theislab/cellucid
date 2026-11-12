@@ -58,7 +58,7 @@ function digitPlanOf(keys) {
  * Each digit's count of `keys` at `shift` (`mask` wide) into `counts`, then
  * turned into each digit's first slot; false (and the counts left) when
  * every key has the same digit there, a pass that would move nothing. Each
- * long loop of a sort is a function of its own, optimised on its own: a
+ * long loop of a sort is a function of its own, optimized on its own: a
  * sort is not left running a later loop in a slower tier when the first one
  * was compiled mid-loop.
  */

@@ -22,7 +22,8 @@
 import { Cursor } from './binary.js';
 import { hasValidChecksum } from './checksum.js';
 import { formatError } from './errors.js';
-import { ByteBudget, ByteCache } from './lru.js';
+import { ByteBudget } from './byte-budget.js';
+import { ByteCache } from '../io/byte-cache.js';
 import { SharedWorks, withinLifetime } from '../../utils/abort.js';
 import { formatCountOf } from '../../utils/format-units.js';
 
@@ -35,7 +36,7 @@ const MiB = 1024 * 1024;
  */
 const DECOMPRESSIONS_AT_ONCE = 16;
 
-/** Stored bytes of neighbouring chunks fetched and decoded as one group. */
+/** Stored bytes of neighboring chunks fetched and decoded as one group. */
 export const CHUNK_GROUP_BYTES = 4 * MiB;
 
 /** Byte reader options; `activity` (a caller's per-read tally) is passed on when given. */

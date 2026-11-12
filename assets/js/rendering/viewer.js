@@ -41,7 +41,7 @@ import { HighPerfRenderer } from './high-perf-renderer.js';
 import { createFullDetailFrameCost, INTERACTIVE_FRAME_BUDGET_MS } from './full-detail-frame-cost.js';
 import { lodLadder } from './high-perf/draw-order.js';
 import { LOD_FULL_DETAIL_ADMISSION_LEVEL, requireLodMembership } from './high-perf/renderer-contracts.js';
-import { cancelDeferredWebGLErrorChecks, isContextLostError, requireCleanWebGLState, requireLiveContext } from './gl-errors.js';
+import { cancelDeferredWebGLErrorChecks, contextRefusedError, isContextLostError, requireCleanWebGLState, requireLiveContext } from './gl-errors.js';
 import { HighlightTools } from './highlight-renderer.js';
 import { OrbitAnchorRenderer } from './orbit-anchor.js';
 import { createProjectileSystem } from './projectiles.js';
@@ -70,6 +70,7 @@ import {
 } from './point-size-scale.js';
 import { applyHorizontalProjectionCenter } from './viewport-center.js';
 import { findScreenSpacePick } from './picking.js';
+import { pointScaleFor, pointSpriteCap } from './point-sprite.js';
 import {
   DEFAULT_SHADER_QUALITY,
   SHADER_QUALITY_TRAITS,
@@ -121,7 +122,6 @@ import {
 
 const INITIAL_DIMENSION_LEVEL = 3;
 const VELOCITY_OVERLAY_ID = 'velocity';
-let nextWebglContextOverlayIdentity = 1;
 // Below this size, one direct interaction scan is cheaper than retaining a
 // tree. Large clicked panes build exactly one notified tree lazily so picking,
 // lasso previews, and proximity previews never rescan 10–30M points per move.
@@ -196,6 +196,8 @@ const FRAME_NEUTRAL_VIEWER_METHODS = new Set([
   'setPlanarPanSpeed',
   'setPlanarZoomToCursor',
   'setPlanarInvertAxes',
+  // A view's name is drawn by the app's pane chip text (`setViewTitlePrefixes`).
+  'setViewName',
 ]);
 
 function isFrameReaderMethodName(methodName) {
@@ -238,7 +240,6 @@ function isContextLossReadableMethodName(methodName) {
 const TERMINAL_SAFE_VIEWER_METHODS = new Set([
   'dispose',
   'onGraphicsReset',
-  'setGraphicsResetSessionSaver',
   'getGLContext',
   'getAntialiasing',
   'getHPRenderer',
@@ -275,6 +276,11 @@ export {
 import { copyLargeArray } from '../utils/large-arrays.js';
 import { cellLayerColors } from './read-cell-layer.js';
 import { StyleManager } from '../utils/style-manager.js';
+import { onReducedMotionChange, prefersReducedMotion } from '../utils/reduced-motion.js';
+import { isPageKey } from '../utils/key-ownership.js';
+import { NAVIGATION_KEYS, NAVIGATION_KEY_CODES, createHeldKeys } from './navigation-keys.js';
+import { createListenerSet } from '../utils/listener-set.js';
+import { debounce } from '../utils/debounce.js';
 
 /**
  * Release dataset-sized owners held by a stable per-frame render descriptor.
@@ -419,7 +425,7 @@ export function createViewer({
   });
 
   if (!gl) {
-    throw new Error('WebGL2 is required but not supported in this browser.');
+    throw contextRefusedError('The viewer');
   }
   // A browser whose graphics process was reset or stopped hands back a
   // context already lost (WebKit after a GPU reset: every later context of
@@ -486,37 +492,19 @@ export function createViewer({
   // for it make frames faster (`full-detail-frame-cost.js`); the render
   // controls turn them on, and off again, by what it reports
   // (`onFullDetailFrameCost`).
-  const fullDetailFrameCostListeners = new Set();
+  const fullDetailFrameCostListeners = createListenerSet('the full-detail frame cost');
   // Each opening's measurement (`armFullDetailFrameCost`) is numbered, and
   // every report and every change of level of detail or culling names the
   // opening it belongs to (`onPerformanceSettingsChanged`): a caller that sets
   // them itself makes the opening's choice, and the render controls leave the
   // rest of that opening's reports alone.
   let fullDetailOpening = 0;
-  const performanceSettingsListeners = new Set();
+  const performanceSettingsListeners = createListenerSet('the performance settings');
   const reportPerformanceSettings = () => {
-    const event = Object.freeze({ opening: fullDetailOpening });
-    for (const listener of [...performanceSettingsListeners]) {
-      try {
-        listener(event);
-      } catch (error) {
-        queueMicrotask(() => {
-          throw error;
-        });
-      }
-    }
+    performanceSettingsListeners.notify(Object.freeze({ opening: fullDetailOpening }));
   };
   const reportFullDetailFrameCost = event => {
-    const frozen = Object.freeze({ ...event, opening: fullDetailOpening });
-    for (const listener of [...fullDetailFrameCostListeners]) {
-      try {
-        listener(frozen);
-      } catch (error) {
-        queueMicrotask(() => {
-          throw error;
-        });
-      }
-    }
+    fullDetailFrameCostListeners.notify(Object.freeze({ ...event, opening: fullDetailOpening }));
   };
   // What the last frame of every cell sampled could have drawn fewer of
   // (`presentedDrawsFewer`), for the answer it is part of.
@@ -683,6 +671,10 @@ export function createViewer({
   }
   let backdropLooks = createBackdropLooksOwner();
 
+  // F97 point sprite: the largest sprite this GPU lets every pass draw
+  // (rendering/point-sprite.js), read again on a restored context.
+  let pointSizeMax = pointSpriteCap(gl);
+
   // === CENTROID PROGRAM (simple WebGL2 shader for small centroid count) ===
   let centroidProgram = initialCentroidProgram;
   const centroidAttribLocations = {
@@ -695,8 +687,9 @@ export function createViewer({
     modelMatrix: gl.getUniformLocation(centroidProgram, 'u_modelMatrix'),
     pointSize: gl.getUniformLocation(centroidProgram, 'u_pointSize'),
     sizeAttenuation: gl.getUniformLocation(centroidProgram, 'u_sizeAttenuation'),
-    viewportHeight: gl.getUniformLocation(centroidProgram, 'u_viewportHeight'),
-    fov: gl.getUniformLocation(centroidProgram, 'u_fov'),
+    // F97 point sprite (rendering/point-sprite.js)
+    pointScale: gl.getUniformLocation(centroidProgram, 'u_pointScale'),
+    pointSizeMax: gl.getUniformLocation(centroidProgram, 'u_pointSizeMax'),
   };
 
   /**
@@ -707,6 +700,7 @@ export function createViewer({
    */
   function rebuildViewerGlResources() {
     [gridProgram, studioProgram, centroidProgram] = compileViewerPrograms();
+    pointSizeMax = pointSpriteCap(gl);
     gridAttribLocations.position = gl.getAttribLocation(gridProgram, 'a_position');
     centroidAttribLocations.position = gl.getAttribLocation(centroidProgram, 'a_position');
     centroidAttribLocations.color = gl.getAttribLocation(centroidProgram, 'a_color');
@@ -867,20 +861,12 @@ export function createViewer({
       getViewGeometry: viewId => getCertifiedEdgeGeometry(viewId),
       retainsPositions: positions => hpRenderer.holdsGeometryFor(positions),
       onVisibleCount: (viewId, stats) => {
-        for (const listener of edgeVisibleCountListeners) {
-          try {
-            listener(viewId, stats);
-          } catch (error) {
-            queueMicrotask(() => {
-              throw error;
-            });
-          }
-        }
+        edgeVisibleCountListeners.notify(viewId, stats);
       },
     });
   }
   let edgeLayer = createEdgeLayerOwner();
-  const edgeVisibleCountListeners = new Set();
+  const edgeVisibleCountListeners = createListenerSet('the visible edge count');
   let useInstancedEdges = false; // Whether published edges are drawn
   // Scratch for the per-draw model-view product the edge shader reads.
   const edgeModelViewMatrix = mat4.create();
@@ -1007,9 +993,9 @@ export function createViewer({
   // === GL State ===
   // What the viewer sets on the context itself rather than per pass. A
   // context the browser restores has every value back at its initial one,
-  // so this is set again there (`restoreLostGraphics`): the clear colour
+  // so this is set again there (`restoreLostGraphics`): the clear color
   // was not, and a restored page cleared every frame to transparent black
-  // under a black, white or grid background. The clear colour is the
+  // under a black, white or grid background. The clear color is the
   // background's (`setBackground`); until one is set, the context's own
   // initial transparent black.
   let backgroundClearColor = [0, 0, 0, 0];
@@ -1161,12 +1147,16 @@ export function createViewer({
   let viewLayoutMode = 'grid';
   let focusedViewId = LIVE_VIEW_ID;
   let liveViewLabel = 'View 1';
+  // The name a person or an agent gave the live view (`view.rename`), or
+  // null; a kept view's is its record's `name`. Only kept here: the app
+  // shows it (`app/actions/targets/views.js`).
+  let liveViewName = null;
   let liveViewHidden = false; // Whether to hide live view from grid
   let viewFocusHandler = typeof onViewFocus === 'function' ? onViewFocus : null;
   let navigationModeChangeHandler = null;
   let highlightRenderFailureHandler = null;
   let smokeRenderFailureHandler = null;
-  // Told whenever the live view's positions or colours are republished: a
+  // Told whenever the live view's positions or colors are republished: a
   // built smoke volume is a function of both, so its owner must rebuild it.
   let smokeSourceChangeHandler = null;
   function publishSmokeSourceChange() {
@@ -1236,7 +1226,7 @@ export function createViewer({
     snapshotIds: []
   };
   const presentedPaneProjections = [];
-  const presentedLayoutListeners = new Set();
+  const presentedLayoutListeners = createListenerSet('the presented layout');
 
 	  // Per-view dimension tracking for multi-dimensional support
 	  const viewDimensionLevels = new Map([
@@ -1260,9 +1250,9 @@ export function createViewer({
 	  // Per-view overlay contexts + stable builder options (avoid per-frame allocations/closures)
 	  const overlayCtxByView = new Map();     // viewId -> OverlayContext
 	  const overlayCtxOptionsByView = new Map(); // viewId -> stable buildOverlayContext options object
-	  const lodChangeListeners = new Set();
+	  const lodChangeListeners = createListenerSet('the level of detail');
 	  const publishedLodCertificates = new Map();
-	  const presentedViewStateListeners = new Set();
+	  const presentedViewStateListeners = createListenerSet('the presented view state');
 	  let presentedViewStateGeneration = 0;
 	  const presentedCameraSettlement =
 	    new PresentedCameraSettlementTracker();
@@ -1293,26 +1283,6 @@ export function createViewer({
 	  let nextViewDataGeneration = 1;
 	  const presentedLodGenerationIds = new WeakMap();
 	  let nextPresentedLodGenerationId = 1;
-
-	  function reportPresentedObserverFailures(failures) {
-	    if (failures.length === 0) return;
-	    const diagnostic = failures.length === 1
-	      ? failures[0]
-	      : new AggregateError(
-	          failures,
-	          'Multiple presented-state observers failed.'
-	        );
-	    queueMicrotask(() => {
-	      try {
-	        console.error(
-	          '[Viewer] Presented-state observer failed.',
-	          diagnostic
-	        );
-	      } catch {
-	        // Diagnostics cannot invalidate a presented-state publication.
-	      }
-	    });
-	  }
 
 	  function publishPresentedViewStateChange(
 	    reason,
@@ -1367,21 +1337,7 @@ export function createViewer({
 	      reason,
 	      viewId: exactViewId
 	    });
-	    const failures = [];
-	    for (const listener of presentedViewStateListeners) {
-	      try {
-	        listener(event);
-	      } catch (error) {
-	        failures.push(
-	          error instanceof Error
-	            ? error
-	            : new Error(
-	                'Presented-state observer threw a non-Error value.'
-	              )
-	        );
-	      }
-	    }
-	    reportPresentedObserverFailures(failures);
+	    presentedViewStateListeners.notify(event);
 	  }
 
 	  function trackPresentedFrameState(now, canvasWidth, canvasHeight) {
@@ -1592,38 +1548,7 @@ export function createViewer({
 	    // the camera burst, or a zoom that steps LOD emits a camera-changing
 	    // per step and never settles.
 	    publishPresentedViewStateChange('lod', exactViewId, false);
-	    const observerFailures = [];
-	    for (const listener of lodChangeListeners) {
-	      try {
-	        listener(next);
-	      } catch (error) {
-	        observerFailures.push(
-	          error instanceof Error
-	            ? error
-	            : new Error(
-	                'LOD change observer threw a non-Error value.'
-	              )
-	        );
-	      }
-	    }
-	    if (observerFailures.length > 0) {
-	      const diagnostic = observerFailures.length === 1
-	        ? observerFailures[0]
-	        : new AggregateError(
-	            observerFailures,
-	            'Multiple LOD change observers failed.'
-	          );
-	      queueMicrotask(() => {
-	        try {
-	          console.error(
-	            '[Viewer] LOD change observer failed.',
-	            diagnostic
-	          );
-	        } catch {
-	          // Diagnostics cannot invalidate a published render generation.
-	        }
-	      });
-	    }
+	    lodChangeListeners.notify(next);
 	  }
 
 	  function getPublishedDimensionLevel(viewId) {
@@ -1963,7 +1888,9 @@ export function createViewer({
 	        useAlphaTexture: false,
 	        multisampled: false,
 	        autoFog: true,
-	        overrideBounds: null
+	        overrideBounds: null,
+	        // F97 point sprite (rendering/point-sprite.js): set every frame.
+	        pointSizeMax: 0
 	      };
 	      renderParamsByView.set(vid, renderParams);
 	    }
@@ -2109,6 +2036,7 @@ export function createViewer({
 	    basePointSize: 0,
 	    sizeAttenuation: 0,
 	    fov: 0,
+	    pointSizeMax: 0,
 	  };
 	  const _orbitAnchorDrawParams = {
 	    viewId: LIVE_VIEW_ID,
@@ -2195,7 +2123,7 @@ export function createViewer({
   let gridTransitionSpeed = 3.0;  // Opacity change per second
   // Studio backdrop state. The palette is the last studio background shown, so
   // a fade-out after switching away keeps its own marks; the surface it fades
-  // over is always the current clear colour.
+  // over is always the current clear color.
   let showStudio = false;
   let studioOpacity = 0;
   let studioPalette = STUDIO_PALETTES.studio;
@@ -2251,28 +2179,27 @@ export function createViewer({
   let orbitKeySpeed = 0.4; // multiplier for orbit rotation and zoom speed
   let planarPanSpeed = 0.0075; // multiplier for planar pan and zoom speed
   const sprintMultiplier = 2.2;
-  // WASD navigation works in all modes (free, orbit, planar). Zoom keys: Equal
-  // (=) and Minus (-), also BracketRight (]) and BracketLeft ([). Shift only
-  // speeds a movement key up, so on its own it moves nothing.
-  const MOVEMENT_KEY_CODES = new Set([
-    'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE',
-    'Equal', 'Minus', 'BracketLeft', 'BracketRight'
-  ]);
-  const NAVIGATION_KEY_CODES = new Set([...MOVEMENT_KEY_CODES, 'ShiftLeft', 'ShiftRight']);
-  // Only navigation keys are held here. Any key left in the set would read as
-  // camera motion and keep the frame loop running until its keyup, which a
-  // shortcut or a focus change can swallow.
-  const activeKeys = new Set();
+  // The camera keys (`NAVIGATION_KEYS`, rendering/navigation-keys.js): W A S D
+  // in every mode, E and Q up and down in free-fly, = ] and - [ zoom in orbit
+  // and planar. Shift only speeds a movement key up, so on its own it moves
+  // nothing. Only camera keys are held here, each with the time it was down:
+  // any other key left in it would read as camera motion and keep the frame
+  // loop running until its keyup, which a shortcut or a focus change can
+  // swallow.
+  const activeKeys = createHeldKeys();
+  // The frame the held keys are read for (`renderSceneFrame`): a key moves
+  // the camera for the share of it that it was held.
+  let keyFrameFrom = 0;
+  let keyFrameTo = 0;
+  /** The share of this frame one of a movement's keys was held (0 to 1). */
+  function keyShare(movement) {
+    return activeKeys.share(NAVIGATION_KEYS[movement], keyFrameFrom, keyFrameTo);
+  }
   function isMovementKeyHeld() {
-    for (const code of activeKeys) {
-      if (MOVEMENT_KEY_CODES.has(code)) return true;
-    }
-    return false;
+    return activeKeys.isMovementDown();
   }
   function releaseHeldKeys() {
-    if (activeKeys.size === 0) return;
-    activeKeys.clear();
-    invalidateFrame();
+    if (activeKeys.clear()) invalidateFrame();
   }
   let freeflyPosition = vec3.fromValues(...initialCameraPose.freefly.position);
   let freeflyVelocity = vec3.create();
@@ -2288,7 +2215,7 @@ export function createViewer({
   let projectileBuildGeneration = 0;
   let projectileBuildCompletion = null;
   const PROJECTILE_CONTEXT_LOSS_MESSAGE =
-    'Projectile preparation was cancelled because the WebGL context was lost.';
+    'Projectile preparation was canceled because the WebGL context was lost.';
   let lookActive = false;
   let lastFrameTime = performance.now();
   let renderFrameId = 0;
@@ -2429,12 +2356,6 @@ export function createViewer({
     return { xSign, ySign };
   }
 
-  function isTypingTarget(target) {
-    if (!target) return false;
-    const tag = target.tagName;
-    return target.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
-  }
-
   // === Event Listener Registry (for cleanup/dispose) ===
   const eventCleanupFns = [];
   const contextEventCleanupFns = [];
@@ -2502,10 +2423,6 @@ export function createViewer({
 
   // === WebGL context loss handling (WebGL2-only policy) ===
   let webglContextLost = false;
-  let webglContextOverlay = null;
-  let webglContextOverlayMessage = null;
-  let webglContextOverlayAction = null;
-  const webglContextOverlayCleanupFns = [];
   function createHpRendererFacade() {
     return createViewerRendererFacade(
       hpRenderer,
@@ -2521,155 +2438,15 @@ export function createViewer({
   }
   let hpRendererFacade = createHpRendererFacade();
 
-  // The notice shown while the browser has taken the graphics context away:
-  // a dialog over the page, since nothing can be drawn or changed until the
-  // context is back (every viewer method refuses meanwhile). It offers the
-  // session captured at the loss (`setGraphicsResetSessionSaver`), and
-  // Reload only once restoring failed.
-  let webglContextOverlaySave = null;
-  let graphicsResetSessionSaver = null;
-  const graphicsResetListeners = new Set();
-
-  function ensureWebglContextOverlay() {
-    if (webglContextOverlay) return webglContextOverlay;
-
-    const overlay = document.createElement('div');
-    const overlayIdentity = nextWebglContextOverlayIdentity++;
-    const titleId =
-      `cellucid-webgl-context-overlay-title-${overlayIdentity}`;
-    const messageId =
-      `cellucid-webgl-context-overlay-message-${overlayIdentity}`;
-    overlay.id = 'cellucid-webgl-context-overlay';
-    overlay.setAttribute('role', 'alertdialog');
-    overlay.setAttribute('aria-modal', 'true');
-    overlay.setAttribute('aria-labelledby', titleId);
-    overlay.setAttribute('aria-describedby', messageId);
-    overlay.style.cssText = `
-      position: fixed;
-      inset: 0;
-      z-index: 2147483647;
-      display: none;
-      align-items: center;
-      justify-content: center;
-      background: rgba(0, 0, 0, 0.45);
-      color: #fff;
-      font-family: var(--font-sans, system-ui, sans-serif);
-      padding: 24px;
-      text-align: center;
-    `;
-
-    const panel = document.createElement('div');
-    panel.style.cssText = `
-      max-width: 520px;
-      width: 100%;
-      background: rgba(20, 20, 20, 0.9);
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      border-radius: 10px;
-      padding: 18px 20px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-    `;
-
-    const title = document.createElement('div');
-    title.id = titleId;
-    title.style.cssText = 'font-size: 16px; font-weight: 700; margin-bottom: 10px;';
-    title.textContent = 'Graphics reset by the browser';
-
-    const message = document.createElement('div');
-    message.id = messageId;
-    message.style.cssText = 'font-size: 13px; line-height: 1.5; opacity: 0.95; margin-bottom: 14px;';
-
-    const actions = document.createElement('div');
-    actions.style.cssText = 'display: flex; gap: 8px; justify-content: center;';
-
-    const save = document.createElement('button');
-    save.type = 'button';
-    save.className = 'btn';
-    save.textContent = 'Save session';
-    save.style.cssText = 'cursor: pointer;';
-    const handleSave = () => {
-      const saver = graphicsResetSessionSaver;
-      if (saver === null) return;
-      Promise.resolve()
-        .then(() => saver())
-        .catch(error => console.error('[Viewer] The session captured at the graphics reset could not be saved.', error));
-    };
-
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'btn';
-    btn.textContent = 'Reload';
-    btn.style.cssText = 'cursor: pointer;';
-    const handleReload = () => window.location.reload();
-    // Focus stays on the dialog's shown buttons.
-    const containDialogFocus = event => {
-      if (event.key !== 'Tab') return;
-      const shown = [save, btn].filter(button => button.style.display !== 'none');
-      if (shown.length === 0) return;
-      event.preventDefault();
-      const at = shown.indexOf(document.activeElement);
-      const next = at === -1 ? 0 : (at + (event.shiftKey ? shown.length - 1 : 1)) % shown.length;
-      shown[next].focus({ preventScroll: true });
-    };
-    save.addEventListener('click', handleSave);
-    btn.addEventListener('click', handleReload);
-    overlay.addEventListener('keydown', containDialogFocus);
-    webglContextOverlayCleanupFns.push(
-      () => save.removeEventListener('click', handleSave),
-      () => btn.removeEventListener('click', handleReload),
-      () => overlay.removeEventListener('keydown', containDialogFocus)
-    );
-
-    actions.appendChild(save);
-    actions.appendChild(btn);
-    panel.appendChild(title);
-    panel.appendChild(message);
-    panel.appendChild(actions);
-    overlay.appendChild(panel);
-
-    document.body.appendChild(overlay);
-    webglContextOverlay = overlay;
-    webglContextOverlayMessage = message;
-    webglContextOverlayAction = btn;
-    webglContextOverlaySave = save;
-    return overlay;
-  }
-
-  /**
-   * Show the notice: `restoring` while the browser may give the context
-   * back (no Reload), else the failure, with Reload.
-   */
-  function showWebglContextOverlay(message, { restoring }) {
-    const overlay = ensureWebglContextOverlay();
-    if (webglContextOverlayMessage) {
-      webglContextOverlayMessage.textContent = message;
-    }
-    if (webglContextOverlayAction) {
-      webglContextOverlayAction.style.display = restoring ? 'none' : '';
-    }
-    if (webglContextOverlaySave) {
-      webglContextOverlaySave.style.display = graphicsResetSessionSaver === null ? 'none' : '';
-    }
-    overlay.style.display = 'flex';
-    const first = [webglContextOverlaySave, webglContextOverlayAction]
-      .find(button => button !== null && button.style.display !== 'none');
-    first?.focus({ preventScroll: true });
-  }
-
-  function hideWebglContextOverlay() {
-    if (webglContextOverlay) webglContextOverlay.style.display = 'none';
-  }
+  // The browser has taken the graphics context away: the viewer tells its
+  // graphics-reset listeners (`onGraphicsReset`), and the app shows what it
+  // means to the person (`app/graphics-reset-session.js`, an app dialog). The
+  // renderer builds no UI of its own (F146).
+  const graphicsResetListeners = createListenerSet('the graphics reset');
 
   /** Tell every graphics-reset listener `phase` (`lost`, `restored`, `failed`). */
   function publishGraphicsReset(phase) {
-    for (const listener of [...graphicsResetListeners]) {
-      try {
-        listener(phase);
-      } catch (error) {
-        queueMicrotask(() => {
-          throw error;
-        });
-      }
-    }
+    graphicsResetListeners.notify(phase);
   }
 
   function invalidateViewerWebGLOwnersAfterContextLoss() {
@@ -2806,10 +2583,7 @@ export function createViewer({
     navigationModeOwnership.clear();
     viewFocusHandler = null;
     sidebarFocusPending = false;
-    if (sidebarFocusTimer !== null) {
-      clearTimeout(sidebarFocusTimer);
-      sidebarFocusTimer = null;
-    }
+    commitAtWheelRest.cancel();
     navigationModeChangeHandler = null;
     highlightRenderFailureHandler = null;
     smokeRenderFailureHandler = null;
@@ -2833,9 +2607,9 @@ export function createViewer({
   // answered by asking for the context back (`preventDefault`), fencing the
   // GPU owners, and, once the browser restores it, making every GPU object
   // again from what the CPU holds (`restoreLostGraphics`). Filters,
-  // selections, kept views and analyses never leave the page. The session
-  // is captured at the loss (`setGraphicsResetSessionSaver`); Reload is
-  // offered only if restoring fails.
+  // selections, kept views and analyses never leave the page. The app hears
+  // each phase (`onGraphicsReset`): it captures the session at the loss and
+  // offers Reload only if restoring fails (`app/graphics-reset-session.js`).
 
   /** What the GPU owners were set to, taken before they are fenced. */
   let lostGraphicsSettings = null;
@@ -2960,12 +2734,6 @@ export function createViewer({
         projectileBuildCompletionToPublish = null;
       });
       attemptContextLossStep(() => publishGraphicsReset('lost'));
-      attemptContextLossStep(() => {
-        showWebglContextOverlay(
-          'The graphics were reset by the browser. Restoring them; your filters, selections, kept views and analyses are kept.',
-          { restoring: true }
-        );
-      });
     } finally {
       contextLossTransitioning = false;
       if (disposalRequestedDuringContextLoss) {
@@ -3106,7 +2874,6 @@ export function createViewer({
       // again, since the render controls turn their own choice off for it
       // through the viewer (`armFullDetailFrameCost`).
       armFullDetailFrameCost();
-      hideWebglContextOverlay();
       publishGraphicsReset('restored');
       if (frameLoopStarted && !renderPaused) {
         invalidateFrame();
@@ -3118,7 +2885,8 @@ export function createViewer({
   /**
    * The context did not come back usable: the viewer stays fenced for good
    * (as a disposed one: listeners, observers and per-view records go), and
-   * the notice offers the session captured at the loss and Reload.
+   * its listeners hear `failed` (the app offers the session captured at the
+   * loss and Reload).
    */
   function failLostGraphics(error) {
     console.error('[Viewer] The graphics could not be restored.', error);
@@ -3144,10 +2912,6 @@ export function createViewer({
     attempt(retireCentroidLabelOwners);
     attempt(retireViewerCpuCaches);
     attempt(() => publishGraphicsReset('failed'));
-    attempt(() => showWebglContextOverlay(
-      'The graphics could not be restored. Save the session, then reload the page to continue.',
-      { restoring: false }
-    ));
     if (failures.length > 0) {
       console.error('[Viewer] Retiring the unrestored graphics was incomplete.', new AggregateError(failures));
     }
@@ -3176,16 +2940,13 @@ export function createViewer({
   }
 
   let sidebarFocusPending = false;
-  let sidebarFocusTimer = null;
   // A wheel gesture has no release: it ends when the wheel has rested this long.
   const WHEEL_GESTURE_REST_MS = 150;
+  const commitAtWheelRest = debounce(() => commitSidebarFocus(), WHEEL_GESTURE_REST_MS);
 
   /** Publish the focused pane to the sidebar now, if a gesture deferred it. */
   function commitSidebarFocus() {
-    if (sidebarFocusTimer !== null) {
-      clearTimeout(sidebarFocusTimer);
-      sidebarFocusTimer = null;
-    }
+    commitAtWheelRest.cancel();
     if (!sidebarFocusPending) return;
     sidebarFocusPending = false;
     if (disposed || webglContextLost) return;
@@ -3200,10 +2961,7 @@ export function createViewer({
    */
   function deferSidebarFocus(commit) {
     sidebarFocusPending = true;
-    if (commit === 'wheel') {
-      if (sidebarFocusTimer !== null) clearTimeout(sidebarFocusTimer);
-      sidebarFocusTimer = setTimeout(commitSidebarFocus, WHEEL_GESTURE_REST_MS);
-    }
+    if (commit === 'wheel') commitAtWheelRest();
   }
 
   /** Start one camera drag at a screen point. */
@@ -3397,7 +3155,7 @@ export function createViewer({
 
   const handleMouseUp = (e) => {
     // The press that focused a pane has ended: the sidebar follows now.
-    if (sidebarFocusPending && sidebarFocusTimer === null) commitSidebarFocus();
+    if (sidebarFocusPending && !commitAtWheelRest.pending) commitSidebarFocus();
     if (highlightTools && highlightTools.handlePointerUp(e.target)) {
       invalidateFrame();
       return;
@@ -3500,10 +3258,9 @@ export function createViewer({
     const previousFocus = focusedViewId;
     focusViewAtScreenPosition(e.clientX, e.clientY, 'wheel');
     if (focusedViewId !== previousFocus) invalidateFrame();
-    else if (sidebarFocusPending && sidebarFocusTimer !== null) {
+    else if (sidebarFocusPending && commitAtWheelRest.pending) {
       // Still wheeling: the gesture's end moves on.
-      clearTimeout(sidebarFocusTimer);
-      sidebarFocusTimer = setTimeout(commitSidebarFocus, WHEEL_GESTURE_REST_MS);
+      commitAtWheelRest();
     }
     if (navigationMode === 'free') {
       return;
@@ -3532,13 +3289,13 @@ export function createViewer({
       const ndcY = -((vpInfo.vpLocalY / vpInfo.vpHeight) * 2 - 1);
       // In planar mode with perspective, calculate world offset at target plane
       const aspect = vpInfo.vpAspect;
-      const halfHeight = oldRadius * Math.tan(fov / 2);
+      const halfHeight = oldRadius * Math.tan(vpInfo.fov / 2);
       const halfWidth = halfHeight * aspect;
       // World position under cursor before zoom (X and Y plane)
       const worldX = target[0] + ndcX * halfWidth;
       const worldY = target[1] + ndcY * halfHeight;
       // After zoom, recalculate what the new half extents would be
-      const newHalfHeight = targetRadius * Math.tan(fov / 2);
+      const newHalfHeight = targetRadius * Math.tan(vpInfo.fov / 2);
       const newHalfWidth = newHalfHeight * aspect;
       // Adjust target so that worldX, worldY stays under cursor
       target[0] = worldX - ndcX * newHalfWidth;
@@ -3558,7 +3315,7 @@ export function createViewer({
   }
 
   const handleAltKeyDown = (e) => {
-    if (isTypingTarget(e.target)) return;
+    if (!isPageKey(e)) return;
     if (e.key === 'Alt') {
       invalidateFrame();
       highlightTools?.handleAltKeyDown?.();
@@ -3566,8 +3323,9 @@ export function createViewer({
   };
   addPageInputListenerWithCleanup(window, 'keydown', handleAltKeyDown);
 
+  // Letting Alt go ends what it armed wherever focus is now: Alt pressed on
+  // the canvas and released in a field would otherwise stay armed.
   const handleAltKeyUp = (e) => {
-    if (isTypingTarget(e.target)) return;
     if (e.key === 'Alt') {
       invalidateFrame();
       highlightTools?.handleAltKeyUp?.();
@@ -3813,7 +3571,7 @@ export function createViewer({
   addEventListenerWithCleanup(document, 'pointerlockerror', handlePointerLockError);
 
   const handleNavigationKeyDown = (e) => {
-    if (isTypingTarget(e.target)) return;
+    if (!isPageKey(e)) return;
     invalidateFrame();
     const code = e.code;
     if (pointerLockActive && code === 'Escape') {
@@ -3827,7 +3585,7 @@ export function createViewer({
     // pressed while Cmd is held.
     if (e.metaKey || e.ctrlKey) return;
     e.preventDefault();
-    activeKeys.add(code);
+    activeKeys.press(code, e.timeStamp);
     // A held key moves the camera every frame: the loop must be running.
     ensureFrameScheduled();
   };
@@ -3836,7 +3594,7 @@ export function createViewer({
   const handleKeyUp = (e) => {
     // Releasing a held key ends its acceleration; the inertia it leaves keeps
     // the frame drawing through sceneAnimationCause().
-    if (activeKeys.delete(e.code)) invalidateFrame();
+    if (activeKeys.release(e.code, e.timeStamp)) invalidateFrame();
     // Keys released while Cmd was held never sent their keyup on macOS.
     if (e.key === 'Meta') releaseHeldKeys();
   };
@@ -3860,7 +3618,7 @@ export function createViewer({
   // during a selection abandons it rather than committing a half-drawn shape.
   //
   // `touch-action: none` on the canvas keeps the browser from claiming these
-  // pointers for page scrolling or zoom, and cancelling the press keeps it
+  // pointers for page scrolling or zoom, and canceling the press keeps it
   // from replaying the touch as mouse events the mouse path would also act on.
   // A touch pointer is implicitly captured by the canvas it lands on, so its
   // moves and release keep arriving here even over the sidebar; that is why
@@ -3988,7 +3746,7 @@ export function createViewer({
     // into a new one: the next gesture starts when every finger is up.
     if (touchPointers.size === 0) {
       touchGesture = 'idle';
-      if (sidebarFocusPending && sidebarFocusTimer === null) commitSidebarFocus();
+      if (sidebarFocusPending && !commitAtWheelRest.pending) commitSidebarFocus();
     }
   };
   addPageInputListenerWithCleanup(canvas, 'pointerup', handleTouchPointerEnd);
@@ -4080,22 +3838,31 @@ export function createViewer({
     const { forward, right, upVec } = getFreeflyAxes();
     // Use scratch vector to avoid per-frame allocation
     vec3.set(_freeflyMove, 0, 0, 0);
-    if (activeKeys.has('KeyW')) vec3.add(_freeflyMove, _freeflyMove, forward);
-    if (activeKeys.has('KeyS')) vec3.sub(_freeflyMove, _freeflyMove, forward);
-    if (activeKeys.has('KeyD')) vec3.add(_freeflyMove, _freeflyMove, right);
-    if (activeKeys.has('KeyA')) vec3.sub(_freeflyMove, _freeflyMove, right);
-    if (activeKeys.has('KeyE')) vec3.add(_freeflyMove, _freeflyMove, upVec);
-    if (activeKeys.has('KeyQ')) vec3.sub(_freeflyMove, _freeflyMove, upVec);
+    // Each direction weighs the share of the frame its key was held; the
+    // camera accelerates for the longest of them.
+    const forwardShare = keyShare('forward');
+    const backShare = keyShare('back');
+    const rightShare = keyShare('right');
+    const leftShare = keyShare('left');
+    const upShare = keyShare('up');
+    const downShare = keyShare('down');
+    vec3.scaleAndAdd(_freeflyMove, _freeflyMove, forward, forwardShare - backShare);
+    vec3.scaleAndAdd(_freeflyMove, _freeflyMove, right, rightShare - leftShare);
+    vec3.scaleAndAdd(_freeflyMove, _freeflyMove, upVec, upShare - downShare);
+    const heldShare = Math.max(forwardShare, backShare, rightShare, leftShare, upShare, downShare);
 
     const hasInput = vec3.length(_freeflyMove) > 0.0001;
     if (hasInput) {
       vec3.normalize(_freeflyMove, _freeflyMove);
-      const sprint = (activeKeys.has('ShiftLeft') || activeKeys.has('ShiftRight')) ? sprintMultiplier : 1;
+      const sprint = keyShare('faster') > 0 ? sprintMultiplier : 1;
       // Use scratch vector for target velocity
       vec3.scale(_freeflyTargetVel, _freeflyMove, moveSpeed * sprint);
-      const lerpAlpha = Math.min(1, dt * 10);
+      const lerpAlpha = Math.min(1, dt * 10 * heldShare);
       vec3.lerp(freeflyVelocity, freeflyVelocity, _freeflyTargetVel, lerpAlpha);
       vec3.scaleAndAdd(freeflyPosition, freeflyPosition, freeflyVelocity, dt);
+    } else if (prefersReducedMotion()) {
+      // Under reduced motion free-fly stops when the keys are let go.
+      vec3.set(freeflyVelocity, 0, 0, 0);
     } else {
       // Coasting: each tick decays the velocity, then moves by it, so the
       // distance over the step is the geometric sum from the first decayed
@@ -4116,10 +3883,17 @@ export function createViewer({
   // WASD navigation and zoom for orbit/planar modes
   // Uses velocity system for smooth inertia (same as mouse drag)
   function updateOrbitPlanarKeys(dt) {
-    const sprint = (activeKeys.has('ShiftLeft') || activeKeys.has('ShiftRight')) ? 3.0 : 1.0;
+    const sprint = keyShare('faster') > 0 ? 3.0 : 1.0;
     // Key acceleration is specified per reference tick, so a held key builds
-    // the same velocity per second at any display rate.
+    // the same velocity per second at any display rate; each key accelerates
+    // for the share of the frame it was held (`keyShare`).
     const ticks = dt * PHYSICS_TICK_RATE;
+    const forwardShare = keyShare('forward');
+    const backShare = keyShare('back');
+    const leftShare = keyShare('left');
+    const rightShare = keyShare('right');
+    const zoomInShare = keyShare('zoomIn');
+    const zoomOutShare = keyShare('zoomOut');
 
     if (navigationMode === 'planar') {
       // Planar mode: WASD pans the view using velocity for smooth inertia
@@ -4127,17 +3901,15 @@ export function createViewer({
       const panAccel = radius * 0.15 * planarPanSpeed * sprint * ticks;
       const invertX = planarInvertAxes ? 1 : -1;
       const invertY = planarInvertAxes ? -1 : 1;
-      if (activeKeys.has('KeyW')) velocityPanY += panAccel * invertY;
-      if (activeKeys.has('KeyS')) velocityPanY -= panAccel * invertY;
-      if (activeKeys.has('KeyA')) velocityPanX += panAccel * invertX;
-      if (activeKeys.has('KeyD')) velocityPanX -= panAccel * invertX;
+      velocityPanY += panAccel * invertY * (forwardShare - backShare);
+      velocityPanX += panAccel * invertX * (leftShare - rightShare);
       // Zoom with = (plus) and - (minus), or ] and [ (brackets)
       const zoomSpeed = radius * 1.5 * planarPanSpeed * dt;
-      if (activeKeys.has('Equal') || activeKeys.has('BracketRight')) {
-        targetRadius = Math.max(minOrbitRadius, targetRadius - zoomSpeed);
+      if (zoomInShare > 0) {
+        targetRadius = Math.max(minOrbitRadius, targetRadius - zoomSpeed * zoomInShare);
       }
-      if (activeKeys.has('Minus') || activeKeys.has('BracketLeft')) {
-        targetRadius = Math.min(100.0, targetRadius + zoomSpeed);
+      if (zoomOutShare > 0) {
+        targetRadius = Math.min(100.0, targetRadius + zoomSpeed * zoomOutShare);
       }
     } else if (navigationMode === 'orbit') {
       // Orbit mode: WASD rotates around the anchor using velocity for smooth inertia
@@ -4145,18 +3917,16 @@ export function createViewer({
       const orbitAccel = 0.008 * orbitKeySpeed * sprint * ticks;
       const xSign = orbitInvertX ? -1 : 1;
       // A/D rotate horizontally (theta) - respects invert setting
-      if (activeKeys.has('KeyA')) velocityTheta -= orbitAccel * xSign;
-      if (activeKeys.has('KeyD')) velocityTheta += orbitAccel * xSign;
+      velocityTheta += orbitAccel * xSign * (rightShare - leftShare);
       // W/S rotate vertically (phi)
-      if (activeKeys.has('KeyW')) velocityPhi -= orbitAccel;
-      if (activeKeys.has('KeyS')) velocityPhi += orbitAccel;
+      velocityPhi += orbitAccel * (backShare - forwardShare);
       // Zoom with = (plus) and - (minus), or ] and [ (brackets)
       const zoomSpeed = radius * 1.5 * orbitKeySpeed * dt;
-      if (activeKeys.has('Equal') || activeKeys.has('BracketRight')) {
-        targetRadius = Math.max(minOrbitRadius, targetRadius - zoomSpeed);
+      if (zoomInShare > 0) {
+        targetRadius = Math.max(minOrbitRadius, targetRadius - zoomSpeed * zoomInShare);
       }
-      if (activeKeys.has('Minus') || activeKeys.has('BracketLeft')) {
-        targetRadius = Math.min(100.0, targetRadius + zoomSpeed);
+      if (zoomOutShare > 0) {
+        targetRadius = Math.min(100.0, targetRadius + zoomSpeed * zoomOutShare);
       }
     }
   }
@@ -4192,6 +3962,12 @@ export function createViewer({
    * one tick per frame this is the per-frame update it replaces.
    */
   function updateInertia(dt) {
+    // Under reduced motion the camera moves only while the person moves it:
+    // a held key drives it, and nothing glides on after a release or a drag.
+    if (prefersReducedMotion() && !isMovementKeyHeld()) {
+      velocityTheta = velocityPhi = velocityPanX = velocityPanY = velocityPanZ = 0;
+      return;
+    }
     const ticks = dt * PHYSICS_TICK_RATE;
     const friction = Math.pow(INERTIA_FRICTION, ticks);
     // Distance covered over `ticks` ticks of a velocity decaying by the
@@ -4226,11 +4002,16 @@ export function createViewer({
   }
 
   /**
-   * Ease the orbit radius toward its target: 15 % of the remaining distance
+   * Ease the orbit radius toward its target: 15% of the remaining distance
    * per reference tick, compounded over the ticks `dt` spans, so a zoom takes
    * the same time at any display rate.
    */
   function updateSmoothZoom(dt) {
+    // Under reduced motion a zoom arrives at once.
+    if (prefersReducedMotion()) {
+      radius = targetRadius;
+      return;
+    }
     const diff = targetRadius - radius;
     if (Math.abs(diff) > 0.001) {
       radius += diff * (1 - Math.pow(1 - SMOOTH_ZOOM_RATE, dt * PHYSICS_TICK_RATE));
@@ -4321,15 +4102,7 @@ export function createViewer({
     // Observers (e.g. the selection bar) place themselves from the same
     // resolved layout the panes are drawn with. An observer failure is
     // reported without interrupting the frame that resolved the layout.
-    for (const listener of presentedLayoutListeners) {
-      try {
-        listener(layout);
-      } catch (error) {
-        queueMicrotask(() => {
-          throw error;
-        });
-      }
-    }
+    presentedLayoutListeners.notify(layout);
     return layout;
   }
 
@@ -4337,7 +4110,7 @@ export function createViewer({
   function configurePaneProjection(output, pane) {
     mat4.perspective(
       output,
-      fov,
+      pane.fov,
       pane.viewportWidth / pane.viewportHeight,
       near,
       far
@@ -4360,7 +4133,7 @@ export function createViewer({
 
   /**
    * The full-canvas projection: the single-view projection, whose principal
-   * point sits at the centre of the presented area. It is the viewer's
+   * point sits at the center of the presented area. It is the viewer's
    * ambient projection outside grid panes.
    */
   function configureFullCanvasProjection(output, aspect) {
@@ -4606,7 +4379,7 @@ export function createViewer({
         : Math.max(target, state.planarity - step);
       if (state.planarity !== target) studioSurfaceInTransition = true;
     }
-    // A singular camera has no rays to cast; the pane keeps its clear colour.
+    // A singular camera has no rays to cast; the pane keeps its clear color.
     if (
       mat4.invert(_studioInvMvpMatrix, mvpMatrix) === null ||
       mat4.invert(_studioInvViewMatrix, viewMatrix) === null
@@ -4718,15 +4491,15 @@ export function createViewer({
     return value;
   }
 
-  // Decorative transitions (backdrop fades and crossfades) complete at once
-  // when the user asked the system for reduced motion.
-  const reducedMotionQuery =
-    typeof window.matchMedia === 'function'
-      ? window.matchMedia('(prefers-reduced-motion: reduce)')
-      : null;
-  function prefersReducedMotion() {
-    return reducedMotionQuery !== null && reducedMotionQuery.matches === true;
-  }
+  // Under reduced motion (utils/reduced-motion.js) decorative transitions
+  // (grid and backdrop fades, the studio surface) complete at once and the
+  // velocity overlay draws a still picture of the flow (the overlay context's
+  // `reducedMotion`). A change of the setting redraws at once, so a still
+  // scene switches mode without waiting for another event.
+  eventCleanupFns.push(onReducedMotionChange(() => {
+    if (disposed || webglContextLost) return;
+    invalidateFrame();
+  }));
 
   // Smoothstep helper for smooth transitions
   function smoothstep(edge0, edge1, x) {
@@ -4779,8 +4552,9 @@ export function createViewer({
     // Make centroids stand out by rendering them much larger than regular points
     gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 4.0);
     gl.uniform1f(centroidUniformLocations.sizeAttenuation, sizeAttenuation);
-    gl.uniform1f(centroidUniformLocations.viewportHeight, viewportHeight);
-    gl.uniform1f(centroidUniformLocations.fov, fov);
+    // F97 point sprite: the cap of the pane's points.
+    gl.uniform1f(centroidUniformLocations.pointScale, pointScaleFor(viewportHeight, fov));
+    gl.uniform1f(centroidUniformLocations.pointSizeMax, pointSizeMax);
 
     // The live buffers are replaced on every centroid publication, so the
     // pointers are re-recorded into the pass's own vertex array per draw.
@@ -5048,8 +4822,9 @@ export function createViewer({
     gl.uniformMatrix4fv(centroidUniformLocations.modelMatrix, false, modelMatrix);
     gl.uniform1f(centroidUniformLocations.pointSize, basePointSize * 4.0);
     gl.uniform1f(centroidUniformLocations.sizeAttenuation, sizeAttenuation);
-    gl.uniform1f(centroidUniformLocations.viewportHeight, viewportHeight);
-    gl.uniform1f(centroidUniformLocations.fov, fov);
+    // F97 point sprite: the cap of the pane's points.
+    gl.uniform1f(centroidUniformLocations.pointScale, pointScaleFor(viewportHeight, fov));
+    gl.uniform1f(centroidUniformLocations.pointSizeMax, pointSizeMax);
 
     // Single VAO bind - no per-frame buffer uploads!
     gl.bindVertexArray(snapshot.vao);
@@ -5068,7 +4843,8 @@ export function createViewer({
     canvasHeight,
     viewportAspect = null,
     customViewMatrix = null,
-    projectionCenterNdcX = 0
+    projectionCenterNdcX = 0,
+    fieldOfView = fov
   ) {
     // Normalize to clip space (-1 to 1)
     const ndcX = (screenX / canvasWidth) * 2 - 1;
@@ -5081,7 +4857,8 @@ export function createViewer({
     const effectiveViewMatrix = customViewMatrix || viewMatrix;
     if (viewportAspect !== null) {
       const tempProj = mat4.create();
-      mat4.perspective(tempProj, fov, viewportAspect, near, far);
+      // The pane's own field of view (`vpInfo.fov`), as it is drawn.
+      mat4.perspective(tempProj, fieldOfView, viewportAspect, near, far);
       if (projectionCenterNdcX !== null) {
         applyHorizontalProjectionCenter(tempProj, projectionCenterNdcX);
       }
@@ -5211,6 +4988,8 @@ export function createViewer({
       effectiveViewMatrix,
       // The framebuffer aspect: the one the pane is rendered with.
       vpAspect: pane.viewportWidth / pane.viewportHeight,
+      // The pane's own field of view (`presented-view-layout.js`).
+      fov: pane.fov,
       framebufferHeight: pane.viewportHeight,
       projectionCenterNdcX,
       projectionMatrix: viewportProjectionMatrix,
@@ -5316,7 +5095,9 @@ export function createViewer({
       pane: { cssWidth: vpWidth, cssHeight: vpHeight, framebufferHeight },
       pointSize: drawnPointSize,
       sizeAttenuation,
-      fov,
+      fov: viewport.fov,
+      // F97 point sprite: the cap the pane draws with.
+      pointSizeMax,
       pointLayers
     });
     if (pick.cellIndex === -1) return null;
@@ -5731,7 +5512,7 @@ export function createViewer({
   }
 
   /**
-   * Update view title chips: one per grid pane, centred on the top edge of
+   * Update view title chips: one per grid pane, centered on the top edge of
    * the pane's presented rectangle.
    * @param {Array} views - Array of view objects with id and label
    * @param {Object} layout - The presented layout the panes belong to
@@ -5801,10 +5582,7 @@ export function createViewer({
         }
         // An explicit choice of pane: the sidebar follows at once.
         sidebarFocusPending = false;
-        if (sidebarFocusTimer !== null) {
-          clearTimeout(sidebarFocusTimer);
-          sidebarFocusTimer = null;
-        }
+        commitAtWheelRest.cancel();
         if (viewFocusHandler) viewFocusHandler(viewId);
       });
 
@@ -5873,7 +5651,7 @@ export function createViewer({
   /**
    * Place one pane's centroid labels. Projection maps NDC onto the pane's
    * render rectangle; a label is shown only inside its presented part, so no
-   * label sits under the sidebar or over a neighbouring grid cell.
+   * label sits under the sidebar or over a neighboring grid cell.
    */
   function updateCentroidLabelPositions(labels, pane, viewId) {
     hiddenCentroidLabelViews.delete(viewId);
@@ -6486,6 +6264,8 @@ export function createViewer({
     const timeSeconds = now / 1000;
     const dt = Math.min(MAX_FRAME_DT, Math.max(0.001, (now - lastFrameTime) / 1000));
     lastFrameTime = now;
+    keyFrameFrom = now - dt * 1000;
+    keyFrameTo = now;
 
     if (navigationMode === 'free') {
       updateFreefly(dt);
@@ -6494,6 +6274,8 @@ export function createViewer({
       updateSmoothZoom(dt);
       updateInertia(dt);
     }
+    // The keys released during this frame have moved the camera.
+    activeKeys.endFrame(now);
 
     projectileSystem.update(dt);
 
@@ -6630,7 +6412,7 @@ export function createViewer({
       return;
     }
 
-    // Single view: one pane over the whole canvas, its projection centred on
+    // Single view: one pane over the whole canvas, its projection centered on
     // the presented area (updateCamera already configured exactly that).
     // The views drawn this frame; a kept view that is not is dormant (its
     // stores are the first released when memory runs out).
@@ -6777,7 +6559,7 @@ export function createViewer({
           panesDrawn += 1;
 
           // Set viewport and clear this pane (a retained frame keeps the
-          // other panes' pixels, so the pane clears its own colour too).
+          // other panes' pixels, so the pane clears its own color too).
           gl.viewport(
             pane.viewportX,
             pane.viewportY,
@@ -7012,8 +6794,17 @@ export function createViewer({
     paneNavigationMode,
     masked = false
   ) {
+    // Every pass of the pane (points, centroids, projectiles, the sprite
+    // scale) reads the field of view the pane is projected with
+    // (`configurePaneProjection`): its own shape's, not the presented area's.
+    const presentedFov = fov;
+    fov = pane.fov;
     if (!masked) {
-      drawPane(pane, viewId, overrideCentroidCount, snapshotBufferId, dtSeconds, timeSeconds, paneNavigationMode, false);
+      try {
+        drawPane(pane, viewId, overrideCentroidCount, snapshotBufferId, dtSeconds, timeSeconds, paneNavigationMode, false);
+      } finally {
+        fov = presentedFov;
+      }
       return;
     }
     let completed = false;
@@ -7021,6 +6812,7 @@ export function createViewer({
       drawPane(pane, viewId, overrideCentroidCount, snapshotBufferId, dtSeconds, timeSeconds, paneNavigationMode, true);
       completed = true;
     } finally {
+      fov = presentedFov;
       if (completed) {
         pulseSampleMask.endPane();
       } else {
@@ -7162,6 +6954,8 @@ export function createViewer({
 	    renderParams.fogColor = fogColor;
 	    renderParams.cameraDistance = camDist;
 	    renderParams.dimensionLevel = dimLevel;
+	    // F97 point sprite: the cap (rendering/point-sprite.js).
+	    renderParams.pointSizeMax = pointSizeMax;
 	    renderParams.useAlphaTexture = false;
 	    renderParams.quality = currentShaderQuality;
 	    renderParams.multisampled = sceneMsaaTarget.isMultisampledThisFrame();
@@ -7227,6 +7021,7 @@ export function createViewer({
 	          renderParams,
 	          timeSeconds,
 		          deltaTimeSeconds: dtSeconds,
+		          reducedMotion: prefersReducedMotion(),
 		          isSnapshot: Boolean(snapshotBufferId),
 		          dimensionLevel: dimLevel,
 		          layoutKey: viewLayoutKeys.get(vid) ?? null,
@@ -7248,6 +7043,7 @@ export function createViewer({
 	        overlayOpts.renderParams = renderParams;
 	        overlayOpts.timeSeconds = timeSeconds;
 		        overlayOpts.deltaTimeSeconds = dtSeconds;
+		        overlayOpts.reducedMotion = prefersReducedMotion();
 		        overlayOpts.isSnapshot = Boolean(snapshotBufferId);
 		        overlayOpts.dimensionLevel = dimLevel;
 		        overlayOpts.layoutKey = viewLayoutKeys.get(vid) ?? null;
@@ -7334,6 +7130,7 @@ export function createViewer({
 	    _projectileDrawParams.basePointSize = basePointSize;
 	    _projectileDrawParams.sizeAttenuation = sizeAttenuation;
 	    _projectileDrawParams.fov = fov;
+	    _projectileDrawParams.pointSizeMax = pointSizeMax;
 	    projectileSystem.draw(_projectileDrawParams);
 
     // Draw the orbit anchor only for panes whose exact camera mode is Orbit.
@@ -7392,8 +7189,8 @@ export function createViewer({
     backdropLookId = isBackdropLook(exactMode) ? exactMode : null;
     backdropLooks.setLook(backdropLookId);
     if (isBackdropLook(exactMode)) {
-      // A baked look: the clear colour is its surface (and the CSS page
-      // colour), shown until its bake lands and the look fades in.
+      // A baked look: the clear color is its surface (and the CSS page
+      // color), shown until its bake lands and the look fades in.
       const surface = backdropLookSurface01(exactMode);
       setBackgroundClearColor(surface[0], surface[1], surface[2]);
       bgColor = surface;
@@ -7437,8 +7234,8 @@ export function createViewer({
 	        break;
       case 'studio':
       case 'studio-dark': {
-        // Floor and dot surface over a neutral stage; the clear colour is the
-        // backdrop's edge colour and the exact CSS page colour.
+        // Floor and dot surface over a neutral stage; the clear color is the
+        // backdrop's edge color and the exact CSS page color.
         showStudio = true;
         studioPalette = STUDIO_PALETTES[exactMode];
         const surface = studioColor01(studioPalette.surface);
@@ -7467,9 +7264,9 @@ export function createViewer({
         gridBgColor = [1, 1, 1];
         gridColor = [0.7, 0.7, 0.7];
     }
-    // The grey of the cells with no value and the fade of the cells not
+    // The gray of the cells with no value and the fade of the cells not
     // read are made from this background (`rendering/read-cell-layer.js`),
-    // and the page's legends show them in the same colours (CSS variables).
+    // and the page's legends show them in the same colors (CSS variables).
     hpRenderer.setLayerBackground(bgColor);
     const layerColors = cellLayerColors(bgColor);
     const pageRoot = canvas.ownerDocument?.documentElement ?? null;
@@ -8180,7 +7977,7 @@ export function createViewer({
 
     highlightTools.retireSpatialInteractions(LIVE_VIEW_ID);
     cancelPendingProjectileBuild(
-      'Projectile preparation was cancelled because the dataset changed.'
+      'Projectile preparation was canceled because the dataset changed.'
     );
     projectileSystem.setEnabled(false);
     pointCount = nextPointCount;
@@ -8208,7 +8005,7 @@ export function createViewer({
     }
     vectorFieldOverlay?.markGeometryDirty?.(LIVE_VIEW_ID);
     // The smoke volume is the replaced dataset's: its 3D textures and the
-    // copies of its colours and visibility it was built from go now (in
+    // copies of its colors and visibility it was built from go now (in
     // smoke mode the owner builds the new one), instead of staying
     // resident until the next build.
     smokeRenderer.clearVolume();
@@ -8488,7 +8285,7 @@ export function createViewer({
       const layoutChanged = oldLayoutKey !== layoutKey;
       if (vid === LIVE_VIEW_ID && layoutChanged) {
         cancelPendingProjectileBuild(
-          'Projectile preparation was cancelled because the live embedding changed.'
+          'Projectile preparation was canceled because the live embedding changed.'
         );
         projectileSystem.setEnabled(false);
       }
@@ -9102,7 +8899,7 @@ export function createViewer({
       highlightTools.setKnnEdgeReleaseCallback(callback);
     },
 
-    // Told when a k-NN expansion could not read the neighbour rows it needed.
+    // Told when a k-NN expansion could not read the neighbor rows it needed.
     setKnnFailureCallback(callback) {
       highlightTools.setKnnFailureCallback(callback);
     },
@@ -9559,12 +9356,12 @@ export function createViewer({
 
     // Smoke renderer API (delegates to SmokeRenderer)
     clearSmokeVolume() { smokeRenderer.clearVolume(); },
-    // The lower layers' colours are made from the view's background (`cellLayerColors`).
+    // The lower layers' colors are made from the view's background (`cellLayerColors`).
     buildSmokeVolumeGPU(positions, options = {}) { return smokeRenderer.buildVolumeGPU(positions, { ...options, layerColors: cellLayerColors(bgColor) }); },
     /**
-     * The colours the lower layers are drawn in now, from the view's
+     * The colors the lower layers are drawn in now, from the view's
      * background (`rendering/read-cell-layer.js` `cellLayerColors`): what a
-     * cell's colour shows as (`drawnCellRgb`).
+     * cell's color shows as (`drawnCellRgb`).
      */
     getCellLayerColors() { return cellLayerColors(bgColor); },
     hasSmokeVolume() { return smokeRenderer.hasVolume(); },
@@ -9615,8 +9412,7 @@ export function createViewer({
      */
     onFullDetailFrameCost(listener) {
       const exactListener = assertExactFunction(listener, 'Full-detail frame cost listener');
-      fullDetailFrameCostListeners.add(exactListener);
-      return () => fullDetailFrameCostListeners.delete(exactListener);
+      return fullDetailFrameCostListeners.add(exactListener);
     },
     /**
      * Hear every call that sets level of detail or frustum culling
@@ -9631,8 +9427,7 @@ export function createViewer({
      */
     onPerformanceSettingsChanged(listener) {
       const exactListener = assertExactFunction(listener, 'Performance settings listener');
-      performanceSettingsListeners.add(exactListener);
-      return () => performanceSettingsListeners.delete(exactListener);
+      return performanceSettingsListeners.add(exactListener);
     },
     setConnectivityLineWidth(width) {
       connectivityLineWidth = assertFiniteNumberInRange(
@@ -9742,8 +9537,7 @@ export function createViewer({
       if (typeof listener !== 'function') {
         throw new TypeError('Connectivity count listener must be a function.');
       }
-      edgeVisibleCountListeners.add(listener);
-      return () => edgeVisibleCountListeners.delete(listener);
+      return edgeVisibleCountListeners.add(listener);
     },
 
     isUsingInstancedEdges() {
@@ -10005,6 +9799,32 @@ export function createViewer({
     },
     getLiveViewLabel() { return liveViewLabel; },
 
+    /**
+     * Name a view (`view.rename`): one trimmed line of text, or null for no
+     * name. A kept view's name goes with it when it is removed. Nothing
+     * drawn changes (the pane chip's text is the app's, through
+     * `setViewTitlePrefixes`); readers of the names hear `names`.
+     * @param {string} viewId
+     * @param {string|null} name
+     */
+    setViewName(viewId, name) {
+      const exactId = assertKnownViewId(viewId);
+      const nextName = name === null ? null : assertNonEmptyTrimmedString(name, 'View name');
+      if (nextName !== null && /[\r\n]/.test(nextName)) {
+        throw new TypeError('A view name must be one line.');
+      }
+      const current = exactId === LIVE_VIEW_ID ? liveViewName : snapshotViewsById.get(exactId).name;
+      if (current === nextName) return;
+      if (exactId === LIVE_VIEW_ID) liveViewName = nextName;
+      else snapshotViewsById.get(exactId).name = nextName;
+      publishPresentedViewStateChange('names', exactId);
+    },
+    /** The name a view was given, or null. */
+    getViewName(viewId) {
+      const exactId = assertKnownViewId(viewId);
+      return exactId === LIVE_VIEW_ID ? liveViewName : snapshotViewsById.get(exactId).name;
+    },
+
     // Snapshot API - stores view configs for multiview
     createSnapshotView(config) {
       if (renderMode === 'smoke') {
@@ -10039,6 +9859,8 @@ export function createViewer({
       const snapshot = {
         id,
         label: exactConfig.label,
+        // A kept view has no name until it is given one (`setViewName`).
+        name: null,
         fieldKey: exactConfig.fieldKey,
         fieldKind: exactConfig.fieldKind,
         colors: exactConfig.colors,
@@ -10611,7 +10433,7 @@ export function createViewer({
      * origin), and the horizontal NDC of its principal point
      * (`projectionCenterNdcX`). Grid cells all have the same size and lie
      * inside the presented area; a single view renders the whole canvas with
-     * its principal point at the presented area's centre. Null while the
+     * its principal point at the presented area's center. Null while the
      * canvas has no area.
      *
      * @returns {Object|null}
@@ -10634,11 +10456,9 @@ export function createViewer({
         throw new TypeError('Presented-layout listener must be a function.');
       }
       const current = getPresentedLayout();
-      presentedLayoutListeners.add(listener);
+      const unsubscribe = presentedLayoutListeners.add(listener);
       if (current !== null) listener(current);
-      return () => {
-        presentedLayoutListeners.delete(listener);
-      };
+      return unsubscribe;
     },
 
     setLiveViewHidden(hidden) {
@@ -10750,7 +10570,7 @@ export function createViewer({
     /**
      * Whether this device can multisample at all.
      *
-     * False means the setting cannot be honoured on this hardware, which is a
+     * False means the setting cannot be honored on this hardware, which is a
      * refusal to report rather than a state to keep offering.
      */
     isAntialiasingAvailable() { return sceneMsaaTarget.isAvailable(); },
@@ -10942,8 +10762,14 @@ export function createViewer({
       const viewMtx = mat4.create();
       computeViewMatrixFromState(camState, viewMtx);
 
+      // The field of view the view is drawn with when it is drawn at this
+      // size (its pane's), else the one this shape takes (`field-of-view.js`).
+      const shownPane = getPresentedLayout()?.panes.find(each => each.viewId === exactViewId) ?? null;
+      const viewFov = shownPane !== null && shownPane.viewportWidth === viewportWidth && shownPane.viewportHeight === viewportHeight
+        ? shownPane.fov
+        : fieldOfViewFor(viewportWidth / viewportHeight);
       const projMtx = mat4.create();
-      mat4.perspective(projMtx, fov, viewportWidth / viewportHeight, near, far);
+      mat4.perspective(projMtx, viewFov, viewportWidth / viewportHeight, near, far);
 
       const mvpMtx = mat4.create();
       mat4.multiply(mvpMtx, projMtx, viewMtx);
@@ -10975,7 +10801,7 @@ export function createViewer({
         sizeAttenuation,
         viewportHeight,
         viewportWidth,
-        fov,
+        fov: viewFov,
         near,
         far,
         lightingStrength,
@@ -11113,7 +10939,7 @@ export function createViewer({
         background: bgColor,
         fogColor,
         fogDensity,
-        fov,
+        fov: pane.fov,
         lightingStrength,
         lightDir: Array.from(lightDir),
         modelMatrix: Array.from(modelMatrix),
@@ -11170,7 +10996,7 @@ export function createViewer({
         fogDensity,
         fogFar: fogRange.fogFar,
         fogNear: fogRange.fogNear,
-        fov,
+        fov: pane.fov,
         lightingStrength,
         lightDir: new Float32Array(lightDir),
         modelMatrix: new Float32Array(modelMatrix),
@@ -11180,6 +11006,7 @@ export function createViewer({
         // canvas-local CSS pixels, framebuffer viewport, principal point.
         pane,
         pointSize: basePointSize,
+        pointSizeMax,
         projectionCenterNdcX,
         projectionMatrix: new Float32Array(projMtx),
         scissorEnabled: pane.scissorEnabled,
@@ -11312,7 +11139,7 @@ export function createViewer({
         listener,
         'LOD change listener'
       );
-      lodChangeListeners.add(exactListener);
+      const unsubscribe = lodChangeListeners.add(exactListener);
       for (const viewId of [
         LIVE_VIEW_ID,
         ...snapshotViews.map((snapshot) => snapshot.id)
@@ -11324,19 +11151,14 @@ export function createViewer({
         const certificate = createLodPublicationCertificate(viewId);
         publishedLodCertificates.set(viewId, certificate);
       }
-      let subscribed = true;
-      return () => {
-        if (!subscribed) return;
-        subscribed = false;
-        lodChangeListeners.delete(exactListener);
-      };
+      return unsubscribe;
     },
     onPresentedViewStateChanged(listener) {
       const exactListener = assertExactFunction(
         listener,
         'Presented-state change listener'
       );
-      presentedViewStateListeners.add(exactListener);
+      const unsubscribe = presentedViewStateListeners.add(exactListener);
       // The next frame establishes a scalar baseline. No initial event is
       // emitted because subscribers already build their initial state.
       presentedFrameState.initialized = false;
@@ -11348,7 +11170,7 @@ export function createViewer({
       return () => {
         if (!subscribed) return;
         subscribed = false;
-        presentedViewStateListeners.delete(exactListener);
+        unsubscribe();
         if (presentedViewStateListeners.size === 0) {
           presentedFrameState.initialized = false;
           presentedFrameState.pending = false;
@@ -11413,18 +11235,7 @@ export function createViewer({
      */
     onGraphicsReset(listener) {
       const exactListener = assertExactFunction(listener, 'Graphics reset listener');
-      graphicsResetListeners.add(exactListener);
-      return () => graphicsResetListeners.delete(exactListener);
-    },
-
-    /**
-     * What the notice's Save session does: write the session captured when
-     * the graphics were lost (null: the notice offers no Save session).
-     *
-     * @param {(() => Promise<void>)|null} saver
-     */
-    setGraphicsResetSessionSaver(saver) {
-      graphicsResetSessionSaver = saver === null ? null : assertExactFunction(saver, 'Graphics reset session saver');
+      return graphicsResetListeners.add(exactListener);
     },
 
     isDisposalSettled() {
@@ -11485,7 +11296,7 @@ export function createViewer({
 
 	      attempt('projectile build cancellation', () => {
 	        cancelPendingProjectileBuild(
-	          'Projectile preparation was cancelled because the viewer was disposed.'
+	          'Projectile preparation was canceled because the viewer was disposed.'
 	        );
 	      });
 	      attempt('pointer-lock retirement', () => {
@@ -11502,38 +11313,6 @@ export function createViewer({
 	      });
 	      attempt('resize observer retirement', () => {
 	        canvasResizeObserver.disconnect();
-	      });
-	      attempt('context overlay retirement', () => {
-	        const overlayFailures = [];
-	        try {
-	          retireCleanupCallbacks(
-	            webglContextOverlayCleanupFns,
-	            'Viewer WebGL context-overlay listener'
-	          );
-	        } catch (error) {
-	          overlayFailures.push(error);
-	        }
-	        const ownedOverlay = webglContextOverlay;
-	        if (ownedOverlay?.parentNode) {
-	          try {
-	            ownedOverlay.parentNode.removeChild(ownedOverlay);
-	          } catch (error) {
-	            if (ownedOverlay.parentNode !== null) {
-	              overlayFailures.push(error);
-	            }
-	          }
-	        }
-	        if (!ownedOverlay || ownedOverlay.parentNode === null) {
-	          webglContextOverlay = null;
-	          webglContextOverlayMessage = null;
-	          webglContextOverlayAction = null;
-	        }
-	        if (overlayFailures.length > 0) {
-	          throw new AggregateError(
-	            overlayFailures,
-	            'Viewer WebGL context overlay retirement was incomplete.'
-	          );
-	        }
 	      });
 	      attempt('view-title retirement', () => {
 	        retireViewTitleOwners();

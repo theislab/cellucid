@@ -56,7 +56,7 @@ function rawLayout(dimension) {
 const RAW = Object.freeze({ 1: rawLayout(1), 2: rawLayout(2), 3: rawLayout(3) });
 
 /**
- * The viewer's normalization, written out here: centre each axis on its
+ * The viewer's normalization, written out here: center each axis on its
  * mid-range and scale the largest range to [-1, 1], stored as Float32.
  */
 function normalized(dimension) {
@@ -291,8 +291,9 @@ test('a categorical from a selection keeps exact labels across dimensions and se
   const overlays = await readFieldOverlays(sessionPath);
   expect(overlays.userFields).toHaveLength(1);
   // A session stores the field's codes, never its centroids: the record is
-  // the definition alone, and centroids are recomputed from the codes on
-  // restore.
+  // the definition alone (with the colors its categories open with, each
+  // page's category in its page's color), and centroids are recomputed from
+  // the codes on restore.
   expect(Object.keys(overlays.userFields[0]).sort()).toEqual([
     'categories',
     'codes',
@@ -305,12 +306,15 @@ test('a categorical from a selection keeps exact labels across dimensions and se
     'operation',
     'overlapLabel',
     'overlapStrategy',
+    'palette',
     'purged',
     'source',
     'sourceField',
     'sourcePages',
     'uncoveredLabel',
   ]);
+  expect(overlays.userFields[0].palette).toHaveLength(overlays.userFields[0].categories.length);
+  expect(overlays.userFields[0].palette.every(color => /^#[0-9a-f]{6}$/.test(color))).toBe(true);
 
   // A fresh page, so nothing but the session file carries the centroids. A
   // session restores only onto the dimension it was saved in, the dataset's

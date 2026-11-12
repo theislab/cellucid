@@ -42,7 +42,7 @@ scripts/
 is the template. Copy exactly these layout files from it, at the same paths:
 `annotations/`, `scripts/validate_user_files.py`,
 `.github/workflows/validate.yml` and `.gitattributes`. Its `tests/`,
-`scripts/generate_contract_corpus.py`, `.github/workflows/tests.yml`, licence
+`scripts/generate_contract_corpus.py`, `.github/workflows/tests.yml`, license
 and policy files test and govern the template itself and are not copied.
 
 **The three schema files must be the template's, byte for byte.** Cellucid

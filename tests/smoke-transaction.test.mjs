@@ -29,7 +29,7 @@ import {
   viewContextViewerSyncMethods,
 } from '../assets/js/app/state/managers/view-context-viewer-sync.js';
 
-// Per-point display colours for a source of `count` points.
+// Per-point display colors for a source of `count` points.
 function colorsFor(count) {
   return new Uint8Array(count * 4).fill(255);
 }
@@ -140,8 +140,8 @@ test('smoke density source retains dataset arrays without an O(n) position copy'
   assert.strictEqual(source.positions, positions);
   assert.equal(source.dimension, 3);
   assert.strictEqual(source.alpha, alpha);
-  // The cloud is coloured by the active field: the source hands over the
-  // dataset's own colour array, again without a copy.
+  // The cloud is colored by the active field: the source hands over the
+  // dataset's own color array, again without a copy.
   assert.strictEqual(source.colors, colors);
   assert.strictEqual(source.outlierQuantiles, outlierQuantiles);
   assert.equal(source.outlierThreshold, 0.75);
@@ -686,7 +686,7 @@ test('a device without float blending is refused in plain words before any alloc
       error instanceof SmokeUnsupportedError
       && error.reason === 'float-blend'
       && error.detail === 'WebGL2 extension EXT_float_blend is unavailable.'
-      && /^Volumetric smoke isn't available on this device: its graphics driver can't blend high-precision colour/.test(error.message)
+      && /^Volumetric smoke isn't available on this device: its graphics driver can't blend high-precision color/.test(error.message)
       && !/EXT_|R32F|WebGL/.test(error.message)
     ),
   );
@@ -979,7 +979,7 @@ test('a rebuild for the same arrays at the same write counts does no work; it ke
   const unnamed = { ...options() };
   delete unnamed.writes;
   assert.equal(sameSmokeInputs(captureSmokeInputs(positions, unnamed, null, null), positions, unnamed), false);
-  assert.throws(() => sameSmokeInputs(built, positions, options({ colors: 1 })), /count the colours and the visibility/);
+  assert.throws(() => sameSmokeInputs(built, positions, options({ colors: 1 })), /count the colors and the visibility/);
   // The build answers an identical request before any GPU work, and only
   // while the volume it built is still the one shown.
   const rendererSource = await readFile(

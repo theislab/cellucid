@@ -11,7 +11,7 @@
  *   same bytes as the reference;
  * - a field the file stores none for because no category is large enough
  *   reads nothing at all;
- * - fields asked for together are computed in one pass, and cancelling every
+ * - fields asked for together are computed in one pass, and canceling every
  *   caller stops the computation.
  *
  * Fixtures: `scripts/generate-outlier-quantile-fixtures.py` (the real writer).

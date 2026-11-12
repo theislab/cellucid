@@ -17,7 +17,6 @@ import { BasePlot } from '../assets/js/app/analysis/plots/plot-base.js';
 import { LayoutEngine } from '../assets/js/app/analysis/plots/layout-engine.js';
 import geneHeatmapDefinition from '../assets/js/app/analysis/plots/types/gene-heatmap.js';
 import { waitForAvailableSlot } from '../assets/js/app/analysis/shared/concurrency-utils.js';
-import { cleanupAnalysisResources } from '../assets/js/app/analysis/shared/resource-cleanup.js';
 import { MultiVariableAnalysis } from '../assets/js/app/analysis/stats/multi-variable-analysis.js';
 import { createRunTuner } from '../assets/js/app/analysis/shared/run-tuner.js';
 import { runGeneStream } from '../assets/js/app/analysis/shared/gene-stream-runner.js';
@@ -47,7 +46,6 @@ test('analysis fallback, retry, coercion, and compatibility shims are absent fro
     'shared/dom-utils.js',
     'shared/gene-stream-runner.js',
     'shared/plot-theme.js',
-    'shared/resource-cleanup.js',
     'ui/analysis-types/de-analysis-ui.js',
     'ui/components/options.js',
   ];
@@ -87,17 +85,17 @@ test('analysis fallback, retry, coercion, and compatibility shims are absent fro
 
 test('plot metadata and ranges require exact scientific ownership', () => {
   assert.equal(
-    BasePlot.getVariableName([{
+    BasePlot.getValueLabel([{
       variableInfo: { name: 'Exact variable' },
     }]),
     'Exact variable',
   );
   assert.throws(
-    () => BasePlot.getVariableName([]),
+    () => BasePlot.getValueLabel([]),
     /variableInfo\.name|variable name/i,
   );
   assert.throws(
-    () => BasePlot.getVariableName([{ variableInfo: {} }]),
+    () => BasePlot.getValueLabel([{ variableInfo: {} }]),
     /variableInfo\.name|variable name/i,
   );
   assert.throws(
@@ -172,7 +170,7 @@ test('marker p-value correction rejects malformed scientific values', () => {
   );
 });
 
-test('marker heatmaps encode exact primitive group labels and keep each group\'s colour', () => {
+test('marker heatmaps encode exact primitive group labels and keep each group\'s color', () => {
   const stats = {
     genes: ['GENE'],
     groups: [
@@ -311,7 +309,7 @@ test('requested clustering never becomes an unclustered result', async () => {
     }),
     {
       name: 'RangeError',
-      message: 'Clustering 1,001 genes needs about 4 MB of memory, more than the 1 MB ' +
+      message: 'Clustering 1,001 genes needs about 3.8 MB of memory, more than the 1.0 MB ' +
         'this device gives an analysis. Show fewer genes, or turn clustering of genes off.',
     },
   );
@@ -379,19 +377,6 @@ test('streaming gene loads and analysis cleanup preserve exact failures', async 
     error => error === loadFailure,
   );
 
-  const cleanupFailure = new Error('exact analysis cleanup failure');
-  assert.throws(
-    () => cleanupAnalysisResources({
-      dataLayer: {
-        performCacheCleanup() {
-          throw cleanupFailure;
-        }
-      },
-      dataLayerCleanup: 'expired',
-    }),
-    error => error === cleanupFailure,
-  );
-
   const resetFailure = new Error('exact dataset reset failure');
   const comparison = Object.create(ComparisonModule.prototype);
   comparison._analysisWindowManager = {
@@ -434,10 +419,12 @@ test('gene signature median computes the exact per-cell median', async () => {
     },
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     getPageCells(pageIds) {
       return pageIds.map(pageId => ({ pageId, pageName: 'Exact page', cellIndices }));
     },
-    performCacheCleanup() {},
   };
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = dataLayer;
@@ -480,6 +467,9 @@ test('gene signature scoring preserves prototype-named gene and page cross-produ
     },
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     getPageCells(pageIds) {
       return pageIds.map(pageId => ({
         pageId,
@@ -487,7 +477,6 @@ test('gene signature scoring preserves prototype-named gene and page cross-produ
         cellIndices: Uint32Array.of(exactNames.indexOf(pageId)),
       }));
     },
-    performCacheCleanup() {},
   };
   analysis._computeManager = null;
 
@@ -534,6 +523,9 @@ test('differential expression requires exact dataset and gene identities', async
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return [{ key: 'KNOWN_GENE', name: 'Known gene' }];

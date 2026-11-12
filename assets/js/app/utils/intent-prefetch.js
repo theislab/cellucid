@@ -13,6 +13,7 @@
  */
 
 import { cancelled } from '../../utils/abort.js';
+import { debounce } from '../../utils/debounce.js';
 
 /**
  * How long an option has to stay under the pointer or active before it is
@@ -31,14 +32,23 @@ export function createIntentPrefetcher(prefetch, dwellMs = INTENT_PREFETCH_DWELL
   if (typeof prefetch !== 'function') {
     throw new TypeError('Intent prefetcher requires a prefetch function');
   }
-  let timer = null;
   let controller = null;
   /** @type {Key|undefined} */
   let intended;
+  // An option is prefetched once it stayed intended for `dwellMs`.
+  const prefetchAfterDwell = debounce(key => {
+    const own = new AbortController();
+    controller = own;
+    void Promise.resolve()
+      .then(() => prefetch(key, own.signal))
+      .catch(() => {})
+      .finally(() => {
+        if (controller === own) controller = null;
+      });
+  }, dwellMs);
 
   function cancel() {
-    if (timer !== null) clearTimeout(timer);
-    timer = null;
+    prefetchAfterDwell.cancel();
     controller?.abort(cancelled('superseded', 'The prefetch was superseded.'));
     controller = null;
     intended = undefined;
@@ -48,17 +58,7 @@ export function createIntentPrefetcher(prefetch, dwellMs = INTENT_PREFETCH_DWELL
     if (key === intended) return;
     cancel();
     intended = key;
-    timer = setTimeout(() => {
-      timer = null;
-      const own = new AbortController();
-      controller = own;
-      void Promise.resolve()
-        .then(() => prefetch(key, own.signal))
-        .catch(() => {})
-        .finally(() => {
-          if (controller === own) controller = null;
-        });
-    }, dwellMs);
+    prefetchAfterDwell(key);
   }
 
   return { intend, cancel, current: () => intended };

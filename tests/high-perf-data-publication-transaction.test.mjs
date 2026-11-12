@@ -435,7 +435,7 @@ test('a live representation switch keeps per-cell owners and retains the geometr
   assert.notEqual(bufferOf(renderer.buffers.positions), old.buffer);
   assert.deepEqual(gl._state.uploads, [flat], 'only the new positions are uploaded');
   assert.equal(renderer._liveGeometryGeneration, 2);
-  // The previous publication's VAO retires; its colour buffer and alpha
+  // The previous publication's VAO retires; its color buffer and alpha
   // texture moved, and its positions are retained in the draw order they
   // hold, with the permutation that order needs.
   assert.equal(gl._state.vertexArrays.has(old.vao), false);
@@ -518,7 +518,7 @@ test('a failed live switch restores the previous publication and retires only wh
   assert.equal(renderer._liveGeometryGeneration, 1);
   assert.equal(renderer._snapshotGeometryPools.size, 0);
   // The candidate's VAO and its uploaded position buffer are deleted; every
-  // previous owner -- colour, alpha, positions, VAO -- is untouched.
+  // previous owner -- color, alpha, positions, VAO -- is untouched.
   const [candidateUpload] = gl._state.uploads;
   assert.ok(candidateUpload instanceof Float32Array);
   for (const handle of [old.buffer, old.colorBuffer]) {

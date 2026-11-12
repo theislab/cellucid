@@ -18,6 +18,8 @@ import { applyLegendPosition } from '../../shared/legend-utils.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
 import { POINT_LAYER } from '../point-layer.js';
+import { niceNumbers } from '../../../../utils/nice-ticks.js';
+import { formatSignificant } from '../../../../utils/format-units.js';
 
 /**
  * Precomputed, columnar volcano-plot data for a single DE result set.
@@ -76,7 +78,7 @@ const VOLCANO_AXIS_BAND_HEIGHT = VOLCANO_TICK_LABEL_HEIGHT +
 /**
  * Lay out the band below the x axis for one viewport.
  *
- * The axis labels are not optional: an unlabelled axis is unreadable, while a
+ * The axis labels are not optional: an unlabeled axis is unreadable, while a
  * volcano without its legend is still a volcano drawn in the conventional
  * red/grey/blue. So when the band the legend needs would squeeze the plot below
  * `VOLCANO_MIN_PLOT_HEIGHT`, the legend is dropped instead of being drawn on
@@ -169,6 +171,32 @@ function requireVolcanoViewport(container) {
  * @param {string} gene
  * @returns {number}
  */
+/**
+ * A gene's test statistic, as its test wrote it: a number, infinite for a
+ * gene its groups separate without spread (a pseudobulk t with no variance),
+ * or unavailable (NaN/null/undefined).
+ * @param {*} value
+ * @param {string} gene
+ * @returns {number}
+ */
+function readOptionalScore(value, gene) {
+  if (value === null || value === undefined || Number.isNaN(value)) return NaN;
+  if (typeof value !== 'number') throw new TypeError(`score for ${gene} must be a number or unavailable`);
+  return value;
+}
+
+/**
+ * The stronger of two |test statistics| first (an infinite one strongest), an
+ * unavailable one last; 0 when they tie.
+ */
+function strongerStatisticFirst(statisticA, statisticB) {
+  const availableA = !Number.isNaN(statisticA);
+  const availableB = !Number.isNaN(statisticB);
+  if (availableA !== availableB) return availableA ? -1 : 1;
+  if (!availableA || statisticA === statisticB) return 0;
+  return statisticB > statisticA ? 1 : -1;
+}
+
 function readOptionalFiniteNumber(value, field, gene) {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return NaN;
@@ -261,6 +289,9 @@ function getVolcanoPrecomputed(results) {
   const log2FoldChange = new Float32Array(n);
   const pValue = new Float64Array(n);
   const adjustedPValue = new Float64Array(n);
+  // The test statistic, when the result has one (a DE's): what ranks genes whose p-values are tied
+  // (many underflow to 0 on hundreds of thousands of cells), as the result's table ranks them.
+  const testScore = new Float64Array(n);
   const negLog10PRaw = new Float64Array(n);
   const negLog10PAdjusted = new Float64Array(n);
 
@@ -281,6 +312,7 @@ function getVolcanoPrecomputed(results) {
     const pAdj = readProbability(row.adjustedPValue, 'adjustedPValue', row.gene);
     pValue[i] = pRaw;
     adjustedPValue[i] = pAdj;
+    testScore[i] = readOptionalScore(row.score, row.gene);
     negLog10PRaw[i] = negativeLog10Probability(pRaw);
     negLog10PAdjusted[i] = negativeLog10Probability(pAdj);
   }
@@ -290,6 +322,7 @@ function getVolcanoPrecomputed(results) {
     log2FoldChange,
     pValue,
     adjustedPValue,
+    testScore,
     negLog10PRaw,
     negLog10PAdjusted
   };
@@ -414,6 +447,10 @@ function buildVolcanoAnnotations(
     if (scoreA === Number.POSITIVE_INFINITY && scoreB !== Number.POSITIVE_INFINITY) return -1;
     if (scoreB === Number.POSITIVE_INFINITY && scoreA !== Number.POSITIVE_INFINITY) return 1;
     if (scoreA !== scoreB) return scoreB - scoreA;
+
+    // Tied significance (p-values that underflowed to 0 above all): the stronger test statistic first.
+    const byStatistic = strongerStatisticFirst(Math.abs(pre.testScore[a]), Math.abs(pre.testScore[b]));
+    if (byStatistic !== 0) return byStatistic;
 
     const foldA = Math.abs(pre.log2FoldChange[a]);
     const foldB = Math.abs(pre.log2FoldChange[b]);
@@ -579,7 +616,7 @@ function buildVolcanoAnnotations(
  * @param {{width: number, height: number}} viewport
  * @returns {{traces: Object[], layout: Object, config: Object}}
  */
-function buildVolcanoFigure(deResults, options, viewport) {
+export function buildVolcanoFigure(deResults, options, viewport) {
   requireVolcanoOptions(options);
   const {
     pValueThreshold,
@@ -823,23 +860,14 @@ function buildVolcanoFigure(deResults, options, viewport) {
   };
 
   if (zeroProbabilityIndices.length > 0) {
-    const tickValues = [
-      0,
-      finiteDomainTop * 0.25,
-      finiteDomainTop * 0.5,
-      finiteDomainTop * 0.75,
-      finiteDomainTop,
-      infinityBoundaryY
-    ];
+    // Round values below the +∞ band (1/2/5 × 10^n), none so close under it that the two labels
+    // meet (found 2026-11-10: quarters of the top read 80.2, 160, 241, 321 and 321 overlapped +∞).
+    const finiteTicks = niceNumbers(0, finiteDomainTop, 4).ticks
+      .filter(value => value >= 0 && value <= finiteDomainTop && value <= infinityBoundaryY * 0.9);
+    const tickValues = [...finiteTicks, infinityBoundaryY];
     layout.yaxis.tickmode = 'array';
     layout.yaxis.tickvals = tickValues;
-    layout.yaxis.ticktext = tickValues.map((value, index) => {
-      if (index === tickValues.length - 1) return '+∞';
-      if (value === 0) return '0';
-      if (value >= 100) return value.toFixed(0);
-      if (value >= 10) return value.toFixed(1);
-      return value.toFixed(2);
-    });
+    layout.yaxis.ticktext = tickValues.map((value, index) => (index === tickValues.length - 1 ? '+∞' : formatSignificant(value)));
   }
 
   const labelLayout = buildVolcanoAnnotations(
@@ -1087,6 +1115,7 @@ const volcanoPlotDefinition = {
       rankedRows.push({
         index,
         selectedPValue: pVal,
+        statistic: Math.abs(readOptionalScore(result.score, result.gene)),
         row: {
           gene: result.gene,
           log2FoldChange: isFiniteNumber(log2FoldChange) ? log2FoldChange : '',
@@ -1111,6 +1140,9 @@ const volcanoPlotDefinition = {
       if (!aUnavailable && a.selectedPValue !== b.selectedPValue) {
         return a.selectedPValue - b.selectedPValue;
       }
+      // Tied p-values (0 for every gene beyond the float's reach): the stronger test statistic first.
+      const byStatistic = strongerStatisticFirst(a.statistic, b.statistic);
+      if (byStatistic !== 0) return byStatistic;
       return a.index - b.index;
     });
     const rows = rankedRows.map(entry => entry.row);

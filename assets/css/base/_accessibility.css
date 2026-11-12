@@ -4,9 +4,9 @@
 
 /* Focus ring default for every focusable element.
 
-   A component may retune this ring (colour, width, offset) or replace it with a
+   A component may retune this ring (color, width, offset) or replace it with a
    different indicator that is at least as visible — a ring drawn with
-   `box-shadow`, a border-colour change, a `:focus-within` outline on a wrapper.
+   `box-shadow`, a border-color change, a `:focus-within` outline on a wrapper.
    A component must never declare `outline: none` on `:focus-visible` without
    painting such a replacement: that leaves keyboard focus with no visual
    position at all (WCAG 2.4.7 Focus Visible). `:focus:not(:focus-visible)`
@@ -33,14 +33,20 @@
   border: 0;
 }
 
-/* Reduced motion – respect user's motion preferences. */
+/* Reduced motion – respect user's motion preferences.
+   Animations keep a 0.01ms run so `animationend` still arrives (the dockable
+   panels and the chat's flash wait for it). Transitions stop outright: a
+   0.01ms duration on every element, whose initial `transition-property` is
+   `all`, made every property change a transition that held the old value for
+   a frame (a menu placed above the page drew a frame at the window's corner;
+   the history tree drew a frame at its old height and showed a scrollbar). */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+    transition: none !important;
     scroll-behavior: auto !important;
   }
 }

@@ -6,6 +6,8 @@
  * @module ui/modules/state/dataset-facts
  */
 
+import { citationText } from '../../../../data/anndata-cellucid-metadata.js';
+
 /**
  * @param {{state: object, dataSourceManager: object|null}} owners
  * @returns {() => {name: string|null, id: string|null, cells: number|null, genes: number|null,
@@ -29,7 +31,7 @@ export function datasetFactsOf({ state, dataSourceManager }) {
       id: datasetId,
       cells: finite(identity?.nOriginal ?? metadata?.stats?.n_cells),
       genes: finite(metadata?.stats?.n_genes),
-      citation: metadata?.source?.citation ?? null,
+      citation: citationText(metadata?.citation),
       openCells: identity?.isSubset
         ? {
           open: identity.n,

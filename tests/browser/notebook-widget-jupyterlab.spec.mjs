@@ -180,7 +180,7 @@ async function runCell(page, index, timeout = 60_000) {
 }
 
 /**
- * The notebook at `url` (three cells: show, report, colour by) run against
+ * The notebook at `url` (three cells: show, report, color by) run against
  * the widget: it renders, a lasso reaches the kernel, a command reaches the
  * viewer. Returns the report cell's text and the lassoed cell count.
  */
@@ -262,10 +262,10 @@ async function exerciseNotebook(page, url, appOrigin, label) {
   await expect(result).toContainText('RESULT');
   const report = (await result.textContent()).trim();
 
-  // A command from the kernel reaches the viewer: colour by the categorical column.
+  // A command from the kernel reaches the viewer: color by the categorical column.
   await runCell(page, 2);
   await expect(app.locator('#categorical-field option:checked')).toHaveText('cell_type');
-  // It is a step of the viewer's history, labelled with the notebook's
+  // It is a step of the viewer's history, labeled with the notebook's
   // language (a Python widget's runtime is "jupyter"; its steps are Python's).
   const hostSteps = await appFrame.evaluate(() => [...window._cellucidHistories.current().active.steps.values()]
     .filter(step => step.by.origin === 'host').map(step => [step.type, step.by.host]));

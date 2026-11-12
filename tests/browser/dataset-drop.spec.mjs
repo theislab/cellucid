@@ -48,7 +48,7 @@ test('a dropped .h5ad file opens like a picked one', async ({ page }) => {
   await expectSettledOn(page, H5AD);
   const { notifications } = await readRecord(page);
   expect(
-    notifications.filter(entry => /User data ready: 120 cells/.test(entry.text)),
+    notifications.filter(entry => /Opened .+: 120 cells/.test(entry.text)),
   ).toHaveLength(1);
   await expectNoFailureAnnounced(page);
   expect(productErrors).toEqual([]);
@@ -145,7 +145,7 @@ test('before the data controls exist a dropped file is refused and never navigat
   const address = page.url();
   const drag = await createDrag(page, { files: [await filePayload(H5AD_PATH)] });
   const early = await dragAndDrop(page, drag);
-  // Cancelled at the document, offered as "none", and nothing opens.
+  // Canceled at the document, offered as "none", and nothing opens.
   expect(early.over.every(event => event.defaultPrevented)).toBe(true);
   expect(early.dropTargetReady).toBe(false);
   expect(early.overlayShown).toBe(false);

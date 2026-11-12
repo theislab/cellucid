@@ -33,7 +33,7 @@ test('only a completed sync outcome produces the success text', () => {
   );
   assert.equal(
     describeSyncOutcome({ status: 'cancelled' }, 'Publish complete.'),
-    'Cancelled.'
+    'Canceled.'
   );
   assert.equal(
     describeSyncOutcome(
@@ -80,7 +80,7 @@ test('Pull and Publish acquire and release syncBusy inside one try/finally', () 
   );
   assert.match(
     controlsSource,
-    /async function pushToGitHub\(\{ signal = null, only = null, interactive = true \} = \{\}\) \{\s*const outcome = await runExclusiveSync\(/
+    /async function pushToGitHub\(\{ signal = null, only = null, interactive = true \} = \{\}\) \{\s*let outcome = await runExclusiveSync\(/
   );
   const publish = controlsSource.slice(
     controlsSource.indexOf('async function publishExclusive')

@@ -141,12 +141,13 @@ test('a dropped folder is read through its handle where the drop gives one, else
   assert.equal(plain.handle, null);
 });
 
-test('a library file dropped goes to My datasets\' Import; a session file is refused saying what it is', () => {
+test('a library file dropped goes to My datasets\' Import; a session file goes to its load (L25-8)', () => {
   const library = describeDatasetDrop(transfer([fileItem('Backup.cellucid-library')]));
   assert.equal(library.kind, 'library');
   assert.equal(library.label, 'Backup.cellucid-library');
   assert.equal(library.file.name, 'Backup.cellucid-library');
   const session = describeDatasetDrop(transfer([fileItem('cellucid-session-2026.cellucid-session')]));
-  assert.equal(session.kind, 'refused');
-  assert.equal(session.message, cellucidFileOfName('x.cellucid-session').said);
+  assert.equal(session.kind, 'session');
+  assert.equal(session.label, 'cellucid-session-2026.cellucid-session');
+  assert.equal(session.file.name, 'cellucid-session-2026.cellucid-session');
 });

@@ -1,0 +1,89 @@
+{
+  "examples": [
+    {
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "groups": [
+        {
+          "categories": [
+            "T cells"
+          ],
+          "label": "T cells"
+        }
+      ],
+      "name": "x",
+      "rest": null
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "const": "obs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "groups": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "categories": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "label": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "label",
+            "categories"
+          ],
+          "type": "object"
+        },
+        "minItems": 1,
+        "type": "array"
+      },
+      "name": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "rest": {
+        "default": null,
+        "minLength": 1,
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "field",
+      "groups"
+    ],
+    "type": "object"
+  },
+  "type": "field.group",
+  "version": 1
+}

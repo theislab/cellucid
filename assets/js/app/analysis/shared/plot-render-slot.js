@@ -13,6 +13,7 @@
  */
 
 import { abortReason, cancel, onAbort } from '../../../utils/abort.js';
+import { InternalError } from '../../../utils/errors.js';
 
 const ALWAYS_CURRENT = () => true;
 
@@ -33,7 +34,7 @@ class MandatorySlotFailure extends Error {
 function defaultCreateCandidate({ host }) {
   const document = host?.ownerDocument;
   if (!document || typeof document.createElement !== 'function') {
-    throw new Error('PlotRenderSlot host must provide an ownerDocument');
+    throw new InternalError('PlotRenderSlot host must provide an ownerDocument');
   }
 
   const candidate = document.createElement('div');
@@ -78,20 +79,20 @@ function defaultRemoveCandidate({ candidate }) {
  */
 export function readHostLayoutBox(host) {
   if (host === null || typeof host !== 'object') {
-    throw new Error('PlotRenderSlot host must be measurable');
+    throw new InternalError('PlotRenderSlot host must be measurable');
   }
 
   const width = Number(host.clientWidth);
   const height = Number(host.clientHeight);
   if (!Number.isFinite(width) || width < 0 || !Number.isFinite(height) || height < 0) {
-    throw new Error('PlotRenderSlot host dimensions must be finite and non-negative');
+    throw new InternalError('PlotRenderSlot host dimensions must be finite and non-negative');
   }
   return { width, height };
 }
 
 function defaultCreateResizeObserver(callback) {
   if (typeof globalThis.ResizeObserver !== 'function') {
-    throw new Error('PlotRenderSlot requires ResizeObserver while its host has no positive size');
+    throw new InternalError('PlotRenderSlot requires ResizeObserver while its host has no positive size');
   }
   return new globalThis.ResizeObserver(callback);
 }
@@ -144,7 +145,7 @@ async function defaultMeasure({ host, signal, createResizeObserver }) {
       observer = createResizeObserver(readPositiveMeasurement);
       if (!observer || typeof observer.observe !== 'function' ||
           typeof observer.disconnect !== 'function') {
-        throw new Error('PlotRenderSlot resize observer must implement observe and disconnect');
+        throw new InternalError('PlotRenderSlot resize observer must implement observe and disconnect');
       }
       stopListening = onAbort(signal, () => settle(null, abortReason(signal)));
       if (settled) return;
@@ -162,7 +163,7 @@ function defaultResize({ candidate, measurement }) {
   const width = Number(measurement?.width);
   const height = Number(measurement?.height);
   if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
-    throw new Error('PlotRenderSlot measurement must contain finite, positive dimensions');
+    throw new InternalError('PlotRenderSlot measurement must contain finite, positive dimensions');
   }
 
   candidate.style.width = `${width}px`;
@@ -171,7 +172,7 @@ function defaultResize({ candidate, measurement }) {
 
 function setCandidateHidden(candidate, hidden) {
   if (!candidate?.style) {
-    throw new Error('PlotRenderSlot candidates must expose a style object');
+    throw new InternalError('PlotRenderSlot candidates must expose a style object');
   }
 
   if (hidden) {
@@ -216,9 +217,9 @@ export class PlotRenderSlot {
     attachCandidate = defaultAttachCandidate,
     removeCandidate = defaultRemoveCandidate
   } = {}) {
-    if (!host) throw new Error('PlotRenderSlot requires a host');
-    if (typeof render !== 'function') throw new Error('PlotRenderSlot requires a render function');
-    if (typeof purge !== 'function') throw new Error('PlotRenderSlot requires a purge function');
+    if (!host) throw new InternalError('PlotRenderSlot requires a host');
+    if (typeof render !== 'function') throw new InternalError('PlotRenderSlot requires a render function');
+    if (typeof purge !== 'function') throw new InternalError('PlotRenderSlot requires a purge function');
 
     const dependencies = {
       measure,
@@ -230,7 +231,7 @@ export class PlotRenderSlot {
     };
     for (const [name, dependency] of Object.entries(dependencies)) {
       if (typeof dependency !== 'function') {
-        throw new Error(`PlotRenderSlot ${name} must be a function`);
+        throw new InternalError(`PlotRenderSlot ${name} must be a function`);
       }
     }
 
@@ -267,10 +268,10 @@ export class PlotRenderSlot {
    */
   render(payload, { isCurrent = ALWAYS_CURRENT } = {}) {
     if (this._destroyed) {
-      return Promise.reject(new Error('PlotRenderSlot has been destroyed'));
+      return Promise.reject(new InternalError('PlotRenderSlot has been destroyed'));
     }
     if (typeof isCurrent !== 'function') {
-      return Promise.reject(new Error('PlotRenderSlot isCurrent must be a function'));
+      return Promise.reject(new InternalError('PlotRenderSlot isCurrent must be a function'));
     }
 
     const generation = ++this._generation;
@@ -354,16 +355,16 @@ export class PlotRenderSlot {
    */
   withCommittedPlot(operation) {
     if (typeof operation !== 'function') {
-      return Promise.reject(new Error('PlotRenderSlot export operation must be a function'));
+      return Promise.reject(new InternalError('PlotRenderSlot export operation must be a function'));
     }
     if (this._destroyed) {
-      return Promise.reject(new Error('PlotRenderSlot has been destroyed'));
+      return Promise.reject(new InternalError('PlotRenderSlot has been destroyed'));
     }
 
     return this._runExclusive(async () => {
       const committed = this._committed;
       if (!committed) {
-        throw new Error('PlotRenderSlot has no committed plot');
+        throw new InternalError('PlotRenderSlot has no committed plot');
       }
       return operation(committed.candidate, committed.renderResult);
     });
@@ -471,7 +472,7 @@ export class PlotRenderSlot {
         payload: request.payload
       });
       if (!candidate) {
-        throw new Error('PlotRenderSlot createCandidate returned no candidate');
+        throw new InternalError('PlotRenderSlot createCandidate returned no candidate');
       }
 
       record = {
@@ -488,7 +489,7 @@ export class PlotRenderSlot {
         payload: request.payload
       });
       if (candidate.isConnected === false) {
-        throw new Error('PlotRenderSlot candidate must be connected before rendering');
+        throw new InternalError('PlotRenderSlot candidate must be connected before rendering');
       }
       let stalePreparation = await this._retirePreparedCandidateIfStale(request, record);
       if (stalePreparation) {
@@ -510,7 +511,7 @@ export class PlotRenderSlot {
       const measuredHeight = Number(measurement?.height);
       if (!Number.isFinite(measuredWidth) || measuredWidth <= 0 ||
           !Number.isFinite(measuredHeight) || measuredHeight <= 0) {
-        throw new Error('PlotRenderSlot measure must resolve with finite, positive dimensions');
+        throw new InternalError('PlotRenderSlot measure must resolve with finite, positive dimensions');
       }
       stalePreparation = await this._retirePreparedCandidateIfStale(request, record);
       if (stalePreparation) {

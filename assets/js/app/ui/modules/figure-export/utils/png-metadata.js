@@ -1,8 +1,10 @@
 /**
- * @fileoverview PNG metadata embedding (UTF-8 iTXt chunks) for figure export.
+ * @fileoverview PNG metadata for figure export: the resolution (`pHYs`) and
+ * UTF-8 text (`iTXt`).
  *
- * Browsers don't provide a native way to write PNG iTXt metadata via Canvas,
- * so we post-process the encoded PNG and inject standard UTF-8 iTXt chunks.
+ * Browsers write neither when they encode a canvas, so the encoded PNG is
+ * post-processed: without `pHYs` a layout program places a 300 dpi figure at
+ * 72 dpi, four times its size.
  *
  * It runs in the figure-export worker, beside the encoder, so reading and
  * checksumming the encoded image never occupies the page's main thread.
@@ -29,6 +31,21 @@ function readU32BE(bytes, offset) {
     (bytes[offset + 2] << 8) |
     (bytes[offset + 3])
   ) >>> 0;
+}
+
+/**
+ * A PNG's width and height from its header (`IHDR`, the first chunk), or
+ * null when the bytes do not begin as a PNG's (24 bytes are enough): the one
+ * reader of a picture's sides, for the views a tool returns and the pictures
+ * a chat is sent.
+ *
+ * @param {Uint8Array} bytes
+ * @returns {{width: number, height: number}|null}
+ */
+export function pngSidesOf(bytes) {
+  if (!isPng(bytes) || bytes.length < 24) return null;
+  if (String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]) !== 'IHDR') return null;
+  return { width: readU32BE(bytes, 16) >>> 0, height: readU32BE(bytes, 20) >>> 0 };
 }
 
 function writeU32BE(bytes, offset, value) {
@@ -87,28 +104,52 @@ function makeTextChunk(keyword, text) {
   return makeChunk('iTXt', data);
 }
 
+/** Meters per inch: `pHYs` counts pixels per meter. */
+const METRES_PER_INCH = 0.0254;
+
 /**
- * Inject PNG iTXt chunks before IEND.
+ * The `pHYs` chunk of a resolution: the same pixels per meter across and
+ * down, unit meter (1), so a layout program places the image at its size.
+ *
+ * @param {number} dpi
+ */
+function makeResolutionChunk(dpi) {
+  const perMetre = Math.round(dpi / METRES_PER_INCH);
+  const data = new Uint8Array(9);
+  writeU32BE(data, 0, perMetre);
+  writeU32BE(data, 4, perMetre);
+  data[8] = 1;
+  return makeChunk('pHYs', data);
+}
+
+/**
+ * Write a figure's metadata into its encoded PNG: its resolution (`pHYs`,
+ * right after `IHDR`: the format wants it before the image data; one the
+ * encoder wrote is replaced) and its text (UTF-8 `iTXt` chunks, before
+ * `IEND`). Every chunk's CRC is checked on the way.
  *
  * @param {Blob} blob
- * @param {Record<string, string>} textMap
+ * @param {{text: Record<string, string>, dpi: number}} metadata
  * @returns {Promise<Blob>}
  */
-export async function embedPngTextChunks(blob, textMap) {
+export async function embedPngMetadata(blob, { text, dpi }) {
   if (!(blob instanceof Blob) || blob.type !== 'image/png') {
     throw new TypeError('PNG metadata input must be an image/png Blob.');
   }
   if (
-    textMap === null ||
-    typeof textMap !== 'object' ||
-    Array.isArray(textMap) ||
-    Object.getPrototypeOf(textMap) !== Object.prototype
+    text === null ||
+    typeof text !== 'object' ||
+    Array.isArray(text) ||
+    Object.getPrototypeOf(text) !== Object.prototype
   ) {
     throw new TypeError('PNG metadata must be a plain object.');
   }
-  const entries = Object.entries(textMap);
+  const entries = Object.entries(text);
   if (entries.length === 0) {
     throw new TypeError('PNG metadata must contain at least one entry.');
+  }
+  if (!Number.isFinite(dpi) || dpi <= 0) {
+    throw new RangeError('PNG metadata needs the resolution in dots per inch.');
   }
 
   const buffer = await blob.arrayBuffer();
@@ -117,8 +158,10 @@ export async function embedPngTextChunks(blob, textMap) {
     throw new Error('PNG metadata input has an invalid PNG signature.');
   }
 
-  // Locate IEND.
+  // Walk the chunks: IHDR first, any pHYs (replaced), IEND last.
+  const kept = [];
   let offset = 8;
+  let headerEnd = -1;
   let iendOffset = -1;
   while (offset + 8 <= bytes.length) {
     const len = readU32BE(bytes, offset);
@@ -132,12 +175,17 @@ export async function embedPngTextChunks(blob, textMap) {
     if (expectedCrc !== actualCrc) {
       throw new Error(`PNG metadata input contains an invalid ${type} chunk CRC.`);
     }
-    if (type === 'IEND') {
+    if (offset === 8) {
+      if (type !== 'IHDR') throw new Error('PNG metadata input does not start with IHDR.');
+      headerEnd = offset + chunkSize;
+    } else if (type === 'IEND') {
       if (len !== 0 || offset + chunkSize !== bytes.length) {
         throw new Error('PNG metadata input contains an invalid IEND chunk.');
       }
       iendOffset = offset;
       break;
+    } else if (type !== 'pHYs') {
+      kept.push(bytes.subarray(offset, offset + chunkSize));
     }
     offset += chunkSize;
   }
@@ -145,9 +193,14 @@ export async function embedPngTextChunks(blob, textMap) {
     throw new Error('PNG metadata input has no IEND chunk.');
   }
 
-  const chunks = entries.map(([keyword, text]) => makeTextChunk(keyword, text));
   return new Blob(
-    [bytes.subarray(0, iendOffset), ...chunks, bytes.subarray(iendOffset)],
+    [
+      bytes.subarray(0, headerEnd),
+      makeResolutionChunk(dpi),
+      ...kept,
+      ...entries.map(([keyword, value]) => makeTextChunk(keyword, value)),
+      bytes.subarray(iendOffset)
+    ],
     { type: 'image/png' }
   );
 }

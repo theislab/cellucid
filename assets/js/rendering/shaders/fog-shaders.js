@@ -17,15 +17,15 @@
  * is off sends a scale of zero, for which the term is exactly one.
  *
  * Fog fades a translucent layer toward whatever lies behind it, through its
- * opacity, rather than mixing its colour toward one constant fog colour. A
- * backdrop is not one colour — a grid, a vignette, the points further back —
- * and mixing toward a constant tinted every fogged point with a colour that
+ * opacity, rather than mixing its color toward one constant fog color. A
+ * backdrop is not one color — a grid, a vignette, the points further back —
+ * and mixing toward a constant tinted every fogged point with a color that
  * was not behind it. `fogOpacity(T) = T * (0.1 + 0.9 T)` is chosen so that
- * over a backdrop of the fog colour the picture is exactly the one the old
- * colour-mixing law drew: `a T c + (1 - a T) bg` with `a = 0.1 + 0.9 T`.
+ * over a backdrop of the fog color the picture is exactly the one the old
+ * color-mixing law drew: `a T c + (1 - a T) bg` with `a = 0.1 + 0.9 T`.
  * Only an opaque layer (the `sculpted` points, which antialias through a
  * multisample coverage mask and cannot be thinned) still mixes toward the fog
- * colour.
+ * color.
  */
 
 /** `extinction = density^2 * FOG_EXTINCTION_SCALE`, per unit of the fog span. */

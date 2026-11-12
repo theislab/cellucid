@@ -7,7 +7,7 @@
 // - EXT_color_buffer_float: the density build renders into R32F and RGBA32F
 //   atlases and the lighting volume into RG16F; core WebGL2 cannot render to
 //   any float format.
-// - EXT_float_blend: the density build sums every cell's weight and colour
+// - EXT_float_blend: the density build sums every cell's weight and color
 //   with additive blending into those float32 atlases. Core WebGL2 forbids
 //   blending into a float32 target, and iOS and many Android GPUs do not
 //   offer the extension. A half-float sum would silently lose small
@@ -58,7 +58,7 @@ export function detectSmokeSupport(gl) {
     return unsupported(
       'color-buffer-float',
       `${NOT_AVAILABLE} its graphics driver can't draw into the high-precision `
-        + `colour buffers the smoke cloud is built in. ${POINTS_WORK}`,
+        + `color buffers the smoke cloud is built in. ${POINTS_WORK}`,
       'WebGL2 extension EXT_color_buffer_float is unavailable.'
     );
   }
@@ -66,7 +66,7 @@ export function detectSmokeSupport(gl) {
     return unsupported(
       'float-blend',
       `${NOT_AVAILABLE} its graphics driver can't blend high-precision `
-        + `colour, which the smoke cloud needs to add up the cells. ${POINTS_WORK}`,
+        + `color, which the smoke cloud needs to add up the cells. ${POINTS_WORK}`,
       'WebGL2 extension EXT_float_blend is unavailable.'
     );
   }

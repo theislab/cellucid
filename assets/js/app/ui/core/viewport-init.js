@@ -12,7 +12,7 @@
  * does not zoom on focus, and `maximum-scale` there would take away page
  * pinch zoom, which low-vision users rely on.
  *
- * iOS WebKit is recognised by a feature it alone supports
+ * iOS WebKit is recognized by a feature it alone supports
  * (`-webkit-touch-callout`), not by the user-agent string; iPadOS reports a
  * desktop user agent but supports it too.
  *

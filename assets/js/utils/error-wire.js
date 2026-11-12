@@ -74,7 +74,7 @@ export function fromWire(record, classes = {}) {
   const message = typeof record.message === 'string' ? record.message : String(record.message);
   let error;
   if (isCancellation(record)) {
-    error = cancelled(typeof record.kind === 'string' ? record.kind : 'user', message || 'The work was cancelled.', cause);
+    error = cancelled(typeof record.kind === 'string' ? record.kind : 'user', message || 'The work was canceled.', cause);
   } else if (record.name === 'TimeoutError' && typeof DOMException === 'function') {
     error = new DOMException(message, 'TimeoutError');
   } else if (Object.hasOwn(classes, record.name)) {

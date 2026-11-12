@@ -127,7 +127,7 @@ test('a summary holds exactly the graph members', () => {
 });
 
 test('no fixed working-set cap refuses a large graph: a k = 15 graph over 10M and 50M cells validates', () => {
-  // A k = 15 neighbour graph has about 11 undirected edges a cell. The
+  // A k = 15 neighbor graph has about 11 undirected edges a cell. The
   // summary is checked for consistency only; memory is the engine's to
   // grant when the edges load (a refusal there is a connectivity error, never
   // a failed dataset).
@@ -452,7 +452,7 @@ test('all four public metadata loaders refuse a pre-aborted owner before reading
         'anndata://dataset/obsp',
         { signal: false }
       ),
-      /AbortSignal or exact null/i
+      /AbortSignal or null/i
     );
   });
 });

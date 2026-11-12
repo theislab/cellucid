@@ -71,7 +71,7 @@ test('awaited cache recovery rechecks the exact pull owner before UI or repo mut
     'await fileCache.clearRepo(resolvedCacheScope)'
   );
   const abortCheck = pull.indexOf(
-    'throwIfActiveSyncAborted(opAbort)',
+    'throwIfAborted(opAbort.signal)',
     clear
   );
   const ownerCheck = pull.indexOf(
@@ -156,7 +156,7 @@ test('Pull applies all visible session stages through one synchronous commit', (
     /session\.(?:setModerationMergesFromDoc|rebuildMergedViewFromUserFiles|setFieldAnnotated|setAnnotatableConsensusSettingsMap|setClosedAnnotatableFields|recordDatasetAccess|setRemoteFileShas|setRemoteFileSha)\(/
   );
   const precheck = pull.lastIndexOf(
-    'throwIfActiveSyncAborted(opAbort);',
+    'throwIfAborted(opAbort.signal);',
     application
   );
   assert.ok(precheck >= 0 && precheck < application);
@@ -172,7 +172,7 @@ test('Pull applies all visible session stages through one synchronous commit', (
   assert.ok(repositoryCommit > progress);
   assert.doesNotMatch(
     pull.slice(application, repositoryCommit),
-    /throwIfActiveSyncAborted\(opAbort\)/
+    /throwIfAborted\(opAbort\.signal\)/
   );
 });
 
@@ -215,19 +215,22 @@ test('an unchanged Pull folds nothing again only while the session still holds t
   assert.doesNotMatch(pull, /remoteUserShas/);
 });
 
-test('a Pull can be cancelled from its progress, and a failure that may pass keeps the connection', () => {
+test('a Pull can be canceled from its progress, and a failure that may pass keeps the connection', () => {
   const pull = source.slice(source.indexOf('async function pullExclusive'), source.indexOf('async function pushToGitHub'));
-  assert.match(pull, /notifications\.progress\([\s\S]*?onCancel: \(\) => \{[\s\S]*?abortActiveSync\(/);
+  assert.match(pull, /notifications\.progress\([\s\S]*?onCancel: \(\) => \{[\s\S]*?cancel\(opAbort, 'user', /);
   assert.match(pull, /onWait: \(wait\) => updateProgress\(progressPct, \{ message: wait === null \? progressMessage : wait\.text \}\)/);
   for (const flow of [pull, source.slice(source.indexOf('async function publishExclusive'))]) {
     // A failure that may pass, or a sign-in GitHub refused, keeps the repository.
     assert.match(flow, /!isTransientRoleResolutionFailure\(err\) &&\s*!isTokenAuthFailure\(err\) &&\s*\(access\.getRole\?\.\(\) \|\| 'unknown'\) === 'unknown'/);
     assert.doesNotMatch(flow, /statusCode === 30[1278]/, 'no dead redirect branches: the Worker never relays a 3xx');
   }
-  // A role resolution that may pass is asked again after the shared back-off
-  // (the Worker link's retransmission timeout, doubled, at most RFC 6298's
-  // 60 s), never a second copy of the retry rules nor an attempt cap.
-  assert.doesNotMatch(source, /roleRetryDelay|maxRetryAfterMs|roleRetryDelaysMs|exhausted/);
-  const retry = source.slice(source.indexOf('function scheduleTransientRoleRetry('), source.indexOf('function retryConnectedRoleImmediately('));
-  assert.match(retry, /Math\.min\(MAX_QUIET_MS, retryWaitMs\(attempt, link\.timeoutMs\)\)/);
+  // A role resolution that may pass was asked again by each of its requests
+  // (the transport's one retry policy, `worker-request.js` `withRetries`):
+  // its failure is said and the role is read again with the next Pull or on
+  // coming online, never by a second retry loop of its own (round 9: one
+  // retried every whole resolution on a timer, without end, on top of it).
+  assert.doesNotMatch(source, /roleRetryDelay|maxRetryAfterMs|roleRetryDelaysMs|exhausted|roleRetryState|scheduleTransientRoleRetry|retryWaitMs|MAX_QUIET_MS/);
+  const resolution = source.slice(source.indexOf('async function resolveConnectedRoleOrDisconnect('), source.indexOf('function disconnectAnnotationRepo('));
+  assert.doesNotMatch(resolution, /setTimeout\(/);
+  assert.match(resolution, /isTransientRoleResolutionFailure\(err\)\) \{[\s\S]*?Cellucid asks again with the next Pull, and at once when this computer comes back online\./);
 });

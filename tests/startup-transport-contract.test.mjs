@@ -7,6 +7,7 @@ import {
   readExactTrueUrlFlag,
   readOptionalExactUrlParameter,
   resolveStartupUrlIntent,
+  isRefusedLaunchLink,
   selectConnectedDatasetId,
   selectIntentDatasetId
 } from '../assets/js/app/startup-url-intent.js';
@@ -26,6 +27,8 @@ import {
   DataSourceManager
 } from '../assets/js/data/data-source-manager.js';
 import { selectDataset } from './helpers/dataset-selection.mjs';
+import { isExplainedFailure } from '../assets/js/data/data-source.js';
+import { isSettledDataSourceFailure } from '../assets/js/app/ui/modules/dataset-connections.js';
 
 function createFakeDocument() {
   const elements = new Map();
@@ -80,21 +83,21 @@ test('startup parameters reject duplicates, empty values, and boolean coercion',
       new URLSearchParams('remote=a&remote=b'),
       'remote'
     ),
-    /must occur at most once/
+    /This link names "remote" 2 times; a link names it once\./
   );
   assert.throws(
     () => readOptionalExactUrlParameter(
       new URLSearchParams('remote='),
       'remote'
     ),
-    /non-empty exact value/
+    /This link's "remote" has no value\./
   );
   assert.throws(
     () => readOptionalExactUrlParameter(
       new URLSearchParams('remote=%20server'),
       'remote'
     ),
-    /non-empty exact value/
+    /This link's "remote" has spaces around its value \(" server"\); remove them\./
   );
   assert.equal(
     readExactTrueUrlFlag(
@@ -108,7 +111,7 @@ test('startup parameters reject duplicates, empty values, and boolean coercion',
       new URLSearchParams('anndata=1'),
       'anndata'
     ),
-    /must be exactly "true"/
+    /This link's "anndata" is "1"; it can only be "true"\./
   );
 });
 
@@ -182,16 +185,27 @@ test('welcome policy is exact for catalog and user-served startup intents', asyn
     );
   });
 
-  await t.test('source conflicts remain terminal before presentation', () => {
-    assert.throws(
-      () => resolveStartupUrlIntent(
-        new URLSearchParams(
-          'remote=http%3A%2F%2Fserver.test&source=local-demo'
-        ),
-        null
-      ),
-      /requires source="remote"/
-    );
+  await t.test('a link Cellucid cannot read is refused as the link\'s, before anything is presented', () => {
+    // R9E-1: refused as the link's (said on its opening card, Cellucid
+    // running), never as Cellucid failing to start.
+    for (const [search, said] of [
+      ['remote=http%3A%2F%2Fserver.test&source=local-demo', /names a Cellucid server \("remote"\) but its "source" is "local-demo"; remove "source"\./],
+      ['remote=http%3A%2F%2Fserver.test&data=x', /names both a Cellucid server \("remote"\) and data \("data"\)/],
+      ['data=x&source=local-demo', /"data" names where its data is; remove "source"\./],
+      // The pair's own reason, before "an unknown source".
+      ['data=x&source=link', /"data" names where its data is; remove "source"\./],
+      ['anndata=true&source=local-demo', /"anndata=true" names a Cellucid server, but its "source" is "local-demo"/],
+      ['source=foo', /"source" is "foo"; a link's source is "local-demo" \(a sample dataset\) or "remote"/],
+      ['source=jupyter', /"source" is "jupyter"/],
+      ['dataset=a&dataset=b', /names "dataset" 2 times/],
+    ]) {
+      assert.throws(
+        () => resolveStartupUrlIntent(new URLSearchParams(search), null),
+        error => said.test(error.message) && isRefusedLaunchLink(error) && isExplainedFailure(error)
+          && isSettledDataSourceFailure(error),
+        search
+      );
+    }
   });
 });
 
@@ -248,12 +262,14 @@ test('explicit source selection never substitutes the first dataset', () => {
     'beta'
   );
   assert.throws(
-    () => selectIntentDatasetId(datasets, null, 'Remote source'),
-    /exact "dataset".*required/
+    () => selectIntentDatasetId(datasets, null, 'The server this link names'),
+    error => isRefusedLaunchLink(error) && error.message ===
+      'The server this link names holds 2 datasets ("alpha" and "beta"), and this link does not say which to open: add "dataset=" with one of them.'
   );
   assert.throws(
-    () => selectIntentDatasetId(datasets, 'missing', 'Remote source'),
-    /does not declare requested dataset/
+    () => selectIntentDatasetId(datasets, 'missing', 'The server this link names'),
+    error => isRefusedLaunchLink(error) && error.message ===
+      'This link names the dataset "missing", which the server this link names does not hold; it holds "alpha" and "beta".'
   );
   assert.throws(
     () => selectIntentDatasetId(
@@ -265,7 +281,7 @@ test('explicit source selection never substitutes the first dataset', () => {
   );
   assert.throws(
     () => selectIntentDatasetId([], null, 'Remote source'),
-    /declared no datasets/
+    /holds no dataset/
   );
   assert.equal(
     selectIntentDatasetId([{ id: 'only' }], null, 'Remote source'),
@@ -303,9 +319,9 @@ test('same-origin served catalogs auto-select only an exact unique dataset', () 
     () => selectConnectedDatasetId(
       datasets,
       'missing',
-      'The same-origin Cellucid source'
+      'This Cellucid server'
     ),
-    /does not declare requested dataset/
+    /names the dataset "missing", which this Cellucid server does not hold/
   );
 });
 
@@ -520,7 +536,7 @@ function createManagerSource(type, {
   return source;
 }
 
-test('DataSourceManager publishes exact source identity and listener failure', async () => {
+test('DataSourceManager publishes exact source identity; a failing listener is reported, never the opening\'s failure', async () => {
   const manager = new DataSourceManager();
   manager.registerSource('alpha', createManagerSource('alpha'));
   const listenerFailure = new Error('dataset listener failed');
@@ -532,14 +548,15 @@ test('DataSourceManager publishes exact source identity and listener failure', a
     observed.push(event);
   });
 
-  await assert.rejects(
-    selectDataset(manager, 'alpha', 'dataset-a'),
-    error => (
-      error instanceof AggregateError &&
-      error.errors.length === 1 &&
-      error.errors[0] === listenerFailure
-    )
-  );
+  const reported = [];
+  const consoleError = console.error;
+  console.error = (message, error) => reported.push(error);
+  try {
+    await selectDataset(manager, 'alpha', 'dataset-a');
+  } finally {
+    console.error = consoleError;
+  }
+  assert.deepEqual(reported, [listenerFailure]);
   assert.equal(manager.getCurrentSourceType(), 'alpha');
   assert.equal(manager.getCurrentDatasetId(), 'dataset-a');
   assert.equal(observed.length, 1);
@@ -580,4 +597,36 @@ test('DataSourceManager cleanup failure retains the published new selection', as
   );
   assert.equal(manager.getCurrentSourceType(), 'beta');
   assert.equal(manager.getCurrentDatasetId(), 'dataset-b');
+});
+
+test('a link\'s "remote" is spelled as the address bar spells a server', async () => {
+  // R9E-3: `?remote=http://127.0.0.1:8765/` (a trailing slash, as people
+  // write a server) was refused as "not one canonical spelling".
+  const { canonicalServerAddress } = await import('../assets/js/app/ui/modules/address-routing.js');
+  const { validateRemoteServerUrl } = await import('../assets/js/data/remote-source.js');
+  for (const [given, canonical] of [
+    ['http://127.0.0.1:8765/', 'http://127.0.0.1:8765'],
+    ['HTTP://Lab-Server:8765//', 'http://lab-server:8765'],
+    ['https://data.example.org/cellucid/', 'https://data.example.org/cellucid'],
+    ['http://127.0.0.1:8765', 'http://127.0.0.1:8765'],
+  ]) {
+    assert.equal(canonicalServerAddress(given), canonical, given);
+    assert.equal(validateRemoteServerUrl(canonicalServerAddress(given)), canonical);
+  }
+  // Text that is no server address is left for the refusal to name.
+  assert.equal(canonicalServerAddress('not a url'), 'not a url');
+  assert.equal(canonicalServerAddress('http://h:1/?q=1'), 'http://h:1/?q=1');
+});
+
+test('a browser with WebGL2 that refuses the viewer a context is told about its graphics, not "Something went wrong"', async () => {
+  // R9E-6: `getContext('webgl2')` null for the viewer only (a reset graphics
+  // process, too many contexts) was said as the app failing to start.
+  const { contextRefusedError } = await import('../assets/js/rendering/gl-errors.js');
+  const refused = contextRefusedError('The viewer');
+  const graphics = describeStartupFailure(refused, { webgl2Available: true, hasLaunchSettings: true });
+  assert.equal(graphics.kind, 'graphics');
+  assert.equal(graphics.offerWithoutSettings, false);
+  assert.match(graphics.sentence, /would not give Cellucid a graphics context/);
+  // A browser with no WebGL2 at all is still told so.
+  assert.equal(describeStartupFailure(refused, { webgl2Available: false, hasLaunchSettings: false }).kind, 'browser');
 });

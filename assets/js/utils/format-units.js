@@ -1,7 +1,8 @@
 /**
- * @fileoverview The one way every user-facing size, duration and count is
- * written: notifications, the dataset card, read progress, opening progress,
- * jobs and conversion notes all format through these functions.
+ * @fileoverview The one way every user-facing size, duration, count and
+ * percent is written: notifications, the dataset card, read progress,
+ * opening progress, jobs and conversion notes all format through these
+ * functions.
  *
  * No unit rounds up into the next one's ceiling: 1023.6 KB is "1.0 MB", not
  * "1024 KB"; 999.6 ms is "1.0 s", not "1000 ms"; 59.96 s is "1 min 0 s",
@@ -172,19 +173,25 @@ export function formatDuration(ms) {
 
 /**
  * The time left, rounded up as an estimate: "<1 s", "~12 s", "~3 min 10 s".
+ * `compact`: in its largest unit, for the narrowest places ("~12 min",
+ * "~1.3 h"; under a minute as above).
  *
  * @param {number} ms
+ * @param {{compact?: boolean}} [options]
  * @returns {string}
  */
-export function formatRemaining(ms) {
+export function formatRemaining(ms, { compact = false } = {}) {
   if (ms < 1000) return '<1 s';
   if (ms < 60_000) return `~${Math.ceil(ms / 1000)} s`;
-  return `~${formatDuration(ms)}`;
+  if (!compact) return `~${formatDuration(ms)}`;
+  if (ms < 3_600_000) return `~${Math.round(ms / 60_000)} min`;
+  const hours = ms / 3_600_000;
+  return `~${hours < 10 ? Math.round(hours * 10) / 10 : Math.round(hours)} h`;
 }
 
 /**
  * A measured value as every place that shows one writes it — the legends'
- * colour bars, the filter list, figure provenance, exported figures' axes
+ * color bars, the filter list, figure provenance, exported figures' axes
  * and legends, cell info, analysis summaries: `figures` significant figures
  * (three by default), in fixed notation from 0.01 up to 10,000 (or up to the
  * power of ten the figures reach, when there are more than four), in
@@ -209,12 +216,83 @@ export function formatSignificant(value, figures = 3) {
   if (value === 0) return '0';
   const sign = value < 0 ? '-' : '';
   const abs = Math.abs(value);
-  // Correctly rounded and renormalised: 9999.6 is "1.00e+4".
+  // Correctly rounded and renormalized: 9999.6 is "1.00e+4".
   const [digits, exponent] = abs.toExponential(figures - 1).split('e');
   const power = Number(exponent);
   if (power >= -2 && power < Math.max(4, figures)) return sign + String(Number(abs.toPrecision(figures)));
   const mantissa = digits.includes('.') ? digits.replace(/0+$/, '').replace(/\.$/, '') : digits;
   return `${sign}${mantissa}e${power}`;
+}
+
+/**
+ * A percentage from a 0..100 value, the sign attached: `formatPercent(60)` →
+ * `"60%"`, `formatPercent(12.34, 1)` → `"12.3%"`; `{figures}` writes that
+ * many significant figures, trailing zeros dropped (`formatPercent(2.5,
+ * {figures: 6})` → `"2.5%"`: a share a person typed, written as typed).
+ * Every percent a person reads is written here or by `formatShare`, never
+ * as `${n}%` or `${n} %` (`tests/percent-format-contract.test.mjs`): the
+ * app wrote both "50%" and "50%" (round 9, R9U-3).
+ *
+ * @param {number} value
+ * @param {number|{figures: number}} [digits=0] - Decimal places, or significant figures
+ * @returns {string}
+ */
+export function formatPercent(value, digits = 0) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError('Percent must be a finite number');
+  if (typeof digits === 'object' && digits !== null) return `${formatSignificant(value, digits.figures)}%`;
+  if (!Number.isInteger(digits) || digits < 0 || digits > 6) throw new RangeError('Percent digits must be an integer from 0 to 6, or {figures}');
+  return `${value.toFixed(digits)}%`;
+}
+
+/**
+ * `part` of `whole` as a percent's number, as a share is written: whole at
+ * 10 and above, two significant figures below; never 100 short of the whole,
+ * never 0 above none (`shareText(3_769, 2_282_447)` → `"0.17"`,
+ * `shareText(2_282_446, 2_282_447)` → `"99"`). For a percent box's value;
+ * text a person reads takes `formatShare`.
+ *
+ * @param {number} part
+ * @param {number} whole
+ * @returns {string}
+ */
+export function shareText(part, whole) {
+  if (!(whole > 0) || part >= whole) return '100';
+  const percent = (100 * part) / whole;
+  if (percent <= 0) return '0';
+  if (percent >= 10) return String(Math.min(99, Math.round(percent)));
+  return String(Number(percent.toPrecision(2)));
+}
+
+/**
+ * `part` of `whole` as a percent: `formatShare(1, 4)` → `"25%"`,
+ * `formatShare(3_769, 2_282_447)` → `"0.17%"` (`shareText`'s figures).
+ *
+ * @param {number} part
+ * @param {number} whole
+ * @returns {string}
+ */
+export function formatShare(part, whole) {
+  return `${shareText(part, whole)}%`;
+}
+
+/** Below it a p-value is written as a bound: a double underflows there (and 0 is an underflow). */
+const SMALLEST_P_SHOWN = 1e-300;
+
+/**
+ * A p-value as every analysis, hover card, table and agent summary shows it:
+ * two significant figures (`0.032`, `4.1e-8`), "< 1e-300" where the double
+ * underflowed, "—" when there is none. Five rules wrote p-values before round 9
+ * (`toFixed(4)` with "< 0.0001", `toExponential(2|3)`, `toPrecision(2)`); one
+ * now (`tests/one-implementation-contract.test.mjs`). A CSV keeps the full
+ * number: it is data, not text.
+ *
+ * @param {number|null|undefined} p
+ * @returns {string}
+ */
+export function formatPValue(p) {
+  if (typeof p !== 'number' || !Number.isFinite(p)) return '—';
+  if (p < SMALLEST_P_SHOWN) return `< ${formatSignificant(SMALLEST_P_SHOWN)}`;
+  return formatSignificant(p, 2);
 }
 
 /**
@@ -250,19 +328,37 @@ export function tickFigures(largest, step) {
 }
 
 /**
- * A large count in compact form: "950", "12.3K", "4.0M", "1.2B".
+ * A compact count for tight readouts and badges: `"950"`, `"1.5K"`, `"15K"`,
+ * `"2.5M"`, `"4M"` (never `"4.0M"`), `"1.2B"`. One decimal is kept while it
+ * is significant; a value that rounds up names the next suffix (`"1M"`, never
+ * `"1000K"`). The app's one compact form (`tests/one-implementation-contract.test.mjs`).
  *
- * @param {number} n
+ * @param {number} value
  * @returns {string}
  */
-export function formatCompactNumber(n) {
-  if (!Number.isFinite(n)) {
-    throw new TypeError('number must be finite.');
+export function formatCompactCount(value) {
+  const number = requireFiniteNumber(value, 'Compact count');
+  const sign = number < 0 ? '-' : '';
+  const magnitude = Math.abs(number);
+  const scales = [[1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
+  for (let at = 0; at < scales.length; at++) {
+    const [scale, suffix] = scales[at];
+    if (magnitude >= scale) {
+      const scaled = magnitude / scale;
+      const text = scaled >= 100 ? Math.round(scaled).toString()
+        : scaled.toFixed(1).replace(/\.0$/, '');
+      // 999,960 rounds to "1000K": it is "1M".
+      if (text === '1000' && at > 0) return `${sign}1${scales[at - 1][1]}`;
+      return `${sign}${text}${suffix}`;
+    }
   }
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-  return String(n);
+  const whole = Math.round(magnitude);
+  return whole === 1000 ? `${sign}1K` : `${sign}${whole}`;
+}
+
+function requireFiniteNumber(value, label) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`${label} must be a finite number`);
+  return value;
 }
 
 /**

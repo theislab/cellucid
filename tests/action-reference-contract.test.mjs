@@ -1,7 +1,7 @@
 /**
  * The action reference page of the docs (`scripts/generate-action-reference.mjs`)
- * lists every action of the catalogue, and the page in the docs tree is what
- * the generator writes from this checkout's catalogue: an action added,
+ * lists every action of the catalog, and the page in the docs tree is what
+ * the generator writes from this checkout's catalog: an action added,
  * renamed or given another parameter fails here until the page is
  * regenerated. The page lives in the shared docs site (CELLUCID_PYTHON_DOCS,
  * else the sibling `cellucid-python/docs`); while it has not landed there the

@@ -60,6 +60,7 @@ import { pageVersion } from '../utils/page-version.js';
 import { myDatasets, readRecord } from './my-datasets.js';
 import { isPlainRecord } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { joinFailure, markDamaged, sayFailure } from '../../utils/errors.js';
 
 /** The file name's extension. */
 export const LIBRARY_FILE_EXTENSION = '.cellucid-library';
@@ -124,9 +125,12 @@ const HISTORY_KEYS = Object.freeze(['chunk', 'name', 'kind', 'dataset', 'created
 const CHUNK_KEYS = Object.freeze(['id', 'kind', 'codec', 'storedBytes']);
 const TRACKER_KEYS = Object.freeze(recordFields('Tracker'));
 
-/** A file that breaks the format: says what, for the person who chose it. */
+/**
+ * A file that breaks the format: its message says what (for Details); the
+ * person reads that the file is damaged (`utils/errors.js` `sayFailure`).
+ */
 function damaged(what, cause = undefined) {
-  return new TypeError(`This library file is damaged: ${what}`, cause === undefined ? undefined : { cause });
+  return markDamaged(new TypeError(`This library file is damaged: ${what}`, cause === undefined ? undefined : { cause }));
 }
 
 function isText(value) {
@@ -231,7 +235,7 @@ export async function exportLibrary({
       written = await savedStateAsSessionFile(state.id, { store, app, catalog });
     } catch (error) {
       const name = state.name ?? `the autosave of ${state.dataset.name ?? 'a dataset'}`;
-      throw new Error(`The saved state "${name}" could not be read: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      throw new Error(`${joinFailure(`the saved state "${name}" could not be read`, sayFailure(error))}`, { cause: error });
     }
     if (written.paused) paused++;
     const bytes = new Uint8Array(await written.blob.arrayBuffer());
@@ -347,7 +351,7 @@ export async function readLibraryFile(blob, { signal = null } = {}) {
     try {
       await readHistoryFile(sessions[index], { signal });
     } catch (error) {
-      throw damaged(`its history "${importedName(manifest.histories[index]).slice(0, -IMPORTED_SUFFIX.length)}" is not a session file this version reads: ${error instanceof Error ? error.message : String(error)}`, error);
+      throw damaged(`its history "${importedName(manifest.histories[index]).slice(0, -IMPORTED_SUFFIX.length)}" is not a session file this version reads.`, error);
     }
   }
   return { manifest, sessions };

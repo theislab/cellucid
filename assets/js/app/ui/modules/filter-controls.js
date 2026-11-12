@@ -23,7 +23,7 @@ import {
   createListItem,
   restoreListItemFocus
 } from '../components/controls.js';
-import { formatCount, formatCountOf, formatOpenCells } from '../../../utils/format-units.js';
+import { formatCount, formatOpenCells } from '../../../utils/format-units.js';
 import { createVisibilityGatedRender } from '../core/visibility-gate.js';
 import { dispatchFromControl } from '../../actions/control-dispatch.js';
 
@@ -112,12 +112,12 @@ export function initFilterControls({ state, viewer, dom, callbacks = {} }) {
     }
     const rows = filters.map((filter) => {
       const counts = state.getFilterCellCounts ? state.getFilterCellCounts(filter) : null;
-      const countText =
-        counts && Number.isFinite(counts.visible) && Number.isFinite(counts.available)
-          ? ` • ${formatCount(counts.visible)} / ${formatCountOf(counts.available, 'cell')}`
-          : '';
+      const counted = counts && Number.isFinite(counts.visible) && Number.isFinite(counts.available);
+      // The cells it keeps, as a number; of how many (those the other filters keep), on hover.
       const { root } = createListItem({
-        text: filter.text + countText,
+        text: filter.text,
+        count: counted ? formatCount(counts.visible) : null,
+        countTitle: counted ? `${formatCount(counts.visible)} of ${formatOpenCells(counts.available)} pass this filter` : null,
         enabled: filter.enabled,
         noun: 'filter'
       });

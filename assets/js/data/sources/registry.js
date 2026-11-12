@@ -204,7 +204,7 @@ export class ProviderRegistry {
         'link'
       );
     }
-    const text = input.trim();
+    const text = pastedLink(input, { isScheme: name => this._providers.has(name) });
     const scheme = /^([a-z][a-z0-9-]*):(?!\/\/)(.+)$/s.exec(text);
     if (scheme !== null && this._providers.has(scheme[1])) {
       const provider = this._providers.get(scheme[1]);
@@ -223,8 +223,12 @@ export class ProviderRegistry {
       const value = provider.match(text, { explicit: false });
       if (value !== null) return resolved(provider, value);
     }
+    const reason = notAWebAddress(text);
+    if (reason !== null) {
+      throw new DataSourceError(reason, DataSourceErrorCode.INVALID_FORMAT, 'link', { input: publicLink(text) });
+    }
     throw new DataSourceError(
-      `Cellucid does not recognise "${publicLink(text)}". Paste a web address (${openableNamesText({ layouts: ['file', 'zip'] })}, ` +
+      `Cellucid does not recognize "${publicLink(text)}". Paste a web address (${openableNamesText({ layouts: ['file', 'zip'] })}, ` +
       'a Zarr store folder, or a folder holding ' +
       'datasets.json ending in "/"), a GitHub repository (owner/repo/path), a Hugging Face dataset ' +
       '(hf:user/repo), a Zenodo record or DOI, a Figshare item or DOI, a Google Drive, OneDrive or ' +
@@ -234,6 +238,69 @@ export class ProviderRegistry {
       { input: publicLink(text) }
     );
   }
+}
+
+/** One pair of marks a link is often pasted between (Markdown, an e-mail, a chat). */
+const LINK_WRAPPERS = Object.freeze([['"', '"'], ["'", "'"], ['<', '>'], ['`', '`'], ['\u201c', '\u201d'], ['\u2018', '\u2019']]);
+
+/** A web address written without its scheme, as an address bar shows it (`zenodo.org/records/1`). */
+const ADDRESS_WITHOUT_SCHEME = /^(?:www\.)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}(?::[0-9]{1,5})?\//i;
+
+/**
+ * A server written without its scheme: this computer's (`127.0.0.1:8765/…`,
+ * `localhost/…`), or any host with its port (`lab-server:8080/…`), as
+ * `cellucid serve` and lab servers serve: over `http://`.
+ */
+const SERVER_ADDRESS_WITHOUT_SCHEME = /^(?:(?:localhost|127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]{1,5})?|([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?):[0-9]{1,5})(?:\/|$)/i;
+
+/**
+ * Pasted text as the link it means: trimmed, one pair of quotes, angle
+ * brackets or backticks around it taken off, and a web address written
+ * without its scheme read at `https://` (a server named with its port, or
+ * this computer's, at `http://`, as `cellucid serve` serves). A DOI
+ * (`10.5281/…`), GitHub's shorthand (`owner/repo`: an account never holds a
+ * dot) and a provider's own form (`zenodo:123/…`, `isScheme`) are not
+ * addresses.
+ *
+ * @param {string} input
+ * @param {{isScheme?: (name: string) => boolean}} [options]
+ * @returns {string}
+ */
+export function pastedLink(input, { isScheme = () => false } = {}) {
+  let text = String(input).trim();
+  for (const [open, close] of LINK_WRAPPERS) {
+    if (text.length > 2 && text.startsWith(open) && text.endsWith(close)) {
+      text = text.slice(open.length, -close.length).trim();
+      break;
+    }
+  }
+  const server = SERVER_ADDRESS_WITHOUT_SCHEME.exec(text);
+  if (server !== null && !(server[1] !== undefined && isScheme(server[1].toLowerCase()))) return `http://${text}`;
+  return ADDRESS_WITHOUT_SCHEME.test(text) ? `https://${text}` : text;
+}
+
+/**
+ * Why text that names no source is no web address, when it is a kind people
+ * paste: a file on a computer (a path, a `file:` address), which opens from
+ * Open… › File…; an address of a protocol a web page cannot read (`ftp://`,
+ * `sftp://`), whose host most often serves the same file at an `https://`
+ * address too. Null for anything else.
+ *
+ * @param {string} text
+ * @returns {string|null}
+ */
+function notAWebAddress(text) {
+  if (/^file:/i.test(text) || /^(?:\/|~\/|[a-z]:[\\/]|\\\\)/i.test(text)) {
+    return `"${publicLink(text)}" is a file on a computer, not a web address: open it with Open… › File… ` +
+      '(or drop it on the page).';
+  }
+  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(text);
+  if (scheme !== null && !['http', 'https', 's3', 'gs'].includes(scheme[1].toLowerCase())) {
+    return `A web page cannot read ${scheme[1].toLowerCase()}:// addresses, so "${publicLink(text)}" cannot be ` +
+      'opened. Paste the https:// address of the same file (most hosts serve one), or download it and open it ' +
+      'with Open… › File….';
+  }
+  return null;
 }
 
 function resolved(provider, value) {

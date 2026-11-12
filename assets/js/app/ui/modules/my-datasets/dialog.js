@@ -25,9 +25,11 @@
  */
 
 import { wireAppDialog } from '../../components/app-dialog.js';
-import { ICONS, createIconButton, renderFactList } from '../../components/controls.js';
+import { setControlAvailability } from '../../core/control-availability.js';
+import { ICONS, createButton, createIconButton, renderFactList } from '../../components/controls.js';
 import { formatAgo } from '../state/model.js';
 import { formatBytes, formatCountOf } from '../../../../utils/format-units.js';
+import { failureDetailsText, joinFailure, sayFailure } from '../../../../utils/errors.js';
 import {
   KIND_LABELS, datasetKind, describeEntryFacts, describeExport, describeExportChoice, describeImport, describeListStatus,
   describeRowMeta, describeSavedStateLine, keptOf, latestSavedState, matchesFilter, savedStatesOf,
@@ -74,6 +76,8 @@ export function createMyDatasetsDialog(dom, { onOpen, onForget, onExport, onImpo
   let alsoTicked = false;
   /** What the last action said, kept over the counts until the filter or the list changes. */
   let said = null;
+  /** The words of the failure `said` names, shown on hover (`say`). */
+  let saidDetails = '';
   /** id → {entry, state} of the rows drawn */
   let rows = new Map();
   /** The export's choice while it is open (dataset ids and saved state ids ticked), else null. */
@@ -84,13 +88,11 @@ export function createMyDatasetsDialog(dom, { onOpen, onForget, onExport, onImpo
   const exportSummary = dom.exportPanel.querySelector('[data-export-summary]');
   const exportConfirm = dom.exportPanel.querySelector('[data-export-action="confirm"]');
 
-  function button(text, action, label) {
-    const element = doc.createElement('button');
-    element.type = 'button';
-    element.className = 'btn btn-compact';
+  /** A row's action: quiet, as every action nested in a list's row (`createButton`). */
+  function button(text, action, label, variant = 'quiet') {
+    // The confirmation that forgets is the one filled button, asked for in the row.
+    const element = createButton({ label: text, variant, ariaLabel: label, className: variant === 'danger' ? 'btn-compact' : undefined });
     element.dataset.libraryAction = action;
-    element.textContent = text;
-    if (label) element.setAttribute('aria-label', label);
     return element;
   }
 
@@ -137,7 +139,7 @@ export function createMyDatasetsDialog(dom, { onOpen, onForget, onExport, onImpo
 
     const actions = doc.createElement('div');
     actions.className = 'library-row-actions';
-    const open = button('Open', 'open', current ? `${entry.name} is open now` : `Open ${entry.name}`);
+    const open = button('Open', 'open', current ? `${entry.name} is open now` : `Open ${entry.name}`, 'quiet-primary');
     open.disabled = current;
     if (way === 'choose') open.title = `Choose ${entry.name} again: this browser does not let a page reopen a file by itself.`;
     const resume = button('Continue', 'continue', state === null
@@ -180,8 +182,7 @@ export function createMyDatasetsDialog(dom, { onOpen, onForget, onExport, onImpo
     }
     const answers = doc.createElement('div');
     answers.className = 'library-row-confirm-actions';
-    const yes = button('Forget', 'forget-confirmed', `Forget ${entry.name}`);
-    yes.classList.add('btn-danger');
+    const yes = button('Forget', 'forget-confirmed', `Forget ${entry.name}`, 'danger');
     answers.append(yes, button('Keep', 'keep', `Keep ${entry.name}`));
     confirm.append(answers);
     const asking = confirming === entry.id;
@@ -202,7 +203,7 @@ export function createMyDatasetsDialog(dom, { onOpen, onForget, onExport, onImpo
     return row;
   }
 
-  function check(text, attributes, { checked, disabled = false, title = text }) {
+  function check(text, attributes, { checked, unavailable = null, title = text }) {
     const label = doc.createElement('label');
     label.className = 'checkbox-inline';
     label.title = title;
@@ -210,7 +211,7 @@ export function createMyDatasetsDialog(dom, { onOpen, onForget, onExport, onImpo
     input.type = 'checkbox';
     for (const [name, value] of Object.entries(attributes)) input.dataset[name] = value;
     input.checked = checked;
-    input.disabled = disabled;
+    setControlAvailability(input, unavailable);
     const span = doc.createElement('span');
     span.textContent = text;
     label.append(input, span);
@@ -222,7 +223,7 @@ export function createMyDatasetsDialog(dom, { onOpen, onForget, onExport, onImpo
     const line = describeSavedStateLine(state, view.now);
     return check(line, { exportState: state.id }, {
       checked: exporting.states.has(state.id),
-      disabled: state.openable === false,
+      unavailable: state.openable === false ? 'kept by another version of Cellucid, which this version cannot read' : null,
       title: state.openable === false ? `${line}: kept by another version of Cellucid, which this version cannot read` : line,
     });
   }
@@ -331,6 +332,8 @@ export function createMyDatasetsDialog(dom, { onOpen, onForget, onExport, onImpo
 
   function say(text, tone = 'muted') {
     dom.status.textContent = text;
+    // A failure's own words (a damaged file's offsets and keys) on hover, out of its sentence.
+    dom.status.title = tone === 'danger' ? saidDetails : '';
     dom.status.dataset.tone = tone;
     dom.status.hidden = text === '';
   }
@@ -449,7 +452,8 @@ export function createMyDatasetsDialog(dom, { onOpen, onForget, onExport, onImpo
       exporting = null;
     } catch (error) {
       console.error('[My datasets] Export failed:', error);
-      said = `The library file could not be written: ${error instanceof Error ? error.message : String(error)}`;
+      said = `${joinFailure(`The library file could not be written`, sayFailure(error))}`;
+      saidDetails = failureDetailsText(error);
       tone = 'danger';
     }
     busy = false;
@@ -482,7 +486,8 @@ export function createMyDatasetsDialog(dom, { onOpen, onForget, onExport, onImpo
       said = describeImport(report);
     } catch (error) {
       // A file that is not one this version imports is the person's choice, said in the status line.
-      said = `${file.name} was not imported: ${error instanceof Error ? error.message : String(error)}`;
+      said = `${joinFailure(`${file.name} was not imported`, sayFailure(error))}`;
+      saidDetails = failureDetailsText(error);
       tone = 'danger';
     }
     busy = false;

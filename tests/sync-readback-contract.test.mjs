@@ -1,7 +1,7 @@
 /**
  * `getError()` is a synchronous round trip to the GPU process that waits for
  * every queued command. Writes into storage WebGL has already accepted (a
- * filter tick's alpha rows, a recolour, a kept view's alpha, a draw order's
+ * filter tick's alpha rows, a recolor, a kept view's alpha, a draw order's
  * rows after its checked allocation) read nothing back: they fail
  * synchronously or not at all, and only fence on a lost context. Allocations
  * keep their check, and only OUT_OF_MEMORY is retried there.

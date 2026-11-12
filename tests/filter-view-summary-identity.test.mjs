@@ -73,7 +73,7 @@ test('a non-active category filter row counts against the current filters', () =
   };
   const owner = countOwner([cellType, score], [1, 1, 0, 0]);
   cellType._categoryCounts = owner.computeCategoryCountsForField(cellType);
-  // Colour by `score` and narrow it: cell_type is no longer active, so its
+  // Color by `score` and narrow it: cell_type is no longer active, so its
   // cached counts are never refreshed.
   owner.activeFieldIndex = 1;
   score._continuousFilter = { min: 0.5, max: 1 };

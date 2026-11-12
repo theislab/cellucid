@@ -26,6 +26,8 @@ import { clickLoadSession } from './helpers/session-buttons.mjs';
 
 const DATASET_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=history-share`;
 const CELL_TYPE = Object.freeze({ source: 'obs', key: 'cell_type' });
+/** What the steps color by: the dataset opens colored by cell_type (its first coloring), so score is a step. */
+const SCORE = Object.freeze({ source: 'obs', key: 'score' });
 const RESTORED = 'Session fully restored.';
 const REPLAYED = 'Session steps replayed.';
 
@@ -39,7 +41,7 @@ async function open(page) {
 /** A history worth sharing: two branches of the first tracker, a note, and a second tracker. */
 async function buildHistory(page) {
   await takeSteps(page, [
-    ['color.by', { field: CELL_TYPE }],
+    ['color.by', { field: SCORE }],
     ['filter.category.visibility', { field: CELL_TYPE, categories: ['gamma'], visible: false }],
   ]);
   await page.evaluate(async () => {
@@ -131,7 +133,7 @@ test('a file of the steps only opens as a replay: a tracker of its own, its step
   test.setTimeout(180_000);
   const errors = observeProductErrors(page);
   await open(page);
-  await takeSteps(page, [['color.by', { field: CELL_TYPE }], ['setting.set', { setting: 'point-size', value: 17 }]]);
+  await takeSteps(page, [['color.by', { field: SCORE }], ['setting.set', { setting: 'point-size', value: 17 }]]);
   const { bytes } = await share(page, { content: 'steps' });
   // Back to the opening, then the plan replayed: a tracker of its own, its steps applied again from the opening.
   await page.evaluate(async () => {
@@ -152,7 +154,7 @@ test('a file of the steps only opens as a replay: a tracker of its own, its step
   expect(after.trackers).toContain(own);
   expect(after.active).not.toBe(own);
   expect(after.start).toBe('replay');
-  // Each step that changes something here is applied again (colouring by what the opening already shows is not).
+  // Each step that changes something here is applied again (coloring by what the opening already shows is not).
   expect(after.steps).toBeGreaterThanOrEqual(2);
   expect(after.pointSize).toBe('17');
   expect(errors).toEqual([]);

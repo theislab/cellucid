@@ -22,7 +22,7 @@ import {
 } from '../../data/categorical-storage-contract.js';
 import { BaseRegistry } from './base-registry.js';
 import {
-  compareIntersectionMasks,
+  intersectionKey,
   intersectionMembership,
   orderedMembership
 } from '../utils/page-membership.js';
@@ -31,6 +31,54 @@ import {
   computeCentroidsForDimension
 } from './user-defined-fields/centroids.js';
 import { isCategoricalCodes } from '../../data/categorical-storage-contract.js';
+import { getCategoryColor } from '../../data/palettes.js';
+import { distinctColor } from '../../data/distinct-colors.js';
+import { isHexColor, rgb01OfHex } from '../../utils/hex-color.js';
+
+/**
+ * The colors a field made from highlight pages opens with (its own palette,
+ * `field.palette`, as a file's `uns['<key>_colors']`): each page's category
+ * in its page's color, one color for one page wherever it is shown; every
+ * other category (the overlap label, an intersection, the cells on no page),
+ * in order, the category palette's color of its place when that can be told
+ * apart from the pages' and the ones before it, else the next palette color
+ * that can (`distinct-colors.js`). A category's color depends only on the
+ * pages and the categories before it. Create categorical's preview draws the
+ * same colors (F124).
+ *
+ * @param {ReadonlyArray<string>} pageColors - Each page's `#rrggbb`, in the field's page order
+ * @param {number} categoryCount - The field's categories, the pages' first
+ * @returns {Array<[number, number, number]>} RGB channels from 0 to 1, a category each
+ */
+export function pageFieldPalette(pageColors, categoryCount) {
+  if (!Array.isArray(pageColors) || !Number.isSafeInteger(categoryCount) || categoryCount < pageColors.length) {
+    throw new TypeError('A page field palette takes each page\'s color and at least as many categories as pages.');
+  }
+  const palette = pageColors.map((color, index) => {
+    if (!isHexColor(color)) throw new TypeError(`Highlight page ${index + 1}'s color must be a #rrggbb color.`);
+    return rgb01OfHex(color);
+  });
+  for (let index = pageColors.length; index < categoryCount; index++) {
+    palette.push(distinctColor(palette, getCategoryColor(index)));
+  }
+  return palette;
+}
+
+/**
+ * One category's color in `pageFieldPalette`: the page's for a page's
+ * category, else the one the palette gives its place beside the pages and
+ * the categories before it.
+ *
+ * @param {ReadonlyArray<string>} pageColors
+ * @param {number} index - The category's place in the field
+ * @returns {[number, number, number]}
+ */
+export function pageFieldColor(pageColors, index) {
+  if (!Number.isSafeInteger(index) || index < 0) {
+    throw new TypeError('A page field color is of a category\'s place, a non-negative integer.');
+  }
+  return pageFieldPalette(pageColors, Math.max(index + 1, pageColors.length))[index];
+}
 
 function requireNonEmptyTrimmedString(value, context) {
   if (
@@ -382,7 +430,11 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
    * @param {string} options.uncoveredLabel
    * @param {string} options.overlapStrategy - 'first'|'last'|'overlap-label'|'intersections'
    * @param {string} options.overlapLabel
-   * @param {Record<string, string>} options.intersectionLabels - mask->label when overlapStrategy='intersections'
+   * @param {Record<string, string>} options.intersectionLabels - intersection key (`intersectionKey`) -> label when overlapStrategy='intersections'
+   * @param {{categories: string[], codes: ArrayLike<number>, missing: number}|null} options.rest - a
+   *   categorical field whose category the cells on no page keep (its labels, its code of each open
+   *   cell, its missing code); null: they take `uncoveredLabel` (bug hunt L25-3: relabelling the
+   *   cells of a page inside an existing annotation cost an agent 101 calls)
    * @param {object} state - DataState
    * @returns {{id: string, field: object, conflicts: number, uncoveredCount: number}}
    */
@@ -394,7 +446,8 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       uncoveredLabel,
       overlapStrategy,
       overlapLabel,
-      intersectionLabels
+      intersectionLabels,
+      rest = null
     } = options;
 
     if (
@@ -480,13 +533,55 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     });
 
     const pageLabels = pages.map(pageInfo => pageInfo.label);
-    const hasUncovered = uncoveredLabel.length > 0;
+    if (typeof state.getHighlightPageColor !== 'function') {
+      throw new TypeError('Creating a categorical requires each highlight page\'s color');
+    }
+    const pageColors = pages.map(pageInfo => state.getHighlightPageColor(pageInfo.pageId));
+    // Cells on no page take the uncovered label, a category only when such
+    // cells exist: one named for nobody is a legend row of 0 cells the builder
+    // never asked about (it hides the question when every cell is covered).
+    const labelsUncovered = uncoveredLabel.length > 0;
     const strategy = overlapStrategy;
+    if (rest !== null && rest.codes.length !== pointCount) {
+      throw new RangeError('The field whose categories the cells on no page keep must have one code per open cell');
+    }
+    /**
+     * With `rest`, each cell on no page keeps its category there: those
+     * categories are added after the pages' (one a page already names is
+     * that page's), and only a cell with none there takes the uncovered
+     * label. Returns each rest code's category (-1: none needed) and how many
+     * cells on no page are left for the uncovered label.
+     */
+    const keepRest = isUncovered => {
+      if (rest === null) return { restCategoryOf: null, unlabeled: null };
+      const used = new Uint8Array(rest.categories.length);
+      let unlabeled = 0;
+      for (let cellIdx = 0; cellIdx < pointCount; cellIdx++) {
+        if (!isUncovered(cellIdx)) continue;
+        const code = rest.codes[cellIdx];
+        if (code === rest.missing || code < 0 || code >= rest.categories.length) unlabeled++;
+        else used[code] = 1;
+      }
+      const restCategoryOf = new Int32Array(rest.categories.length).fill(-1);
+      for (let code = 0; code < rest.categories.length; code++) {
+        if (used[code] === 0) continue;
+        const label = rest.categories[code];
+        const at = categories.indexOf(label);
+        restCategoryOf[code] = at >= 0 ? at : categories.push(label) - 1;
+      }
+      return { restCategoryOf, unlabeled };
+    };
+    const codeOfUncovered = (restCategoryOf, cellIdx, unassigned) => {
+      if (restCategoryOf === null) return unassigned;
+      const code = rest.codes[cellIdx];
+      const at = code === rest.missing || code < 0 || code >= restCategoryOf.length ? -1 : restCategoryOf[code];
+      return at >= 0 ? at : unassigned;
+    };
 
     let categories = [...pageLabels];
     let overlapCategoryLabel = null;
     let overlapCategoryIndex = -1;
-    let intersectionLabelByMask = null;
+    let intersectionLabelByKey = null;
     let uncoveredCategoryLabel = null;
     let uncoveredCount = 0;
     let conflictCount = 0;
@@ -497,31 +592,37 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     // ---------------------------------------------------------------------
     if (strategy === OverlapStrategy.INTERSECTIONS) {
       const membership = intersectionMembership(membershipPages, pointCount);
-      const intersectionMasks = [...membership.intersectionCounts.keys()]
-        .sort(compareIntersectionMasks);
-      const expectedMaskKeys = intersectionMasks.map(mask => String(mask));
-      const expectedMaskKeySet = new Set(expectedMaskKeys);
-      const providedMaskKeys = Object.keys(intersectionLabels);
+      const expectedKeys = membership.intersections.map(row => row.key);
+      const expectedKeySet = new Set(expectedKeys);
+      const providedKeys = Object.keys(intersectionLabels);
       if (
-        providedMaskKeys.length !== expectedMaskKeys.length
-        || providedMaskKeys.some(maskKey => !expectedMaskKeySet.has(maskKey))
+        providedKeys.length !== expectedKeys.length
+        || providedKeys.some(key => !expectedKeySet.has(key))
       ) {
         throw new Error(
-          'Intersection labels must identify every current overlap mask exactly once'
+          'Intersection labels must name every combination of pages that holds cells exactly once'
         );
       }
 
-      intersectionLabelByMask = { ...intersectionLabels };
-      const intersectionIndexByMask = new Map();
-
-      for (const mask of intersectionMasks) {
-        intersectionIndexByMask.set(mask, categories.length);
-        categories.push(intersectionLabels[String(mask)]);
+      intersectionLabelByKey = { ...intersectionLabels };
+      // The category of each combination of pages: a single page's own,
+      // an intersection's, or the uncovered one (the empty combination).
+      const { combinations, combinationOf } = membership;
+      const categoryOfCombination = new Int32Array(combinations.length);
+      const intersectionIndexByKey = new Map();
+      for (const { key } of membership.intersections) {
+        intersectionIndexByKey.set(key, categories.length);
+        categories.push(intersectionLabels[key]);
       }
+      const { restCategoryOf, unlabeled } = keepRest(cellIdx => combinationOf[cellIdx] === 0);
+      const hasUncovered = labelsUncovered && (unlabeled ?? (pointCount - membership.coveredCount)) > 0;
 
+      // A kept category named as the uncovered label is that category (`rest`).
+      let uncoveredIndex = -1;
       if (hasUncovered) {
         uncoveredCategoryLabel = uncoveredLabel;
-        categories.push(uncoveredCategoryLabel);
+        uncoveredIndex = categories.indexOf(uncoveredCategoryLabel);
+        if (uncoveredIndex < 0) uncoveredIndex = categories.push(uncoveredCategoryLabel) - 1;
       }
 
       requireCategoryInventory(categories, 'Highlight-page categorical field');
@@ -530,20 +631,23 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
         categories.length,
         'Highlight-page categorical field'
       );
-      const uncoveredIndex = hasUncovered
-        ? (categories.length - 1)
+      categoryOfCombination[0] = hasUncovered
+        ? uncoveredIndex
         : storage.missingValue;
+      for (let id = 1; id < combinations.length; id++) {
+        const combination = combinations[id];
+        // A combination reached on the way to a larger one and holding no
+        // cell has no category; no cell reads it.
+        categoryOfCombination[id] = combination.length === 1
+          ? combination[0]
+          : (intersectionIndexByKey.get(intersectionKey(combination)) ?? -1);
+      }
       codes = new storage.TypedArrayClass(pointCount);
-      const { masks } = membership;
       for (let cellIdx = 0; cellIdx < pointCount; cellIdx++) {
-        const mask = masks[cellIdx];
-        if (mask === 0) {
-          codes[cellIdx] = uncoveredIndex;
-        } else if ((mask & (mask - 1)) === 0) {
-          codes[cellIdx] = 31 - Math.clz32(mask);
-        } else {
-          codes[cellIdx] = intersectionIndexByMask.get(mask);
-        }
+        const combination = combinationOf[cellIdx];
+        codes[cellIdx] = combination === 0
+          ? codeOfUncovered(restCategoryOf, cellIdx, categoryOfCombination[0])
+          : categoryOfCombination[combination];
       }
 
       conflictCount = membership.overlapCount;
@@ -566,9 +670,15 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
         );
       }
 
+      const membership = orderedMembership(membershipPages, pointCount);
+      const { restCategoryOf, unlabeled } = keepRest(cellIdx => membership.first[cellIdx] < 0);
+      const hasUncovered = labelsUncovered && (unlabeled ?? (pointCount - membership.coveredCount)) > 0;
+      // A kept category named as the uncovered label is that category (`rest`).
+      let uncoveredIndex = -1;
       if (hasUncovered) {
         uncoveredCategoryLabel = uncoveredLabel;
-        categories.push(uncoveredCategoryLabel);
+        uncoveredIndex = categories.indexOf(uncoveredCategoryLabel);
+        if (uncoveredIndex < 0) uncoveredIndex = categories.push(uncoveredCategoryLabel) - 1;
       }
 
       requireCategoryInventory(categories, 'Highlight-page categorical field');
@@ -578,17 +688,16 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
         'Highlight-page categorical field'
       );
       const unassigned = hasUncovered
-        ? (categories.length - 1)
+        ? uncoveredIndex
         : storage.missingValue;
       codes = new storage.TypedArrayClass(pointCount);
 
-      const membership = orderedMembership(membershipPages, pointCount);
       const owner = strategy === OverlapStrategy.LAST ? membership.last : membership.first;
       const { overlapping } = membership;
       for (let cellIdx = 0; cellIdx < pointCount; cellIdx++) {
         const page = owner[cellIdx];
         if (page < 0) {
-          codes[cellIdx] = unassigned;
+          codes[cellIdx] = codeOfUncovered(restCategoryOf, cellIdx, unassigned);
         } else if (strategy === OverlapStrategy.OVERLAP_LABEL && overlapping[cellIdx] === 1) {
           codes[cellIdx] = overlapCategoryIndex;
         } else {
@@ -607,6 +716,8 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       key,
       kind: FieldKind.CATEGORY,
       categories: [...categories],
+      // Each page's category in its page's color (`pageFieldPalette`).
+      palette: pageFieldPalette(pageColors, categories.length),
       codes,
       centroidsByLayout,
       loaded: true,
@@ -622,7 +733,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
       _sourcePages: pages.map((p) => ({ pageId: p.pageId, label: p.label })),
       _overlapStrategy: strategy,
       _overlapLabel: overlapCategoryLabel,
-      _intersectionLabels: intersectionLabelByMask,
+      _intersectionLabels: intersectionLabelByKey,
       _uncoveredLabel: uncoveredCategoryLabel,
       _createdAt: Date.now()
     };
@@ -731,6 +842,7 @@ export class UserDefinedFieldsRegistry extends BaseRegistry {
     field._normalizedLayouts = new Set();
     field._sourcePages = [];
     field._intersectionLabels = null;
+    if (field.kind === FieldKind.CATEGORY) field.palette = null;
     return true;
   }
 

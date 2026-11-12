@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import { expect, test } from './helpers/test.mjs';
 import { appUrl, ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
+import { tabKey } from './helpers/dialog-keys.mjs';
 
 const catalogPath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -12,59 +13,72 @@ const catalogPath = path.join(
   'datasets.json',
 );
 
-test('invalid explicit remote intent stops on one visible startup failure', async ({
+test('a link Cellucid cannot read leaves it running and says what is wrong with the link', async ({
+  page
+}) => {
+  // R9E-1: each of these stopped Cellucid on "Cellucid could not start —
+  // Something went wrong while starting", Try again first.
+  const pageErrors = [];
+  page.on('pageerror', error => pageErrors.push(error.stack || error.message));
+  const catalog = `sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`;
+  for (const [search, said] of [
+    [`${catalog}&remote=`, 'This link\'s "remote" has no value.'],
+    [`${catalog}&dataset=a&dataset=b`, 'This link names "dataset" 2 times; a link names it once.'],
+    [`${catalog}&dataset=%20a`, 'This link\'s "dataset" has spaces around its value (" a"); remove them.'],
+    [`${catalog}&anndata=1`, 'This link\'s "anndata" is "1"; it can only be "true".'],
+    [`${catalog}&source=foo`, 'This link\'s "source" is "foo"; a link\'s source is "local-demo" (a sample dataset) or "remote" (a Cellucid server).'],
+    [`${catalog}&remote=http%3A%2F%2F127.0.0.1%3A1&data=x`, 'This link names both a Cellucid server ("remote") and data ("data"); a link opens one of them.'],
+    [`${catalog}&viewer=1`, /^This link is the address of a viewer that Python or R opened/],
+  ]) {
+    await page.goto(`/?${search}`, { waitUntil: 'domcontentloaded' });
+    const failed = page.locator('.opening-overlay[data-state="failed"]');
+    await expect(failed, search).toBeVisible();
+    await expect(page.locator('#cellucid-startup-failure')).toHaveCount(0);
+    await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
+    await expect(failed.locator('.opening-step'), search).toHaveText(said);
+    // Opening the same link again meets the same refusal: the way on leads.
+    await expect(failed.locator('.opening-actions button')).toHaveText(['Open without this link', 'Try again']);
+    await expect(page.locator('#welcome-modal[open]')).toHaveCount(0);
+    await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
+  }
+  // Open without this link drops every parameter the link named its data
+  // with, and keeps the page's own (the sample catalog).
+  await page.locator('.opening-overlay').getByRole('button', { name: 'Open without this link' }).click();
+  expect([...new URL(page.url()).searchParams.keys()]).toEqual(['sampleCatalog']);
+  expect(pageErrors).toEqual([]);
+});
+
+test('the startup failure screen holds the keyboard and folds the technical message under Details', async ({
   page
 }, testInfo) => {
-  const pageErrors = [];
-  const failedResponses = [];
-  page.on('pageerror', error => {
-    pageErrors.push(error.stack || error.message);
+  // A browser older than Cellucid needs: the one screen the app cannot run past.
+  await page.addInitScript(() => {
+    AbortSignal.any = undefined;
   });
-  page.on('response', response => {
-    if (response.status() >= 400) {
-      failedResponses.push(`${response.status()}: ${response.url()}`);
-    }
-  });
-
-  await page.goto('/?remote=', { waitUntil: 'domcontentloaded' });
+  await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`, { waitUntil: 'domcontentloaded' });
   const failure = page.locator('#cellucid-startup-failure');
   await expect(failure).toBeVisible();
   await expect(failure).toHaveAttribute('role', 'alert');
-  await expect(failure).toContainText('Cellucid could not start');
-  await expect(failure).toContainText(
-    'Startup URL parameter "remote" must be one non-empty exact value.'
-  );
+  await expect(failure).toHaveAttribute('data-failure', 'browser');
   await expect(failure).toHaveCount(1);
-  // What happened and what to do in plain words; the technical message is
-  // folded under Details, never in the sentence.
-  await expect(failure.locator('.welcome-title')).toHaveText('Cellucid could not start');
-  await expect(failure.locator('.welcome-intro')).not.toContainText('remote');
+  await expect(failure.locator('.welcome-title')).toHaveText('This browser cannot run Cellucid');
+  await expect(failure.locator('.welcome-intro')).not.toContainText('AbortSignal');
   // The application behind it is out of reach: Tab stays on the screen.
   // WebKit, like Safari, moves to links and buttons with Option+Tab (plain
   // Tab reaches them only with "Press Tab to highlight each item" on).
-  await page.keyboard.press(testInfo.project.name === 'webkit' ? 'Alt+Tab' : 'Tab');
+  await page.keyboard.press(tabKey(testInfo.project.name));
   await expect(failure.getByRole('link', { name: 'Try again' })).toBeFocused();
   const details = failure.locator('details.welcome-details');
   await expect(details).not.toHaveAttribute('open', /.*/);
   await expect(details.locator('.welcome-details-text')).toBeHidden();
   await details.locator('summary').click();
-  await expect(details.locator('.welcome-details-text')).toHaveText(
-    'Startup URL parameter "remote" must be one non-empty exact value.'
-  );
-  await expect(failure.getByRole('link', { name: 'Try again' })).toHaveAttribute('href', '/?remote=');
-  await expect(
-    failure.getByRole('link', { name: 'Open Cellucid without this link' })
-  ).toHaveAttribute('href', '/');
-  await expect(page.locator('#dataset-cells')).not.toHaveText('120');
+  await expect(details.locator('.welcome-details-text')).toContainText('This browser lacks AbortSignal.any');
   await page.screenshot({
     path: testInfo.outputPath(
       `startup-failure-${testInfo.project.name}.png`
     ),
     fullPage: true
   });
-
-  expect(pageErrors).toEqual([]);
-  expect(failedResponses).toEqual([]);
 });
 
 test('a data link that does not open leaves Cellucid running and offers the ways on', async ({
@@ -92,13 +106,27 @@ test('a data link that does not open leaves Cellucid running and offers the ways
   await expect(failed.locator('.opening-actions button')).toHaveText(['Open without this link', 'Try again']);
   await expect(failed.getByRole('button', { name: 'Open without this link' })).toBeFocused();
 
-  // Open without this link: the overlay goes, the address loses the link's
+  // Open without this link: the failure goes, the address loses the link's
   // parameters and nothing else, and the app is there to use.
   await failed.getByRole('button', { name: 'Open without this link' }).click();
-  await expect(page.locator('.opening-overlay')).toBeHidden();
+  await expect(page.locator('.opening-overlay[data-state="failed"]')).toHaveCount(0);
   expect([...new URL(page.url()).searchParams.keys()]).toEqual(['sampleCatalog']);
   await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
   await expect(page.locator('#user-data-open-btn')).toBeEnabled();
+  // The empty viewer says what it waits for and where (R9E-10), and its
+  // button shows that place.
+  const empty = page.locator('.opening-overlay[data-state="empty"]');
+  await expect(empty).toBeVisible();
+  await expect(empty.locator('.opening-title')).toHaveText('No dataset open');
+  await expect(empty.locator('.opening-step')).toHaveText(
+    'Choose a sample, open a file or folder, or paste a link in Session › Open data; a file can also be dropped here.'
+  );
+  await empty.getByRole('button', { name: 'Show Open data' }).click();
+  await expect(page.locator('#dataset-select')).toBeFocused();
+  // A dataset chosen there takes the panel away.
+  await page.locator('#dataset-select').selectOption({ index: 1 });
+  await expect(page.locator('#dataset-name')).not.toHaveText('No dataset open');
+  await expect(page.locator('.opening-overlay')).toBeHidden();
 });
 
 test('a browser without WebGL2 is told so, and no link setting is offered', async ({

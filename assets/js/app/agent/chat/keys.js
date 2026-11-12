@@ -15,6 +15,8 @@
  * @module app/agent/chat/keys
  */
 
+import { webStorage } from '../../../utils/web-storage.js';
+
 const PREFIX = 'cellucid:agent-key:';
 
 /** The storage key of one provider's API key. */
@@ -22,13 +24,6 @@ export function keyStorageName(providerId) {
   return `${PREFIX}${providerId}`;
 }
 
-function storageOf(name, win) {
-  try {
-    return win?.[name] ?? null;
-  } catch {
-    return null;
-  }
-}
 
 function read(storage, name) {
   try {
@@ -53,8 +48,8 @@ function write(storage, name, value) {
  */
 export function createKeyStore({ win = globalThis.window ?? null } = {}) {
   const memory = new Map();
-  const tab = () => storageOf('sessionStorage', win);
-  const browser = () => storageOf('localStorage', win);
+  const tab = () => webStorage('sessionStorage', win);
+  const browser = () => webStorage('localStorage', win);
 
   return Object.freeze({
     /**

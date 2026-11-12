@@ -137,6 +137,8 @@ function createViewport({
     visibleWidth,
     visibleHeight: height,
     vpAspect: width / height,
+    // The pane's own field of view (`presented-view-layout.js`), passed to every ray it casts.
+    fov: Math.PI / 4,
     projectionCenterNdcX,
     projectionMatrix,
     effectiveViewMatrix: identityMatrix(),
@@ -353,6 +355,8 @@ test('unlocked grid proximity owns the clicked pane plane and scale for the full
   assert.notEqual(rayCalls[0][5], clickedViewMatrix);
   assert.deepEqual([...rayCalls[0][5]], [...clickedViewMatrix]);
   assert.equal(rayCalls[0][6], -0.2);
+  // The clicked pane's own field of view, as the pane is drawn (a grid's portrait panes see wider).
+  assert.equal(rayCalls[0][7], Math.PI / 4);
 
   // Mutating the producer's object cannot alter the captured interaction.
   sourceViewport.projectionMatrix[12] = 0.8;
@@ -767,7 +771,7 @@ function armLasso(owner, path) {
 test('a lasso that encloses no cells still publishes its step', t => {
   installBrowserPixelRatio(t);
   const owner = createGestureRenderer({ pickCell: -1 });
-  // The one cell projects to the canvas centre; this polygon is nowhere near it.
+  // The one cell projects to the canvas center; this polygon is nowhere near it.
   armLasso(owner, [
     { x: 5, y: 5 },
     { x: 15, y: 5 },

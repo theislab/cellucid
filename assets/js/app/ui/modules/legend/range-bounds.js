@@ -5,7 +5,7 @@
  *
  * A typed bound is applied exactly as typed (`parseBound`: a decimal point
  * or comma, in the data range). A slider moves in `SLIDER_STEPS` steps, in
- * value units on a linear colour scale and in log units on a log one (zeros
+ * value units on a linear color scale and in log units on a log one (zeros
  * and negatives at its first step), and the bound it sets is the shortest
  * decimal that tells its step from the next (`createRangeScale`), so what the
  * box shows is what is applied, and a bound like "≥ 1,500 counts" can be set
@@ -36,7 +36,7 @@ function snap(value, step) {
  * How a range slider's positions map onto a field's values.
  *
  * @param {{min: number, max: number, positiveMin?: number|null, log?: boolean}} range -
- *   The data's minimum and maximum; with `log` (the colour scale is
+ *   The data's minimum and maximum; with `log` (the color scale is
  *   logarithmic) and a smallest positive value below the maximum, positions
  *   after the first are log-spaced from it to the maximum
  * @returns {{log: boolean, valueAt: (position: number) => number, positionOf: (value: number, side?: 'min'|'max') => number}}

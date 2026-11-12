@@ -1,5 +1,5 @@
 /**
- * @fileoverview Each category's colour and whether it is shown, for a
+ * @fileoverview Each category's color and whether it is shown, for a
  * categorical field, as typed arrays that are never changed in place.
  *
  * - `field._categoryColors`: a `Uint8Array` of `3 × K` bytes, category `i`'s
@@ -13,21 +13,21 @@
  * `carriedCategoryState`). So a kept view shares its source's arrays until
  * either view changes one (copy on write: a new view costs nothing per
  * category), and an array is checked once (`checkCategoryState`), not on
- * every colouring, filter pass or legend draw. A field of 1M categories
+ * every coloring, filter pass or legend draw. A field of 1M categories
  * (clone or lineage ids, a text column of one label per cell) holds 4 MB,
  * shared by every view, where an RGB array per category and an object keyed
  * by index held ~90 MB per view and took ~50 ms to check on every action.
  *
- * Colours enter and leave as `[r, g, b]` channels from 0 to 1 (the colour
+ * Colors enter and leave as `[r, g, b]` channels from 0 to 1 (the color
  * picker's, a palette's, a session's): `categoryRgbAt` gives a category's as
- * its bytes over 255, the same numbers a hex colour gives.
+ * its bytes over 255, the same numbers a hex color gives.
  *
  * @module utils/category-state
  */
 
 import { defaultCategoryColor } from '../../data/palettes.js';
 
-/** Arrays checked to be a field's colours or visibility, by the count they were checked for. */
+/** Arrays checked to be a field's colors or visibility, by the count they were checked for. */
 const CHECKED = new WeakMap();
 /** How many categories each visibility array hides (counted once per array). */
 const HIDDEN = new WeakMap();
@@ -43,7 +43,7 @@ const CHECKED_LABELS = new WeakSet();
 
 /**
  * Whether a category list was checked (`markLabelsChecked`): a list is
- * checked once, not on every colouring of a field of a million categories.
+ * checked once, not on every coloring of a field of a million categories.
  *
  * @param {ReadonlyArray<unknown>} categories
  */
@@ -56,7 +56,7 @@ export function markLabelsChecked(categories) {
   CHECKED_LABELS.add(categories);
 }
 
-/** One colour channel from 0 to 1 as the byte it is drawn in. */
+/** One color channel from 0 to 1 as the byte it is drawn in. */
 function channelByte(value, label) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
     throw new TypeError(`${label} must be an RGB triplet of channels from 0 through 1.`);
@@ -80,7 +80,7 @@ function checked(array, count) {
 }
 
 /**
- * The colours a field's categories open with (`defaultCategoryColor`: its
+ * The colors a field's categories open with (`defaultCategoryColor`: its
  * file's palette, else Cellucid's sequence).
  *
  * @param {{categories: ReadonlyArray<unknown>, palette?: ReadonlyArray<ReadonlyArray<number>>|null}} field
@@ -99,9 +99,9 @@ function allCategoriesVisible(count) {
 }
 
 /**
- * Check a field's colours and visibility (each array once: an array is
+ * Check a field's colors and visibility (each array once: an array is
  * never written after it is made), making either it lacks: its default
- * colours, every category shown.
+ * colors, every category shown.
  *
  * @param {Object} field - A categorical field with its categories
  */
@@ -129,7 +129,7 @@ export function checkCategoryState(field) {
 }
 
 /**
- * Category `index`'s colour as `[r, g, b]`, channels from 0 to 1.
+ * Category `index`'s color as `[r, g, b]`, channels from 0 to 1.
  *
  * @param {Uint8Array} colors - A field's `_categoryColors`
  * @param {number} index
@@ -140,7 +140,7 @@ export function categoryRgbAt(colors, index) {
 }
 
 /**
- * Category `index`'s colour as CSS, `rgb(r,g,b)` of its bytes: what a
+ * Category `index`'s color as CSS, `rgb(r,g,b)` of its bytes: what a
  * swatch, a figure's legend or a chart draws it in.
  *
  * @param {Uint8Array} colors - A field's `_categoryColors`
@@ -163,10 +163,10 @@ export function categoryShownAt(visible, index) {
 }
 
 /**
- * The colour `field`'s category `index` is drawn in, as CSS: its own once
- * the field holds colours, else the one it opens with
+ * The color `field`'s category `index` is drawn in, as CSS: its own once
+ * the field holds colors, else the one it opens with
  * (`defaultCategoryColor`); read without making the field's state (an
- * analysis reads a field no view has coloured).
+ * analysis reads a field no view has colored).
  *
  * @param {{categories: ReadonlyArray<unknown>, _categoryColors?: Uint8Array, palette?: ReadonlyArray<ReadonlyArray<number>>|null}} field
  * @param {number} index
@@ -207,8 +207,8 @@ export function hiddenCategoryBytes(visible) {
 }
 
 /**
- * Give category `index` of `field` the colour `rgb` (channels from 0 to 1):
- * a new colour array, so a view sharing the old one keeps its own.
+ * Give category `index` of `field` the color `rgb` (channels from 0 to 1):
+ * a new color array, so a view sharing the old one keeps its own.
  */
 export function withCategoryColor(field, index, rgb) {
   checkCategoryState(field);
@@ -248,7 +248,7 @@ export function withCategoriesVisible(field, visible, only = null) {
 }
 
 /**
- * Several categories' visibility and colours changed at once (a restored
+ * Several categories' visibility and colors changed at once (a restored
  * session's, labels held until their cells opened): each array copied once,
  * whatever the number of changes.
  *
@@ -278,15 +278,15 @@ export function withCategoryChanges(field, { visibility = [], colors = [] }) {
 }
 
 /**
- * One view's colours and visibility carried to another category list:
+ * One view's colors and visibility carried to another category list:
  * category `index` of the new list takes old category `from(index)`'s
- * colour and visibility; where that is -1 it opens in `opening(index)`'s
- * colour (`[r, g, b]`, channels from 0 to 1), shown.
+ * color and visibility; where that is -1 it opens in `opening(index)`'s
+ * color (`[r, g, b]`, channels from 0 to 1), shown.
  *
  * @param {{colors: Uint8Array, visible: Uint8Array}} state - By old index
  * @param {number} count - The new list's categories
  * @param {(index: number) => number} from
- * @param {(index: number) => ArrayLike<number>} opening - The colour a new category opens with
+ * @param {(index: number) => ArrayLike<number>} opening - The color a new category opens with
  * @returns {{colors: Uint8Array, visible: Uint8Array}} By new index, checked
  */
 export function carriedCategoryState({ colors, visible }, count, from, opening) {

@@ -341,6 +341,9 @@ export function makeSerializer(state, { chrome = null } = {}) {
       }));
     },
   });
+  // Settings as the app holds them (every control listed): a starting view
+  // leaves the viewer background as shown (`published-default.js` `keepShownControls`).
+  domains.provide('settings', { capture: () => ({ controls: {}, figureExport: null }), restore: () => {} });
   for (const id of domains.missing()) domains.provide(id, { capture: () => null, restore: () => {} });
   // The history's own actions (journal undo among them), which the history provides itself.
   const dispatcher = createActionDispatcher({ catalog: createActionCatalog(historyActions) });

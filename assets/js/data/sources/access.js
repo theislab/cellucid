@@ -39,14 +39,24 @@
  * never in a resource, a session, a URL, the Transfers log, the console or an
  * error.
  *
+ * An access lives as long as the source that reads its file, which lets it
+ * go (`releaseSourceAccessesOf`): a provider registers it only once the file
+ * is described (a refusal registers none); the reading source
+ * (`AnnDataFileSource`) releases it when the source is replaced or closed, or
+ * its opening is not adopted; whoever took an opening releases it when the
+ * opening fails before a reader took it (the link source, a catalog entry).
+ * Nothing else keeps a registration, so a day of opening linked files keeps
+ * only the ones open.
+ *
  * @module data/sources/access
  */
 
-import { createOpaqueId } from '../../app/utils/opaque-id.js';
+import { createOpaqueId } from '../../utils/opaque-id.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
 /** @type {Map<string, {provider: string, target: Function, confirm: Function|null, checking: Promise<boolean>|null, version: Function|null}>} */
 const registrations = new Map();
-const revokeListeners = new Set();
+const revokeListeners = createListenerSet('a source access revoked');
 
 /**
  * Register one file's access; the descriptor goes into its resource.
@@ -154,6 +164,40 @@ export function confirmSourceVersion(ref) {
 }
 
 /**
+ * Let one file's access go: its target and the provider closure it holds
+ * (the item, the token getter). A read still asking for it after this is told
+ * to open the file again (`resolveSourceAccess`); letting go twice is nothing.
+ *
+ * @param {{ref: string}} descriptor - What `registerSourceAccess` returned
+ */
+export function releaseSourceAccess(descriptor) {
+  if (typeof descriptor?.ref !== 'string') throw new TypeError('A source access is released by its descriptor.');
+  registrations.delete(descriptor.ref);
+}
+
+/**
+ * Let go of every access a reader's source names: its remote file
+ * (`{file}`) and the files of a remote file set (`{files}`); a source of
+ * files on this computer or a store names none.
+ *
+ * @param {{file?: Object|null, files?: Map<string, Object>}|null} source
+ */
+export function releaseSourceAccessesOf(source) {
+  for (const file of sourceFiles(source)) {
+    if (file?.access != null) releaseSourceAccess(file.access);
+  }
+}
+
+/** The files of a reader's source that may name an access. */
+function sourceFiles(source) {
+  if (source === null || typeof source !== 'object') return [];
+  return [
+    ...(source.file == null ? [] : [source.file]),
+    ...(source.files instanceof Map ? source.files.values() : []),
+  ];
+}
+
+/**
  * Drop every target a reader holds for `provider` (a sign-out): the next
  * read asks the page again.
  *
@@ -162,7 +206,7 @@ export function confirmSourceVersion(ref) {
 export function revokeSourceAccess(provider) {
   for (const [ref, registration] of registrations) {
     if (registration.provider !== provider) continue;
-    for (const listener of revokeListeners) listener(ref);
+    revokeListeners.notify(ref);
   }
 }
 
@@ -173,6 +217,5 @@ export function revokeSourceAccess(provider) {
  * @returns {() => void}
  */
 export function onSourceAccessRevoked(listener) {
-  revokeListeners.add(listener);
-  return () => revokeListeners.delete(listener);
+  return revokeListeners.add(listener);
 }

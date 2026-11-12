@@ -19,17 +19,19 @@
  * - The open dataset read again with other cells (Apply, Open all, a
  *   session's exact cells, a progressive opening's steps) is given its
  *   request by its caller (`AnnDataFileSource.reopenCells`), never through
- *   this module: a reading cancelled, or the earlier cells read back after
+ *   this module: a reading canceled, or the earlier cells read back after
  *   one, never takes or overwrites the request of another.
  *
  * @module data/cell-subset-policy
  */
 
+import { createListenerSet } from '../utils/listener-set.js';
+
 const DEFAULT_REQUEST = Object.freeze({ mode: 'auto' });
 
 let tabRequest = DEFAULT_REQUEST;
 let nextRequest = null;
-const listeners = new Set();
+const listeners = createListenerSet('the tab\'s cell subset request');
 
 /**
  * A cell subset request, checked and frozen.
@@ -69,6 +71,38 @@ export function geneSampleRequestOf(sample) {
   if (sample.fit?.limit === 'stream') return null;
   const fit = sample.fit ?? null;
   return fit === null ? sample.cells : { cells: sample.cells, fit };
+}
+
+/**
+ * The cells an opening was asked for, whatever step of it is open now: null
+ * for every cell, else the subsample's specification at the share it grows
+ * to, with how it was chosen (`autoFit`: fitted to the device;
+ * `reproduced: false`: a restored set its specification no longer gives).
+ * A progressive opening shows steps on its way (`anndata/progressive-open.js`):
+ * one grown from few chunks names its share's size (`chunks.target`), any
+ * other the request it ends with (`growth.final`). The one reading for every
+ * place that names the open cells (the session's `cells` domain, the page
+ * address, the Share link, Copy link): read from a step, a session saved
+ * while Suo grew reopened its first 131,072 cells, and its link named them
+ * (bug hunt F60, F64).
+ *
+ * @param {Object|null} subset - `AnnDataFileSource.getCellSubset()`
+ * @returns {{spec: Object, autoFit: Object|null, reproduced: boolean|null}|null}
+ */
+export function askedCellsOf(subset) {
+  if (subset === null || subset === undefined) return null;
+  const final = subset.growth?.final ?? null;
+  if (final !== null) {
+    if (final.mode === 'all' || final.kept == null || final.spec == null) return null;
+    return { spec: final.spec, autoFit: final.autoFit ?? null, reproduced: final.reproduced ?? null };
+  }
+  const target = subset.chunks?.target ?? null;
+  if (target !== null) {
+    if (target >= subset.nObs || subset.spec == null) return null;
+    return { spec: { ...subset.spec, k: target }, autoFit: subset.autoFit ?? null, reproduced: subset.reproduced ?? null };
+  }
+  if (subset.kept === null || subset.spec == null) return null;
+  return { spec: subset.spec, autoFit: subset.autoFit ?? null, reproduced: subset.reproduced ?? null };
 }
 
 /**
@@ -116,13 +150,12 @@ export function setTabCellSubsetRequest(request) {
   const checked = requireCellSubsetRequest(request);
   if (checked.mode === 'kept') throw new TypeError('A tab opens datasets by fraction, never by a recorded cell set.');
   tabRequest = checked;
-  for (const listener of listeners) listener(tabRequest);
+  listeners.notify(tabRequest);
 }
 
 /** Be told when the tab's request changes; returns the unsubscribe. */
 export function onTabCellSubsetRequest(listener) {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
+  return listeners.add(listener);
 }
 
 /**
@@ -141,7 +174,7 @@ export function setNextCellSubsetRequest(request) {
  * Take back the next opening's request `held` (what
  * `setNextCellSubsetRequest` returned) when no opening has taken it: an
  * opening that ended before it reached its reader (a link that did not
- * resolve, a reopen cancelled) leaves no request behind for whatever opens
+ * resolve, a reopen canceled) leaves no request behind for whatever opens
  * next. A request set since stays.
  *
  * @param {Readonly<Object>} held

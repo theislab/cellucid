@@ -2,7 +2,7 @@
 
 ``tests/fixtures/subsample/*.h5ad``: one small AnnData (300 cells; a
 categorical obs field with an unused category and missing codes, a float
-column, a 2-D embedding with NaN rows, a neighbour graph with self-loops, a
+column, a 2-D embedding with NaN rows, a neighbor graph with self-loops, a
 CSR layer) written in every HDF5 layout the reader treats differently:
 
 - ``X`` as CSR, CSC or dense;

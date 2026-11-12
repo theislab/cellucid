@@ -143,8 +143,8 @@ export function assertDrawOrder(drawOrder, { pointCount, label = 'Figure export 
  *
  * With `colors` layering the cells (`alpha-visibility.js`), the layers come
  * bottom first, each in that order, as the pane draws them a pass a layer:
- * the cells not read (`UNREAD_ALPHA_BYTE`), the grey beneath
- * (`BENEATH_ALPHA_BYTE`), the coloured cells. When the pane drew the cells
+ * the cells not read (`UNREAD_ALPHA_BYTE`), the gray beneath
+ * (`BENEATH_ALPHA_BYTE`), the colored cells. When the pane drew the cells
  * read at every level (`readEveryLevel`, `rendering/read-cell-layer.js`),
  * the read layers hold every read cell of the full draw order, not only the
  * level's.
@@ -195,8 +195,8 @@ export function drawnSequence(lodMembership, drawOrder, colors = null, readEvery
 
 /**
  * How a figure draws the layers of its cells (`rendering/read-cell-layer.js`)
- * when any cell lies below the top layer: the colour the grey of the cells
- * with no value is drawn in and the colour the cells not read are drawn in
+ * when any cell lies below the top layer: the color the gray of the cells
+ * with no value is drawn in and the color the cells not read are drawn in
  * (both from the figure's own background, `zeroCellColor`,
  * `unreadCellColor`, channels 0..1), and, while some cells are not read, the
  * read cells' size over the others' (`readScale`, the pane's) and whether the
@@ -234,8 +234,8 @@ export function requireFigurePointLayers(layers, label) {
 
 /**
  * A panel's point layers as its figure draws them (`FigurePointLayers`), or
- * null when every cell of `colors` is on the top layer: the colours of the
- * grey beneath and of the cells not read made from the figure's own
+ * null when every cell of `colors` is on the top layer: the colors of the
+ * gray beneath and of the cells not read made from the figure's own
  * background, and, while some cells are not read, the pane's read-cell size
  * and levels (`scientificState.pointLayers`).
  *

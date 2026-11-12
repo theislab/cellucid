@@ -22,7 +22,10 @@ import {
   compositionCounts,
   presentCompositionUnits
 } from '../assets/js/app/analysis/compute/composition-counts.js';
-import { testComposition } from '../assets/js/app/analysis/stats/composition-tests.js';
+import {
+  MIN_PAIRS_WITH_CELLS, TOO_FEW_PAIRS, testComposition, transformedProportions, wilcoxonSignedRank
+} from '../assets/js/app/analysis/stats/composition-tests.js';
+import { benjaminiHochbergAdjusted, pairedTTest } from '../assets/js/app/analysis/stats/statistical-tests.js';
 import { chiSquaredIndependence, fisherExact2x2 } from '../assets/js/app/analysis/stats/categorical-tests.js';
 
 const FIXTURE = new URL('./fixtures/analysis/scanpy-reference.json', import.meta.url);
@@ -217,6 +220,93 @@ test('a type with no cells is not tested and leaves every other type as without 
       }
     }
   }
+});
+
+test('paired, a type whose cells are all in units outside the pairs is not tested (L11-7)', () => {
+  // Live (Suo, liver vs spleen, 7 donors with both): one Langerhans cell in a spleen-only
+  // donor; in the pairs its logit pseudo-proportions were the units' sizes alone, every
+  // liver unit larger than its spleen, so the paired t said adjusted p 0.04.
+  // Units: 4 donors × (liver, spleen), liver 10× the spleen, then one spleen-only donor.
+  const unitCount = 9;
+  const unitSample = Int32Array.of(0, 0, 1, 1, 2, 2, 3, 3, 4);
+  const conditionOfUnit = Int32Array.of(0, 1, 0, 1, 0, 1, 0, 1, 1);
+  const common = [
+    [400, 40, 380, 42, 410, 37, 390, 45, 30],
+    [600, 50, 610, 61, 590, 55, 620, 52, 20],
+  ];
+  const rare = [0, 0, 0, 0, 0, 0, 0, 0, 1];
+  const input = { unitCount, conditionOfUnit, conditionCount: 2, samples: true, unitSample, paired: true, correction: 'bh' };
+  for (const method of ['logit', 'clr', 'rank']) {
+    const out = testComposition({ ...input, method, counts: Uint32Array.from([...rare, ...common.flat()]), typeCount: 3 });
+    const without = testComposition({ ...input, method, counts: Uint32Array.from(common.flat()), typeCount: 2 });
+    assert.equal(out.pairs, 4);
+    assert.equal(out.typeTest[0], 'no cells', `${method}: no cell of it in the pairs`);
+    for (const lane of ['statistic', 'pValue', 'adjustedP']) {
+      assert.ok(Number.isNaN(out[lane][0]), `${method}: its ${lane} is NaN`);
+      assert.deepEqual([...out[lane].subarray(1)], [...without[lane]], `${method}: ${lane} of the others as without it`);
+    }
+    // Its mean proportions are over the pairs, as the test reads them (L25-12): none there. Where its
+    // cell is, the table's per-sample proportions say (the spleen-only donor's column).
+    assert.deepEqual([out.meanProportion[0], out.meanProportion[1]], [0, 0]);
+  }
+});
+
+test('paired, a type is tested over the pairs holding its cells, and not below 3 of them (F109)', () => {
+  // Live (Suo, liver vs spleen, seven donors with both): myelocytes, cells in one donor's
+  // spleen only, came out adjusted p 0.03. In each pair without one on either side the two
+  // logit pseudo-proportions are the units' sizes alone, every liver unit larger than its
+  // spleen, so the differences agree in sign and a paired t calls a change of a type that
+  // is not there. Units: seven donors × (liver, spleen), liver ten times the spleen.
+  const pairCount = 7;
+  const unitCount = 2 * pairCount;
+  const unitSample = Int32Array.from({ length: unitCount }, (_, unit) => unit >> 1);
+  const conditionOfUnit = Int32Array.from({ length: unitCount }, (_, unit) => unit & 1);
+  const perPair = (liver, spleen) => Array.from({ length: pairCount }, (_, pair) => [liver[pair], spleen[pair]]).flat();
+  const common = [
+    perPair([400, 380, 410, 390, 405, 395, 385], [40, 42, 37, 45, 41, 39, 44]),
+    perPair([600, 610, 590, 620, 595, 605, 615], [50, 61, 55, 52, 58, 49, 57]),
+  ];
+  // Cells in two pairs (spleen of donors 0 and 1): not tested.
+  const twoPairs = perPair([0, 0, 0, 0, 0, 0, 0], [3, 2, 0, 0, 0, 0, 0]);
+  // Cells in four pairs: tested over those four only.
+  const fourPairs = perPair([1, 0, 2, 0, 0, 3, 0], [4, 0, 5, 0, 0, 2, 6]);
+  const counts = Uint32Array.from([...twoPairs, ...fourPairs, ...common.flat()]);
+  const typeCount = 4;
+  const input = { counts, typeCount, unitCount, conditionOfUnit, conditionCount: 2, samples: true, unitSample, paired: true, correction: 'bh' };
+  const totals = new Float64Array(unitCount);
+  for (let type = 0; type < typeCount; type++) for (let unit = 0; unit < unitCount; unit++) totals[unit] += counts[type * unitCount + unit];
+  assert.equal(MIN_PAIRS_WITH_CELLS, 3);
+  for (const method of ['logit', 'clr', 'rank']) {
+    const out = testComposition({ ...input, method });
+    assert.equal(out.pairs, pairCount);
+    assert.deepEqual([...out.pairsTested], [2, 4, 7, 7], `${method}: the pairs holding each type's cells`);
+    assert.equal(out.typeTest[0], TOO_FEW_PAIRS, `${method}: cells in two pairs`);
+    for (const lane of ['statistic', 'pValue', 'adjustedP']) assert.ok(Number.isNaN(out[lane][0]), `${method}: its ${lane} is NaN`);
+    // Still a type with cells: its mean proportion shows where they are.
+    assert.ok(out.meanProportion[1] > 0);
+    // The four-pair type's test is the paired test of exactly those four pairs' values
+    // (the transformed proportions themselves are unchanged: it has cells, so it counts
+    // in the CLR center and the pseudo-proportions' K).
+    const values = transformedProportions(method, counts, typeCount, unitCount, totals, Uint8Array.of(1, 1, 1, 1));
+    const withCells = [0, 2, 5, 6];
+    const a = withCells.map(pair => values[1 * unitCount + 2 * pair]);
+    const b = withCells.map(pair => values[1 * unitCount + 2 * pair + 1]);
+    const expected = method === 'rank' ? wilcoxonSignedRank(a, b) : pairedTTest(a, b);
+    assert.equal(out.statistic[1], expected.statistic, `${method}: statistic over its four pairs`);
+    assert.equal(out.pValue[1], expected.pValue, `${method}: p over its four pairs`);
+    // The family is the three tested types: the two-pair type is out of the correction.
+    const tested = [...out.pValue].filter(Number.isFinite);
+    assert.equal(tested.length, 3, `${method}: three types tested`);
+    assert.deepEqual([...out.adjustedP.subarray(1)], [...benjaminiHochbergAdjusted(tested).adjustedPValues], `${method}: a family of three`);
+  }
+  // Without the rule the two-pair type was "significant" on the logit scale: its seven
+  // differences are the units' size ratios, all one sign.
+  const logit = transformedProportions('logit', counts, typeCount, unitCount, totals, Uint8Array.of(1, 1, 1, 1));
+  const all = pairedTTest(
+    Array.from({ length: pairCount }, (_, pair) => logit[2 * pair]),
+    Array.from({ length: pairCount }, (_, pair) => logit[2 * pair + 1])
+  );
+  assert.ok(all.pValue < 0.05, `the artefact the rule removes (p ${all.pValue})`);
 });
 
 test('one categorical kernel: the Detailed view and Composition give one answer for one table (NS-5)', async () => {

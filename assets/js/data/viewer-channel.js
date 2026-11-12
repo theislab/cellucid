@@ -1,7 +1,10 @@
 /**
  * The viewer's end of the viewer channel: one WebSocket to the host program
- * (a notebook's `cellucid` Python package, the `cellucid` R package's viewer)
- * that served this page. `data/viewer-protocol.js` holds the rules.
+ * (the `cellucid` Python package -- a notebook, a script, `cellucid serve`,
+ * `cellucid mcp --open` -- or the `cellucid` R package's viewer) that served
+ * this page. `data/viewer-protocol.js` holds the rules. Every sentence the
+ * channel says names that program as its `runtime` does
+ * (`viewerHostWords`).
  *
  * - `open()` connects, says `hello` with the viewer's id and token, and
  *   resolves on the host's `welcome`.
@@ -35,6 +38,8 @@ import {
   VIEWER_WELCOME_FIELDS,
   decodeViewerBinaryCommand,
   encodeViewerBinaryFrame,
+  viewerHostSentenceName,
+  viewerHostWords,
 } from './viewer-protocol.js';
 import { isPlainRecord } from '../utils/exact-record.js';
 
@@ -46,6 +51,41 @@ import { isPlainRecord } from '../utils/exact-record.js';
  *
  * @typedef {{kind: 'stopped'|'replaced'|'unreachable'|'protocol'|'closed', message: string}} ViewerChannelEnd
  */
+
+/**
+ * What a viewer its host stopped says (the host's `freeze`, or its channel
+ * closed as stopped): one sentence wherever it is said, naming the host as
+ * `runtime` (a key of `VIEWER_HOST_RUNTIMES`, or null) does.
+ *
+ * @param {string|null} runtime
+ */
+export function viewerStoppedMessage(runtime) {
+  return `${viewerHostSentenceName(runtime)} stopped this viewer. The last complete view stays as it is.`;
+}
+
+/**
+ * Every sentence a channel that ended says, by why it ended, naming the host
+ * as `runtime` does (`detail`: what the sentence quotes, a reason or an
+ * address).
+ *
+ * @param {string|null} runtime
+ */
+export function viewerChannelMessages(runtime) {
+  const { name, reopen } = viewerHostWords(runtime);
+  const Name = viewerHostSentenceName(runtime);
+  return Object.freeze({
+    stopped: viewerStoppedMessage(runtime),
+    unreadable: detail => `${Name} sent something this viewer cannot read (${detail}); reload the page.`,
+    replaced: `This viewer was opened again in another page; that page now talks to ${name}, and this one no longer does.`,
+    closed: detail => `${Name} closed this viewer's channel: ${detail}.`,
+    forgotten: `${Name} no longer knows this viewer (it was stopped). ${reopen}`,
+    unreachable: detail => `${Name} is running, but this viewer cannot open its channel (${detail}). `
+      + 'Something between this page and the host does not pass WebSockets: a reverse proxy or firewall '
+      + 'in front of the host. (A notebook widget needs none: its channel runs over the kernel.)',
+    gone: `${Name}, which opened this viewer, stopped (its server no longer answers). `
+      + `The last complete view stays as it is. ${reopen}`,
+  });
+}
 
 /**
  * The WebSocket address of the channel of the server at `serverUrl`: the same
@@ -92,11 +132,14 @@ export class ViewerChannel {
    *   onEnd: (end: ViewerChannelEnd) => void,
    *   onReopen?: () => void,
    *   isHostAlive: () => Promise<boolean>,
+   *   runtime: string|null,
    *   WebSocketImpl?: typeof WebSocket,
-   * }} options
+   * }} options - `runtime`: what opened the viewer, as its
+   *   `/_cellucid/info` names it, which every sentence the channel says names
    */
   constructor(options) {
     this._url = viewerChannelUrl(options.serverUrl, options.channelPath);
+    this._messages = viewerChannelMessages(options.runtime);
     this._hello = JSON.stringify({
       type: 'hello',
       viewerId: options.viewerId,
@@ -222,7 +265,7 @@ export class ViewerChannel {
         }
       }
     } catch (error) {
-      this._end('protocol', `The notebook or R session sent something this viewer cannot read (${error.message}); reload the page.`, VIEWER_CLOSE_CODES.protocolViolation);
+      this._end('protocol', this._messages.unreadable(error.message), VIEWER_CLOSE_CODES.protocolViolation);
       return;
     }
     this._onCommand(command);
@@ -231,15 +274,15 @@ export class ViewerChannel {
   async _closed(code, reason) {
     if (this.state === 'ended') return;
     if (code === VIEWER_CLOSE_CODES.replaced) {
-      this._end('replaced', 'This viewer was opened again in another page; that page now talks to the notebook or R session, and this one no longer does.');
+      this._end('replaced', this._messages.replaced);
       return;
     }
     if (code === VIEWER_CLOSE_CODES.goingAway || code === VIEWER_CLOSE_CODES.unauthorized) {
-      this._end('stopped', 'The notebook or R session stopped this viewer. The last complete view stays as it is.');
+      this._end('stopped', this._messages.stopped);
       return;
     }
     if (code === VIEWER_CLOSE_CODES.protocolViolation) {
-      this._end('protocol', `The notebook or R session closed this viewer's channel: ${reason || 'a frame broke the protocol'}.`);
+      this._end('protocol', this._messages.closed(reason || 'a frame broke the protocol'));
       return;
     }
     // A drop: reopen once, at once.
@@ -273,11 +316,11 @@ export class ViewerChannel {
     if (error instanceof ChannelClosedBeforeWelcome && error.code === VIEWER_CLOSE_CODES.unauthorized) {
       kind = 'stopped';
       message = reconnecting
-        ? 'The notebook or R session stopped this viewer. The last complete view stays as it is.'
-        : 'The notebook or R session no longer knows this viewer (it was stopped). Run the cell that shows it again.';
+        ? this._messages.stopped
+        : this._messages.forgotten;
     } else if (error instanceof ChannelClosedBeforeWelcome && error.opened) {
       kind = 'protocol';
-      message = `The notebook or R session closed this viewer's channel: ${error.reason || `code ${error.code}`}.`;
+      message = this._messages.closed(error.reason || `code ${error.code}`);
     } else {
       let alive = false;
       try {
@@ -287,14 +330,10 @@ export class ViewerChannel {
       }
       if (alive) {
         kind = 'unreachable';
-        message =
-          `The notebook or R session is running, but this viewer cannot open its channel (${this._url}). ` +
-          'Something between this page and the host does not pass WebSockets: a reverse proxy or firewall ' +
-          'in front of the host. (A notebook widget needs none: its channel runs over the kernel.)';
+        message = this._messages.unreachable(this._url);
       } else {
         kind = 'stopped';
-        message = 'The notebook or R session that opened this viewer stopped (its server no longer answers). ' +
-          'The last complete view stays as it is.';
+        message = this._messages.gone;
       }
     }
     const explained = new Error(message, { cause: error });

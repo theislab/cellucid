@@ -1,6 +1,6 @@
 // Coordinates must be finite before anything normalizes them.
 //
-// `normalizePositions()` derives one centre and one scale from a whole
+// `normalizePositions()` derives one center and one scale from a whole
 // embedding buffer, so a non-finite coordinate is never contained to the cell
 // that carries it:
 //
@@ -24,7 +24,7 @@ import { normalizePositions } from '../assets/js/rendering/gl-utils.js';
 
 test('the collapse this guard prevents is real, not hypothetical', () => {
   // Executed against the real normalizePositions so the invariant is anchored
-  // to observed behaviour rather than to a claim about it.
+  // to observed behavior rather than to a claim about it.
   const oneNaN = new Float32Array([0, 0, 0, Number.NaN, 1, 1, 2, 2, 2]);
   normalizePositions(oneNaN);
   assert.equal(Number.isNaN(oneNaN[3]), true, 'the NaN cell vanishes');

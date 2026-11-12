@@ -8,7 +8,7 @@
  * Playwright's Linux WebKit through 1.62 (r2336), which had no
  * `navigator.storage` at all.
  * A spec asks the page which it is (`workersKeepFiles`), never the engine's
- * name, and holds the app to the behaviour of that case.
+ * name, and holds the app to the behavior of that case.
  */
 
 /**

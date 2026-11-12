@@ -23,10 +23,11 @@ async function waitFor(predicate, label) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 
-function pageData(pageId, values = [1, 2, 3]) {
+function pageData(pageId, values = [1, 2, 3], variableInfo = { name: 'v', kind: 'continuous' }) {
   return {
     pageId,
     pageName: `Page ${pageId}`,
+    variableInfo,
     values: Float32Array.from(values),
     cellIndices: Uint32Array.from(values, (_value, index) => index),
     cellCount: values.length,
@@ -94,10 +95,12 @@ test('a cancelled signature job stops its gene reads and the run publishes nothi
     },
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     getPageCells(pageIds) {
       return pageIds.map(pageId => ({ pageId, pageName: pageId, cellIndices: Uint32Array.of(0, 1, 2) }));
     },
-    performCacheCleanup() {},
   };
   analysis._computeManager = null;
 
@@ -129,7 +132,7 @@ test('correlation snapshots variable records and page IDs before its first await
         const values = request.variableKey === 'color'
           ? ['A', 'B', 'A']
           : [1, 2, 3];
-        return [pageData(request.pageIds[0], values)];
+        return [pageData(request.pageIds[0], values, { name: request.variableKey, kind: 'continuous' })];
       });
     },
   };
@@ -172,6 +175,8 @@ test('correlation snapshots variable records and page IDs before its first await
   assert.equal(result.pageId, 'page-original');
   assert.equal(result.xVariable, 'x');
   assert.equal(result.yVariable, 'y');
+  assert.equal(result.xLabel, 'x');
+  assert.equal(result.yLabel, 'y');
   assert.equal(result.colorVariable, 'color');
 });
 
@@ -188,11 +193,13 @@ test('signature snapshots genes and page IDs before its first await', async () =
     },
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     getPageCells(pageIds) {
       received.pageIds = pageIds;
       return pageIds.map(pageId => ({ pageId, pageName: pageId, cellIndices: Uint32Array.of(0, 1, 2) }));
     },
-    performCacheCleanup() {},
   };
   analysis._computeManager = null;
 
@@ -233,6 +240,9 @@ function createDEMembershipProbe(indicesByPage) {
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     state: { pointCount: 6 },
     getAvailableVariables() {

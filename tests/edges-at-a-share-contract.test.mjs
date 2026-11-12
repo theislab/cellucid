@@ -1,5 +1,5 @@
 /**
- * Edges at a share: a subsample's neighbour-graph edges never cost more than
+ * Edges at a share: a subsample's neighbor-graph edges never cost more than
  * every cell's, and are exactly the induced subgraph's.
  *
  * - A share's induced subgraph is read in the stored graph's order, by the
@@ -34,7 +34,7 @@ const random = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2
 
 /**
  * A symmetric k-NN-like graph of `n` cells as CSR: each cell joined to
- * neighbours near it in the file and, for some, to one far away (so a block
+ * neighbors near it in the file and, for some, to one far away (so a block
  * of cells reaches outside itself); float32 weights.
  */
 function knnGraph(n) {
@@ -123,7 +123,7 @@ test('a share\'s edges are its induced subgraph\'s, bit for bit, by either read 
     await root.load?.(['obsp/connectivities/*']);
     for (const plan of ['rows', 'stream']) {
       const lines = await inducedGraphLines(root.get('obsp/connectivities'), rows, { mergeGapBytes: () => 0, choose: () => plan });
-      // Lines in stored order: relabelled onto the open cells unless they were opened in it.
+      // Lines in stored order: relabeled onto the open cells unless they were opened in it.
       assert.equal(lines.relabel === null, order.every((row, i) => i === 0 || row > order[i - 1]), `${label} ${plan}: relabelled exactly when out of stored order`);
       sameEdges(await connectivityEdgesFromLines(lines, order.length), expected, `${label} by ${plan}`);
     }

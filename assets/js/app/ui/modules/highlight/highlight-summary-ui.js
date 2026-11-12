@@ -233,13 +233,12 @@ export function initHighlightSummaryUI(options) {
     const focused = captureListItemFocus(highlightedGroupsEl, 'highlightId');
     const rows = groups.map((group) => {
       const { root } = createListItem({
-        text: `${group.label} (${formatCount(group.cellCount)})`,
+        text: group.label,
+        count: formatCount(group.cellCount),
         enabled: group.enabled,
         noun: 'highlight'
       });
       root.dataset.highlightId = group.id;
-      // The text's tooltip is the group's own label, without the count.
-      root.children[1].title = group.label;
       return root;
     });
     highlightedGroupsEl.replaceChildren(...rows);

@@ -7,7 +7,7 @@
  * datasets require an explicit enabled-selector choice.
  */
 
-import { formatCompactCount } from '../components/display-format.js';
+import { setControlAvailability } from '../core/control-availability.js';
 import {
   PASSING_HOST_FAULTS,
   describeHostFault,
@@ -22,10 +22,11 @@ import {
   cellucidFileOfName, filePickerAccept, folderFormatOfPaths, folderMarkersOf, inputFormat, openableNamesText,
 } from '../../../data/input-formats.js';
 import { importLibraryFile } from './my-datasets/index.js';
+import { openSessionFile } from './session-controls.js';
 import { routeAddress } from './address-routing.js';
 import { initOpenDataMenu } from './open-data-menu.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { beginOpening } from '../../../data/opening-progress.js';
+import { beginOpening, getOpeningProgress } from '../../../data/opening-progress.js';
 import { DATA_LOAD_METHODS } from '../../data-load-methods.js';
 import { analytics } from '../../optional-analytics.js';
 import { debug } from '../../../utils/debug.js';
@@ -41,8 +42,12 @@ import {
   tabLocalDataset
 } from '../../library/local-file-handles.js';
 import { isPlainRecord } from '../../../utils/exact-record.js';
-import { formatCountOf, countNoun } from '../../../utils/format-units.js';
-import { isCancellation, cancelled, onAbort } from '../../../utils/abort.js';
+import { failureDetailsText } from '../../../utils/errors.js';
+import { formatCountOf, countNoun, formatCompactCount } from '../../../utils/format-units.js';
+import { isHostSideStatus } from '../../../formats/io/byte-source.js';
+import { awaitWithSignal, isCancellation, cancelled, onAbort } from '../../../utils/abort.js';
+import { noteSeenAddress } from './seen-addresses.js';
+import { lowerFirst } from '../../../utils/text-case.js';
 
 const CONNECTION_OPTION_KEYS = Object.freeze([
   'clearDataset',
@@ -198,34 +203,48 @@ function requireDatasetInventory(value, sourceType) {
  */
 const DATA_SOURCE_FAILURES = Object.freeze({
   'not-found': Object.freeze({
+    // Asking again meets the same answer.
+    settled: true,
     cause:
       'nothing is published at that address (the server answered "not '
       + 'found").',
     action: 'Check the address for a typo, then try again.'
   }),
   refused: Object.freeze({
+    // Asking again meets the same answer.
+    settled: true,
     cause: 'the server refused access.',
     action: 'Check that the data is shared publicly, then try again.'
   }),
   rejected: Object.freeze({
+    // Asking again meets the same answer.
+    settled: true,
     cause: 'the server rejected the request.',
     action: 'Check the address, then try again.'
   }),
   server: Object.freeze({
+    // It may pass: asking again can succeed.
+    settled: false,
     cause: 'the host is not answering: a problem on its side, not with the address or with Cellucid.',
     action: 'It usually passes; try again later.'
   }),
   'too-large': Object.freeze({
+    // Asking again meets the same answer.
+    settled: true,
     cause: 'what is published there is larger than Cellucid opens in a browser.',
     action:
       'Serve it with the Cellucid server, or publish a smaller file, then '
       + 'try again.'
   }),
   unreadable: Object.freeze({
+    // Asking again meets the same answer.
+    settled: true,
     cause: 'what is published there is not in a format Cellucid can read.',
     action: 'Write it again with anndata (or cellucid.prepare), then try again.'
   }),
   unreachable: Object.freeze({
+    // It may pass: asking again can succeed.
+    settled: false,
     cause:
       'nothing readable came back — the connection may have failed, or that ' +
       'address may not hold Cellucid data.',
@@ -236,7 +255,10 @@ const DATA_SOURCE_FAILURES = Object.freeze({
 /**
  * What to say when the loader published no cause at all. Naming one anyway
  * would be an invention: an error with no code and no status is as likely to be
- * a broken invariant inside Cellucid as anything on the network.
+ * a broken invariant inside Cellucid as anything on the network. A refusal
+ * that asking again cannot change is never left here: it carries its cause
+ * (a code, or a sentence of its own: `explainedFailure`), as a subsample this
+ * dataset cannot be read with does (`subsample-plan.js` `subsampleRefused`).
  */
 const UNCLASSIFIED_DATA_SOURCE_ACTION =
   'Try again; if it keeps failing, check the address and your connection.';
@@ -281,7 +303,7 @@ export function classifyDataSourceFailure(error) {
   if (status === 401 || status === 403) return 'refused';
   // A host that timed the request out or turns this network away for now
   // (408, 429) fails on its side, as a 5xx does: asking again may succeed.
-  if (status >= 500 || status === 408 || status === 429) return 'server';
+  if (isHostSideStatus(status)) return 'server';
   if (status >= 400) return 'rejected';
   return 'unreachable';
 }
@@ -304,28 +326,43 @@ export function describeDataSourceFailure(subject, verb, error) {
   if (typeof verb !== 'string' || verb.length === 0) {
     throw new TypeError('Data source failure verb must be a non-empty string.');
   }
+  return `${subject} ${verb}${failureReason(error)}`;
+}
+
+/** What follows the subject and verb: `: why. What to do.`, or `. What to do.` */
+function failureReason(error) {
+  // One dataset of a listing that could not be listed (`anndata-catalog.js`):
+  // named by its id, with its own cause said as any other (found 2026-11-10:
+  // the samples' notice quoted the store's URL).
+  const unlisted = error?.details?.unlisted;
+  if (typeof unlisted === 'string' && error.details.cause !== undefined) {
+    return `: “${unlisted}” could not be listed${failureReason(error.details.cause)}`;
+  }
   // A failure written for the person (a link naming several files, a file
   // with nothing to plot) already says what is wrong and what to do.
-  if (isExplainedFailure(error)) {
-    return `${subject} could not be opened: ${explainedMessage(error)}`;
-  }
+  if (isExplainedFailure(error)) return `: ${explainedMessage(error)}`;
   // A host's answer says whose problem it is (`describeHostFault`).
   const fault = describeHostFault(error);
-  if (fault !== null) return `${subject} ${verb}: ${fault.sentence}`;
+  if (fault !== null) return `: ${fault.sentence}`;
   const failure = classifyDataSourceFailure(error);
-  if (failure === null) {
-    return `${subject} ${verb}. ${UNCLASSIFIED_DATA_SOURCE_ACTION}`;
-  }
+  if (failure === null) return `. ${UNCLASSIFIED_DATA_SOURCE_ACTION}`;
   const { cause, action } = DATA_SOURCE_FAILURES[failure];
-  return `${subject} ${verb}: ${cause} ${action}`;
+  return `: ${cause} ${action}`;
 }
 
 /**
- * Causes that asking again cannot change: the same request meets the same
- * answer (an address with nothing there, a refusal, a file Cellucid does not
- * read). The others (no answer, a server's own problem) may pass.
+ * Whether asking again cannot change a failure's cause (`DATA_SOURCE_FAILURES`
+ * `settled`: an address with nothing there, a refusal, a file Cellucid does
+ * not read, a request this dataset cannot do) or it may pass (no answer, a
+ * server's own problem). One classification says both the wording and this.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
  */
-const SETTLED_FAILURES = new Set(['not-found', 'refused', 'rejected', 'too-large', 'unreadable']);
+export function isSettledDataSourceFailure(error) {
+  const failure = classifyDataSourceFailure(error);
+  return failure !== null && DATA_SOURCE_FAILURES[failure].settled;
+}
 
 /**
  * What a failed opening over the empty viewer says (the startup opening of
@@ -340,7 +377,7 @@ const SETTLED_FAILURES = new Set(['not-found', 'refused', 'rejected', 'too-large
  * - Anything else is the opening's sentence and the ways on.
  *
  * Either is settled (trying again meets it again) when its cause is one
- * asking again cannot change (`SETTLED_FAILURES`).
+ * asking again cannot change (`isSettledDataSourceFailure`).
  *
  * @param {string} sentence - What failed, as one sentence ending in "."
  *   ("Cellucid could not read the data this link points to.")
@@ -357,13 +394,13 @@ export function describeOpeningFailure(sentence, error, { withoutLink }) {
   if (isExplainedFailure(error)) {
     // Settled when its cause is ("Google has limited downloads of this file
     // for now" is not: no answer may pass).
-    return { summary: explainedMessage(error), settled: SETTLED_FAILURES.has(failure) };
+    return { summary: explainedMessage(error), settled: isSettledDataSourceFailure(error) };
   }
   const fault = describeHostFault(error);
   if (fault !== null) return { summary: fault.sentence, settled: !PASSING_HOST_FAULTS.has(fault.kind) };
   if (failure !== null) {
     const { cause, action } = DATA_SOURCE_FAILURES[failure];
-    return { summary: `${sentence.slice(0, -1)}: ${cause} ${action}`, settled: SETTLED_FAILURES.has(failure) };
+    return { summary: `${sentence.slice(0, -1)}: ${cause} ${action}`, settled: isSettledDataSourceFailure(error) };
   }
   return {
     summary: `${sentence} ${withoutLink ? 'Try again, or open Cellucid without it.' : 'Try again, or open other data.'}`,
@@ -371,13 +408,6 @@ export function describeOpeningFailure(sentence, error, { withoutLink }) {
   };
 }
 
-function errorMessage(error) {
-  if (error instanceof AggregateError) {
-    const causes = error.errors.map(item => errorMessage(item));
-    return `${error.message} Causes: ${causes.join('; ')}`;
-  }
-  return error instanceof Error ? error.message : String(error);
-}
 
 /**
  * The raw text of a failure, for its notification's Details and the console:
@@ -390,7 +420,7 @@ function errorMessage(error) {
  * @returns {string}
  */
 export function dataSourceFailureDetails(error) {
-  return errorMessage(error);
+  return failureDetailsText(error);
 }
 
 function explainedMessage(error) {
@@ -432,7 +462,7 @@ export function describeRemoteAddressProblem(value) {
     return null;
   } catch (error) {
     if (!(error instanceof TypeError)) throw error;
-    const reason = error.message.charAt(0).toLowerCase() + error.message.slice(1);
+    const reason = lowerFirst(error.message);
     return `The remote server address was not tried: ${reason}. Use the bare `
       + 'address the server prints as Local URL.';
   }
@@ -698,7 +728,7 @@ export function initDatasetConnections(options) {
     const promise = trackOperation(work);
     void promise.catch(error => {
       if (destroyed || isCancellation(error)) return;
-      debug.error(`[UI] ${label}: ${errorMessage(error)}`, error);
+      debug.error(`[UI] ${label}: ${failureDetailsText(error)}`, error);
     });
     return promise;
   }
@@ -729,12 +759,15 @@ export function initDatasetConnections(options) {
         );
       }
       admittedControls.add(control);
-      control.disabled = false;
+      setControlAvailability(control, null);
     }
   }
 
+  /** Why a connection control is off once its listeners are gone. */
+  const CONNECTION_RETIRED = 'the data connections stopped with the page; reload the page to use them';
+
   function retireAdmittedControls() {
-    for (const control of admittedControls) control.disabled = true;
+    for (const control of admittedControls) setControlAvailability(control, CONNECTION_RETIRED);
     admittedControls.clear();
   }
 
@@ -970,7 +1003,7 @@ export function initDatasetConnections(options) {
       settleShownOpening(
         'complete',
         localOpening,
-        `User data ready: ${formatCompactCount(metadata.stats.n_cells)} ${countNoun(metadata.stats.n_cells, 'cell')}`
+        `Opened ${metadata.name}: ${formatCompactCount(metadata.stats.n_cells)} ${countNoun(metadata.stats.n_cells, 'cell')}`
       );
       // What it was opened from reopens with one click later, where the
       // browser gave its handle.
@@ -1003,7 +1036,7 @@ export function initDatasetConnections(options) {
       }
       dataLoad.fail(error);
       if (!candidatePublished) userSource.disconnect();
-      debug.error(`[UI] Failed to load user data: ${errorMessage(error)}`, error);
+      debug.error(`[UI] Failed to load user data: ${failureDetailsText(error)}`, error);
       settleShownOpening('fail', localOpening, error);
       return false;
     }
@@ -1037,14 +1070,21 @@ export function initDatasetConnections(options) {
     userDataFileInput.accept = filePickerAccept();
     /**
      * Cellucid's own files chosen in File… (`CELLUCID_FILES`): a library file
-     * goes to My datasets' Import, a session file is refused saying where it
-     * goes. Whether `file` was one.
+     * goes to My datasets' Import, a session file loads as Load…'s does (its
+     * dataset opened with it, L25-8). Whether `file` was one.
      */
+    /**
+     * A file refused before it could open: said as an opening's failure is,
+     * and withdrawn as one is when the next opening begins (R9U-13).
+     */
+    const refusePick = message => getOpeningProgress().untilNextOpening(
+      notifications.error(message, { category: 'data', title: 'Cannot open this file' })
+    );
     const takeCellucidFile = file => {
       const own = cellucidFileOfName(file.name);
       if (own === null) return false;
       if (own.id === 'library') importLibraryFile(file);
-      else notifications.error(own.said, { category: 'data', title: 'Cannot open this file' });
+      else if (!openSessionFile(file)) refusePick(own.said);
       return true;
     };
     /**
@@ -1090,10 +1130,7 @@ export function initDatasetConnections(options) {
         if (takeCellucidFile(file)) return;
         const layout = localFileLayout(file);
         if (layout === null) {
-          notifications.error(
-            `"${file.name}" is not a file Cellucid can open. ${describePickableFiles()}`,
-            { category: 'data', title: 'Cannot open this file' }
-          );
+          refusePick(`"${file.name}" is not a file Cellucid can open. ${describePickableFiles()}`);
           return;
         }
         await loadLocalUserSelection({
@@ -1122,10 +1159,7 @@ export function initDatasetConnections(options) {
       }
       const layout = localFileLayout(files[0]);
       if (layout === null) {
-        notifications.error(
-          `"${files[0].name}" is not a file Cellucid can open. ${describePickableFiles()}`,
-          { category: 'data', title: 'Cannot open this file' }
-        );
+        refusePick(`"${files[0].name}" is not a file Cellucid can open. ${describePickableFiles()}`);
         userDataFileInput.value = '';
         return undefined;
       }
@@ -1188,6 +1222,13 @@ export function initDatasetConnections(options) {
         importLibrary: file => {
           if (destroyed) return;
           importLibraryFile(file);
+        },
+        openSession: file => {
+          if (destroyed) return;
+          // A page without session controls (none here) says what the file is and where it goes.
+          if (!openSessionFile(file)) {
+            notifications.error(cellucidFileOfName(file.name).said, { category: 'data', title: 'Cannot open the dropped item' });
+          }
         },
         refuse: message => {
           if (destroyed) return;
@@ -1339,7 +1380,7 @@ export function initDatasetConnections(options) {
       }
       source = candidate;
       updateConnectionUI(true);
-      datasetSelect.disabled = false;
+      setControlAvailability(datasetSelect, null);
       datasetSelect.focus();
       let cleanupError = null;
       try {
@@ -1451,7 +1492,7 @@ export function initDatasetConnections(options) {
           );
         }
         const datasets = requireDatasetInventory(
-          await candidate.listDatasets(),
+          await awaitWithSignal(candidate.listDatasets(), lifecycleController.signal),
           sourceType
         );
         assertCurrentOperation(revision);
@@ -1537,8 +1578,8 @@ export function initDatasetConnections(options) {
               'complete',
               connectOpening,
               ready === true
-                ? `Connected - dataset "${opened.name}" loaded`
-                : `Connected - "${opened.name}" was not opened because ` +
+                ? `Opened ${opened.name}`
+                : `Connected; "${opened.name}" was not opened because ` +
                   'another dataset was chosen meanwhile. Open the address ' +
                   'again to show it.'
             );
@@ -1562,7 +1603,7 @@ export function initDatasetConnections(options) {
             'fail',
             connectOpening,
             saidFailure(
-              `Connected - ${formatCountOf(adoption.count, 'dataset')} found, but the prior ` +
+              `Connected: ${formatCountOf(adoption.count, 'dataset')} found, but the earlier ` +
               'connection could not be released.',
               adoption.cleanupError
             )
@@ -1573,10 +1614,10 @@ export function initDatasetConnections(options) {
           'complete',
           connectOpening,
           adoption.count === 1
-            ? `Connected - "${datasets[0].name}" was not opened because ` +
+            ? `Connected; "${datasets[0].name}" was not opened because ` +
               'another dataset was chosen meanwhile. Open the address again ' +
               'to show it.'
-            : `Connected - ${formatCountOf(adoption.count, 'dataset')} found. Choose one ` +
+            : `Connected: ${formatCountOf(adoption.count, 'dataset')} found. Choose one ` +
               `from the dataset list.`
         );
       } catch (error) {
@@ -1612,7 +1653,7 @@ export function initDatasetConnections(options) {
             )
           );
           debug.error(
-            `[UI] ${inputLabel} post-publication catalog error: ${errorMessage(error)}`,
+            `[UI] ${inputLabel} post-publication catalog error: ${failureDetailsText(error)}`,
             error
           );
           return;
@@ -1672,7 +1713,7 @@ export function initDatasetConnections(options) {
             ? { summary: said, actions: [{ label: 'Try again', run: () => void handleConnect(inputValue, clickLoadMethod) }] }
             : null
         );
-        debug.error(`[UI] ${inputLabel} connection error: ${errorMessage(exactError)}`, exactError);
+        debug.error(`[UI] ${inputLabel} connection error: ${failureDetailsText(exactError)}`, exactError);
       } finally {
         setBusy(-1);
       }
@@ -1727,14 +1768,15 @@ export function initDatasetConnections(options) {
         disconnectButton.disabled = true;
         notifications.error(
           `${inputLabel} disconnect could not finish safely. Reload the ` +
-          `page before reconnecting. Cause: ${errorMessage(error)}`,
+          'page before reconnecting.',
           {
             category: 'connectivity',
+            details: failureDetailsText(error),
             duration: 0,
             title: 'Disconnect recovery blocked'
           }
         );
-        debug.error(`[UI] ${inputLabel} disconnect error: ${errorMessage(error)}`, error);
+        debug.error(`[UI] ${inputLabel} disconnect error: ${failureDetailsText(error)}`, error);
       } finally {
         setBusy(-1);
         if (
@@ -1784,7 +1826,7 @@ export function initDatasetConnections(options) {
      */
     async function reopenConnected(requestLoadMethod) {
       const datasets = requireDatasetInventory(
-        await source.listDatasets(),
+        await awaitWithSignal(source.listDatasets(), lifecycleController.signal),
         sourceType
       );
       if (datasets.length !== 1) {
@@ -1922,6 +1964,9 @@ export function initDatasetConnections(options) {
      * whether it is a Cellucid server before anything is connected.
      */
     async function openAddress() {
+      // The person typed or pasted it: an agent may open it later without
+      // asking them (`seen-addresses.js`, F121).
+      noteSeenAddress(dataAddressInput.value);
       // Asking the address whether it is a server is the opening's first
       // step: the connection that follows joins this opening, and how the
       // opening ends is that connection's (`saysOutcome: false`), its

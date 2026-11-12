@@ -58,7 +58,7 @@ import { describeRemoteFile } from './remote-file.js';
 import { getProviderRegistry } from './registry.js';
 import { afterWholeFileOpened, downloadReason, keptCopyOf, wholeFileOf } from '../whole-download.js';
 import { formatBytes } from '../../utils/format-units.js';
-import { SharedWork, abortReason, isCancellation, cancel, onAbort } from '../../utils/abort.js';
+import { SharedWork, abortReason, isCancellation, cancel, onAbort, requireSignalOrNull } from '../../utils/abort.js';
 import { ANNDATA_SOURCE_TYPE, createAnnDataFileSource } from '../anndata-file-source.js';
 import { fileFormatOfName, folderFormatOfName, openableNamesText, titleOfName } from '../input-formats.js';
 import { getTransferLog } from '../transfer-log.js';
@@ -183,7 +183,12 @@ export function validateAnnDataCatalog(catalog, baseUrl, sourceType) {
   const urls = new Set();
   const datasets = catalog.datasets.map((entry, index) => {
     const label = `datasets[${index}]`;
-    requireCatalogKeys(entry, ['id', 'path'], ['session'], label, sourceType);
+    requireCatalogKeys(entry, ['id', 'path'], ['session', 'name'], label, sourceType);
+    // Its name as a person reads it (the dataset's own, `uns['cellucid']['name']`): what the picker
+    // and the opening say before its file is read (round 9 close: "Opening garcia" until then).
+    if (Object.hasOwn(entry, 'name') && (typeof entry.name !== 'string' || entry.name.trim() === '' || entry.name !== entry.name.trim())) {
+      throw invalidCatalog(`${label}.name must be the dataset's name, a trimmed nonempty text`, sourceType);
+    }
     if (!isPortableDatasetId(entry.id)) {
       throw invalidCatalog(`${label}.id ${JSON.stringify(entry.id)} must be ${PORTABLE_DATASET_ID_RULE}`, sourceType);
     }
@@ -220,6 +225,7 @@ export function validateAnnDataCatalog(catalog, baseUrl, sourceType) {
       path: entry.path,
       url,
       name: lastSegment(entry.path),
+      title: entry.name ?? null,
       form,
       session,
     });
@@ -424,15 +430,16 @@ export class AnnDataCatalog {
 
   /**
    * The datasets as `datasets.json` itself lists them, in catalog order:
-   * `{id, name}`, the name taken from each path. Nothing is read, so the
-   * picker can list them while their files are still being described.
+   * `{id, name}`, the name the catalog gives it, else one taken from its
+   * path. Nothing is read, so the picker can list them, and an opening name
+   * them, while their files are still being described.
    *
    * @returns {ReadonlyArray<Readonly<{id: string, name: string}>>}
    */
   entries() {
     return Object.freeze(this.catalog.datasets.map(entry => Object.freeze({
       id: entry.id,
-      name: nameOfPath(entry.path),
+      name: entry.title ?? nameOfPath(entry.path),
     })));
   }
 
@@ -470,11 +477,17 @@ export class AnnDataCatalog {
             });
           } catch (error) {
             if (isCancellation(error)) throw error;
+            // The message (Details, the log) keeps the cause's own words; the
+            // person is told which dataset by its id (`unlisted`) and why in
+            // the cause's terms (`describeDataSourceFailure`), never by a URL.
+            const first = error instanceof AggregateError && error.errors[0] instanceof Error
+              ? error.errors[0]
+              : error;
             throw new DataSourceError(
               `Dataset '${entry.id}' (${entry.path}) cannot be listed: ${error?.message ?? error}`,
-              error?.code ?? DataSourceErrorCode.INVALID_FORMAT,
+              first?.code ?? DataSourceErrorCode.INVALID_FORMAT,
               this._sourceType,
-              { datasetId: entry.id, cause: error, explained: true }
+              { ...first?.details, datasetId: entry.id, path: entry.path, unlisted: entry.id, cause: error }
             );
           }
         },
@@ -536,9 +549,7 @@ export class AnnDataCatalog {
    */
   open(datasetId, signal = null) {
     if (this._closed) throw new Error('The catalog was closed.');
-    if (signal !== null && !(signal instanceof AbortSignal)) {
-      throw new TypeError('A catalog open signal must be an AbortSignal or null.');
-    }
+    requireSignalOrNull(signal, 'A catalog open signal');
     const entry = this._entry(datasetId);
     // A caller that no longer wants it starts nothing.
     if (signal?.aborted) return Promise.reject(abortReason(signal));
@@ -625,7 +636,7 @@ export class AnnDataCatalog {
    * lists many files, and what a format package says ("The selected file is
    * not a valid HDF5/H5AD file") does not say which one. The cause's code and
    * details (an HTTP status, `explained`) are kept, so it is classified and
-   * shown as before; a cancelled open stays a cancellation.
+   * shown as before; a canceled open stays a cancellation.
    * @private
    */
   _namedOpenFailure(entry, error) {

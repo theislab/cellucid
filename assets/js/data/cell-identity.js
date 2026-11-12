@@ -48,7 +48,7 @@ import { allocateTypedArray } from './sparse-column-index.js';
 import { orderByKey } from '../utils/radix-order.js';
 
 /**
- * The 32-bit finaliser every subsampling hash uses (MurmurHash3 `fmix32`):
+ * The 32-bit finalizer every subsampling hash uses (MurmurHash3 `fmix32`):
  * a bijection on uint32 with full avalanche.
  *
  * @param {number} h
@@ -189,7 +189,7 @@ function openCellBits(nObs, kept, { counted = false } = {}) {
  * @property {Readonly<import('./subsample.js').SubsampleSpec>|null} spec - The subsample's
  *   specification; null when it is not known
  * @property {boolean} chunked - The cells of the chunks read so far of an opening still growing
- *   (`subsample-plan.js` `chunkStep`): whole runs of neighbouring cells, whatever `spec` says
+ *   (`subsample-plan.js` `chunkStep`): whole runs of neighboring cells, whatever `spec` says
  */
 
 /**
@@ -290,7 +290,7 @@ export function createCellIdentity({ nObs, kept = null, openOrder = null, choice
    * The open position of each original position, -1 where the cell is not
    * open. Ascending input walks `kept` once; many in any other order are
    * placed by the bits of the open cells (`keptRanks`: a step a cell, where
-   * a search of `kept` a cell took 2.4 s of a 50 % share of 10M cells put
+   * a search of `kept` a cell took 2.4 s of a 50% share of 10M cells put
    * in priority order in place); a few, by a search of `kept` each.
    */
   function openPositionsOf(originals) {

@@ -11,10 +11,11 @@
  * - `initialize` gives the local instructions and a tool list that changes;
  *   `tools/list` is the page's own list for this connection;
  * - a call runs in the page as "Claude Code", through a local connection: a
- *   step of the person's history labelled as the agent's, and the activity
+ *   step of the person's history labeled as the agent's, and the activity
  *   line names it "Claude Code (local)"; its Undo turn takes the turn back;
- * - the person's permission settings changed tell the app to list the tools
- *   again, and the list says what they now make of each kind;
+ * - the tool list is the same whatever the person's settings (nothing says it
+ *   changed); the agent is told the settings after its first result and again
+ *   after a result once they changed (L26-9);
  * - a change the settings ask about: the page's confirm card, and the app's
  *   own MCP elicitation; the app's Decline answers the card, and the agent
  *   reads that the person declined; the app giving up on a call while it
@@ -36,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 
 import { APP_ORIGIN } from './helpers/origins.mjs';
 import { waitForHistory } from './helpers/state-history.mjs';
-import { firstCategoricalField, observeProductErrors, resultJson } from './helpers/agent-chat.mjs';
+import { fieldNotShown, observeProductErrors, resultJson } from './helpers/agent-chat.mjs';
 import { expect, test } from './helpers/test.mjs';
 
 const PYTHON = process.env.CELLUCID_PYTHON ?? null;
@@ -139,22 +140,25 @@ test('an agent app drives a notebook viewer through cellucid mcp: steps, Undo tu
     })).result;
     app.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     expect(init.serverInfo.name).toBe('cellucid');
-    expect(init.capabilities.tools.listChanged).toBe(true);
+    expect(init.capabilities.tools.listChanged).toBe(false);
     expect(init.instructions).toContain('a Cellucid viewer on this computer');
 
-    // The page's own list, for this connection: the catalogue's tools and the status tool.
+    // The page's own list, for this connection: the catalog's tools and the status tool.
     const tools = (await request('tools/list')).result.tools;
     const names = tools.map(tool => tool.name);
     expect(names).toContain('color_by');
     expect(names.at(-1)).toBe('cellucid_status');
-    expect(tools.find(tool => tool.name === 'history_step_delete').description).toMatch(/Cellucid asks the person before it deletes what was saved\.$/);
+    expect(JSON.stringify(tools)).not.toMatch(/person's settings|Cellucid asks the person before/);
     // The status is data, between the data tags (names written by others are marked as data).
     const status = resultJson((await call('cellucid_status')).content[0].text);
     expect(status).toMatchObject({ agent: 'Claude Code', connected: true, viewer: { dataset: { id: 'local-agents', name: 'Local agents' } } });
 
-    // A change: a step of the person's history, the agent's; the line names it, local.
-    const coloured = await call('color_by', { field: { source: 'obs', key: 'leiden' } });
-    expect(coloured.isError).toBe(false);
+    // A change: a step of the person's history, the agent's; the line names it, local. The connection's
+    // first result tells the person's settings after it.
+    // (A gene: the page opens colored by leiden already, its only category field, so leiden would change nothing.)
+    const colored = await call('color_by', { field: { source: 'var', key: 'g1' } });
+    expect(colored.isError).toBe(false);
+    expect(colored.content[0].text).toMatch(/\[Cellucid: the person's settings for you now\. Permissions: [^\]]*changes in this tab: run without asking/);
     const steps = () => page.evaluate(() => {
       const tree = window._cellucidHistories.current().active;
       const out = [];
@@ -171,13 +175,11 @@ test('an agent app drives a notebook viewer through cellucid mcp: steps, Undo tu
     await line.locator('.agent-activity-undo').click();
     await expect.poll(async () => (await steps()).length).toBe(0);
 
-    // The person has every change asked first: the app is told to list the tools again, and the list says so.
-    const colourDescription = list => list.find(tool => tool.name === 'color_by').description;
-    expect(colourDescription(tools)).toMatch(/it can be undone\.$/);
+    // The person has every change asked first: the list stays the same; the next result tells the agent.
     await page.evaluate(() => window._cellucidUi.agents.presence.permissions.set({ kinds: { change: 'ask' } }));
-    await app.next(message => message.method === 'notifications/tools/list_changed');
-    expect(colourDescription((await request('tools/list')).result.tools))
-      .toMatch(/The person's settings ask them before each change: Cellucid asks, and you wait for the answer\.$/);
+    expect((await request('tools/list')).result.tools).toEqual(tools);
+    const told = await call('fields_list');
+    expect(told.content[0].text).toMatch(/\[Cellucid: the person's settings for you now\. Permissions: [^\]]*changes in this tab[^\]]*: are asked of the person first/);
 
     // A change now asks: the card in the page, and the same question in the app; the app's Decline answers it.
     const card = page.locator('#agent-presence .agent-confirm');
@@ -206,10 +208,11 @@ test('an agent app drives a notebook viewer through cellucid mcp: steps, Undo tu
     app.send({ jsonrpc: '2.0', id: elicited.id, result: { action: 'accept', content: {} } });
 
     // Allowed in the card for this connection: the change runs, and the next one is not asked again.
-    const allowing = call('color_by', { field: { source: 'obs', key: 'leiden' } });
+    // (A gene again: the view is colored by leiden after the Undo turn, so leiden would change nothing.)
+    const allowing = call('color_by', { field: { source: 'var', key: 'g2' } });
     await card.locator('.agent-confirm-allow-here').click();
     expect((await allowing).isError).toBe(false);
-    expect((await call('color_by', { field: { source: 'obs', key: 'leiden' } })).isError).toBe(false);
+    expect((await call('color_by', { field: { source: 'var', key: 'g2' } })).isError).toBe(false);
     await expect(card).toHaveCount(0);
     expect((await steps()).map(entry => entry.agent)).toEqual(['Claude Code']);
     expect(errors).toEqual([]);
@@ -251,9 +254,9 @@ test('cellucid mcp --open serves a file in a viewer of its own and drives it; th
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await waitForHistory(page);
     await expect.poll(async () => resultJson((await request('tools/call', { name: 'cellucid_status', arguments: {} })).result.content[0].text).connected, { timeout: 60_000 }).toBe(true);
-    const field = await firstCategoricalField(page);
-    const coloured = (await request('tools/call', { name: 'color_by', arguments: { field: { source: 'obs', key: field } } })).result;
-    expect(coloured.isError, JSON.stringify(coloured)).toBe(false);
+    const field = await fieldNotShown(page);
+    const colored = (await request('tools/call', { name: 'color_by', arguments: { field: { source: 'obs', key: field } } })).result;
+    expect(colored.isError, JSON.stringify(colored)).toBe(false);
     await expect(page.locator('#agent-presence .agent-activity[data-agent="Cursor"]')).toContainText('Cursor (local)');
     expect(errors).toEqual([]);
   } finally {

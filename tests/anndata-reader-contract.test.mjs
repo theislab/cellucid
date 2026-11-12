@@ -694,7 +694,7 @@ test('genes of one dense chunk strip fetch each chunk of the strip once', async 
 
 test('a dense gene is read by its chunk strip only while the whole strip fits the decoded-chunk budget', async () => {
   // A strip is 4 cells x 4 genes of float32: 64 bytes. Within the budget the
-  // store keeps the strip's chunks decoded for its neighbouring genes; beyond
+  // store keeps the strip's chunks decoded for its neighboring genes; beyond
   // it, reading strip by strip would decode the same chunks again for every
   // gene, so the matrix is indexed by gene in row slabs instead.
   const strip = await openReader(chunkedDenseTree(), { decodedChunkCacheBytes: 64 });
@@ -1690,7 +1690,7 @@ test('missing categorical labels and out-of-bounds codes are refused', async t =
 });
 
 // ---------------------------------------------------------------------------
-// The neighbour graph (obsp).
+// The neighbor graph (obsp).
 // ---------------------------------------------------------------------------
 
 /** A dataset of `nObs` cells whose obsp holds `connectivities`. */

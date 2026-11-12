@@ -87,9 +87,11 @@
   min-width: 0;
 }
 
+/* A tab is as wide as its name and count, up to the row: a name is cut only
+   when the row cannot hold it, never beside empty space. */
 .highlight-page-tab {
   gap: var(--space-0-5);
-  max-width: 110px;
+  max-width: 100%;
 }
 
 .highlight-page-tab-activate {
@@ -113,6 +115,9 @@
   opacity: var(--opacity-80);
 }
 
+/* Quiet by the secondary text color (a quiet button's), never by opacity (a
+   faded glyph fell below AA contrast, lens-a11y LF-10); on the selected page,
+   the chip's inverse color. */
 .highlight-page-tab-combine,
 .highlight-page-tab-delete {
   background: none;
@@ -120,25 +125,21 @@
   cursor: pointer;
   font-size: var(--control-glyph-sm);
   line-height: var(--leading-none);
-  color: inherit;
-  opacity: var(--opacity-50);
+  color: var(--color-text-secondary);
   padding: 0 var(--space-0-5);
   min-width: var(--control-target-min);
   min-height: var(--control-target-min);
   flex-shrink: 0;
-  transition: opacity var(--duration-fast) var(--easing-standard);
-}
-
-/* On a coarse pointer a tab may take the whole row, for room beside its two
-   44px buttons. */
-@media (pointer: coarse) {
-  .highlight-page-tab {
-    max-width: 100%;
-  }
+  transition: var(--transition-colors);
 }
 
 .highlight-page-tab-combine:hover {
-  opacity: 1;
+  color: var(--color-text-primary);
+}
+
+.highlight-page-tab[data-state="selected"] .highlight-page-tab-combine,
+.highlight-page-tab[data-state="selected"] .highlight-page-tab-delete {
+  color: inherit;
 }
 
 .highlight-page-tab-activate:focus-visible,
@@ -147,13 +148,7 @@
   outline-color: currentColor;
 }
 
-.highlight-page-tab-combine:focus-visible,
-.highlight-page-tab-delete:focus-visible {
-  opacity: 1;
-}
-
-.highlight-page-tab-delete:hover {
-  opacity: 1;
+.highlight-page-tab:not([data-state="selected"]) .highlight-page-tab-delete:hover {
   color: var(--color-danger-text);
 }
 
@@ -202,42 +197,6 @@
   cursor: grab;
 }
 
-/* Page combine menu (intersection/union dropdown) */
-.page-combine-menu {
-  position: fixed;
-  z-index: var(--z-popover);
-  background: var(--color-surface-elevated);
-  border: var(--border-default);
-  border-radius: var(--radius-none);
-  box-shadow: var(--shadow-lg);
-  padding: var(--space-1) 0;
-  min-width: 140px;
-  max-width: calc(100vw - var(--space-4));
-  overflow-y: auto;
-}
-
-.page-combine-option {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  width: 100%;
-  padding: var(--space-2) var(--space-3);
-  background: none;
-  border: none;
-  cursor: pointer;
-  font-family: inherit;
-  font-size: var(--type-control);
-  color: var(--color-text-primary);
-  text-align: left;
-  overflow-wrap: anywhere;
-  transition: background-color var(--duration-fast) var(--easing-standard);
-}
-
-.page-combine-option:hover,
-.page-combine-option:focus-visible {
-  background: var(--color-surface-tertiary);
-}
-
 /* Selection cursor for canvas - active drag states */
 #glcanvas.selecting {
   cursor: cell !important;
@@ -279,6 +238,21 @@
 .lasso-step-controls .btn-redo,
 .select-bar-actions .btn-undo {
   font-size: var(--type-button);
+}
+
+/* The step line's help on combining (highlight/mode-copy.js combineHelpHtml):
+   the Alt keys, or, while the panel's Select mode is on, the choice under the
+   tools; it follows the switch at once (R9F-13). */
+.combine-help-select {
+  display: none;
+}
+
+#highlighted-cells-section:has(#highlight-select-mode[aria-checked="true"]) .combine-help-keys {
+  display: none;
+}
+
+#highlighted-cells-section:has(#highlight-select-mode[aria-checked="true"]) .combine-help-select {
+  display: inline;
 }
 
 /* Selection mode indicator tags (used across all highlight modes) */

@@ -29,6 +29,28 @@
 
 import { formatCountOf } from '../../utils/format-units.js';
 
+/**
+ * What a `pattern` in use asks for, in words: a refusal says it ("a name with
+ * no space at its start or end"), never "does not have the expected form",
+ * which leaves a person or an agent to guess (R9R-5). A pattern not listed is
+ * said by its schema's first example; a contract test keeps every pattern of
+ * the catalog said one way or the other.
+ */
+export const PATTERN_WORDS = new Map([
+  ['^\\S(?:.*\\S)?$', 'a name with no space at its start or end'],
+  ['^#[0-9a-fA-F]{6}$', 'a color as #rrggbb'],
+  ['^#[0-9a-f]{6}$', 'a color as #rrggbb'],
+  ['^View [1-9][0-9]*$', 'a view name such as "View 2"'],
+]);
+
+/** The words a refusal of `schema.pattern` says, or null when it has none. */
+export function patternWords(schema) {
+  const words = PATTERN_WORDS.get(schema.pattern);
+  if (words !== undefined) return words;
+  const example = Array.isArray(schema.examples) ? schema.examples.find(item => typeof item === 'string') : undefined;
+  return example === undefined ? null : `like ${JSON.stringify(example)}`;
+}
+
 const KEYWORDS = new Set([
   'type', 'properties', 'required', 'additionalProperties', 'items', 'minItems', 'maxItems',
   'uniqueItems', 'enum', 'const', 'minimum', 'maximum', 'exclusiveMinimum', 'minLength',
@@ -129,7 +151,43 @@ function describeValue(value) {
   if (value === null) return 'null';
   if (Array.isArray(value)) return 'an array';
   if (ArrayBuffer.isView(value)) return value.constructor.name;
+  if (typeof value === 'object') {
+    // Was "[object Object]": the model could not see what it had sent (live-7 L25-15).
+    const text = JSON.stringify(value);
+    return `the object ${text.length > 60 ? `${text.slice(0, 60)}…` : text}`;
+  }
   return typeof value === 'string' ? `"${value.length > 40 ? `${value.slice(0, 40)}…` : value}"` : String(value);
+}
+
+/**
+ * A field given as `{source, key}` where its name alone is asked for: the
+ * analysis options name fields by name, the other tools by `{source, key}`,
+ * and a model sent the one form for the other (live-7 L25-15).
+ */
+function nameFormHint(types, value) {
+  if (!types.includes('string') || value === null || typeof value !== 'object' || Array.isArray(value)) return '';
+  return typeof value.key === 'string' && value.key !== '' ? `: give the name itself, ${JSON.stringify(value.key)}` : '';
+}
+
+const LEAVE_OUT = 'leave it out';
+
+/**
+ * How to fix an optional parameter given wrong: leave it out, and what is
+ * used then (the description's "omitted, …" or "… when left out", or the
+ * default).
+ */
+function leaveOutHint(key, schema, value) {
+  const description = typeof schema.description === 'string' ? schema.description : '';
+  const omitted = description.match(/[Oo]mitted, ([^.;]+)/)?.[1]
+    ?? description.match(/;\s*([^.;]+?) when left out/)?.[1]
+    ?? null;
+  const then = omitted !== null
+    ? ` for ${omitted.trim()}`
+    : schema.default !== undefined ? ` for ${JSON.stringify(schema.default)}` : '';
+  // A model asked for "the current one" often sends an empty stand-in.
+  const empty = value === null || value === 'null' || value === ''
+    || (typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0);
+  return `; ${key} is optional: ${LEAVE_OUT}${empty ? ' (send no value at all, not null, "null" or {})' : ''}${then}`;
 }
 
 /**
@@ -171,7 +229,7 @@ export function schemaProblem(schema, value, path = 'params') {
   const types = typesOf(schema);
   if (types !== null) {
     const type = types.find(t => typeMatches(t, value));
-    if (type === undefined) return `${path} must be ${types.join(' or ')}, not ${describeValue(value)}`;
+    if (type === undefined) return `${path} must be ${types.join(' or ')}, not ${describeValue(value)}${nameFormHint(types, value)}`;
     if (type === 'string') {
       if (schema.minLength !== undefined && value.length < schema.minLength) {
         return `${path} must have at least ${formatCountOf(schema.minLength, 'character')}`;
@@ -180,7 +238,8 @@ export function schemaProblem(schema, value, path = 'params') {
         return `${path} must have at most ${formatCountOf(schema.maxLength, 'character')}`;
       }
       if (schema.pattern !== undefined && !new RegExp(schema.pattern, 'u').test(value)) {
-        return `${path} ${describeValue(value)} does not have the expected form`;
+        const words = patternWords(schema);
+        return `${path} ${describeValue(value)} must be ${words ?? `of the form ${schema.pattern}`}`;
       }
     }
     if (type === 'integer' || type === 'number') {
@@ -217,10 +276,15 @@ export function schemaProblem(schema, value, path = 'params') {
       for (const key of schema.required ?? []) {
         if (!Object.hasOwn(value, key)) return `${path}.${key} is required`;
       }
+      const required = new Set(schema.required ?? []);
       for (const [key, sub] of Object.entries(properties)) {
         if (!Object.hasOwn(value, key)) continue;
         const problem = schemaProblem(sub, value[key], `${path}.${key}`);
-        if (problem !== null) return problem;
+        if (problem === null) continue;
+        // An optional parameter given wrong (null, "null", {} for "the
+        // current one") is fixed by leaving it out: say so, and what then.
+        // A field's name given in the other form: how to give it, not to leave it out.
+        return required.has(key) || problem.includes(LEAVE_OUT) || problem.includes(': give the name itself') ? problem : `${problem}${leaveOutHint(key, sub, value[key])}`;
       }
     }
   }

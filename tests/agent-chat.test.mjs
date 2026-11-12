@@ -1,8 +1,8 @@
 /**
  * The chat bar's core (`assets/js/app/agent/chat/`) without a page: a
  * conversation and what of it a model is sent and the history keeps, the
- * context budget and the summarising rule, one agent turn run against the
- * scripted model and a real dispatcher and history (steps labelled with the
+ * context budget and the summarizing rule, one agent turn run against the
+ * scripted model and a real dispatcher and history (steps labeled with the
  * agent and the turn, Undo turn, refusals back to the model, waiting out a
  * provider, Stop mid-reply and mid-call, a conversation too long, a refusal,
  * an answer cut at its limit, the effort chosen, a chat's token budget),
@@ -17,28 +17,30 @@ import test from 'node:test';
 
 import {
   SUMMARY_LEAD, TRANSCRIPT_SCHEMA, appendMessage, conversationFrom, createConversation, latestConversation,
-  modelMessages, sentOf, summarize, transcriptOf, turnsOf, usageOf, closeInterrupted,
+  modelMessages, progressNotes, sentOf, summarize, transcriptOf, turnsOf, usageOf, closeInterrupted,
 } from '../assets/js/app/agent/chat/conversation.js';
 import { conversationMarkdown, turnNoteOf } from '../assets/js/app/agent/chat/export.js';
 import { readSuggestionFacts, suggestionsFor } from '../assets/js/app/agent/chat/suggestions.js';
 import {
   registerStepRevealer, registerTurnLink, revealStep, revealTurn, stepsOfTurn, subscribeTurns, turnSteps, turnsChanged,
-  undoAgentTurn,
+  undoAgentTurn, turnUndoPlan as historyTurnUndoPlan,
 } from '../assets/js/app/agent/history-link.js';
 import { CHARS_PER_TOKEN, estimateTokens, overflows, summaryInputOf } from '../assets/js/app/agent/chat/context.js';
 import { RETRY_CEILING_MS, retryDelayOf, runAgentTurn } from '../assets/js/app/agent/chat/agent-loop.js';
 import { createKeyStore, keyStorageName } from '../assets/js/app/agent/chat/keys.js';
 import { PREFERENCES_STORAGE_KEY, effortKey, readChatPreferences, writeChatPreferences } from '../assets/js/app/agent/chat/preferences.js';
 import { parseInline, parseMarkdown } from '../assets/js/app/agent/chat/markdown.js';
-import { sentText, tokensText, toolRowText, workingTextOf } from '../assets/js/app/agent/chat/transcript-view.js';
+import { sentText, tokensText, workingTextOf } from '../assets/js/app/agent/chat/transcript-view.js';
+import { toolRowText } from '../assets/js/app/agent/chat/work.js';
 import { createScriptedProvider } from '../assets/js/app/agent/providers/scripted.js';
 import { ASKED_TEXT, ASK_TOOL, askOf, pendingQuestion } from '../assets/js/app/agent/chat/ask.js';
-import { openaiToolsOf } from '../assets/js/app/agent/providers/openai.js';
+import { openaiInputOf, openaiToolsOf } from '../assets/js/app/agent/providers/openai.js';
+import { anthropicMessagesOf } from '../assets/js/app/agent/providers/anthropic.js';
 import { ProviderError } from '../assets/js/app/agent/providers/contract.js';
 import { mcpToolsOf, toolIndexOf } from '../assets/js/app/agent/bridge/mcp-tools.js';
 import { page as fixturePage, setup } from './helpers/history-fixtures.mjs';
 import { catalogDocument, createActionCatalog, defineAction } from '../assets/js/app/actions/catalog.js';
-import { createActionDispatcher } from '../assets/js/app/actions/dispatcher.js';
+import { ActionRefused, createActionDispatcher } from '../assets/js/app/actions/dispatcher.js';
 import { createHistory } from '../assets/js/app/history/history.js';
 import { cancelled, onAbort } from '../assets/js/utils/abort.js';
 
@@ -77,6 +79,14 @@ async function chatPage(replies, { agent = 'Claude', model = { id: 'scripted', c
     });
   };
   return { ...page, provider, conversation, calls, changes, turn };
+}
+
+/** A provider whose one call streams what `stream` yields (a note, then waits for its Stop). */
+function checkedNotesProvider(stream) {
+  return {
+    id: 'scripted', label: 'Notes', agent: 'Claude', needsKey: false, defaultModel: 'scripted',
+    models: async () => [], stream,
+  };
 }
 
 // -------------------------------------------------------------- Conversation
@@ -140,7 +150,7 @@ test('the context budget is the model\'s window: estimated from the last call\'s
   assert.equal(overflows({ conversation, window: 500, lastInput: 480, lastCount: 1, system: '', tools: [] }), true);
   assert.equal(overflows({ conversation, window: 700, lastInput: 480, lastCount: 1, system: '', tools: [] }), false);
 
-  // The summariser reads text; a result is cut to a share with what was cut said.
+  // The summarizer reads text; a result is cut to a share with what was cut said.
   appendMessage(conversation, { role: 'assistant', turn: 't2', agent: 'Claude', parts: [{ type: 'text', text: 'Reading.' }, { type: 'tool-call', id: 'c', name: 'fields_list', args: {} }] });
   appendMessage(conversation, { role: 'tool', turn: 't2', results: [{ id: 'c', name: 'fields_list', isError: false, content: [{ type: 'text', text: 'abcdefghij' }] }] });
   const whole = summaryInputOf(conversation, conversation.messages.length);
@@ -155,35 +165,36 @@ test('the context budget is the model\'s window: estimated from the last call\'s
 
 test('a turn: tool calls are the page\'s actions, recorded as the agent\'s steps of this turn, and Undo turn takes them all back', async () => {
   const page = await chatPage([
-    { text: 'Let me colour.', calls: [{ name: 'color_by', args: { field: 'leiden' } }, { name: 'camera_set', args: { at: 4 } }] },
-    { text: 'Done: coloured by leiden.', chunks: 3 },
+    { text: 'Let me color.', calls: [{ name: 'color_by', args: { field: 'leiden' } }, { name: 'camera_set', args: { at: 4 } }] },
+    { text: 'Done: colored by leiden.', chunks: 3 },
   ]);
   const before = structuredClone(page.state);
   const connections = [];
   page.dispatcher.subscribe(event => { if (event.kind === 'start') connections.push(event.meta.connection); });
-  const result = await page.turn('Colour by leiden', 'turn-a');
+  const result = await page.turn('Color by leiden', 'turn-a');
   assert.equal(result.ended, 'end');
   // Each call comes through the chat as its connection (what a permission "in this chat" holds for).
   assert.deepEqual(connections, [
-    { id: 'chat-1', kind: 'chat', client: null, host: null }, { id: 'chat-1', kind: 'chat', client: null, host: null },
+    // The chat is the page's own: no host vouches for its name (`known`, the relay's).
+    { id: 'chat-1', kind: 'chat', client: null, host: null, known: false }, { id: 'chat-1', kind: 'chat', client: null, host: null, known: false },
   ]);
   assert.equal(result.usage.calls, 2);
   assert.ok(result.usage.input > 0);
   assert.deepEqual(page.conversation.messages.map(message => message.role), ['user', 'assistant', 'tool', 'assistant']);
   const steps = [...page.history.active.steps.values()].filter(step => step.type !== null);
   assert.deepEqual(steps.map(step => [step.type, step.by.origin, step.by.agent, step.by.turn, step.label]), [
-    ['color.by', 'agent', 'Claude', 'turn-a', 'Coloured by leiden'],
+    ['color.by', 'agent', 'Claude', 'turn-a', 'Colored by leiden'],
     ['camera.set', 'agent', 'Claude', 'turn-a', 'Camera at 4'],
   ]);
   const results = page.conversation.messages[2].results;
   assert.deepEqual(results.map(entry => [entry.name, entry.title, entry.isError, entry.step?.label]), [
-    ['color_by', 'Colour by', false, 'Coloured by leiden'],
+    ['color_by', 'Color by', false, 'Colored by leiden'],
     ['camera_set', 'Camera', false, 'Camera at 4'],
   ]);
-  assert.match(results[0].content[0].text, /"label":"Coloured by leiden"/);
+  assert.match(results[0].content[0].text, /"label":"Colored by leiden"/);
   // The second call was sent the results, in one tool message after the calls.
   assert.deepEqual(page.calls[1].messages.map(message => message.role), ['user', 'assistant', 'tool']);
-  assert.ok(page.changes.some(change => change.kind === 'status' && change.status?.phase === 'tool' && change.status.tool === 'Colour by'));
+  assert.ok(page.changes.some(change => change.kind === 'status' && change.status?.phase === 'tool' && change.status.tool === 'Color by'));
   assert.ok(page.changes.some(change => change.kind === 'text'));
   assert.equal(page.changes.at(-1).kind, 'status');
   assert.equal(page.changes.at(-1).status, null);
@@ -223,7 +234,7 @@ test('Undo turn, one for the chat, the activity line and the State panel: alone 
   let result = await undoAgentTurn(page.history, 'c1', choose('own'));
   assert.deepEqual(asked.at(-1), { agent: 'ChatGPT', own: 2, others: 2, elsewhere: 0 });
   assert.deepEqual({ ...result, report: result.report.length }, { found: true, undone: true, how: 'own', agent: 'ChatGPT', steps: 2, report: 0, outside: [] });
-  assert.equal(page.state.colors.by, 'cell_type', 'ChatGPT\'s colourings are taken back');
+  assert.equal(page.state.colors.by, 'cell_type', 'ChatGPT\'s colorings are taken back');
   assert.equal(page.state.camera.at, 4, 'Claude\'s camera stays');
   assert.equal(page.state.highlights.groups.length, 1, 'the person\'s highlight stays');
   assert.deepEqual(pathOf(page), [['camera.set', 'Claude', 't1'], ['highlight.cells', null, null]]);
@@ -290,16 +301,16 @@ test('Undo only an agent\'s steps reports what no longer applies; the turn\'s st
       return { flagged: [{ step: 's4', reason: 'There is no field score.' }] };
     },
   };
-  steps.get('s4').label = 'Coloured by score';
+  steps.get('s4').label = 'Colored by score';
   let plan = null;
   let told = null;
   const result = await undoAgentTurn(history, 't1', { ask: async asked => { plan = asked; return 'own'; }, tell: note => { told = note; } });
   assert.deepEqual([plan.own.map(each => each.id), plan.others.map(each => each.id), plan.elsewhere], [['s1', 's3'], ['s2', 's4'], 1]);
   assert.deepEqual(calls, [['t1', { onlyOwn: true }]]);
-  assert.deepEqual(result.report, [{ step: 's4', label: 'Coloured by score', reason: 'There is no field score.' }]);
+  assert.deepEqual(result.report, [{ step: 's4', label: 'Colored by score', reason: 'There is no field score.' }]);
   assert.deepEqual(told, {
     text: 'Undid Claude\'s 2 steps (to Recently deleted); 1 step no longer applies.', tone: 'warning',
-    title: 'Undid Claude\'s 2 steps. “Coloured by score”: There is no field score.',
+    title: 'Undid Claude\'s 2 steps. “Colored by score”: There is no field score.',
   });
   // A change that failed (the caller's run reported it) is no undo, and nothing more is said.
   told = null;
@@ -361,7 +372,7 @@ test('every call costs and is counted: a failed try that began to answer, the su
   // An answer Cellucid could not read: asked for once more, and a second one ends the turn.
   const unreadable = { error: { kind: 'unreadable', message: 'Anthropic sent a tool call Cellucid could not read.', retryAfterMs: 5 }, usage: { input: 300, output: 40 } };
   const twice = await chatPage([unreadable, unreadable, { text: 'Never asked.' }]);
-  const gaveUp = await twice.turn('Colour it', 'turn-unreadable');
+  const gaveUp = await twice.turn('Color it', 'turn-unreadable');
   assert.equal(gaveUp.ended, 'error');
   assert.equal(twice.calls.length, 2);
   assert.equal(twice.changes.find(change => change.kind === 'status' && change.status?.phase === 'waiting').status.reason,
@@ -372,7 +383,7 @@ test('every call costs and is counted: a failed try that began to answer, the su
     otherCalls: { input: 600, output: 80, cacheRead: 0, cacheWrite: 0, calls: 2 },
   });
   const once = await chatPage([unreadable, { text: 'Read this time.' }]);
-  assert.equal((await once.turn('Colour it', 'turn-once')).ended, 'end');
+  assert.equal((await once.turn('Color it', 'turn-once')).ended, 'end');
   assert.equal(once.calls.length, 2);
 
   // Past the budget, no try again: the failed try that spent it ends the turn with the budget's note.
@@ -406,13 +417,13 @@ test('Stop mid-reply keeps the words streamed so far and runs nothing; Stop mid-
   assert.deepEqual(note, { role: 'note', turn: 'turn-e', kind: 'stopped', text: 'Stopped.' });
   assert.equal(page.state.colors.by, 'cell_type', 'the call was never run');
 
-  // Mid-call: the first call changes the colouring, then waits; Stop rolls it back and the second is not run.
+  // Mid-call: the first call changes the coloring, then waits; Stop rolls it back and the second is not run.
   const { state, domains } = fixturePage();
   const dispatcher = createActionDispatcher({ catalog: createActionCatalog([
     defineAction({
-      type: 'color.by', title: 'Colour by', summary: 'Colour by a field.', group: 'Colours',
+      type: 'color.by', title: 'Color by', summary: 'Color by a field.', group: 'Colors',
       params: { type: 'object', additionalProperties: false, required: ['field'], properties: { field: { type: 'string' } } },
-      touches: ['colors'], reads: [], effect: 'view', describe: p => `Coloured by ${p.field}`, code: () => 'x',
+      touches: ['colors'], reads: [], effect: 'view', describe: p => `Colored by ${p.field}`, code: () => 'x',
     }),
     defineAction({
       type: 'camera.set', title: 'Camera', summary: 'Place the camera.', group: 'Camera',
@@ -469,14 +480,14 @@ test('a conversation too long for the model is summarised by the model, and the 
   assert.equal(page.conversation.epoch, 1);
   assert.equal(sentFirst, `${SUMMARY_LEAD}\n\nSummary of the talk.`);
   const summaryNote = page.conversation.messages.find(message => message.role === 'note' && message.kind === 'summary');
-  // The summariser's call is counted with the turn, on its note.
+  // The summarizer's call is counted with the turn, on its note.
   assert.equal(summaryNote.otherCalls.calls, 1);
   assert.ok(summaryNote.otherCalls.input > 0);
   assert.equal(usageOf(page.conversation, 'turn-h').calls, 2, 'the summary and the answer');
-  // The summariser was sent no tools.
+  // The summarizer was sent no tools.
   assert.equal(page.calls[2].tools.length, 0);
 
-  // A known window the conversation would not fit: summarised before the call, not after a refusal.
+  // A known window the conversation would not fit: summarized before the call, not after a refusal.
   const known = await chatPage([{ text: 'x'.repeat(50) }, { text: 'Short summary.' }, { text: 'Fine.' }], { model: { id: 'small', contextTokens: 200_000, outputTokens: null } });
   await known.turn('a'.repeat(30), 'turn-i');
   const tight = await known.turn('b', 'turn-j', { lastUsage: { input: 199_999, count: 2 } });
@@ -494,15 +505,53 @@ test('a refusal and an answer cut at its limit end the turn with a note', async 
   await assert.rejects(runAgentTurn({ conversation: createConversation(), turn: 'nope', signal: new AbortController().signal }), RangeError);
 });
 
+test('what changed in the history since the last turn goes to the model with the person\'s message, after the context (L3-15)', () => {
+  const conversation = createConversation();
+  appendMessage(conversation, { role: 'user', text: 'Now color by Neurog3.', turn: 'turn-s', at: 1, context: 'Permissions: ask.', since: 'Since your last turn the history changed: Your step "Hid Ductal" was undone.' });
+  assert.equal(modelMessages(conversation)[0].text, 'Now color by Neurog3.\n\n[Cellucid: Permissions: ask.]\n\n[Cellucid: Since your last turn the history changed: Your step "Hid Ductal" was undone.]');
+});
+
+test('each call\'s result is kept as it comes, so a reload between two calls keeps the one that finished (live pass 2, S4)', async () => {
+  const page = await chatPage([{ calls: [{ name: 'fields_list', args: {} }, { name: 'fields_list', args: {} }] }, { text: 'Done.' }]);
+  const kept = [];
+  page.changes.push = function push(change) {
+    if (change.kind === 'message' && change.message.role === 'tool') kept.push(change.message.results.map(result => result.id));
+    return Array.prototype.push.call(this, change);
+  };
+  assert.equal((await page.turn('Read the fields twice', 'turn-r')).ended, 'end');
+  // Saved empty as the calls began, then with each result: one tool message for the reply's calls.
+  assert.deepEqual(kept, [[], ['call-1'], ['call-1', 'call-2']]);
+  assert.equal(page.conversation.messages.filter(message => message.role === 'tool').length, 1);
+  // A transcript saved between the two calls continues with the first call's result as it was.
+  const between = {
+    ...page.conversation,
+    messages: page.conversation.messages.slice(0, 3).map((message, index) => (index === 2 ? { ...message, results: message.results.slice(0, 1) } : message)),
+  };
+  const continued = conversationFrom(transcriptOf(between));
+  closeInterrupted(continued, { stepsOfTurn: () => [], toolOf: () => ({ type: 'fields.list', title: 'List fields' }) });
+  const results = continued.messages[2].results;
+  assert.equal(results[0].interrupted, undefined, 'the finished read keeps its result');
+  assert.equal(results[1].interrupted, true, 'only the call that did not finish is said interrupted');
+});
+
+test('a reply with no words for the person (only reasoning, or nothing) ends the turn with a note, never silence (F82)', async () => {
+  const page = await chatPage([{ calls: [{ name: 'fields_list', args: {} }] }, { text: '' }, { text: '   ' }]);
+  assert.equal((await page.turn('Annotate the clusters', 'turn-e')).ended, 'empty');
+  assert.deepEqual(page.conversation.messages.at(-1), { role: 'note', turn: 'turn-e', kind: 'empty', text: 'Claude ended its turn without a reply; ask it to go on, or try again.' });
+  // White space alone is no reply either.
+  assert.equal((await page.turn('Go on', 'turn-f')).ended, 'empty');
+  assert.equal(page.conversation.messages.filter(message => message.role === 'note' && message.kind === 'empty').length, 2);
+});
+
 test('what the chat shows of a tool row and of the work under way', () => {
-  const call = { title: 'Colour by' };
-  assert.deepEqual(toolRowText(call, null), { state: 'running', label: 'Colour by…' });
-  assert.deepEqual(toolRowText(call, { isError: false, step: { label: 'Coloured by leiden' }, content: [] }), { state: 'step', label: 'Coloured by leiden' });
-  assert.deepEqual(toolRowText(call, { isError: false, step: null, content: [] }), { state: 'read', label: 'Colour by' });
-  assert.deepEqual(toolRowText(call, { isError: true, step: null, content: [{ type: 'text', text: 'There is no field "x".' }] }), { state: 'refused', label: 'Colour by · refused' });
-  assert.deepEqual(toolRowText(call, { isError: true, step: null, content: [{ type: 'text', text: 'Not run: the person stopped this turn.' }] }), { state: 'stopped', label: 'Colour by · stopped' });
+  const call = { title: 'Color by' };
+  assert.deepEqual(toolRowText(call, null), { state: 'running', label: 'Color by…' });
+  assert.deepEqual(toolRowText(call, { isError: false, step: { label: 'Colored by leiden' }, content: [] }), { state: 'step', label: 'Colored by leiden' });
+  assert.deepEqual(toolRowText(call, { isError: false, step: null, content: [] }), { state: 'read', label: 'Color by' });
+  assert.deepEqual(toolRowText(call, { isError: true, step: null, content: [{ type: 'text', text: 'There is no field "x".' }] }), { state: 'refused', label: 'Color by · refused' });
+  assert.deepEqual(toolRowText(call, { isError: true, step: null, content: [{ type: 'text', text: 'Not run: the person stopped this turn.' }] }), { state: 'stopped', label: 'Color by · stopped' });
   assert.equal(workingTextOf({ phase: 'thinking' }), 'Thinking…');
-  assert.equal(workingTextOf({ phase: 'tool', tool: 'Colour by' }), 'Running: Colour by…');
+  assert.equal(workingTextOf({ phase: 'tool', tool: 'Color by' }), 'Running: Color by…');
   assert.equal(workingTextOf({ phase: 'waiting', reason: 'Slow down.', retryAt: 12_000 }, 3_500), 'Slow down. Next try in ~9 s.');
   assert.equal(workingTextOf(null), '');
 });
@@ -542,23 +591,31 @@ test('an API key is kept for the tab only unless Remember is ticked; Forget remo
   assert.equal(strict.get('anthropic'), null);
 });
 
-test('the remembered chat choices: provider, a model per provider, open; never a key; defaults when unreadable', () => {
+test('the remembered chat choices: provider, a model per provider, the prompt cache, open; never a key; defaults when unreadable', () => {
   const storage = memoryStorage();
-  const empty = { provider: null, models: {}, efforts: {}, instructions: '', budget: null, open: false };
+  const empty = { provider: null, models: {}, efforts: {}, instructions: '', budget: null, cache: '5m', open: false };
   assert.deepEqual(readChatPreferences({ storage }), empty);
   writeChatPreferences({ provider: 'openai', models: { openai: 'gpt-x' }, efforts: { 'openai:gpt-x': 'high' } }, { storage });
   writeChatPreferences({ open: true, models: { anthropic: 'claude-x' }, instructions: 'Be brief.', budget: 50_000 }, { storage });
   writeChatPreferences({ efforts: { 'anthropic:claude-x': 'low' } }, { storage });
   assert.deepEqual(readChatPreferences({ storage }), {
     provider: 'openai', models: { openai: 'gpt-x', anthropic: 'claude-x' }, efforts: { 'openai:gpt-x': 'high', 'anthropic:claude-x': 'low' },
-    instructions: 'Be brief.', budget: 50_000, open: true,
+    instructions: 'Be brief.', budget: 50_000, cache: '5m', open: true,
   });
+  // The prompt cache: an hour when chosen, back to 5 minutes; anything else read as the default.
+  writeChatPreferences({ cache: '1h' }, { storage });
+  assert.equal(readChatPreferences({ storage }).cache, '1h');
+  writeChatPreferences({ cache: '5m' }, { storage });
+  assert.equal(readChatPreferences({ storage }).cache, '5m');
+  storage.setItem(PREFERENCES_STORAGE_KEY, JSON.stringify({ cache: '2h' }));
+  assert.equal(readChatPreferences({ storage }).cache, '5m');
+  writeChatPreferences({ provider: 'openai', models: { openai: 'gpt-x', anthropic: 'claude-x' }, efforts: { 'anthropic:claude-x': 'low' }, instructions: 'Be brief.', budget: 50_000, open: true }, { storage });
   // An effort set back to the model's own default, and the budget taken away, are not kept.
   writeChatPreferences({ efforts: { 'openai:gpt-x': null }, budget: null }, { storage });
   assert.deepEqual(readChatPreferences({ storage }).efforts, { 'anthropic:claude-x': 'low' });
   assert.equal(readChatPreferences({ storage }).budget, null);
   assert.equal(effortKey('openai', 'gpt-x'), 'openai:gpt-x');
-  assert.deepEqual(Object.keys(JSON.parse(storage.getItem(PREFERENCES_STORAGE_KEY))).sort(), ['budget', 'efforts', 'instructions', 'models', 'open', 'provider']);
+  assert.deepEqual(Object.keys(JSON.parse(storage.getItem(PREFERENCES_STORAGE_KEY))).sort(), ['budget', 'cache', 'efforts', 'instructions', 'models', 'open', 'provider']);
   storage.setItem(PREFERENCES_STORAGE_KEY, '{nope');
   assert.deepEqual(readChatPreferences({ storage }), empty);
 });
@@ -581,11 +638,18 @@ test('a reply\'s Markdown: paragraphs, headings, lists, tables, code, quotes; in
     { text: 'a ' }, { code: 'b*c' }, { text: ' ' }, { strong: [{ text: 'd' }] }, { text: ' ' }, { em: [{ text: 'e' }] }, { text: ' ' },
     { link: 'f', href: 'https://g.h/i' }, { text: ' [j](javascript:alert(1)) snake_case_name' },
   ]);
+  // Underscores, single or double, mark emphasis only at a word's edge, never inside a word or a
+  // name (as CommonMark reads them); asterisks may. The rule sees the character before a run too.
+  assert.deepEqual(parseInline('snake__case__name window.__xss=(window.__xss)'), [
+    { text: 'snake__case__name window.__xss=(window.__xss)' },
+  ]);
+  assert.deepEqual(parseInline('__a__ and **b**er'), [{ strong: [{ text: 'a' }] }, { text: ' and ' }, { strong: [{ text: 'b' }] }, { text: 'er' }]);
+  assert.deepEqual(parseInline('a__b__ (__c__)'), [{ text: 'a__b__ (' }, { strong: [{ text: 'c' }] }, { text: ')' }]);
 });
 
 // ----------------------------------------------- Effort, budget, what was sent
 
-test('a turn sends the effort chosen; a chat past its budget makes no more model calls and says so', async () => {
+test('a turn sends the effort chosen; the budget is a cap: no call that would pass it is made, and the chat says so', async () => {
   const page = await chatPage([
     { text: 'One.', usage: { input: 600, output: 100 } },
     { text: 'Two.', usage: { input: 700, output: 200 } },
@@ -593,10 +657,20 @@ test('a turn sends the effort chosen; a chat past its budget makes no more model
   const first = await page.turn('Hello', 'turn-e', { effort: 'high', budget: 1000 });
   assert.equal(first.ended, 'end');
   assert.equal(page.calls[0].effort, 'high');
-  // 700 tokens used, under 1000: the next turn makes its call, then the budget is spent.
-  const second = await page.turn('Again', 'turn-f', { budget: 1000 });
+  // 700 tokens used, and the next call reads the whole prompt again (estimated here, with no
+  // last usage given: system, tools and messages): it would pass 1,000, so it is not made (L14-7: checked against what was spent alone, a
+  // 150,000-token budget ended at 209,751).
+  const held = await page.turn('Again', 'turn-f', { budget: 1000 });
+  assert.equal(held.ended, 'budget');
+  assert.equal(page.calls.length, 1, 'no call that would pass the budget');
+  assert.match(page.conversation.messages.at(-1).text,
+    /^This chat used 700 tokens, its budget is 1,000, and its next call would read about [\d,]+ more; raise it in the chat settings to go on\.$/);
+  // A budget with room for it: the call is made.
+  const second = await page.turn('Again', 'turn-f2', { budget: 2000 });
   assert.equal(second.ended, 'end');
   assert.equal(page.calls[1].effort, null);
+  assert.equal(page.calls.length, 2);
+  // Spent past a budget lowered since: the plain note.
   const third = await page.turn('And again', 'turn-g', { budget: 1000 });
   assert.equal(third.ended, 'budget');
   assert.equal(page.calls.length, 2, 'no call past the budget');
@@ -604,14 +678,20 @@ test('a turn sends the effort chosen; a chat past its budget makes no more model
     role: 'note', turn: 'turn-g', kind: 'limit', text: 'This chat used 1,600 tokens, its budget is 1,000; raise it in the chat settings to go on.',
   });
   assert.deepEqual(usageOf(page.conversation), { input: 1300, output: 300, cacheRead: 0, cacheWrite: 0, calls: 2 });
-  assert.deepEqual(usageOf(page.conversation, 'turn-f'), { input: 700, output: 200, cacheRead: 0, cacheWrite: 0, calls: 1 });
+  assert.deepEqual(usageOf(page.conversation, 'turn-f2'), { input: 700, output: 200, cacheRead: 0, cacheWrite: 0, calls: 1 });
   assert.equal(tokensText(usageOf(page.conversation, 'turn-g')), null, 'a turn with no call has no tokens');
   assert.equal(tokensText(usageOf(page.conversation)), '1,300 tokens read (0 from the cache), 300 written, in 2 calls');
+  // Before any call, the whole prompt is estimated: a budget smaller than it makes no call at all.
+  const small = await chatPage([{ text: 'Never asked.' }]);
+  const none = await small.turn('Hello', 'turn-h', { budget: 10 });
+  assert.equal(none.ended, 'budget');
+  assert.equal(small.calls.length, 0);
+  assert.match(small.conversation.messages.at(-1).text, /^This chat used 0 tokens, its budget is 10, and its next call would read about [\d,]+ more; raise it in the chat settings to go on\.$/);
 });
 
 test('what left this browser in a turn: the message with what Cellucid added, each tool result and its pictures; the model reads the addition', async () => {
   const conversation = createConversation({ id: 'c', now: 1 });
-  appendMessage(conversation, { role: 'user', text: 'Colour it', turn: 't1', at: 2, context: 'Permissions: read only.' });
+  appendMessage(conversation, { role: 'user', text: 'Color it', turn: 't1', at: 2, context: 'Permissions: read only.' });
   appendMessage(conversation, { role: 'assistant', turn: 't1', provider: 'scripted', agent: 'Claude', model: 'm', parts: [{ type: 'tool-call', id: 'a', name: 'fields_list', args: {} }, { type: 'tool-call', id: 'b', name: 'view_picture', args: {} }], at: 3, epoch: 0, stop: 'tool-use' });
   appendMessage(conversation, { role: 'tool', turn: 't1', results: [
     { id: 'a', name: 'fields_list', title: 'List fields', isError: false, step: null, content: [{ type: 'text', text: '{"fields":[]}' }] },
@@ -619,7 +699,7 @@ test('what left this browser in a turn: the message with what Cellucid added, ea
   ] });
   const sent = sentOf(conversation, 't1');
   // The message as the model reads it: the words and what Cellucid told with them.
-  assert.deepEqual(sent, { message: 'Colour it\n\n[Cellucid: Permissions: read only.]'.length, results: 2, resultChars: 15, pictures: 1, tools: ['fields_list', 'view_picture'], summariesOnly: false });
+  assert.deepEqual(sent, { message: 'Color it\n\n[Cellucid: Permissions: read only.]'.length, results: 2, resultChars: 15, pictures: 1, tools: ['fields_list', 'view_picture'], summariesOnly: false });
   assert.equal(sentText(sent, 'Anthropic'),
     "Sent to Anthropic: your message and 2 tool results (15 characters, 1 picture). That is all that left this browser for this turn; the dataset's files stay here, but a result can carry part of the data (the values of cells, a picture of the plot).");
   assert.deepEqual(sentOf(conversation, 'other'), { message: 0, results: 0, resultChars: 0, pictures: 0, tools: [], summariesOnly: false });
@@ -632,40 +712,140 @@ test('what left this browser in a turn: the message with what Cellucid added, ea
   assert.equal(sentOf(conversation, 't2').summariesOnly, true);
   assert.equal(sentOf(conversation, 't1').summariesOnly, false);
   assert.match(sentText(sentOf(conversation, 't2'), 'Anthropic'), /the dataset's files stay here, and the dataset was set to names and summaries only, so no result carried values of cells or a picture\.$/);
-  assert.equal(modelMessages(conversation)[0].text, 'Colour it\n\n[Cellucid: Permissions: read only.]');
+  // A turn received with the conversation was sent by the browser it was made in, not this one (L24-9).
+  assert.equal(sentText(sent, 'Anthropic', { received: true }),
+    'Nothing of this turn left this browser: it came with the conversation (a shared session or a saved state). The browser it was made in sent Anthropic the message and 2 tool results (15 characters, 1 picture); a result can carry part of the data (the values of cells, a picture of the plot).');
+  assert.doesNotMatch(sentText(sentOf(conversation, 't2'), 'Anthropic', { received: true }), /your message|left this browser for this turn/);
+  assert.equal(modelMessages(conversation)[0].text, 'Color it\n\n[Cellucid: Permissions: read only.]');
+});
+
+test('a model\'s notes between its calls: shown as they stream, kept before the call they introduce, never sent as words, kept in the saved chat, its export and a summary\'s input', async () => {
+  const page = await chatPage([
+    { calls: [{ name: 'color_by', args: { field: 'leiden' }, note: 'The fields are read; coloring by leiden.' }] },
+    { text: 'Coloured by leiden.' },
+  ]);
+  await page.turn('Colour by leiden.', 'turn-n');
+  const reply = page.conversation.messages.find(message => message.role === 'assistant');
+  assert.deepEqual(reply.parts.map(part => part.type), ['progress', 'tool-call']);
+  assert.deepEqual(progressNotes(reply), ['The fields are read; coloring by leiden.']);
+  // Streamed as it came: the chat was told to draw the reply (it has no words, only the note) while the model answered.
+  assert.ok(page.changes.some(change => change.kind === 'text' && change.message === reply));
+  // No provider sends it as words: Anthropic sends its own block back (here, from another provider, nothing), OpenAI nothing.
+  const sent = modelMessages(page.conversation);
+  assert.equal(anthropicMessagesOf(sent).flatMap(message => message.content).some(block => block.type === 'text' && /coloring by leiden/.test(block.text)), false);
+  assert.equal(JSON.stringify(openaiInputOf(sent)).includes('coloring by leiden'), false);
+  // The person keeps it: the saved chat, the export (a quiet line), what a summarizer reads.
+  assert.deepEqual(progressNotes(conversationFrom(transcriptOf(page.conversation)).messages.find(message => message.role === 'assistant')), ['The fields are read; coloring by leiden.']);
+  assert.match(conversationMarkdown(page.conversation), /\*\*Claude\*\* \(scripted\)\n\n\*The fields are read; coloring by leiden\.\*\n\n- `color_by`/);
+  assert.match(summaryInputOf(page.conversation, page.conversation.messages.length), /Assistant noted: The fields are read; coloring by leiden\.\n\nAssistant called color_by/);
+});
+
+test('a refused call keeps its refusal\'s code with the chat (saved, never sent): the model reads the sentence', async () => {
+  const dispatcher = createActionDispatcher({ catalog: createActionCatalog([
+    defineAction({
+      type: 'annotation.publish', title: 'Vote', summary: 'Vote.', group: 'Community annotation',
+      params: { type: 'object', additionalProperties: false, properties: {} },
+      touches: [], reads: [], effect: 'outside', describe: () => 'Voted', code: () => 'x',
+    }),
+  ]) });
+  dispatcher.provide('annotation.publish', () => { throw new ActionRefused('Community annotation is not connected for the dataset shown.', { code: 'unavailable', type: 'annotation.publish' }); });
+  const conversation = createConversation();
+  appendMessage(conversation, { role: 'user', text: 'Vote', turn: 'turn-c', at: 1 });
+  const replies = [{ calls: [{ name: 'annotation_publish', args: {} }, { name: 'no_such_tool', args: {} }] }, { text: 'It is not connected.' }];
+  await runAgentTurn({
+    conversation, key: null, model: { id: 'scripted', contextTokens: null, outputTokens: null },
+    provider: createScriptedProvider({ agent: 'Claude', reply: () => replies.shift() }),
+    system: 's', tools: mcpToolsOf(catalogDocument(dispatcher.catalog)), toolIndex: toolIndexOf(dispatcher.catalog), actions: dispatcher,
+    turn: 'turn-c', signal: new AbortController().signal, onChange: () => {}, win: null,
+  });
+  const [vote, unknown] = conversation.messages.find(message => message.role === 'tool').results;
+  assert.equal(vote.code, 'unavailable');
+  assert.equal(vote.isError, true);
+  assert.match(vote.content[0].text, /not connected/);
+  // A refusal that is not an action's (no such tool) has no code.
+  assert.equal('code' in unknown, false);
+  assert.equal(conversationFrom(transcriptOf(conversation)).messages.find(message => message.role === 'tool').results[0].code, 'unavailable');
+  assert.deepEqual(Object.keys(modelMessages(conversation).find(message => message.role === 'tool').results[0]), ['id', 'name', 'content', 'isError']);
+});
+
+test('Stop while a note streams keeps the note shown, as words already streamed are kept', async () => {
+  const conversation = createConversation();
+  appendMessage(conversation, { role: 'user', text: 'Go', turn: 'turn-s', at: 1 });
+  const stop = new AbortController();
+  let noted;
+  const shown = new Promise(resolve => { noted = resolve; });
+  const provider = checkedNotesProvider(async function* stream({ signal }) {
+    yield { type: 'progress', text: 'Reading the fields first.' };
+    noted();
+    await new Promise((resolve, reject) => { onAbort(signal, () => reject(signal.reason)); });
+  });
+  const page = setup();
+  const run = runAgentTurn({
+    conversation, provider, key: null, model: { id: 'scripted', contextTokens: null, outputTokens: null }, system: 's', tools: [],
+    toolIndex: new Map(), actions: page.dispatcher, turn: 'turn-s', signal: stop.signal, onChange: () => {}, win: null,
+  });
+  await shown;
+  stop.abort(cancelled('user', 'The person stopped Claude.'));
+  assert.equal((await run).ended, 'stopped');
+  const kept = conversation.messages.find(message => message.role === 'assistant');
+  assert.deepEqual(kept.parts, [{ type: 'progress', text: 'Reading the fields first.' }]);
+  assert.equal(kept.stop, 'stopped');
 });
 
 test('a conversation kept mid-turn (the page closed): each call left is answered with what became of it, and a model accepts it again', () => {
   const kept = createConversation({ id: 'c', now: 1 });
-  appendMessage(kept, { role: 'user', text: 'Colour, then hide', turn: 't1', at: 1 });
+  appendMessage(kept, { role: 'user', text: 'Color, then hide', turn: 't1', at: 1 });
   appendMessage(kept, { role: 'assistant', turn: 't1', provider: 'anthropic', agent: 'Claude', model: 'm', at: 2, epoch: 0, stop: 'tool-use',
     parts: [{ type: 'text', text: 'On it.' }, { type: 'tool-call', id: 'a', name: 'color_by', args: {} }, { type: 'tool-call', id: 'b', name: 'categories_hide', args: {} }] });
   appendMessage(kept, { role: 'user', text: 'Hello?', turn: 't2', at: 3 });
   const restored = conversationFrom(transcriptOf(kept));
-  const tools = new Map([['color_by', { type: 'color.by', title: 'Colour by' }], ['categories_hide', { type: 'filter.hide', title: 'Hide' }]]);
-  // The history kept the colouring's step (applied before the page closed); the hiding never ran.
+  const tools = new Map([['color_by', { type: 'color.by', title: 'Color by' }], ['categories_hide', { type: 'filter.hide', title: 'Hide' }]]);
+  // The history kept the coloring's step (applied before the page closed); the hiding never ran.
   const closed = closeInterrupted(restored, {
-    stepsOfTurn: turn => (turn === 't1' ? [{ id: 's4', type: 'color.by', label: 'Coloured by leiden' }] : []),
+    stepsOfTurn: turn => (turn === 't1' ? [{ id: 's4', type: 'color.by', label: 'Colored by leiden' }] : []),
     toolOf: name => tools.get(name),
   });
-  assert.equal(closed, 2);
-  assert.deepEqual(restored.messages.map(message => message.role), ['user', 'assistant', 'tool', 'user']);
+  // Two calls answered, and the turn they ended says it stopped there (with Try again).
+  assert.equal(closed, 3);
+  assert.deepEqual(restored.messages.map(message => message.role), ['user', 'assistant', 'tool', 'note', 'user']);
+  assert.deepEqual(restored.messages[3], { role: 'note', turn: 't1', kind: 'stopped', text: 'The page closed during this turn, so it stopped here.' });
   assert.deepEqual(restored.messages[2].results.map(result => [result.id, result.isError, result.step, result.content[0].text]), [
-    ['a', false, { id: 's4', label: 'Coloured by leiden' }, 'The page closed before this call\'s answer was kept; it was applied: <cellucid-data>"Coloured by leiden"</cellucid-data>, a step of the history.'],
+    ['a', false, { id: 's4', label: 'Colored by leiden' }, 'The page closed before this call\'s answer was kept; it was applied: <cellucid-data>"Colored by leiden"</cellucid-data>, a step of the history.'],
     ['b', true, null, 'The page closed before this call finished; nothing was applied.'],
   ]);
   assert.deepEqual(modelMessages(restored).map(message => message.role), ['user', 'assistant', 'tool', 'user'], 'every call is followed by its result');
   assert.equal(closeInterrupted(restored, { stepsOfTurn: () => [], toolOf: () => undefined }), 0, 'nothing left to answer');
   // The rows: an answered-as-applied call shows its step; one with nothing applied, and one with no result outside a running turn, are interrupted.
-  assert.deepEqual(toolRowText({ title: 'Colour by' }, restored.messages[2].results[0]), { state: 'step', label: 'Coloured by leiden' });
+  assert.deepEqual(toolRowText({ title: 'Color by' }, restored.messages[2].results[0]), { state: 'step', label: 'Colored by leiden' });
   assert.deepEqual(toolRowText({ title: 'Hide' }, restored.messages[2].results[1]), { state: 'interrupted', label: 'Hide · interrupted' });
   assert.deepEqual(toolRowText({ title: 'Hide' }, null, { running: false }), { state: 'interrupted', label: 'Hide · interrupted' });
   assert.deepEqual(toolRowText({ title: 'Hide' }, null), { state: 'running', label: 'Hide…' });
 });
 
+test('a turn the page closed in after its calls were answered (the model was to reply) says it stopped, once', () => {
+  const kept = createConversation({ id: 'c', now: 1 });
+  appendMessage(kept, { role: 'user', text: 'Dot plot, then describe it', turn: 't1', at: 1 });
+  appendMessage(kept, { role: 'assistant', turn: 't1', provider: 'anthropic', agent: 'Claude', model: 'm', at: 2, epoch: 0, stop: 'tool-use',
+    parts: [{ type: 'tool-call', id: 'a', name: 'analysis_dotplot_set', args: {} }] });
+  appendMessage(kept, { role: 'tool', turn: 't1', results: [{ id: 'a', name: 'analysis_dotplot_set', title: 'Dot plot', isError: false, step: { id: 's2', label: 'Opened Dot plot' }, content: [{ type: 'text', text: '{}' }] }] });
+  const restored = conversationFrom(transcriptOf(kept));
+  assert.equal(closeInterrupted(restored, { stepsOfTurn: () => [], toolOf: () => undefined }), 1);
+  assert.deepEqual(restored.messages.map(message => [message.role, message.kind ?? null]), [['user', null], ['assistant', null], ['tool', null], ['note', 'stopped']]);
+  assert.equal(closeInterrupted(restored, { stepsOfTurn: () => [], toolOf: () => undefined }), 0, 'said once');
+  assert.deepEqual(modelMessages(restored).map(message => message.role), ['user', 'assistant', 'tool'], 'the note is never sent');
+  // A question with choices ends its turn on its result by design: no note.
+  const asked = createConversation({ id: 'd', now: 1 });
+  appendMessage(asked, { role: 'user', text: 'Color it', turn: 't1', at: 1 });
+  appendMessage(asked, { role: 'assistant', turn: 't1', provider: 'anthropic', agent: 'Claude', model: 'm', at: 2, epoch: 0, stop: 'tool-use',
+    parts: [{ type: 'tool-call', id: 'q', name: 'ask_person', args: { question: 'Which field?', choices: ['a', 'b'] } }] });
+  appendMessage(asked, { role: 'tool', turn: 't1', results: [{ id: 'q', name: 'ask_person', title: 'Ask', isError: false, step: null, content: [{ type: 'text', text: 'Asked.' }] }] });
+  const askedAgain = conversationFrom(transcriptOf(asked));
+  assert.equal(closeInterrupted(askedAgain, { stepsOfTurn: () => [], toolOf: () => undefined }), 0);
+});
+
 test('a turn that fails between a reply and its results answers the calls left: the conversation stays one a model accepts', async () => {
   const page = await chatPage([{ calls: [{ name: 'color_by', args: { field: 'leiden' } }, { name: 'camera_set', args: { at: 3 } }] }]);
-  appendMessage(page.conversation, { role: 'user', text: 'Colour and turn', turn: 'turn-fault', at: 2 });
+  appendMessage(page.conversation, { role: 'user', text: 'Color and turn', turn: 'turn-fault', at: 2 });
   // A fault outside the tools (here, what is told of the second call's work throws) ends the turn mid-calls.
   const result = await runAgentTurn({
     conversation: page.conversation, provider: page.provider, key: null, model: { id: 'scripted', contextTokens: null, outputTokens: null },
@@ -680,7 +860,7 @@ test('a turn that fails between a reply and its results answers the calls left: 
     [reply.parts[0].id, false, results.results[0].content[0].text],
     [reply.parts[1].id, true, 'Not run: the turn failed (the status line is gone).'],
   ]);
-  assert.equal(results.results[0].step.label, 'Coloured by leiden', 'the call that ran keeps its step');
+  assert.equal(results.results[0].step.label, 'Colored by leiden', 'the call that ran keeps its step');
   assert.equal(note.text, 'The chat stopped: the status line is gone');
 });
 
@@ -688,10 +868,10 @@ test('a turn that fails between a reply and its results answers the calls left: 
 
 test('a chat exported as Markdown, and a turn as the short note the history shows beside its steps', async () => {
   const page = await chatPage([
-    { text: 'Let me colour.', calls: [{ name: 'color_by', args: { field: 'leiden' } }, { name: 'no_such_tool', args: {} }], usage: { input: 50, output: 5 } },
-    { text: 'Coloured by leiden. The clusters separate well.', usage: { input: 80, output: 9 } },
+    { text: 'Let me color.', calls: [{ name: 'color_by', args: { field: 'leiden' } }, { name: 'no_such_tool', args: {} }], usage: { input: 50, output: 5 } },
+    { text: 'Colored by leiden. The clusters separate well.', usage: { input: 80, output: 9 } },
   ]);
-  await page.turn('Colour by leiden please. Then tell me.', 'turn-h');
+  await page.turn('Color by leiden please. Then tell me.', 'turn-h');
   appendMessage(page.conversation, { role: 'note', turn: 'turn-h', kind: 'stopped', text: 'You stopped Claude.' });
   const markdown = conversationMarkdown(page.conversation, { dataset: 'Pancreas', version: '0.9.7', now: Date.UTC(2026, 10, 4) });
   assert.equal(markdown, [
@@ -701,18 +881,18 @@ test('a chat exported as Markdown, and a turn as the short note the history show
     '',
     '**You**',
     '',
-    '> Colour by leiden please. Then tell me.',
+    '> Color by leiden please. Then tell me.',
     '',
     '**Claude** (scripted)',
     '',
-    'Let me colour.',
+    'Let me color.',
     '',
-    '- `color_by` — step "Coloured by leiden"',
+    '- `color_by` — step "Colored by leiden"',
     '- `no_such_tool` — refused: Cellucid has no tool "no_such_tool".',
     '',
     '**Claude** (scripted)',
     '',
-    'Coloured by leiden. The clusters separate well.',
+    'Colored by leiden. The clusters separate well.',
     '',
     '*You stopped Claude.*',
     '',
@@ -726,9 +906,9 @@ test('a chat exported as Markdown, and a turn as the short note the history show
   const safe = conversationMarkdown(hostile, { now: 0 });
   assert.match(safe, /> hi \\<img src=x onerror="steal\(\)">/);
   assert.match(safe, /\*\*Claude\*\* \(\\<b>m\\<\/b>\)/);
-  assert.match(safe, /Plain \\<script>steal\(\)\\<\/script> \[go\]\\\(javascript:steal\(\)\) \[web\]\(https:\/\/example\.org\) `<kept>`\n```\n<also kept>\n```/);
+  assert.match(safe, /Plain \\<script>steal\(\)\\<\/script> \\\[go\]\(javascript:steal\(\)\) \[web\]\(https:\/\/example\.org\) `<kept>`\n```\n<also kept>\n```/);
   assert.match(safe, /- `` a`b<i> `` — refused: No tool \\<u>x\\<\/u>/);
-  assert.equal(turnNoteOf(page.conversation, 'turn-h'), 'Asked: "Colour by leiden please." Step: Coloured by leiden. Why: Coloured by leiden.');
+  assert.equal(turnNoteOf(page.conversation, 'turn-h'), 'Asked: "Color by leiden please." Step: Colored by leiden. Why: Colored by leiden.');
   assert.equal(turnNoteOf(page.conversation, 'nope'), null);
   const quiet = createConversation({ id: 'q', now: 1 });
   appendMessage(quiet, { role: 'user', text: 'What is this', turn: 't', at: 1 });
@@ -737,14 +917,21 @@ test('a chat exported as Markdown, and a turn as the short note the history show
 
 // ---------------------------------------------------------------- Suggestions
 
-test('what the empty chat offers: a first look; annotating and comparing the first categorical field; explaining the steps; no values read', async () => {
+test('what the empty chat offers: a first look; labelling the clustering (else the identity field\'s markers); comparing the identity field\'s groups; explaining the steps; no values read', async () => {
   assert.deepEqual(suggestionsFor(), ['Give me a first look at this dataset']);
-  assert.deepEqual(suggestionsFor({ field: 'cell_type', steps: 3 }), [
+  // No dataset open: a first look "at this dataset" would ask about nothing (R9E-8).
+  assert.deepEqual(suggestionsFor({ dataset: false, identity: 'cell_type', steps: 2 }), ['Open a sample dataset and give me a first look at it']);
+  assert.deepEqual(suggestionsFor({ identity: 'cell_type', cluster: 'leiden', steps: 3 }), [
     'Give me a first look at this dataset',
-    'Annotate the clusters of cell_type',
-    'Compare the two largest groups of cell_type',
+    'Label each cluster in "leiden" with a cell type',
+    'Compare the two largest groups in "cell_type"',
     'Explain what was done so far and write a methods paragraph',
   ]);
+  assert.deepEqual(suggestionsFor({ identity: 'cell_type' }), [
+    'Give me a first look at this dataset',
+    'Find the marker genes of each group in "cell_type"',
+    'Compare the two largest groups in "cell_type"',
+  ], 'cell types and no clustering: nothing to label, their markers instead');
   const asked = [];
   const actions = {
     async dispatch(type, params) {
@@ -752,9 +939,21 @@ test('what the empty chat offers: a first look; annotating and comparing the fir
       return { outcome: { fields: [{ key: 'batch', categories: 1 }, { key: 'leiden' }, { key: 'cell_type', categories: 9 }] }, step: null };
     },
   };
-  assert.deepEqual(await readSuggestionFacts(actions, 2), { field: 'leiden', steps: 2 }, 'a field counted as one category is passed over; one not yet counted may have several');
+  assert.deepEqual(await readSuggestionFacts(actions, 2), { identity: 'cell_type', cluster: 'leiden', steps: 2 }, 'the cell types before the clusters; a field counted as one category is passed over');
+  const named = fields => ({ dispatch: async () => ({ outcome: { fields }, step: null }) });
+  assert.deepEqual(
+    await readSuggestionFacts(named([{ key: 'clusters_coarse' }, { key: 'clusters' }, { key: 'cell_type', categories: 8 }]), 0),
+    { identity: 'cell_type', cluster: 'clusters', steps: 0 },
+    'Pancreas: cell_type is already named, clusters is what to label (offered "Annotate the clusters of cell_type")',
+  );
+  assert.deepEqual(
+    await readSuggestionFacts(named([{ key: 'sample_ID' }, { key: 'donor' }, { key: 'leiden', categories: 1 }, { key: 'louvain' }]), 0),
+    { identity: 'louvain', cluster: 'louvain', steps: 0 },
+    'never a sample (Suo offered "Annotate the clusters of sample_ID")',
+  );
+  assert.deepEqual(await readSuggestionFacts(named([{ key: 'sample_ID' }, { key: 'batch' }]), 0), { identity: null, cluster: null, steps: 0 }, 'only samples: nothing to label or compare');
   assert.deepEqual(asked, [['fields.list', { kind: 'categorical' }]], 'only what the dataset says of itself: no field is read');
-  assert.deepEqual(await readSuggestionFacts({ dispatch: async () => { throw new Error('no dataset'); } }, 0), { field: null, steps: 0 });
+  assert.deepEqual(await readSuggestionFacts({ dispatch: async () => { throw new Error('no dataset'); } }, 0), { identity: null, cluster: null, steps: 0 });
 });
 
 // --------------------------------------------------------------- History link
@@ -767,7 +966,7 @@ test('a turn\'s steps in the tracker shown: how many, how many on the path, the 
     { calls: [{ name: 'camera_set', args: { at: 7 } }] },
     { text: 'Done.' },
   ]);
-  await page.turn('Colour then move', 'turn-i');
+  await page.turn('Color then move', 'turn-i');
   await page.turn('Move', 'turn-j');
   const tree = page.history.active;
   const lastOf = turn => [...tree.steps.values()].filter(step => step.by.turn === turn).at(-1).id;
@@ -815,11 +1014,11 @@ test('a question with choices: checked, answered at once, the turn ends; the cho
 
   const page = await chatPage([
     { text: '', calls: [{ name: 'ask_person', args: { question: 'Which?', choices: ['one'] } }] },
-    { text: 'Before I go on:', calls: [{ name: 'ask_person', args: { question: 'Colour by which field?', choices: ['leiden', 'cell_type'] } }] },
+    { text: 'Before I go on:', calls: [{ name: 'ask_person', args: { question: 'Color by which field?', choices: ['leiden', 'cell_type'] } }] },
     { text: 'never asked for' },
   ]);
   const tools = [...mcpToolsOf(catalogDocument(page.dispatcher.catalog)), ASK_TOOL];
-  appendMessage(page.conversation, { role: 'user', text: 'Colour it', turn: 't1', at: 2 });
+  appendMessage(page.conversation, { role: 'user', text: 'Color it', turn: 't1', at: 2 });
   const ran = await runAgentTurn({
     conversation: page.conversation, provider: page.provider, key: null, model: { id: 'scripted', contextTokens: null, outputTokens: null },
     system: 'x', tools, toolIndex: toolIndexOf(page.dispatcher.catalog), actions: page.dispatcher, turn: 't1',
@@ -834,10 +1033,10 @@ test('a question with choices: checked, answered at once, the turn ends; the cho
   ]);
   assert.equal(stepsOfTurn(page.history.active, 't1').inTree, 0, 'asking records nothing');
   const pending = pendingQuestion(page.conversation);
-  assert.deepEqual({ ...pending, id: undefined }, { turn: 't1', id: undefined, question: 'Colour by which field?', choices: ['leiden', 'cell_type'] });
+  assert.deepEqual({ ...pending, id: undefined }, { turn: 't1', id: undefined, question: 'Color by which field?', choices: ['leiden', 'cell_type'] });
   // Shown as words in the exported chat; the tool's own row is not repeated.
   const markdown = conversationMarkdown(page.conversation, { now: 0 });
-  assert.match(markdown, /Colour by which field\? \*\(leiden · cell_type\)\*/);
+  assert.match(markdown, /Color by which field\? \*\(leiden · cell_type\)\*/);
   assert.equal(markdown.includes('`ask_person` — read'), false);
   // The person's answer is their next message: the question no longer waits.
   appendMessage(page.conversation, { role: 'user', text: 'leiden', turn: 't2', at: 3 });

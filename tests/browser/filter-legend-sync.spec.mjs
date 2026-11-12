@@ -62,7 +62,7 @@ test('removing a range filter from Active filters resets the legend sliders it d
 
 test('Filter is offered only while Live filtering is off, and applies the range once', async ({ page }) => {
   // With Live filtering on every slider step applies the range, so a Filter
-  // button beside the switch (it used to be a greyed-out one) has nothing to do.
+  // button beside the switch (it used to be a grayed-out one) has nothing to do.
   const productErrors = observeProductErrors(page);
   await openPreparedFixture(page);
 

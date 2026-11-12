@@ -1,0 +1,30 @@
+{
+  "examples": [
+    {
+      "pages": [
+        "Page 1"
+      ]
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "pages": {
+        "items": {
+          "minLength": 1,
+          "pattern": "^\\S(?:.*\\S)?$",
+          "type": "string"
+        },
+        "minItems": 1,
+        "type": "array",
+        "uniqueItems": true
+      }
+    },
+    "required": [
+      "pages"
+    ],
+    "type": "object"
+  },
+  "type": "highlight.page.delete",
+  "version": 2
+}

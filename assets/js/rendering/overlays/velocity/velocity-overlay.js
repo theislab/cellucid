@@ -18,6 +18,14 @@
  * 4. BLOOM: Multi-pass anamorphic bloom for cinematic glow
  * 5. OUTPUT: HDR tone mapping + color grading + film grain
  *
+ * REDUCED MOTION: when the person asks for reduced motion (the overlay
+ * context's `reducedMotion`, from `utils/reduced-motion.js`), nothing flows.
+ * Steps 1-3 run once, in one frame, as a fixed trace from fixed seeds
+ * (`stillFlowTrace`): a still picture of streaks showing the direction and
+ * speed of the field. The trail holds it; it is traced again only when what
+ * it shows changes (the camera, the table, the look), and it asks for no
+ * frame (`needsContinuousFrames`). A change of the setting switches at once.
+ *
  * @module rendering/overlays/velocity/velocity-overlay
  */
 
@@ -57,7 +65,7 @@ import { requireCleanWebGLState, requireLiveContext } from '../../gl-errors.js';
 import { isProvenCellRows, isUnplacedCell, positionsForGpu, requirePlacedOrUnplacedRows, unplacedCountOf, vectorsForGpu } from '../../unplaced-positions.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { requireLodMembership } from '../../high-perf/renderer-contracts.js';
-import { failureText } from '../../../utils/errors.js';
+import { InternalError, failureDetails, sayFailure } from '../../../utils/errors.js';
 
 /**
  * The cells particles may spawn from at a view's level of detail
@@ -236,6 +244,69 @@ function normalizeVelocityDropChance(probabilityAt60Hz, frameScale) {
   return 1 - Math.pow(1 - probability, frameScale);
 }
 
+/**
+ * The trail's retention per 60 Hz frame for each channel (red, green, blue,
+ * alpha): the fade, split by the chromatic fade so red lingers and blue
+ * goes first. The moving flow's fade pass and the still picture's step
+ * weights (`stillFlowTrace`) both read it.
+ *
+ * @param {number} fadeAt60Hz
+ * @param {number} chromaticFade
+ * @returns {[number, number, number, number]}
+ */
+export function trailChannelFades(fadeAt60Hz, chromaticFade) {
+  return [
+    Math.min(1, fadeAt60Hz * (1 + 0.025 * chromaticFade)),
+    Math.min(1, fadeAt60Hz * (1 + 0.005 * chromaticFade)),
+    Math.min(1, fadeAt60Hz * (1 - 0.035 * chromaticFade)),
+    Math.min(1, fadeAt60Hz * (1 - 0.005 * chromaticFade)),
+  ];
+}
+
+/** Steps of the still picture's trace (`stillFlowTrace`). */
+export const STILL_FLOW_STEPS = 48;
+/** Each step's simulated time, s: a 60 Hz frame of the moving flow. */
+export const STILL_FLOW_STEP_SECONDS = 1 / 60;
+
+/**
+ * The still picture of the flow drawn under reduced motion (F103): the
+ * particles respawn from fixed seeds and advance `STILL_FLOW_STEPS` fixed
+ * steps at fixed times, all in one frame, each step drawn into a cleared
+ * trail with the fade the later steps would have applied in the moving flow
+ * (`trailChannelFades`). Every particle leaves a streak from its cell along
+ * the field: its direction (a bright head, a fading tail) and its speed (the
+ * streak's length and color). Nothing in it depends on the clock or on how
+ * many frames ran, so the same inputs draw the same picture every time.
+ *
+ * @param {{trailFade: number, chromaticFade: number}} config
+ * @returns {ReadonlyArray<Readonly<{time: number, dt: number, forceRespawn: boolean, weight: Float32Array}>>}
+ */
+export function stillFlowTrace({ trailFade, chromaticFade }) {
+  requireNumber(trailFade, 'trailFade', 0.5, 0.999);
+  requireNumber(chromaticFade, 'chromaticFade', 0, 1);
+  const fades = trailChannelFades(trailFade, chromaticFade);
+  const steps = [];
+  for (let step = 0; step < STILL_FLOW_STEPS; step++) {
+    const later = STILL_FLOW_STEPS - 1 - step;
+    steps.push(Object.freeze({
+      time: step * STILL_FLOW_STEP_SECONDS,
+      dt: STILL_FLOW_STEP_SECONDS,
+      forceRespawn: step === 0,
+      weight: Float32Array.from(fades, fade => Math.pow(fade, later)),
+    }));
+  }
+  return Object.freeze(steps);
+}
+
+/**
+ * The values a still picture depends on beyond its table and particles
+ * (`_stillPictureOf`): three matrices, the camera position, ten scalars.
+ */
+const STILL_PICTURE_SIGNATURE_LENGTH = 61;
+
+/** A particle draw of the moving flow adds its full light to the trail. */
+const FULL_WEIGHT = new Float32Array([1, 1, 1, 1]);
+
 function nextParticleCapacity(requested, maximum) {
   requirePositiveSafeInteger(requested, 'requested particle capacity');
   requirePositiveSafeInteger(maximum, 'maximum particle capacity');
@@ -324,7 +395,7 @@ export function computeVelocityRenderTargetLayout(options) {
     maxViewportHeight / viewportHeight
   );
   if (!Number.isFinite(effectiveScale) || effectiveScale <= 0) {
-    throw new Error('VelocityOverlay could not derive a renderable target scale.');
+    throw new InternalError('VelocityOverlay could not derive a renderable target scale.');
   }
   const width = Math.max(1, Math.floor(viewportWidth * effectiveScale));
   const height = Math.max(1, Math.floor(viewportHeight * effectiveScale));
@@ -840,6 +911,9 @@ export class VelocityOverlay extends OverlayBase {
     this._contextLost = false;
     this._disposePending = false;
     this._failureHandler = null;
+    // A count of configuration changes: a still picture is of one
+    // configuration (any setting can change the trace, its bloom or its look).
+    this._configGeneration = 0;
   }
 
   // ===========================================================================
@@ -1124,7 +1198,7 @@ export class VelocityOverlay extends OverlayBase {
       this._disposed ||
       this._disposePending
     ) {
-      throw new Error(
+      throw new InternalError(
         'VelocityOverlay cannot change enabled state while disposal-pending or disposed.'
       );
     }
@@ -1141,7 +1215,7 @@ export class VelocityOverlay extends OverlayBase {
       return;
     }
     if (this._disposed || this._disposePending) {
-      throw new Error(
+      throw new InternalError(
         'VelocityOverlay cannot enable a disposed or disposal-pending instance.'
       );
     }
@@ -1154,7 +1228,7 @@ export class VelocityOverlay extends OverlayBase {
       throw error;
     }
     if (!this._initialized) {
-      throw new Error(
+      throw new InternalError(
         'VelocityOverlay initialization did not publish a ready instance.'
       );
     }
@@ -1189,7 +1263,7 @@ export class VelocityOverlay extends OverlayBase {
     for (let index = 0; index < viewIds.length; index++) {
       requireViewId(viewIds[index]);
       if (viewIds.indexOf(viewIds[index]) !== index) {
-        throw new Error(
+        throw new InternalError(
           `VelocityOverlay prepareFrame received duplicate view "${viewIds[index]}".`
         );
       }
@@ -1226,7 +1300,8 @@ export class VelocityOverlay extends OverlayBase {
    * presented view's spawn table is being built or must be rebuilt (the next
    * frame starts or adopts it). With no field for the layout, nothing
    * visible, particles off at this level of detail, or in smoke mode (no view
-   * presented), the overlay draws nothing and the scene settles.
+   * presented), the overlay draws nothing and the scene settles. Under
+   * reduced motion the flow is a still picture: once drawn it asks for none.
    * @returns {boolean}
    */
   needsContinuousFrames() {
@@ -1234,9 +1309,13 @@ export class VelocityOverlay extends OverlayBase {
       return false;
     }
     for (const viewId of this._presentedViewIds) {
-      // A particle state flows, or is owed the update that settles it (a
-      // table emptied by a filter disposes it there).
-      if (this._particleByView.has(viewId)) return true;
+      // A particle state flows, is a still picture not drawn yet, or is owed
+      // the update that settles it (a table emptied by a filter disposes it
+      // there).
+      const particles = this._particleByView.get(viewId);
+      if (particles !== undefined && !this._holdsStillPicture(viewId, particles)) {
+        return true;
+      }
       const spawn = this._spawnByView.get(viewId);
       // A table serves frames only while its view wants particles (a field
       // for the layout, particles on at this level of detail): one being
@@ -1244,7 +1323,7 @@ export class VelocityOverlay extends OverlayBase {
       // next update creates.
       if (spawn === undefined || !(spawn.targetCount > 0)) continue;
       if (spawn.building || spawn.dirty) return true;
-      if (spawn.ready && spawn.tableSize > 0) return true;
+      if (particles === undefined && spawn.ready && spawn.tableSize > 0) return true;
     }
     return false;
   }
@@ -1257,7 +1336,8 @@ export class VelocityOverlay extends OverlayBase {
    * particles (none made, another count, an earlier generation). Particles
    * flowing from the table of every presented view that wants them owe
    * nothing: their frames animate without end and are paced
-   * (`rendering/ambient-frame-pacing.js`).
+   * (`rendering/ambient-frame-pacing.js`). A still picture not drawn yet
+   * (reduced motion) is owed: it is drawn once and holds.
    * @returns {boolean}
    */
   needsOwedFrames() {
@@ -1265,6 +1345,13 @@ export class VelocityOverlay extends OverlayBase {
     for (const viewId of this._presentedViewIds) {
       const particles = this._particleByView.get(viewId);
       if (particles !== undefined && !(particles.activeParticleCount > 0)) return true;
+      if (
+        particles !== undefined &&
+        particles.still === true &&
+        !this._holdsStillPicture(viewId, particles)
+      ) {
+        return true;
+      }
       const spawn = this._spawnByView.get(viewId);
       if (spawn === undefined || !(spawn.targetCount > 0)) continue;
       if (spawn.building || spawn.dirty) return true;
@@ -1444,6 +1531,7 @@ export class VelocityOverlay extends OverlayBase {
       return;
     }
     cfg[validated.key] = validated.value;
+    this._configGeneration += 1;
     if (
       validated.key === 'trailResolution' ||
       validated.key === 'renderTargetByteBudget'
@@ -1531,7 +1619,7 @@ export class VelocityOverlay extends OverlayBase {
 
       this._transformFeedback = gl.createTransformFeedback();
       if (this._transformFeedback === null) {
-        throw new Error(
+        throw new InternalError(
           'VelocityOverlay could not allocate transform-feedback ownership.'
         );
       }
@@ -1566,6 +1654,8 @@ export class VelocityOverlay extends OverlayBase {
       );
     }
     const dim = requireDimensionLevel(ctx.dimensionLevel);
+    // Reduced motion: the flow is a still picture (`stillFlowTrace`).
+    const still = requireBoolean(ctx.reducedMotion, 'context reducedMotion');
     const field = this._activeFieldId && typeof ctx.layoutKey === 'string'
       ? this._fieldsById.get(this._activeFieldId)?.get(ctx.layoutKey)
       : null;
@@ -1599,7 +1689,7 @@ export class VelocityOverlay extends OverlayBase {
         // the raw level against ascending thresholds reads the ladder backwards:
         // it awarded the full particle count to the coarsest level and disposed
         // the overlay at full detail, which is the exact inverse of the
-        // documented behaviour ("the flow vanishes with the camera zoomed out").
+        // documented behavior ("the flow vanishes with the camera zoomed out").
         if (typeof ctx.getLodLevelCount !== 'function') {
           throw new TypeError(
             'VelocityOverlay context getLodLevelCount() is required.'
@@ -1699,6 +1789,18 @@ export class VelocityOverlay extends OverlayBase {
       this._scheduleTrailClear(viewId);
     }
     particleState.activeParticleCount = targetCount;
+    particleState.positionTexture = posTexture;
+    if (particleState.still !== still) {
+      // Between the moving flow and the still picture the camera history
+      // starts over: the flow goes on from the picture without a smear.
+      particleState.still = still;
+      particleState.lastCameraPosition = null;
+      particleState.lastViewMatrix = null;
+      particleState.cameraMotionAmount = 0;
+    }
+    // A still picture is traced when it is drawn, and only when what it
+    // shows changed (`_renderFlow`); nothing advances from frame to frame.
+    if (still) return;
     this._updateCameraMotion(ctx, particleState, dt);
     this._simulate(
       dt,
@@ -1998,7 +2100,7 @@ export class VelocityOverlay extends OverlayBase {
       this._fullscreenVAO !== null ||
       this._fullscreenAttrib0Buffer !== null
     ) {
-      throw new Error(
+      throw new InternalError(
         'VelocityOverlay fullscreen geometry is already initialized.'
       );
     }
@@ -2008,14 +2110,14 @@ export class VelocityOverlay extends OverlayBase {
 
     const vao = gl.createVertexArray();
     if (vao === null) {
-      throw new Error(
+      throw new InternalError(
         'VelocityOverlay could not allocate the fullscreen vertex array.'
       );
     }
     this._fullscreenVAO = vao;
     const buffer = gl.createBuffer();
     if (buffer === null) {
-      throw new Error(
+      throw new InternalError(
         'VelocityOverlay could not allocate the fullscreen attribute-zero buffer.'
       );
     }
@@ -2084,7 +2186,13 @@ export class VelocityOverlay extends OverlayBase {
       lastCameraPosition: null,
       lastViewMatrix: null,
       positionsRef: null,
+      // The view's position texture of the last update, which the still
+      // picture's trace reads when it is drawn (`_renderFlow`).
+      positionTexture: null,
       readyGeneration: -1,
+      // Whether the flow is drawn as a still picture (reduced motion): set
+      // by each update from the context.
+      still: false,
       vaos,
     };
     let allocationFailure;
@@ -2092,7 +2200,7 @@ export class VelocityOverlay extends OverlayBase {
       for (let index = 0; index < 2; index++) {
         const buffer = gl.createBuffer();
         if (buffer === null) {
-          throw new Error(
+          throw new InternalError(
             `VelocityOverlay could not allocate particle buffer ${index}.`
           );
         }
@@ -2105,7 +2213,7 @@ export class VelocityOverlay extends OverlayBase {
 
         const vao = gl.createVertexArray();
         if (vao === null) {
-          throw new Error(
+          throw new InternalError(
             `VelocityOverlay could not allocate particle vertex array ${index}.`
           );
         }
@@ -2265,9 +2373,25 @@ export class VelocityOverlay extends OverlayBase {
   // ===========================================================================
 
   _simulate(dt, ctx, field, posTexture, spawnState, particleState) {
-    const gl = this.gl;
     if (particleState.lastAdvancedFrameId === ctx.frameId) return;
+    this._advanceParticles(
+      dt,
+      ctx.time,
+      field,
+      posTexture,
+      spawnState,
+      particleState
+    );
+    particleState.lastAdvancedFrameId = ctx.frameId;
+  }
 
+  /**
+   * One simulation step of every active particle (transform feedback): a
+   * respawn when `particleState.forceRespawn` is set, else the advance by
+   * `dt` at time `time` (the shader's seeds and turbulence read it).
+   */
+  _advanceParticles(dt, time, field, posTexture, spawnState, particleState) {
+    const gl = this.gl;
     const readIdx = particleState.currentBuffer;
     const writeIdx = 1 - readIdx;
 
@@ -2287,7 +2411,7 @@ export class VelocityOverlay extends OverlayBase {
     );
     gl.useProgram(this._programUpdate);
     gl.uniform1f(u.u_dt, dt);
-    gl.uniform1f(u.u_time, ctx.time);
+    gl.uniform1f(u.u_time, time);
     gl.uniform1f(u.u_speedMultiplier, this.config.speedMultiplier);
     gl.uniform1f(u.u_lifetime, this.config.lifetime);
     gl.uniform1f(
@@ -2387,7 +2511,6 @@ export class VelocityOverlay extends OverlayBase {
 
     particleState.currentBuffer = writeIdx;
     particleState.forceRespawn = false;
-    particleState.lastAdvancedFrameId = ctx.frameId;
   }
 
   // ===========================================================================
@@ -2399,6 +2522,7 @@ export class VelocityOverlay extends OverlayBase {
     let flowFailure;
     let fbos = null;
     let writeIdx = -1;
+    let picture = null;
     try {
       // Pane scissor coordinates are canvas-relative and must never leak into
       // pane-sized offscreen targets.
@@ -2410,29 +2534,55 @@ export class VelocityOverlay extends OverlayBase {
         ctx.viewportWidth,
         ctx.viewportHeight
       );
-      writeIdx = 1 - fbos.trailIdx;
-      // PASS 1: Chromatic fade previous frame (creates trail persistence), or
-      // consume one coalesced history clear after an appearance/generation
-      // transition without reallocating the full-resolution targets.
-      if (fbos.trailClearPending) {
-        this._clearTrailWriteTarget(fbos, writeIdx);
+      // Under reduced motion the trail holds a still picture, traced again
+      // only when what it shows changed (the camera, the table, the look).
+      picture = particleState.still
+        ? this._stillPictureOf(ctx, field, fbos, particleState, spawnState)
+        : null;
+      if (picture !== null && this._isStillPictureHeld(fbos, picture)) {
+        // PASSES 1-4 are the held picture and its bloom.
+        writeIdx = fbos.trailIdx;
       } else {
-        this._passFade(fbos, writeIdx, particleState, ctx.deltaTime);
-      }
+        writeIdx = 1 - fbos.trailIdx;
+        if (picture !== null) {
+          // PASSES 1 & 2: the still picture, traced at once into a cleared
+          // trail (`stillFlowTrace`).
+          this._clearTrailWriteTarget(fbos, writeIdx);
+          this._traceStillFlow(
+            ctx,
+            field,
+            fbos,
+            writeIdx,
+            particleState,
+            spawnState
+          );
+        } else {
+          // PASS 1: Chromatic fade previous frame (creates trail
+          // persistence), or consume one coalesced history clear after an
+          // appearance/generation transition without reallocating the
+          // full-resolution targets.
+          if (fbos.trailClearPending) {
+            this._clearTrailWriteTarget(fbos, writeIdx);
+          } else {
+            this._passFade(fbos, writeIdx, particleState, ctx.deltaTime);
+          }
 
-      // PASS 2: Render particles to trail buffer
-      this._passRenderParticles(
-        ctx,
-        field,
-        fbos,
-        writeIdx,
-        particleState,
-        spawnState
-      );
+          // PASS 2: Render particles to trail buffer
+          this._passRenderParticles(
+            ctx,
+            field,
+            fbos,
+            writeIdx,
+            particleState,
+            spawnState,
+            FULL_WEIGHT
+          );
+        }
 
-      // PASS 3 & 4: Anamorphic Bloom (if enabled)
-      if (fbos.bloomEnabled) {
-        this._passBloom(fbos, writeIdx);
+        // PASS 3 & 4: Anamorphic Bloom (if enabled)
+        if (fbos.bloomEnabled) {
+          this._passBloom(fbos, writeIdx);
+        }
       }
 
       // PASS 5: Final composite with HDR and color grading
@@ -2454,7 +2604,7 @@ export class VelocityOverlay extends OverlayBase {
       } else {
         gl.disable(gl.SCISSOR_TEST);
       }
-      this._passComposite(ctx, fbos, writeIdx);
+      this._passComposite(ctx, fbos, writeIdx, picture === null ? ctx.time : 0);
     } catch (error) {
       flowFailure = error;
     }
@@ -2476,6 +2626,122 @@ export class VelocityOverlay extends OverlayBase {
     );
     fbos.trailIdx = writeIdx;
     fbos.trailClearPending = false;
+    fbos.stillPicture = picture;
+  }
+
+  /**
+   * What a still picture drawn now would show: the camera and the pane's
+   * drawing inputs (`signature`), the field, the spawn table (its generation
+   * and which of its fills), the particle count and the configuration. Equal
+   * descriptions draw equal pictures (`stillFlowTrace`).
+   */
+  _stillPictureOf(ctx, field, fbos, particleState, spawnState) {
+    const signature = new Float64Array(STILL_PICTURE_SIGNATURE_LENGTH);
+    signature.set(ctx.mvpMatrix, 0);
+    signature.set(ctx.viewMatrix, 16);
+    signature.set(ctx.modelMatrix, 32);
+    signature.set(ctx.cameraPosition, 48);
+    signature[51] = ctx.viewportHeight;
+    signature[52] = ctx.fov;
+    signature[53] = ctx.sizeAttenuation;
+    signature[54] = ctx.devicePixelRatio;
+    signature[55] = ctx.fogDensity;
+    signature[56] = ctx.fogNear;
+    signature[57] = ctx.fogFar;
+    signature[58] = fbos.rasterScale;
+    signature[59] = fbos.width;
+    signature[60] = fbos.height;
+    return {
+      configGeneration: this._configGeneration,
+      count: particleState.activeParticleCount,
+      field,
+      generation: spawnState.generation,
+      signature,
+      tableEpoch: spawnState.tableEpoch,
+    };
+  }
+
+  /** Whether the trail already holds `picture` (drawn, nothing cleared it). */
+  _isStillPictureHeld(fbos, picture) {
+    const held = fbos.stillPicture;
+    if (
+      held === null ||
+      held === undefined ||
+      fbos.trailClearPending ||
+      held.configGeneration !== picture.configGeneration ||
+      held.count !== picture.count ||
+      held.field !== picture.field ||
+      held.generation !== picture.generation ||
+      held.tableEpoch !== picture.tableEpoch
+    ) {
+      return false;
+    }
+    for (let index = 0; index < STILL_PICTURE_SIGNATURE_LENGTH; index++) {
+      if (!Object.is(held.signature[index], picture.signature[index])) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Whether a view's flow is a still picture already drawn for its current
+   * table and particles: it asks for no frame (a camera move draws one
+   * anyway, and traces the picture again for the new camera).
+   */
+  _holdsStillPicture(viewId, particles) {
+    if (particles.still !== true) return false;
+    const fbos = this._fboByView.get(viewId);
+    const spawn = this._spawnByView.get(viewId);
+    const held = fbos?.stillPicture;
+    return (
+      held !== null &&
+      held !== undefined &&
+      !fbos.trailClearPending &&
+      spawn !== undefined &&
+      spawn.ready === true &&
+      !spawn.dirty &&
+      !spawn.building &&
+      particles.activeParticleCount > 0 &&
+      particles.activeParticleCount === spawn.targetCount &&
+      particles.readyGeneration === spawn.generation &&
+      held.configGeneration === this._configGeneration &&
+      held.count === particles.activeParticleCount &&
+      held.generation === spawn.generation &&
+      held.tableEpoch === spawn.tableEpoch
+    );
+  }
+
+  /**
+   * Trace the still picture into the cleared trail target `writeIdx`: each
+   * step of `stillFlowTrace` advances the particles and draws them with its
+   * weight.
+   */
+  _traceStillFlow(ctx, field, fbos, writeIdx, particleState, spawnState) {
+    const posTexture = particleState.positionTexture;
+    if (posTexture === null || typeof posTexture !== 'object') {
+      throw new InternalError(
+        'VelocityOverlay still flow requires the position texture of its update.'
+      );
+    }
+    for (const step of stillFlowTrace(this.config)) {
+      particleState.forceRespawn = step.forceRespawn;
+      this._advanceParticles(
+        step.dt,
+        step.time,
+        field,
+        posTexture,
+        spawnState,
+        particleState
+      );
+      this._passRenderParticles(
+        ctx,
+        field,
+        fbos,
+        writeIdx,
+        particleState,
+        spawnState,
+        step.weight
+      );
+    }
   }
 
   _clearTrailWriteTarget(fbos, writeIdx) {
@@ -2584,36 +2850,18 @@ export class VelocityOverlay extends OverlayBase {
     const fadeAt60Hz = this._getEffectiveTrailFadeAt60Hz(
       particleState
     );
-    const chromaticFade = this.config.chromaticFade;
+    const [fadeR, fadeG, fadeB, fadeAlpha] = trailChannelFades(
+      fadeAt60Hz,
+      this.config.chromaticFade
+    );
     // Spatially uniform powers belong on the CPU. Evaluating these four
     // factors per fragment is prohibitive for full-resolution 4K trails.
-    gl.uniform1f(
-      this._uniformsFade.u_fadeR,
-      Math.pow(
-        Math.min(1, fadeAt60Hz * (1 + 0.025 * chromaticFade)),
-        frameScale
-      )
-    );
-    gl.uniform1f(
-      this._uniformsFade.u_fadeG,
-      Math.pow(
-        Math.min(1, fadeAt60Hz * (1 + 0.005 * chromaticFade)),
-        frameScale
-      )
-    );
-    gl.uniform1f(
-      this._uniformsFade.u_fadeB,
-      Math.pow(
-        Math.min(1, fadeAt60Hz * (1 - 0.035 * chromaticFade)),
-        frameScale
-      )
-    );
+    gl.uniform1f(this._uniformsFade.u_fadeR, Math.pow(fadeR, frameScale));
+    gl.uniform1f(this._uniformsFade.u_fadeG, Math.pow(fadeG, frameScale));
+    gl.uniform1f(this._uniformsFade.u_fadeB, Math.pow(fadeB, frameScale));
     gl.uniform1f(
       this._uniformsFade.u_fadeAlpha,
-      Math.pow(
-        Math.min(1, fadeAt60Hz * (1 - 0.005 * chromaticFade)),
-        frameScale
-      )
+      Math.pow(fadeAlpha, frameScale)
     );
     gl.uniform1f(this._uniformsFade.u_frameScale, frameScale);
 
@@ -2632,7 +2880,8 @@ export class VelocityOverlay extends OverlayBase {
     fbos,
     writeIdx,
     particleState,
-    spawnState
+    spawnState,
+    weight
   ) {
     const gl = this.gl;
 
@@ -2669,6 +2918,7 @@ export class VelocityOverlay extends OverlayBase {
     gl.uniform1f(u.u_glowAmount, this.config.glowAmount);
     gl.uniform1f(u.u_coreSharpness, this.config.coreSharpness);
     gl.uniform1f(u.u_cometStretch, this.config.cometStretch);
+    gl.uniform4fv(u.u_weight, weight);
 
     // Velocity normalization
     gl.uniform1f(
@@ -2780,7 +3030,7 @@ export class VelocityOverlay extends OverlayBase {
     gl.bindVertexArray(null);
   }
 
-  _passComposite(ctx, fbos, trailIdx) {
+  _passComposite(ctx, fbos, trailIdx, time) {
     const gl = this.gl;
 
     gl.viewport(
@@ -2804,7 +3054,7 @@ export class VelocityOverlay extends OverlayBase {
     gl.uniform1f(u.u_exposure, this.config.exposure);
     gl.uniform1f(u.u_contrast, this.config.contrast);
     gl.uniform1f(u.u_saturation, this.config.saturation);
-    gl.uniform1f(u.u_time, ctx.time);
+    gl.uniform1f(u.u_time, time);
 
     // Advanced color grading
     gl.uniform1f(u.u_highlights, this.config.highlights);
@@ -2993,7 +3243,7 @@ export class VelocityOverlay extends OverlayBase {
     const gl = this.gl;
     const pendingError = gl.getError();
     if (pendingError !== gl.NO_ERROR) {
-      throw new Error(
+      throw new InternalError(
         `VelocityOverlay format detection cannot start with WebGL error 0x${pendingError.toString(16)} pending.`
       );
     }
@@ -3050,14 +3300,14 @@ export class VelocityOverlay extends OverlayBase {
       try {
         const texture = gl.createTexture();
         if (texture === null) {
-          throw new Error(
+          throw new InternalError(
             'VelocityOverlay could not allocate a format-probe texture.'
           );
         }
         probe.trail[0] = texture;
         const framebuffer = gl.createFramebuffer();
         if (framebuffer === null) {
-          throw new Error(
+          throw new InternalError(
             'VelocityOverlay could not allocate a format-probe framebuffer.'
           );
         }
@@ -3070,7 +3320,7 @@ export class VelocityOverlay extends OverlayBase {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         const storageError = gl.getError();
         if (storageError !== gl.NO_ERROR) {
-          throw new Error(
+          throw new InternalError(
             `VelocityOverlay format probe failed with WebGL error 0x${storageError.toString(16)}.`
           );
         }
@@ -3135,7 +3385,7 @@ export class VelocityOverlay extends OverlayBase {
       throw detectionFailure;
     }
     if (!selected) {
-      const unavailable = new Error(
+      const unavailable = new InternalError(
         'VelocityOverlay requires a complete renderable trail texture format.'
       );
       if (restorationFailures !== null) {
@@ -3289,7 +3539,7 @@ export class VelocityOverlay extends OverlayBase {
           !(maxViewportDims instanceof Int32Array)) ||
         maxViewportDims.length !== 2
       ) {
-        throw new Error(
+        throw new InternalError(
           'VelocityOverlay requires exact two-value MAX_VIEWPORT_DIMS.'
         );
       }
@@ -3366,6 +3616,8 @@ export class VelocityOverlay extends OverlayBase {
         trailClearPending: false,
         trailFramebuffers,
         trailIdx: 0,
+        // The still picture the trail holds (reduced motion), or null.
+        stillPicture: null,
         trailTextureBytes,
       };
       let allocationFailure;
@@ -3381,14 +3633,14 @@ export class VelocityOverlay extends OverlayBase {
         ) => {
           const texture = gl.createTexture();
           if (texture === null) {
-            throw new Error(
+            throw new InternalError(
               `VelocityOverlay could not allocate ${label} texture ${index} for view "${key}".`
             );
           }
           textures[index] = texture;
           const framebuffer = gl.createFramebuffer();
           if (framebuffer === null) {
-            throw new Error(
+            throw new InternalError(
               `VelocityOverlay could not allocate ${label} framebuffer ${index} for view "${key}".`
             );
           }
@@ -3407,7 +3659,7 @@ export class VelocityOverlay extends OverlayBase {
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
           const storageError = gl.getError();
           if (storageError !== gl.NO_ERROR) {
-            throw new Error(
+            throw new InternalError(
               `VelocityOverlay ${label} texture ${index} allocation failed with WebGL error 0x${storageError.toString(16)}.`
             );
           }
@@ -3425,7 +3677,7 @@ export class VelocityOverlay extends OverlayBase {
           );
           const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
           if (status !== gl.FRAMEBUFFER_COMPLETE) {
-            throw new Error(
+            throw new InternalError(
               `VelocityOverlay ${label} framebuffer ${index} is incomplete for view "${key}" (status ${status}).`
             );
           }
@@ -3571,7 +3823,7 @@ export class VelocityOverlay extends OverlayBase {
       !Number.isSafeInteger(bytesPerPixel) ||
       bytesPerPixel <= 0
     ) {
-      throw new Error(
+      throw new InternalError(
         'VelocityOverlay derived texture byte ownership is invalid.'
       );
     }
@@ -3930,6 +4182,7 @@ export class VelocityOverlay extends OverlayBase {
       u_glowAmount: gl.getUniformLocation(this._programRender, 'u_glowAmount'),
       u_coreSharpness: gl.getUniformLocation(this._programRender, 'u_coreSharpness'),
       u_cometStretch: gl.getUniformLocation(this._programRender, 'u_cometStretch'),
+      u_weight: gl.getUniformLocation(this._programRender, 'u_weight'),
       u_invMaxMagnitude: gl.getUniformLocation(this._programRender, 'u_invMaxMagnitude'),
       u_alphaTex: gl.getUniformLocation(this._programRender, 'u_alphaTex'),
       u_alphaLayout: gl.getUniformLocation(this._programRender, 'u_alphaLayout'),
@@ -4125,7 +4378,7 @@ export class VelocityOverlay extends OverlayBase {
     );
     const candidate = gl.createTexture();
     if (candidate === null) {
-      throw new Error(
+      throw new InternalError(
         'VelocityOverlay could not allocate its colormap texture.'
       );
     }
@@ -4156,7 +4409,7 @@ export class VelocityOverlay extends OverlayBase {
       );
       const uploadError = gl.getError();
       if (uploadError !== gl.NO_ERROR) {
-        throw new Error(
+        throw new InternalError(
           `VelocityOverlay colormap upload failed with WebGL error 0x${uploadError.toString(16)}.`
         );
       }
@@ -4226,7 +4479,7 @@ export class VelocityOverlay extends OverlayBase {
 
     if (prev?.source === positions) {
       if (!prev.textureInfo) {
-        throw new Error(
+        throw new InternalError(
           `VelocityOverlay position texture ownership is invalid for view "${key}".`
         );
       }
@@ -4264,7 +4517,7 @@ export class VelocityOverlay extends OverlayBase {
       !Number.isSafeInteger(entry.refs) ||
       entry.refs <= 0
     ) {
-      throw new Error(
+      throw new InternalError(
         'VelocityOverlay position texture reference ownership is invalid.'
       );
     }
@@ -4356,6 +4609,8 @@ export class VelocityOverlay extends OverlayBase {
       lodIndices,
       // The visiting order: position `position`, then `+ stride` mod count.
       position: candidateCount === 0 ? 0 : start % candidateCount,
+      // Where this build's visits began (the table's `tableStart`).
+      start: candidateCount === 0 ? 0 : start % candidateCount,
       stride: spawnStrideOf(candidateCount),
       visited: 0,
       // Whether the build visited every candidate (its table is every visible cell).
@@ -4517,7 +4772,7 @@ export class VelocityOverlay extends OverlayBase {
 
   _finishSpawnTableBuild(build) {
     if (build.phase !== 'complete') {
-      throw new Error(
+      throw new InternalError(
         'VelocityOverlay cannot publish an incomplete spawn-table build.'
       );
     }
@@ -4565,6 +4820,11 @@ export class VelocityOverlay extends OverlayBase {
         spawnNext: 0,
         coversAll: true,
         epochStartedAt: -Infinity,
+        // Where the published table's visits began, and a count of the
+        // tables published (a refill keeps the generation): a still picture
+        // is of one table (`_renderFlow`).
+        tableStart: 0,
+        tableEpoch: 0,
       };
       this._spawnByView.set(key, state);
     }
@@ -4599,12 +4859,23 @@ export class VelocityOverlay extends OverlayBase {
     // A respawn epoch over (one particle lifetime): the table is refilled
     // from where the last one stopped, so every visible cell becomes a spawn
     // source in turn, unless it already holds every one. The table drawn
-    // stays until the refill lands.
+    // stays until the refill lands. A still picture (reduced motion) has no
+    // epochs: it is drawn from the table that begins the visiting order, so
+    // it is the same picture whenever it is drawn.
     if (
       !state.dirty && !state.building && state.ready && state.coversAll === false
-      && Number.isFinite(ctx.time) && ctx.time - state.epochStartedAt >= this.config.lifetime
     ) {
-      state.dirty = true;
+      if (ctx.reducedMotion === true) {
+        if (state.tableStart !== 0) {
+          state.spawnNext = 0;
+          state.dirty = true;
+        }
+      } else if (
+        Number.isFinite(ctx.time)
+        && ctx.time - state.epochStartedAt >= this.config.lifetime
+      ) {
+        state.dirty = true;
+      }
     }
 
     if (!state.dirty || state.building) return state;
@@ -4616,7 +4887,7 @@ export class VelocityOverlay extends OverlayBase {
 
     const notifications = getNotificationCenter();
     const showNotif = !state.textureInfo;
-    const notifId = showNotif ? notifications.loading('Preparing velocity overlay...', { category: 'render' }) : null;
+    const notifId = showNotif ? notifications.loading('Preparing velocity overlay…', { category: 'render' }) : null;
     state.notificationId = notifId;
 
     const schedule = typeof requestIdleCallback === 'function'
@@ -4758,8 +5029,8 @@ export class VelocityOverlay extends OverlayBase {
           }
         } else {
           notifications.error(
-            `Velocity overlay preparation failed: ${failureText(err)}`,
-            { category: 'render' }
+            `Velocity overlay preparation failed: ${sayFailure(err)}`,
+            { ...failureDetails(err), category: 'render' }
           );
         }
       } finally {
@@ -4970,6 +5241,8 @@ export class VelocityOverlay extends OverlayBase {
           state.spawnNext = build.position;
           state.coversAll = build.coversAll;
           state.epochStartedAt = ctx.time;
+          state.tableStart = build.start;
+          state.tableEpoch += 1;
 
           let retirementFailures = null;
           if (

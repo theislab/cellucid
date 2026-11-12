@@ -12,8 +12,8 @@
  * - `AnnDataReader.matrixRowsCost`: the export's price from the layout, the
  *   bytes a read of those rows fetches.
  * - The page's range cache keeps and looks up ranges in logarithmic time.
- * - `failureText`: never an empty failure; no notification shows
- *   `error.message` alone.
+ * - `failureText`: never an empty failure (that no notification shows an
+ *   error's words alone is `failure-wording-contract.test.mjs`).
  */
 import { blocksRun } from './helpers/block-counts.mjs';
 
@@ -232,25 +232,6 @@ test('a failure is never shown without words: its class and cause when its messa
   assert.equal(failureText(null), 'Error (no message given)');
 });
 
-test('no notification or status line shows error.message alone (failureText)', () => {
-  const offenders = [];
-  const walk = dir => {
-    for (const name of readdirSync(dir)) {
-      const full = path.join(dir, name);
-      if (statSync(full).isDirectory()) walk(full);
-      else if (name.endsWith('.js')) {
-        readFileSync(full, 'utf8').split('\n').forEach((line, index) => {
-          if (/(notifications?|_notifications|notify|getNotificationCenter\(\))\b[^;]*\b(error|err|e|failure)\.message\b|textContent = [^;]*\b(error|err|failure)\.message\b/.test(line)) {
-            offenders.push(`${path.relative(ROOT, full)}:${index + 1}`);
-          }
-        });
-      }
-    }
-  };
-  walk(path.join(ROOT, 'assets/js'));
-  assert.deepEqual(offenders, []);
-});
-
 test('an .h5ad export says what it will read before it reads it, and its Cancel stops it with nothing saved', async () => {
   const { initCellExportsUi } = await import('../assets/js/app/ui/modules/cell-exports-ui.js');
   const { createCellIdentity } = await import('../assets/js/data/cell-identity.js');
@@ -413,9 +394,9 @@ test('a CSV of every cell of a file in priority order reads the names once, as o
   assert.deepEqual(loads, [[0, { signal, silent: true }]]);
   assert.deepEqual(reads, [{ rows: [0, n] }], 'one range read of every open cell\'s names');
   const lines = (await blob.text()).trimEnd().split('\n');
-  assert.equal(lines.length, n + 2);
+  assert.equal(lines.length, n + 3);
   // Rows by original position, each named and valued as its cell.
-  for (const row of [0, 1, 65_535, 65_536, n - 1]) assert.equal(lines[row + 2], `cell-${row},${row % 5}`);
+  for (const row of [0, 1, 65_535, 65_536, n - 1]) assert.equal(lines[row + 3], `cell-${row},${row % 5}`);
 });
 
 test('an export reads the embedding rows of its listed cells alone, in their order, never every open row between them', async () => {

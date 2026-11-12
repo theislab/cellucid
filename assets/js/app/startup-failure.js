@@ -8,7 +8,7 @@ import {
 } from './ui/onboarding/welcome-modal.js';
 import { DataSourceError, isExplainedFailure } from '../data/data-source.js';
 import { STARTUP_STALL_CODE } from './startup-phase.js';
-import { isContextLostError } from '../rendering/gl-errors.js';
+import { isContextLostError, isContextRefusedError } from '../rendering/gl-errors.js';
 import { failureText } from '../utils/errors.js';
 
 /**
@@ -115,7 +115,8 @@ function explainedReason(error) {
  * - `browser`: no WebGL2, or a browser older than `BROWSER_FLOOR`, so
  *   Cellucid cannot run in this browser at all;
  * - `graphics`: the browser's graphics stopped working while Cellucid
- *   started (its WebGL2 context was lost, as it was made or after);
+ *   started (its WebGL2 context was lost, as it was made or after, or a
+ *   browser with WebGL2 would not give the viewer one);
  * - `data`: the server the page itself is served from could not be read;
  * - `stall`: a server startup waited on never answered (the page's own
  *   server, the sample catalog, a published default view);
@@ -152,6 +153,19 @@ export function describeStartupFailure(error, { webgl2Available, hasLaunchSettin
         'Update the browser or turn on hardware acceleration, then try again.',
       offerWithoutSettings: false,
       links: [[STARTUP_REQUIREMENTS_URL, 'System requirements']]
+    };
+  }
+  if (isContextRefusedError(error)) {
+    // This browser has WebGL2 (the probe's context came), yet refused one to
+    // the viewer: its graphics process cannot make another now (R9E-6).
+    return {
+      kind: 'graphics',
+      title: 'The browser\u2019s graphics stopped working',
+      sentence:
+        'The browser would not give Cellucid a graphics context: its graphics process was reset, or too many pages are drawing at once. ' +
+        'Close other tabs that draw 3D graphics and reload the page; if this happens again, restart the browser.',
+      offerWithoutSettings: false,
+      links: [[STARTUP_TROUBLESHOOTING_INDEX_URL, 'Troubleshooting']]
     };
   }
   if (isContextLostError(error)) {

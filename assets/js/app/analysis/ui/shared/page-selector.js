@@ -38,8 +38,7 @@
  * pageSelector.destroy();
  */
 
-import { formatCompactCount } from '../../../ui/components/display-format.js';
-import { formatCells, formatCountOf } from '../../../../utils/format-units.js';
+import { formatCells, formatCountOf, formatCompactCount } from '../../../../utils/format-units.js';
 import { createDomId } from '../../../ui/components/dom-id.js';
 import { createInfoTip } from '../../../ui/components/controls.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
@@ -48,6 +47,7 @@ import { deriveRestOfColor } from '../../shared/color-utils.js';
 import { getPageColor } from '../../core/plugin-contract.js';
 import { isPlainRecord, requireExactKeys } from '../../../../utils/exact-record.js';
 import { PLACES } from '../../../ui/place-names.js';
+import { isHexColor } from '../../../../utils/hex-color.js';
 
 /** What the Dynamic chip does: its hover title and part of its accessible name. */
 const DYNAMIC_MODE_DESCRIPTION = 'Follows the active highlight page.';
@@ -66,7 +66,7 @@ export const PAGE_MODE = {
  * Announce a page chip's toggle state.
  *
  * Each chip is a native `<button>` toggle, so click, Enter, and Space all
- * reach the same click handler. The page's colour `<input type="color">` is a
+ * reach the same click handler. The page's color `<input type="color">` is a
  * sibling of that button inside the chip wrapper, never nested in it: an
  * interactive control inside a button is unreachable for assistive
  * technology. The input is laid over the swatch the button draws.
@@ -199,7 +199,7 @@ export class PageSelectorComponent {
       this._labelEl.textContent = this.label;
       captionId = this._labelEl.id;
       labelRow.appendChild(this._labelEl);
-      // How to pick pages (and recolour them) is told by the (i), not a line.
+      // How to pick pages (and recolor them) is told by the (i), not a line.
       const info = createInfoTip({ tip: 'compare-pages', label: 'About choosing pages' });
       labelRow.appendChild(info.button);
 
@@ -394,7 +394,7 @@ export class PageSelectorComponent {
   }
 
   /**
-   * Resolve the colour a page is drawn in.
+   * Resolve the color a page is drawn in.
    * @param {Object} page
    * @param {number} index
    * @returns {string}
@@ -415,8 +415,8 @@ export class PageSelectorComponent {
   }
 
   /**
-   * Create a single page chip: its toggle button plus, when colours are
-   * editable, the colour input laid over the swatch beside it.
+   * Create a single page chip: its toggle button plus, when colors are
+   * editable, the color input laid over the swatch beside it.
    * @returns {{ wrapper: HTMLDivElement, tab: HTMLButtonElement }}
    */
   _createPageTab(page, index) {
@@ -457,8 +457,8 @@ export class PageSelectorComponent {
       colorInput.className = 'color-swatch-input';
       colorInput.dataset.pageId = page.id;
       colorInput.value = currentColor;
-      colorInput.setAttribute('aria-label', `Colour for ${page.name}`);
-      colorInput.title = `Colour for ${page.name}`;
+      colorInput.setAttribute('aria-label', `Highlight color for ${page.name}`);
+      colorInput.title = `Highlight color for ${page.name}`;
       chip.appendChild(colorInput);
     }
 
@@ -502,7 +502,7 @@ export class PageSelectorComponent {
   }
 
   /**
-   * Delegated colour-input handler: recolour the page's swatch and publish.
+   * Delegated color-input handler: recolor the page's swatch and publish.
    * @param {Event} event
    */
   _handleColorInput(event) {
@@ -1108,11 +1108,24 @@ export class PageSelectorComponent {
   }
 
   /**
-   * Get custom colors map (for passing to plots)
+   * The colors the person chose here (what an analysis saves and restores).
    * @returns {Map<string, string>}
    */
   getCustomColors() {
     return this.customColors;
+  }
+
+  /**
+   * The color every page this selector offers is drawn in, as its swatch
+   * shows it (`_resolvePageColor`: one chosen here, else the page's own, else
+   * its place among the pages): what a plot colors the pages by, so a plot
+   * and its swatches agree whatever order the pages were picked in (found
+   * 2026-11-10: plots colored pages whose color was not chosen here by
+   * their pick order).
+   * @returns {Map<string, string>}
+   */
+  getPageColors() {
+    return new Map(this._getPages().map((page, index) => [page.id, this._resolvePageColor(page, index)]));
   }
 
   /**
@@ -1178,7 +1191,7 @@ export class PageSelectorComponent {
         typeof entry[0] !== 'string' ||
         entry[0].length === 0 ||
         typeof entry[1] !== 'string' ||
-        !/^#[0-9a-fA-F]{6}$/.test(entry[1])
+        !isHexColor(entry[1])
       ) {
         throw new TypeError(
           'Page selector customColors must contain [pageId, #rrggbb] pairs'

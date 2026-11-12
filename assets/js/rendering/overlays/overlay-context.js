@@ -41,6 +41,9 @@ const VECTOR3_RENDER_PARAM_KEYS = Object.freeze([
  * @property {number} frameId
  * @property {number} time
  * @property {number} deltaTime
+ * @property {boolean} reducedMotion - The person asked for reduced motion
+ *   (`utils/reduced-motion.js`, read by the viewer each frame): an overlay
+ *   draws a still picture and asks no frame to animate.
  * @property {boolean} isSnapshot
  * @property {number} dimensionLevel
  * @property {string|null} layoutKey - Identity of the embedding the view's
@@ -85,6 +88,7 @@ const VECTOR3_RENDER_PARAM_KEYS = Object.freeze([
  * @param {object} options.renderParams - The object passed into HighPerfRenderer.render()
  * @param {number} options.timeSeconds
  * @param {number} options.deltaTimeSeconds
+ * @param {boolean} options.reducedMotion
  * @param {boolean} options.isSnapshot
  * @param {number} options.dimensionLevel
  * @param {string|null} options.layoutKey
@@ -111,6 +115,7 @@ export function buildOverlayContext(options) {
     renderParams,
     timeSeconds,
     deltaTimeSeconds,
+    reducedMotion,
     isSnapshot,
     dimensionLevel,
     layoutKey,
@@ -151,6 +156,9 @@ export function buildOverlayContext(options) {
   }
   if (!renderParams || typeof renderParams !== 'object') {
     throw new TypeError('Overlay context renderParams are required.');
+  }
+  if (typeof reducedMotion !== 'boolean') {
+    throw new TypeError('Overlay context reducedMotion must be a boolean.');
   }
   if (typeof isSnapshot !== 'boolean') {
     throw new TypeError('Overlay context isSnapshot must be a boolean.');
@@ -242,6 +250,7 @@ export function buildOverlayContext(options) {
   ctx.frameId = frameId;
   ctx.time = timeSeconds;
   ctx.deltaTime = deltaTimeSeconds;
+  ctx.reducedMotion = reducedMotion;
   ctx.isSnapshot = isSnapshot;
   ctx.dimensionLevel = dimensionLevel;
   ctx.layoutKey = layoutKey;

@@ -72,12 +72,14 @@ test('the module adopts the token from the page memory once and restores the res
   Object.defineProperty(globalThis.window, 'cellucidGitHubAuthFragment', {
     configurable: true,
     enumerable: false,
-    value: '#view=umap&cellucid_github_auth=1&cellucid_github_token=TOKEN&cellucid_github_token_expires_in=28800',
+    value: '#view=umap&cellucid_github_state=S1&cellucid_github_auth=1&cellucid_github_token=TOKEN&cellucid_github_token_expires_in=28800',
     writable: false,
   });
   globalThis.fetch = async () => new Response('{"id":42,"login":"researcher"}', { status: 200 });
   try {
-    const { GitHubAuthSession } = await import('../assets/js/app/community-annotations/github-auth.js');
+    const { GitHubAuthSession, SIGN_IN_STATE_STORAGE_KEY } = await import('../assets/js/app/community-annotations/github-auth.js');
+    // The sign-in this tab started (`signIn`) named this state.
+    values.set(SIGN_IN_STATE_STORAGE_KEY, 'S1');
     const auth = new GitHubAuthSession();
     auth._verifiedWorkerOrigin = auth.getWorkerOrigin();
     const result = await auth.completeSignInFromRedirect();
@@ -85,6 +87,79 @@ test('the module adopts the token from the page memory once and restores the res
     assert.deepEqual(replacements, ['https://app.example/view?dataset=x#view=umap']);
     assert.equal(Object.hasOwn(globalThis.window, 'cellucidGitHubAuthFragment'), false, 'read once');
     assert.equal(await auth.completeSignInFromRedirect(), null, 'nothing left to adopt');
+    assert.equal(values.has(SIGN_IN_STATE_STORAGE_KEY), false, 'the state is used once');
+  } finally {
+    Object.assign(globalThis, previous);
+  }
+});
+
+/**
+ * LG-3 (login CSRF): the worker hands the token to the page in the address
+ * fragment, which anyone can write into a link. A token is adopted only when
+ * the callback names the state of a sign-in this tab started, so a link
+ * carrying someone else's token cannot sign the person in as them (their
+ * votes and annotations would then be written as that account).
+ */
+test('a token is adopted only for a sign-in this tab started (its state), once', async () => {
+  const replacements = [];
+  const values = new Map();
+  const assigned = [];
+  const previous = { window: globalThis.window, sessionStorage: globalThis.sessionStorage, fetch: globalThis.fetch };
+  globalThis.sessionStorage = {
+    getItem: key => (values.has(key) ? values.get(key) : null),
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: key => values.delete(key),
+  };
+  const page = (hash = '') => ({
+    location: {
+      origin: 'https://app.example', pathname: '/view', search: '?dataset=x', hash,
+      href: `https://app.example/view?dataset=x${hash}`, assign: url => assigned.push(url),
+    },
+    history: { state: null, replaceState: (state, title, url) => replacements.push(url) },
+  });
+  const users = [];
+  globalThis.fetch = async (url, init) => {
+    users.push(init?.headers?.Authorization ?? init?.headers?.authorization ?? null);
+    return new Response('{"id":42,"login":"researcher"}', { status: 200 });
+  };
+  const TOKEN = '&cellucid_github_auth=1&cellucid_github_token=THEIRS&cellucid_github_token_expires_in=28800';
+  try {
+    const { GitHubAuthSession, SIGN_IN_STATE_PARAM, SIGN_IN_STATE_STORAGE_KEY } = await import('../assets/js/app/community-annotations/github-auth.js');
+    // signIn() keeps a fresh state and names it in the address GitHub returns to; the rest of the fragment is kept.
+    globalThis.window = page('#view=umap&cellucid_github_state=stale');
+    const auth = new GitHubAuthSession();
+    auth._verifiedWorkerOrigin = auth.getWorkerOrigin();
+    auth._verifyWorkerForOwner = async () => {};
+    await auth.signIn();
+    const state = values.get(SIGN_IN_STATE_STORAGE_KEY);
+    assert.match(state, /^[0-9a-f]{32}$/);
+    const returnTo = new URL(assigned[0]).searchParams.get('return_to');
+    assert.equal(returnTo, `https://app.example/view?dataset=x#view=umap&${SIGN_IN_STATE_PARAM}=${state}`);
+
+    const refused = async (hash, why) => {
+      if (state !== null) values.set(SIGN_IN_STATE_STORAGE_KEY, state);
+      globalThis.window = page();
+      await assert.rejects(auth.completeSignInFromRedirect({ url: `https://app.example/view?dataset=x#${hash}` }), { code: 'GITHUB_AUTH_NOT_STARTED_HERE' }, why);
+      assert.equal(auth.isAuthenticated(), false, why);
+      assert.equal(values.has(SIGN_IN_STATE_STORAGE_KEY), false, `${why}: the state is spent`);
+      assert.doesNotMatch(replacements.at(-1), /THEIRS|cellucid_github/, `${why}: nothing of the callback stays in the address`);
+    };
+    await refused(`view=umap${TOKEN}`, 'no state (a link someone made)');
+    await refused(`view=umap&${SIGN_IN_STATE_PARAM}=0123${TOKEN}`, 'another state');
+    await refused(`${SIGN_IN_STATE_PARAM}=${state}&${SIGN_IN_STATE_PARAM}=${state}${TOKEN}`, 'the state twice');
+    // A tab that started no sign-in adopts none, whatever the link names.
+    values.delete(SIGN_IN_STATE_STORAGE_KEY);
+    globalThis.window = page();
+    await assert.rejects(auth.completeSignInFromRedirect({ url: `https://app.example/view?dataset=x#${SIGN_IN_STATE_PARAM}=${state}${TOKEN}` }), { code: 'GITHUB_AUTH_NOT_STARTED_HERE' });
+    assert.equal(users.length, 0, 'GitHub was never asked who the refused token is');
+
+    // The callback of the sign-in started here signs in, and its state leaves the address.
+    values.set(SIGN_IN_STATE_STORAGE_KEY, state);
+    const result = await auth.completeSignInFromRedirect({ url: `https://app.example/view?dataset=x#view=umap&${SIGN_IN_STATE_PARAM}=${state}${TOKEN}` });
+    assert.equal(result.token, 'THEIRS');
+    assert.equal(replacements.at(-1), 'https://app.example/view?dataset=x#view=umap');
+    // Replayed (the same link again): the state was spent.
+    await assert.rejects(auth.completeSignInFromRedirect({ url: `https://app.example/view?dataset=x#${SIGN_IN_STATE_PARAM}=${state}${TOKEN}` }), { code: 'GITHUB_AUTH_NOT_STARTED_HERE' });
   } finally {
     Object.assign(globalThis, previous);
   }

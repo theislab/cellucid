@@ -50,8 +50,8 @@ body:has(#sidebar.hidden) #view-title-layer {
   );
 }
 
-/* Centred on its cell (the viewer publishes the centre as --view-title-x/-y),
-   but never left of the safe edge: the horizontal shift is the centring -50%
+/* Centered on its cell (the viewer publishes the center as --view-title-x/-y),
+   but never left of the safe edge: the horizontal shift is the centering -50%
    unless that would cross --view-title-safe-left, in which case the chip's
    left edge sits on it. */
 .view-title-chip {
@@ -61,7 +61,7 @@ body:has(#sidebar.hidden) #view-title-layer {
   translate: max(-50%, calc(var(--view-title-safe-left) - var(--view-title-x))) -50%;
   /* A long label in a narrow pane ends in an ellipsis inside its own pane
      rather than running into the next pane's chip; the full label is the
-     chip's title. Centred, it may span the pane less a gap each side; pushed
+     chip's title. Centered, it may span the pane less a gap each side; pushed
      right of the safe edge, it may reach from there to the pane's right edge
      less a gap. */
   box-sizing: border-box;

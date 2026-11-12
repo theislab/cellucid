@@ -1,31 +1,23 @@
 /**
- * @fileoverview Welcome modal onboarding logic.
+ * @fileoverview The welcome dialog shown at an ordinary start.
+ *
+ * An app dialog (`ui/components/app-dialog.js`): Start exploring (its
+ * `data-dialog-close`), Escape and the backdrop close it, and focus goes back
+ * where it was. It opens with focus on the dialog itself, so no choice looks
+ * pre-selected; the first Tab reaches the first choice.
+ *
  * @module ui/onboarding/welcome-modal
  */
 
 import { welcomeQuotes } from './quotes.js';
+import { wireAppDialog } from '../components/app-dialog.js';
+import { holdStartupFor } from '../../../utils/startup-sequence.js';
+import { webStorage } from '../../../utils/web-storage.js';
 
-/**
- * Focusable descendants, matching `ui/modules/figure-export/components/modal.js`.
- * That dialog moves focus by index on every Tab instead of only at the ends of
- * the cycle, which is what keeps the cycle correct in engines whose native tab
- * order differs from this list — WebKit skips links, so a boundary-only trap
- * leaks focus straight out of the dialog there.
- */
-const FOCUSABLE_SELECTOR = [
-  'a[href]',
-  'button',
-  'input',
-  'select',
-  'textarea',
-  '[tabindex]',
-  '[contenteditable="true"]'
-].join(',');
-
+/** @type {HTMLDialogElement|null} */
 let welcomeModal = null;
-let welcomeListenersAttached = false;
-/** Element that owned focus when the modal opened, restored when it closes. */
-let welcomeReturnFocus = null;
+/** @type {ReturnType<typeof wireAppDialog>|null} */
+let welcomeDialog = null;
 
 function setRandomQuote() {
   const quoteEl = welcomeModal?.querySelector('.welcome-quote-text');
@@ -37,7 +29,7 @@ function setRandomQuote() {
   // Avoid showing the same quote twice in a row.
   let lastIndex = -1;
   try {
-    lastIndex = parseInt(localStorage.getItem('cellucid_last_quote_index') || '-1', 10);
+    lastIndex = parseInt(webStorage('localStorage')?.getItem('cellucid_last_quote_index') || '-1', 10);
   } catch {
     // localStorage unavailable
   }
@@ -48,7 +40,7 @@ function setRandomQuote() {
   } while (newIndex === lastIndex && welcomeQuotes.length > 1);
 
   try {
-    localStorage.setItem('cellucid_last_quote_index', String(newIndex));
+    webStorage('localStorage')?.setItem('cellucid_last_quote_index', String(newIndex));
   } catch {
     // localStorage unavailable
   }
@@ -60,126 +52,30 @@ function setRandomQuote() {
   if (explanationEl) explanationEl.textContent = quote.explanation;
 }
 
-function welcomeDialogRoot() {
-  return welcomeModal?.querySelector('.welcome-content') ?? null;
-}
-
-function listWelcomeFocusable() {
-  const root = welcomeDialogRoot();
-  if (!root) return [];
-  return Array.from(root.querySelectorAll(FOCUSABLE_SELECTOR)).filter(
-    (element) => (
-      element instanceof HTMLElement &&
-      element.tabIndex >= 0 &&
-      element.getAttribute('aria-hidden') !== 'true' &&
-      !('disabled' in element && element.disabled) &&
-      element.getClientRects().length > 0
-    )
-  );
-}
-
-/** Whether the dialog holds a control focus can enter, read without layout. */
-function hasWelcomeFocusTarget() {
-  const root = welcomeDialogRoot();
-  if (!root) return false;
-  return Array.from(root.querySelectorAll(FOCUSABLE_SELECTOR)).some(
-    (element) => (
-      element instanceof HTMLElement &&
-      element.tabIndex >= 0 &&
-      element.getAttribute('aria-hidden') !== 'true' &&
-      !('disabled' in element && element.disabled) &&
-      !element.closest('[hidden]')
-    )
-  );
-}
-
-/**
- * Keep Tab inside the dialog. `aria-modal="true"` tells assistive technology
- * the rest of the document is inert, so keyboard focus must not leave either.
- */
-function containWelcomeFocus(e) {
-  if (e.key !== 'Tab' || !isWelcomeModalVisible()) return;
-  e.preventDefault();
-  e.stopImmediatePropagation();
-  const focusables = listWelcomeFocusable();
-  if (focusables.length === 0) return;
-  const activeIndex = focusables.indexOf(document.activeElement);
-  const nextIndex = e.shiftKey
-    ? (activeIndex <= 0 ? focusables.length - 1 : activeIndex - 1)
-    : (
-        activeIndex < 0 || activeIndex === focusables.length - 1
-          ? 0
-          : activeIndex + 1
-      );
-  focusables[nextIndex].focus();
-}
-
-function captureWelcomeReturnFocus() {
-  const previous = document.activeElement;
-  welcomeReturnFocus =
-    previous instanceof HTMLElement &&
-    previous !== document.body &&
-    !welcomeModal.contains(previous)
-      ? previous
-      : null;
-}
-
-function restoreWelcomeReturnFocus() {
-  const target = welcomeReturnFocus;
-  welcomeReturnFocus = null;
-  if (target === null || !target.isConnected) return;
-  if (target instanceof HTMLButtonElement && target.disabled) return;
-  target.focus();
-}
-
 export function initWelcomeModal() {
   welcomeModal = document.getElementById('welcome-modal');
   if (!welcomeModal) return;
-
-  if (!welcomeListenersAttached) {
-    welcomeListenersAttached = true;
-
-    // Start exploring, the backdrop and Escape all close the dialog: the
-    // dataset behind it is the start, and focus returns where it was.
-    welcomeModal.querySelector('#welcome-start-btn')?.addEventListener('click', () => hideWelcomeModal());
-    welcomeModal.querySelector('.welcome-backdrop')?.addEventListener('click', () => hideWelcomeModal());
-
-    document.addEventListener('keydown', containWelcomeFocus, true);
-
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && isWelcomeModalVisible()) {
-        hideWelcomeModal();
-      }
-    });
-  }
-
+  welcomeDialog ??= wireAppDialog(welcomeModal);
   setRandomQuote();
 }
 
+/**
+ * Show the welcome; the start holds what else it shows until it is closed
+ * (`utils/startup-sequence.js`: Continue, a sample view's notices, an
+ * opening's question come after it, never on top of it).
+ */
 export function showWelcomeModal() {
-  if (!welcomeModal) return false;
-  captureWelcomeReturnFocus();
-  welcomeModal.classList.remove('hidden');
-  // A structural check, not listWelcomeFocusable(): its getClientRects() on
-  // the dialog just unhidden forced a layout of the whole page inside the
-  // startup task (26 ms of it). Tab, later, measures what is visible.
-  if (!hasWelcomeFocusTarget()) {
-    throw new Error(
-      'Welcome modal must expose at least one focusable control to receive focus.'
-    );
-  }
-  // Focus enters the dialog itself, so no choice opens looking pre-selected;
-  // the first Tab reaches the first choice.
-  welcomeModal.focus({ preventScroll: true });
+  if (welcomeDialog === null) return false;
+  const dialog = welcomeModal;
+  holdStartupFor(new Promise(resolve => dialog.addEventListener('close', () => resolve(), { once: true })));
+  welcomeDialog.open(null, { focus: welcomeModal });
   return true;
 }
 
 export function hideWelcomeModal() {
-  if (!welcomeModal) return;
-  welcomeModal.classList.add('hidden');
-  restoreWelcomeReturnFocus();
+  welcomeDialog?.close();
 }
 
 export function isWelcomeModalVisible() {
-  return Boolean(welcomeModal && !welcomeModal.classList.contains('hidden'));
+  return welcomeModal?.open === true;
 }

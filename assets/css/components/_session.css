@@ -168,6 +168,34 @@
   z-index: var(--z-popover);
 }
 
+/* A menu built for the items of the moment, opened at a button or a point
+   (`ui/components/menu.js`: a history row's or branch's menu, the history
+   search's Filter, a highlight page's Combine): as wide as its items. */
+.open-menu-list.popup-menu {
+  position: fixed;
+  left: var(--popup-menu-left, 0px);
+  right: auto;
+  top: var(--popup-menu-top, 0px);
+  width: max-content;
+  z-index: var(--z-popover);
+  min-width: max-content;
+  max-width: calc(100vw - var(--space-4));
+  max-height: calc(100dvh - var(--space-4));
+  overflow-y: auto;
+}
+
+.popup-menu .open-menu-item.is-danger .open-menu-item-label {
+  color: var(--color-danger-text);
+}
+
+.popup-menu .open-menu-item[aria-disabled="true"] {
+  opacity: var(--control-disabled-opacity);
+}
+
+.popup-menu .open-menu-item[role="menuitemcheckbox"][aria-checked="true"] .open-menu-item-label::before {
+  content: '✓ ';
+}
+
 .open-menu-item {
   display: flex;
   align-items: baseline;
@@ -291,6 +319,9 @@
   flex: 1;
   min-width: 0;
   white-space: nowrap;
+  /* Short by construction; never under Manage…, whatever the counts (found 2026-11-10). */
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-size: var(--type-hint);
   line-height: var(--leading-normal);
   color: var(--color-text-secondary);
@@ -344,16 +375,20 @@
   text-decoration: underline;
 }
 
-/* A line that links to help carries a long reason beside the link and a
-   button ("Use another account"): kept on one row, the reason was squeezed to
-   a column one letter wide. The reason takes the first row whole; the link,
-   the button and the (i) follow on the next. */
-.connection-line:has(> .connection-help:not([hidden])) {
+/* A status said beside its button ("Private file on Google Drive. [Sign in
+   to Google] (i)"): squeezed beside the button it wrapped into a narrow
+   column of three or four lines (F73), and a long reason with a help link
+   into one letter a line. The words keep their one line when they fit beside
+   the button; when they do not, they take the row whole and the link, the
+   button and the (i) follow on the next. */
+.connection-line.connection-status {
   flex-wrap: wrap;
+  row-gap: var(--space-1);
 }
 
-.connection-line:has(> .connection-help:not([hidden])) > .connection-target {
-  flex-basis: 100%;
+.connection-line.connection-status > .connection-target {
+  flex: 1 0 auto;
+  max-width: 100%;
 }
 
 /* ------------------------------------------------------------------------
@@ -379,10 +414,17 @@
   font-size: var(--type-hint);
   line-height: var(--leading-normal);
   color: var(--color-danger-text);
+  /* A failure may name a link or a path longer than the panel: it breaks, never overflows. */
+  max-width: 100%;
+  overflow-wrap: break-word;
 }
 
 /* The startup line in Open data, and the failure that replaces it when the
    app's code could not load (ui/core/code-load-watch.js). */
+#data-source-status {
+  overflow-wrap: break-word;
+}
+
 #data-source-status.error {
   color: var(--color-danger-text);
 }

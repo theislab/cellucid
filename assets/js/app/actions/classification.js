@@ -5,10 +5,10 @@
  * - `reads()`: changes nothing.
  * - `internal(reason)`: changes no state domain's value a step covers (its
  *   reason, from `INTERNAL_REASONS`, says why: the state's own
- *   synchronisation, a restore, a dataset's publication, a selection in
+ *   synchronization, a restore, a dataset's publication, a selection in
  *   progress, …).
  * - `mutates(domains, actions)`: changes the value of `domains`
- *   (`domains.js`); `actions` are the catalogue's action types that own the
+ *   (`domains.js`); `actions` are the catalog's action types that own the
  *   change. A control never calls it: it dispatches one of those actions
  *   (`control-dispatch.js`), or, for a setting or a camera gesture, the
  *   owner applies the change and it is recorded by observation
@@ -22,7 +22,7 @@
  * The drift guards: `tests/action-method-classification-contract.test.mjs`
  * fails on a method that is not classified here (a new `DataState` mixin
  * method, a new viewer API method), on a classification of a method that is
- * gone, and on an action type the catalogue lacks;
+ * gone, and on an action type the catalog lacks;
  * `tests/action-mutation-owners-contract.test.mjs` fails on a call of a
  * `mutates` method outside its owners, and on an owner entry that no longer
  * holds. Underscore members of `DataState` are internal by construction:
@@ -37,7 +37,7 @@ export const METHOD_KINDS = Object.freeze(['reads', 'internal', 'mutates']);
 
 /** Why an `internal` method changes no state a step covers. */
 export const INTERNAL_REASONS = Object.freeze({
-  'state-layer': 'the state\'s own synchronisation: arrays pushed to the viewer, summaries and colours recomputed from the domains\' values',
+  'state-layer': 'the state\'s own synchronization: arrays pushed to the viewer, summaries and colors recomputed from the domains\' values',
   restore: 'how a domain owner or a restore path puts a value back',
   dataset: 'a dataset\'s publication or its cells read again: the state every history of it starts from',
   wiring: 'a callback or handler installed once when a module starts',
@@ -141,6 +141,7 @@ export const DATA_STATE_METHODS = Object.freeze({
   getDataMappingOrigin: reads(),
   getMappingAnalytics: reads(),
   getMappingCandidates: reads(),
+  representationNameOf: reads(),
   getGuessedMappingGroups: reads(),
   getExpressionReason: reads(),
   canMapAnyEmbedding: reads(),
@@ -170,9 +171,36 @@ export const DATA_STATE_METHODS = Object.freeze({
   describeMappingChoiceRefusal: reads(),
   describeMappingGroupRefusal: reads(),
   openExpressionMatrix: internal('derived'),
+  // The gene list and loader a mapping maps, read to install or to price it.
+  mappingVarLoaderOf: internal('derived'),
   // Reads under another modality for the length of `read` and puts it back.
   withMappingModality: reads(),
   defaultModalityGroups: reads(),
+  // The groups that follow a named modality or matrix (the panel's menus, `mapping.set`).
+  followMappingChanges: reads(),
+  mappingMatrixHoldsCounts: reads(),
+
+  // expression-values.js
+  getExpressionTransform: reads(),
+  getShownExpressionTransform: reads(),
+  expressionTransformOffer: reads(),
+  shownTransformFor: reads(),
+  storedCellTotals: reads(),
+  cellTotalsPlan: reads(),
+  expressionTransformCost: reads(),
+  cellTotalsCostOf: reads(),
+  mappingTotalsCost: reads(),
+  shownCellTotalsCost: reads(),
+  shownValuesRecord: reads(),
+  mappedLibrarySizes: internal('derived'),
+  // The cells' totals a change needs, read (and asked for) before it shows anything.
+  cellTotalsForChange: internal('derived'),
+  prepareCellTotals: internal('derived'),
+  matrixLineage: internal('derived'),
+  resetCellTotals: internal('dataset'),
+  shownVarLoader: internal('state-layer'),
+  renewShownVarLoader: internal('dataset'),
+  setExpressionTransform: mutates(['expression', 'filters', 'colors'], ['expression.transform.set', 'cells.open']),
 
   // var-axis.js, latent-space.js
   beginGeneListing: internal('dataset'),
@@ -227,11 +255,13 @@ export const DATA_STATE_METHODS = Object.freeze({
   // field/category-ops.js
   deleteCategoryToUnassigned: mutates('field-overlays', ['category.delete']),
   mergeCategoriesToNewField: mutates('field-overlays', ['category.merge']),
+  groupCategoriesToNewField: mutates('field-overlays', ['field.group']),
   createCategoricalFromPages: mutates('field-overlays', ['field.create-from-pages']),
 
   // field/loading.js
   setFieldLoader: internal('dataset'),
   setVarFieldLoader: internal('dataset'),
+  scheduleLoaderRead: internal('derived'),
   getDatasetGeneration: reads(),
   initVarData: internal('dataset'),
   ensureFieldLoaded: internal('derived'),
@@ -252,7 +282,7 @@ export const DATA_STATE_METHODS = Object.freeze({
   unloadVarField: internal('derived'),
   setActiveField: mutates('active-field', ['color.by', 'cells.open']),
   setActiveVarField: mutates('active-field', ['color.by', 'cells.open']),
-  // A gene's colours drawn as its cells are read, and drawn again when its
+  // A gene's colors drawn as its cells are read, and drawn again when its
   // read stopped: the field shown is the same (`color.by` chooses it).
   showPartialVarField: internal('derived'),
   restoreActiveFieldColors: internal('derived'),
@@ -571,6 +601,9 @@ export const VIEWER_METHODS = Object.freeze({
   setNavigationModeChangeHandler: internal('wiring'),
   setLiveViewLabel: internal('state-layer'),
   getLiveViewLabel: reads(),
+  // The name a person or an agent gave a view (`app/actions/targets/views.js`).
+  setViewName: mutates('views', ['view.rename', 'view.keep']),
+  getViewName: reads(),
   createSnapshotView: mutates('views', ['view.keep']),
   updateSnapshotAttributes: internal('state-layer'),
   removeSnapshotView: mutates('views', ['view.remove', 'view.clear']),
@@ -628,7 +661,6 @@ export const VIEWER_METHODS = Object.freeze({
   isDisposed: reads(),
   isContextLost: reads(),
   onGraphicsReset: internal('wiring'),
-  setGraphicsResetSessionSaver: internal('wiring'),
   isDisposalSettled: reads(),
   dispose: internal('lifecycle'),
 });
@@ -649,7 +681,7 @@ const SETTINGS_RECORDED = 'owns these settings controls: it applies a person\'s 
 export const MUTATION_OWNERS = Object.freeze([
   {
     prefix: 'assets/js/app/state/',
-    why: 'the state layer implements these methods, its domain owners (`domains/`) put values back through them, and its actions (`actions/field-actions.js`) are the field, colour, filter and mapping actions\' implementations',
+    why: 'the state layer implements these methods, its domain owners (`domains/`) put values back through them, and its actions (`actions/field-actions.js`) are the field, color, filter and mapping actions\' implementations',
   },
   {
     prefix: 'assets/js/rendering/',
@@ -658,10 +690,10 @@ export const MUTATION_OWNERS = Object.freeze([
   {
     module: 'assets/js/app/main.js',
     methods: [
-      'clearActiveField', 'clearSnapshotViews', 'setShowConnectivity', 'setConnectivityColor', 'setConnectivityAlpha',
+      'clearActiveField', 'clearSnapshotViews', 'setViewName', 'setShowConnectivity', 'setConnectivityColor', 'setConnectivityAlpha',
       'setConnectivityLineWidth', 'setEdgeVisibleTarget',
     ],
-    why: 'publishes a dataset (no field shown, no kept view: the state its history starts from) and owns the connectivity controls, whose changes are recorded by observation (`setting.set`)',
+    why: 'publishes a dataset (no field shown, no kept view, the live view unnamed: the state its history starts from) and owns the connectivity controls, whose changes are recorded by observation (`setting.set`)',
   },
   {
     module: 'assets/js/app/cell-subset-carry.js',
@@ -683,7 +715,7 @@ export const MUTATION_OWNERS = Object.freeze([
   },
   {
     module: 'assets/js/app/ui/modules/view-controls.js',
-    methods: ['setActiveView', 'setViewLayout', 'setLiveViewHidden', 'setCamerasLocked', 'setCellVisibility'],
+    methods: ['setActiveView', 'setViewLayout', 'setLiveViewHidden', 'setCamerasLocked', 'setViewName', 'setCellVisibility'],
     why: 'implements the view actions (`view.*`) and `cells.visibility.set`; a click on a pane, which the viewer focuses itself, is recorded by observation (`view.focus`)',
   },
   {

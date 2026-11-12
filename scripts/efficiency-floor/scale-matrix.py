@@ -40,8 +40,8 @@ Every AnnData-shaped store holds, for ``n`` cells:
 - ``obsm``: ``X_umap`` (2-D), ``X_umap_3d`` (3-D), ``X_pca`` (``--latent``
   dimensions), and the vector fields ``velocity_umap`` / ``velocity_umap_3d``
   on them;
-- ``obsp['connectivities']``: a symmetric k-nearest-neighbour graph (``--k``
-  neighbours a cell, spatially local, so the drawn edges are short);
+- ``obsp['connectivities']``: a symmetric k-nearest-neighbor graph (``--k``
+  neighbors a cell, spatially local, so the drawn edges are short);
 - ``var``: ``--genes`` genes with a ``gene_symbols`` and a
   ``highly_variable`` column; ``X``: ``--per-cell`` stored values a cell,
   counts drawn so gene g of the first 10 marks cell type g (differential
@@ -50,7 +50,7 @@ Every AnnData-shaped store holds, for ``n`` cells:
   (``--layers``) the same entries.
 
 Cells come in runs of 4,096 of one type laid along a smooth curve, so a
-cell's neighbours are its neighbours in the file, the velocity is the
+cell's neighbors are its neighbors in the file, the velocity is the
 curve's tangent, and a block subsample covers every type. Values are
 deterministic per cell (seeded by the block), so any writer rebuilds the
 same block twice (CSC's two passes).
@@ -156,7 +156,7 @@ class Cells:
         return out
 
     def graph_rows(self, index: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Cell i's neighbours (rows of cells, ascending) and their weights:
+        """Cell i's neighbors (rows of cells, ascending) and their weights:
         i +- 1..k/2 inside its run (wrapping), symmetric."""
         half = max(1, self.k // 2)
         run_start = (index // RUN) * RUN
@@ -211,7 +211,7 @@ class PriorityCells:
         return out
 
     def graph_block(self, start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
-        """File rows [start, end)'s neighbours as file rows, ascending."""
+        """File rows [start, end)'s neighbors as file rows, ascending."""
         cols, weights = self.base.graph_rows(self.order[start:end])
         cols = self.position[cols]
         order = np.argsort(cols, axis=1)

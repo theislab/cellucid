@@ -18,12 +18,28 @@
 import { assertCropRect01 } from './crop.js';
 import { requireExactKeys } from '../../../../../utils/exact-record.js';
 import { parseDecimalText } from '../../../../../utils/format-units.js';
+import { HEX_COLOR } from '../../../../../utils/hex-color.js';
+import {
+  FIGURE_DEFAULT_WIDTH_PRESET,
+  FIGURE_WIDTH_PRESETS,
+  mmOfFigurePx,
+  ptOfFigurePx,
+} from './figure-size.js';
 
-export const FIGURE_EXPORT_SESSION_SETTINGS_VERSION = 1;
+/**
+ * The record's version: 3 (2026-11-11, F271) sizes the figure physically —
+ * its width in millimetres (a journal column, `sizePreset`), which the figure
+ * fills at its own height, and text in points; 2 held a box in pixels
+ * (`width` × `height`) the figure was fitted in and text in pixels; 2 has an
+ * SVG strategy always (full vector until another is chosen, F160), 1 held
+ * null until one was chosen. A saved record of an earlier version is read by
+ * `readSavedFigureExportSettings`.
+ */
+export const FIGURE_EXPORT_SESSION_SETTINGS_VERSION = 3;
 
-export const FIGURE_EXPORT_SIZE_PRESETS = Object.freeze([
-  'screen-half', 'screen', '1200x900', '1600x1200', '1920x1080',
-]);
+/** The width presets (`utils/figure-size.js` `FIGURE_WIDTH_PRESETS`) and a width of one's own. */
+export const FIGURE_EXPORT_SIZE_PRESETS = Object.freeze([...Object.keys(FIGURE_WIDTH_PRESETS), 'custom']);
+export { FIGURE_DEFAULT_WIDTH_PRESET };
 export const FIGURE_EXPORT_FONT_FAMILIES = Object.freeze([
   'Arial, Helvetica, sans-serif',
   'Helvetica, Arial, sans-serif',
@@ -35,10 +51,12 @@ export const FIGURE_EXPORT_COLORBLIND_MODES = Object.freeze(['none', 'deuteranop
 export const FIGURE_EXPORT_DOWNLOADS = Object.freeze(['svg', 'png', 'svg+png', 'png-multi', 'all']);
 export const FIGURE_EXPORT_DPIS = Object.freeze([150, 300, 600]);
 export const FIGURE_EXPORT_SVG_STRATEGIES = Object.freeze(['full-vector', 'optimized-vector', 'hybrid']);
+/** How an SVG draws its points until another is chosen: every point, editable (F160). */
+export const FIGURE_EXPORT_DEFAULT_SVG_STRATEGY = 'full-vector';
 
 const KEYS = Object.freeze([
   'version',
-  'sizePreset', 'width', 'height', 'frame',
+  'sizePreset', 'width', 'frame',
   'background', 'backgroundColor', 'fontFamily', 'autoTextSize', 'fontSizes',
   'titleFollowsDataset', 'title', 'xLabel', 'yLabel',
   'includeAxes', 'includeLegend', 'referenceGrid', 'showOrientation', 'depthSort', 'legendPosition',
@@ -51,10 +69,15 @@ const RECT_KEYS = Object.freeze(['x', 'y', 'width', 'height']);
 const FONT_SIZE_KEYS = Object.freeze(['base', 'legend', 'ticks', 'axisLabel', 'title', 'centroidLabel']);
 const PREVIEW_KEYS = Object.freeze(['enabled', 'colorblindMode']);
 
-/** The ranges the export itself accepts (`figure-export-ui.js`). */
+/**
+ * The ranges the export itself accepts (`figure-export-ui.js`): a figure at
+ * least 10 mm wide (a plot and a line of text), with no widest (the browser's
+ * canvas decides what a PNG can be, `utils/figure-canvas.js`; an SVG has no
+ * limit); text from 1 pt, in steps of half a point, to 375 pt (500 px).
+ */
 export const FIGURE_EXPORT_SETTING_RANGES = Object.freeze({
-  plotSize: Object.freeze([100, 20_000]),
-  fontSize: Object.freeze([1, 500]),
+  widthMm: Object.freeze([10, Infinity]),
+  fontSize: Object.freeze([1, 375]),
   optimizedTargetCount: Object.freeze([1000, 5_000_000]),
   selectionMutedOpacity: Object.freeze([0, 1]),
 });
@@ -69,6 +92,8 @@ export const FIGURE_EXPORT_SETTING_RANGES = Object.freeze({
  * typed turns Auto text off): a burst of typing is one coalesced step.
  */
 export const FIGURE_EXPORT_LINKED_KEYS = Object.freeze([
+  // A preset is its own width (F271): the two are read, restored and recorded together.
+  Object.freeze(['sizePreset', 'width']),
   Object.freeze(['titleFollowsDataset', 'title']),
   Object.freeze(['autoTextSize', 'fontSizes']),
 ]);
@@ -119,48 +144,73 @@ export function changedFigureExportSettings(before, after) {
   return Object.fromEntries(KEYS.filter(key => changed.has(key)).map(key => [key, structuredClone(after[key])]));
 }
 
-const PLOT_SIZE = Object.freeze({
-  type: 'integer', minimum: FIGURE_EXPORT_SETTING_RANGES.plotSize[0], maximum: FIGURE_EXPORT_SETTING_RANGES.plotSize[1],
-});
+// Whole or half points (the action's schema has no step; `assertPointSize` holds it).
 const FONT_SIZE = Object.freeze({
-  type: 'integer', minimum: FIGURE_EXPORT_SETTING_RANGES.fontSize[0], maximum: FIGURE_EXPORT_SETTING_RANGES.fontSize[1],
+  type: 'number', minimum: FIGURE_EXPORT_SETTING_RANGES.fontSize[0], maximum: FIGURE_EXPORT_SETTING_RANGES.fontSize[1],
+});
+/** The text each font size sizes (L24-5: an agent took `title` for the panel titles). */
+const FONT_SIZE_TEXT = Object.freeze({
+  base: 'Panel titles of a multi-panel figure ("A. Cell type") and the other small labels (orientation, selection badge).',
+  legend: 'The legend\'s title and entries.',
+  ticks: 'Axis tick labels.',
+  axisLabel: 'Axis labels.',
+  title: 'The figure\'s title above everything (not the panel titles: base sizes those).',
+  centroidLabel: 'Category labels drawn at their cells\' centers.',
 });
 const FRACTION = Object.freeze({ type: 'number', minimum: 0, maximum: 1 });
+
+/** A frame as a record holds it: the part of the view exported, or null for the whole view. */
+const FRAME_SETTING = Object.freeze({
+  type: ['object', 'null'], additionalProperties: false, required: ['lock_aspect', 'rect'],
+  description: 'The part of the view exported (needs the preview on), or null for the whole view.',
+  properties: {
+    lock_aspect: { type: 'boolean', description: 'Keep the frame\'s shape when it is resized.' },
+    rect: {
+      type: 'object', additionalProperties: false, required: ['x', 'y', 'width', 'height'],
+      description: 'The frame as fractions of the view, from its top left.',
+      properties: { x: FRACTION, y: FRACTION, width: FRACTION, height: FRACTION },
+    },
+  },
+});
+
+/** The value of `frame` that fits the frame to the cells (Fit the cells, F161). */
+export const FIGURE_EXPORT_FRAME_CELLS = 'cells';
 
 /**
  * The parameter schema of `figure-export.set` (`app/actions/definitions/settings.js`):
  * every setting of a record but its version, each optional, in the names
- * `figureExportParamsOf` gives them. `tests/figure-export-session-settings.test.mjs`
+ * `figureExportParamsOf` gives them; `frame` also takes "cells" (the panel's
+ * Fit the cells: the frame every cell drawn fills). `tests/figure-export-session-settings.test.mjs`
  * holds it to the record's keys, so a setting added to the record is a
- * parameter the day it lands.
+ * parameter the day it lands. `FIGURE_EXPORT_SETTINGS` is the record as
+ * `figure-export.get` reads it back.
  */
 export const FIGURE_EXPORT_PARAMS = Object.freeze({
   type: 'object', additionalProperties: false,
-  examples: [{ width: 1200, height: 900, include_axes: false }],
+  examples: [{ size_preset: 'double-column', include_axes: false }, { width: 180 }, { frame: FIGURE_EXPORT_FRAME_CELLS }],
   properties: {
-    size_preset: { enum: [...FIGURE_EXPORT_SIZE_PRESETS], description: 'The size preset shown in the panel.' },
-    width: { ...PLOT_SIZE, description: 'Plot width in CSS pixels.' },
-    height: { ...PLOT_SIZE, description: 'Plot height in CSS pixels.' },
+    size_preset: {
+      enum: [...FIGURE_EXPORT_SIZE_PRESETS],
+      description: `The figure's width as a journal column: single-column (${FIGURE_WIDTH_PRESETS['single-column']} mm), one-and-half-column (${FIGURE_WIDTH_PRESETS['one-and-half-column']} mm), double-column (${FIGURE_WIDTH_PRESETS['double-column']} mm); custom is the width given. A preset sets width.`,
+    },
+    // An agent set 1800 for "180 mm" (10 px a mm) and got a figure 476 mm wide at 300 dpi, and twice
+    // did px-to-pt arithmetic wrong (live-7 L25-10): the width is millimetres and text points, no pixels.
+    width: {
+      type: 'number', minimum: FIGURE_EXPORT_SETTING_RANGES.widthMm[0],
+      description: 'The figure\'s width in millimetres; the figure is exactly this wide, at every resolution, and as tall as its plots make it (each keeps its view\'s shape, or its frame\'s: set a frame to change the shape). A width that is not a preset\'s makes size_preset custom.',
+    },
     frame: {
-      type: ['object', 'null'], additionalProperties: false, required: ['lock_aspect', 'rect'],
-      description: 'The part of the view exported (needs the preview on), or null for the whole view.',
-      properties: {
-        lock_aspect: { type: 'boolean', description: 'Keep the frame\'s shape when it is resized.' },
-        rect: {
-          type: 'object', additionalProperties: false, required: ['x', 'y', 'width', 'height'],
-          description: 'The frame as fractions of the view, from its top left.',
-          properties: { x: FRACTION, y: FRACTION, width: FRACTION, height: FRACTION },
-        },
-      },
+      description: 'The part of the view exported (needs the preview on, which "cells" turns on), null for the whole view, or "cells": the frame every cell the figure draws fills, with a small margin (the panel\'s Fit the cells), so a plot takes the cells\' shape instead of its pane\'s (a narrow pane gives a narrow plot; never rearrange the person\'s screen for a figure). With export_all_views, one frame holding every panel\'s cells.',
+      oneOf: [FRAME_SETTING, { const: FIGURE_EXPORT_FRAME_CELLS }],
     },
     background: { enum: [...FIGURE_EXPORT_BACKGROUNDS], description: 'The background: the viewer\'s, white, transparent or custom.' },
-    background_color: { type: 'string', pattern: '^#[0-9a-f]{6}$', examples: ['#ffffff'], description: 'The custom background colour, lowercase #rrggbb.' },
+    background_color: { type: 'string', pattern: '^#[0-9a-f]{6}$', examples: ['#ffffff'], description: 'The custom background color, lowercase #rrggbb.' },
     font_family: { enum: [...FIGURE_EXPORT_FONT_FAMILIES], description: 'The font of every text.' },
-    auto_text_size: { type: 'boolean', description: 'Size the text from the figure\'s size (font_sizes is then null).' },
+    auto_text_size: { type: 'boolean', description: 'Set the text in the sizes journals print figure text at: 7 pt, ticks and centroid labels 6 pt, the title 8 pt (font_sizes is then null).' },
     font_sizes: {
       type: ['object', 'null'], additionalProperties: false, required: [...FONT_SIZE_KEYS].map(snakeOf),
-      description: 'Text sizes in pixels while auto_text_size is off, else null.',
-      properties: Object.fromEntries(FONT_SIZE_KEYS.map(key => [snakeOf(key), FONT_SIZE])),
+      description: 'Text sizes in points (1/72 inch; halves allowed) while auto_text_size is off, else null. They keep their printed size at any width and resolution.',
+      properties: Object.fromEntries(FONT_SIZE_KEYS.map(key => [snakeOf(key), { ...FONT_SIZE, description: FONT_SIZE_TEXT[key] }])),
     },
     title_follows_dataset: { type: 'boolean', description: 'The title is the dataset\'s name (title is then null).' },
     title: { type: ['string', 'null'], description: 'The figure title while it does not follow the dataset, else null.' },
@@ -176,21 +226,32 @@ export const FIGURE_EXPORT_PARAMS = Object.freeze({
     selection_muted_opacity: { ...FRACTION, description: 'The opacity of the faded cells, 0 to 1.' },
     preview: {
       type: 'object', additionalProperties: false, required: ['enabled', 'colorblind_mode'],
-      description: 'The preview in the panel and the colour-vision deficiency it simulates.',
+      description: 'The preview in the panel and the color-vision deficiency it simulates; with the preview on, view.picture with source "export" draws that simulation too (Export writes the true colors).',
       properties: {
         enabled: { type: 'boolean' },
         colorblind_mode: { enum: [...FIGURE_EXPORT_COLORBLIND_MODES] },
       },
     },
     download: { enum: [...FIGURE_EXPORT_DOWNLOADS], description: 'What Export downloads.' },
-    dpi: { enum: [...FIGURE_EXPORT_DPIS], description: 'The resolution of a PNG.' },
-    svg_strategy: { enum: [...FIGURE_EXPORT_SVG_STRATEGIES, null], description: 'How an SVG draws many points, or null until chosen.' },
+    dpi: { enum: [...FIGURE_EXPORT_DPIS], description: 'The resolution of a PNG: its pixels are the width in inches times this (an SVG is the same size, as vectors).' },
+    svg_strategy: { enum: [...FIGURE_EXPORT_SVG_STRATEGIES], description: 'How an SVG draws its points: full-vector (the default: every point a circle, editable; a file grows with the cells drawn), optimized-vector (fewer points, optimized_target_count), hybrid (the points as one image, text and axes as vector: small at any cell count).' },
     optimized_target_count: {
       type: 'integer', minimum: FIGURE_EXPORT_SETTING_RANGES.optimizedTargetCount[0], maximum: FIGURE_EXPORT_SETTING_RANGES.optimizedTargetCount[1],
       description: 'How many points an optimized SVG keeps.',
     },
-    export_all_views: { type: 'boolean', description: 'Export every view of the multiview, side by side.' },
+    export_all_views: { type: 'boolean', description: 'Export every view of the multiview, side by side: each panel is titled by its view\'s name (view_rename; a view with none by its field and filters).' },
   },
+});
+
+/**
+ * The settings as `figure-export.get` reads them back: every parameter of
+ * `figure-export.set`, required, the frame as the record holds it (a rect or
+ * null; "cells" is something to do, not a setting).
+ */
+export const FIGURE_EXPORT_SETTINGS = Object.freeze({
+  type: 'object', additionalProperties: false,
+  required: Object.keys(FIGURE_EXPORT_PARAMS.properties),
+  properties: { ...FIGURE_EXPORT_PARAMS.properties, frame: FRAME_SETTING },
 });
 
 function context(path) {
@@ -217,6 +278,13 @@ function assertInteger(value, [minimum, maximum], path) {
   }
 }
 
+/** A text size in points: a whole or half point in its range. */
+function assertPointSize(value, [minimum, maximum], path) {
+  if (!Number.isFinite(value) || value < minimum || value > maximum || !Number.isInteger(value * 2)) {
+    throw new RangeError(`${context(path)} must be a size in points from ${minimum} to ${maximum}, in steps of 0.5.`);
+  }
+}
+
 /**
  * Validate one recorded settings object exactly; returns it.
  *
@@ -231,8 +299,12 @@ export function assertFigureExportSessionSettings(settings) {
     );
   }
   assertOneOf(settings.sizePreset, FIGURE_EXPORT_SIZE_PRESETS, 'sizePreset');
-  assertInteger(settings.width, FIGURE_EXPORT_SETTING_RANGES.plotSize, 'width');
-  assertInteger(settings.height, FIGURE_EXPORT_SETTING_RANGES.plotSize, 'height');
+  if (!Number.isFinite(settings.width) || settings.width < FIGURE_EXPORT_SETTING_RANGES.widthMm[0]) {
+    throw new RangeError(`${context('width')} must be a width in millimetres, at least ${FIGURE_EXPORT_SETTING_RANGES.widthMm[0]}.`);
+  }
+  if (settings.sizePreset !== 'custom' && settings.width !== FIGURE_WIDTH_PRESETS[settings.sizePreset]) {
+    throw new RangeError(`${context('width')} must be ${FIGURE_WIDTH_PRESETS[settings.sizePreset]} mm, the ${settings.sizePreset} width (or sizePreset custom).`);
+  }
 
   if (settings.frame !== null) {
     requireExactKeys(settings.frame, FRAME_KEYS, context('frame'));
@@ -248,7 +320,7 @@ export function assertFigureExportSessionSettings(settings) {
 
   assertOneOf(settings.background, FIGURE_EXPORT_BACKGROUNDS, 'background');
   assertString(settings.backgroundColor, 'backgroundColor');
-  if (!/^#[0-9a-f]{6}$/.test(settings.backgroundColor)) {
+  if (!HEX_COLOR.test(settings.backgroundColor)) {
     throw new RangeError(`${context('backgroundColor')} must be a lowercase #rrggbb color.`);
   }
   assertOneOf(settings.fontFamily, FIGURE_EXPORT_FONT_FAMILIES, 'fontFamily');
@@ -260,7 +332,7 @@ export function assertFigureExportSessionSettings(settings) {
   } else {
     requireExactKeys(settings.fontSizes, FONT_SIZE_KEYS, context('fontSizes'));
     for (const key of FONT_SIZE_KEYS) {
-      assertInteger(settings.fontSizes[key], FIGURE_EXPORT_SETTING_RANGES.fontSize, `fontSizes.${key}`);
+      assertPointSize(settings.fontSizes[key], FIGURE_EXPORT_SETTING_RANGES.fontSize, `fontSizes.${key}`);
     }
   }
 
@@ -298,9 +370,7 @@ export function assertFigureExportSessionSettings(settings) {
 
   assertOneOf(settings.download, FIGURE_EXPORT_DOWNLOADS, 'download');
   assertOneOf(settings.dpi, FIGURE_EXPORT_DPIS, 'dpi');
-  if (settings.svgStrategy !== null) {
-    assertOneOf(settings.svgStrategy, FIGURE_EXPORT_SVG_STRATEGIES, 'svgStrategy');
-  }
+  assertOneOf(settings.svgStrategy, FIGURE_EXPORT_SVG_STRATEGIES, 'svgStrategy');
   assertInteger(
     settings.optimizedTargetCount,
     FIGURE_EXPORT_SETTING_RANGES.optimizedTargetCount,
@@ -311,18 +381,17 @@ export function assertFigureExportSessionSettings(settings) {
 
 /**
  * @typedef {object} FigureExportSessionSettings
- * @property {1} version
- * @property {'screen-half'|'screen'|'1200x900'|'1600x1200'|'1920x1080'} sizePreset
- * @property {number} width - plot width in CSS px, 100–20000
- * @property {number} height - plot height in CSS px, 100–20000
+ * @property {3} version
+ * @property {'single-column'|'one-and-half-column'|'double-column'|'custom'} sizePreset
+ * @property {number} width - the figure's width in millimetres (at least 10); a preset's own width unless custom
  * @property {null|{lockAspect: boolean, rect: {x: number, y: number, width: number, height: number}}} frame
  *   - null while framing is off; the rect is normalized to the viewport
  * @property {'viewer'|'white'|'transparent'|'custom'} background
- * @property {string} backgroundColor - '#rrggbb', the custom background colour control
+ * @property {string} backgroundColor - '#rrggbb', the custom background color control
  * @property {string} fontFamily - one of the panel's font families
  * @property {boolean} autoTextSize
  * @property {null|{base: number, legend: number, ticks: number, axisLabel: number, title: number, centroidLabel: number}} fontSizes
- *   - null while autoTextSize derives them; whole px, 1–500
+ *   - null while autoTextSize sets them; points, 1–375 in steps of 0.5
  * @property {boolean} titleFollowsDataset
  * @property {string|null} title - null while the title follows the dataset
  * @property {string} xLabel
@@ -338,10 +407,115 @@ export function assertFigureExportSessionSettings(settings) {
  * @property {{enabled: boolean, colorblindMode: 'none'|'deuteranopia'|'protanopia'|'tritanopia'}} preview
  * @property {'svg'|'png'|'svg+png'|'png-multi'|'all'} download
  * @property {150|300|600} dpi
- * @property {null|'full-vector'|'optimized-vector'|'hybrid'} svgStrategy - null until chosen
+ * @property {'full-vector'|'optimized-vector'|'hybrid'} svgStrategy - full-vector until another is chosen
  * @property {number} optimizedTargetCount - 1000–5000000
  * @property {boolean} exportAllViews
  */
+
+/**
+ * Each earlier version's record as the next one reads it: the one change
+ * between them, made once here (the session reader), never in the panel.
+ */
+const RECORD_UPGRADES = Object.freeze({
+  // 1 → 2: an SVG strategy not chosen yet is full vector, as the panel opens now (F160).
+  1: record => ({ ...record, version: 2, svgStrategy: record.svgStrategy ?? FIGURE_EXPORT_DEFAULT_SVG_STRATEGY }),
+  // 2 → 3: the figure physical (F271): `upgradeFigureSizeOfVersion2`.
+  2: record => upgradeFigureSizeOfVersion2(record),
+});
+
+/**
+ * A version-2 record's size in version 3's terms: its box's width (CSS
+ * pixels, 1/96 inch) is the figure's width in millimetres, a preset's when it
+ * is one; the box's height goes (the figure is as tall as its plots make it);
+ * text sizes in pixels become points (3/4 of a pixel each, to the half
+ * point). The same conversion as the action's upgrader
+ * (`figure-export.set` version 3, `app/actions/definitions/settings.js`).
+ *
+ * @param {object} record - a version-2 record (or a version-2 action's settings, without `version`)
+ * @returns {object}
+ */
+export function upgradeFigureSizeOfVersion2(record) {
+  const { height: _height, ...rest } = record;
+  const next = Object.hasOwn(record, 'version') ? { ...rest, version: 3 } : { ...rest };
+  // A size that followed the window ('screen', 'screen-half': version 2's
+  // default) was nobody's choice of a figure size: its box is the window's,
+  // so it becomes version 3's default (double column), never a custom width
+  // measured off whatever window saved it (found 2026-11-11: every sample's
+  // starting view, saved at 'screen-half' in a 1440 px window, came back as a
+  // custom 190.5 mm).
+  if (record.sizePreset === 'screen' || record.sizePreset === 'screen-half') {
+    delete next.sizePreset;
+    delete next.width;
+  } else if (Object.hasOwn(record, 'width') || Object.hasOwn(record, 'sizePreset')) {
+    const widthMm = Number.isFinite(record.width) ? Math.round(mmOfFigurePx(record.width) * 10) / 10 : null;
+    const preset = widthMm === null ? null : Object.keys(FIGURE_WIDTH_PRESETS).find(key => FIGURE_WIDTH_PRESETS[key] === widthMm) ?? null;
+    if (widthMm !== null) next.width = widthMm;
+    if (Object.hasOwn(record, 'sizePreset') || widthMm !== null) next.sizePreset = preset ?? 'custom';
+  }
+  if (record.fontSizes !== null && typeof record.fontSizes === 'object' && !Array.isArray(record.fontSizes)) {
+    next.fontSizes = Object.fromEntries(Object.entries(record.fontSizes)
+      .map(([key, px]) => [key, Number.isFinite(px) ? Math.max(1, Math.round(ptOfFigurePx(px) * 2) / 2) : px]));
+  }
+  return next;
+}
+
+/**
+ * A saved record (a session's, a dataset's starting view's, a history
+ * step's) read against the settings the panel holds now: an earlier
+ * version's record upgraded first (`RECORD_UPGRADES`), then every setting
+ * the current reader accepts is taken, and a setting it refuses (a value of
+ * another version, out of range, unknown) keeps the panel's value and is
+ * named in `unread`. One setting never fails the others: a session that saved
+ * a value this version cannot use restores everything else (found 2026-11-11:
+ * a dataset's starting view and an hour-old session lost every figure
+ * setting to the SVG strategy's null). Settings that go together
+ * (`FIGURE_EXPORT_LINKED_KEYS`) are taken together, and one that needs
+ * another (a frame needs the preview) is tried again once the others are in.
+ *
+ * @param {unknown} saved
+ * @param {FigureExportSessionSettings} current - the panel's record now (valid)
+ * @returns {{settings: FigureExportSessionSettings, unread: Array<{setting: string, reason: string}>}}
+ */
+export function readSavedFigureExportSettings(saved, current) {
+  assertFigureExportSessionSettings(current);
+  if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) {
+    return { settings: current, unread: [{ setting: 'figure export settings', reason: 'not a record of settings' }] };
+  }
+  let record = saved;
+  for (let version = record.version; Object.hasOwn(RECORD_UPGRADES, version); version = record.version) {
+    record = RECORD_UPGRADES[version](record);
+  }
+  const groups = [];
+  for (const key of KEYS) {
+    if (key === 'version' || groups.some(group => group.includes(key))) continue;
+    groups.push(FIGURE_EXPORT_LINKED_KEYS.find(group => group.includes(key)) ?? [key]);
+  }
+  let settings = { ...current };
+  let pending = groups.filter(group => group.some(key => Object.hasOwn(record, key)));
+  const refusals = new Map();
+  let progressed = true;
+  while (pending.length > 0 && progressed) {
+    progressed = false;
+    const next = [];
+    for (const group of pending) {
+      const candidate = { ...settings };
+      for (const key of group) if (Object.hasOwn(record, key)) candidate[key] = structuredClone(record[key]);
+      try {
+        settings = assertFigureExportSessionSettings(candidate);
+        progressed = true;
+      } catch (error) {
+        refusals.set(group, String(error?.message ?? error).replace(/^Figure-export session settings\.?\s*/, ''));
+        next.push(group);
+      }
+    }
+    pending = next;
+  }
+  const unread = pending.map(group => ({ setting: group.join(' and '), reason: refusals.get(group) }));
+  for (const key of Object.keys(record)) {
+    if (!KEYS.includes(key)) unread.push({ setting: key, reason: 'not a setting of this version' });
+  }
+  return { settings, unread };
+}
 
 /**
  * The last valid value of one number control, for a session saved while the
@@ -386,7 +560,7 @@ export function trackCommittedNumber(input, { label, range, integer, signal }) {
       commit();
       if (committed === null) {
         throw new TypeError(
-          `Figure export ${label} has never held a ${integer ? 'whole ' : ''}number from ${minimum} to ${maximum}.`
+          `Figure export ${label} has never held a ${integer ? 'whole ' : ''}number ${maximum === Infinity ? `of at least ${minimum}` : `from ${minimum} to ${maximum}`}.`
         );
       }
       return committed;

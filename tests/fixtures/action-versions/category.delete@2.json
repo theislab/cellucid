@@ -1,0 +1,51 @@
+{
+  "examples": [
+    {
+      "category": "T cells",
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "unassigned_label": "T cells"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "category": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "const": "obs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "unassigned_label": {
+        "default": "Unassigned",
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "field",
+      "category"
+    ],
+    "type": "object"
+  },
+  "type": "category.delete",
+  "version": 2
+}

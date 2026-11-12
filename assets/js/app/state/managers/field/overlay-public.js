@@ -24,7 +24,7 @@ import { carryCategoryStateByCategory } from '../../../utils/categorical-ops.js'
 import { isCategoricalCodes } from '../../../../data/categorical-storage-contract.js';
 import { requireFields } from './overlay-internals.js';
 import { requireObjectKeys, requireObjectRecord } from '../../../../utils/exact-record.js';
-import { cancelled } from '../../../../utils/abort.js';
+import { cancelled, throwIfAborted } from '../../../../utils/abort.js';
 
 function requireSource(source) {
   if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
@@ -315,21 +315,26 @@ export class FieldOverlayPublicMethods {
       requireIdentifier(field._userDefinedId, 'User-defined field id');
       requireUserDefinedOwner(this);
     }
-    if (!Object.hasOwn(field, '_originalKey')) {
-      field._originalKey = field.key;
-    }
-    const originalKey = requireOriginalKey(field);
     const previousKey = field.key;
-
-    if (newKey === originalKey) {
-      field.key = originalKey;
+    // A field the person made has no original name to go back to (R9F-8): it
+    // is named by its id (`state/domains/fields.js`), its name is whatever
+    // it is called now, so it shows no `*` and offers no "Put name back",
+    // in the page and after a session's round trip alike.
+    let originalKey = previousKey;
+    if (isUserDefined) {
       delete field._originalKey;
-      if (!isUserDefined) {
-        this._renameRegistry.revertFieldRename(src, originalKey);
-      }
-    } else {
       field.key = newKey;
-      if (!isUserDefined) {
+    } else {
+      if (!Object.hasOwn(field, '_originalKey')) {
+        field._originalKey = field.key;
+      }
+      originalKey = requireOriginalKey(field);
+      if (newKey === originalKey) {
+        field.key = originalKey;
+        delete field._originalKey;
+        this._renameRegistry.revertFieldRename(src, originalKey);
+      } else {
+        field.key = newKey;
         this._renameRegistry.setFieldRename(src, originalKey, newKey);
       }
     }
@@ -350,7 +355,9 @@ export class FieldOverlayPublicMethods {
     this._propagateRenameToViewContexts(src, field);
     this._refreshHighlightGroupsForField(src, fieldIndex);
     // The field registry indexes fields by their original keys, which a
-    // rename keeps: it stays valid.
+    // rename keeps: it stays valid — but for a field the person made, whose
+    // key is its only name (above).
+    if (isUserDefined) getFieldRegistry().invalidate();
     this.updateFilterSummary();
     this._syncActiveContext();
     this._refreshInactiveViewLabels();
@@ -419,7 +426,7 @@ export class FieldOverlayPublicMethods {
       }
     }
     field.categories = categories;
-    // Centroid tables relabelled as new tables (`_syncCentroidCategoryLabels`).
+    // Centroid tables relabeled as new tables (`_syncCentroidCategoryLabels`).
     this._syncCentroidCategoryLabels(field, previousCategories);
 
     if (isUserDefined) {
@@ -430,7 +437,7 @@ export class FieldOverlayPublicMethods {
         delete field._originalCategories;
       }
       // One definition for every copy: the registry's template and each
-      // view's copy take the new list and the relabelled tables.
+      // view's copy take the new list and the relabeled tables.
       const updated = requireBoolean(
         this._userDefinedFields.updateField(
           field._userDefinedId,
@@ -502,7 +509,7 @@ export class FieldOverlayPublicMethods {
 
     getFieldRegistry().invalidate();
     // Every obs field's filter takes part in which cells are shown; a gene's
-    // only while it colours the view, and clearing it has recomputed them.
+    // only while it colors the view, and clearing it has recomputed them.
     if (!wasActive && src === FieldSource.OBS) this.computeGlobalVisibility();
     this.updateFilterSummary();
     this._notifyFieldChange(src, fieldIndex, ChangeType.DELETE, { originalKey });
@@ -621,7 +628,7 @@ export class FieldOverlayPublicMethods {
     }
 
     getFieldRegistry().invalidate();
-    // A restored gene colours no view, so only an obs field's filter can
+    // A restored gene colors no view, so only an obs field's filter can
     // change which cells are shown.
     if (src === FieldSource.OBS) this.computeGlobalVisibility();
     this.updateFilterSummary();
@@ -821,6 +828,8 @@ export class FieldOverlayPublicMethods {
    * @param {number} fieldIndex
    * @param {object} [options]
    * @param {string} [options.newKey]
+   * @param {AbortSignal|null} [options.signal] - What stops it (an action's
+   *   Stop): the source field's read ends with it, and nothing is made
    * @returns {Promise<{newFieldIndex: number, newKey: string}>}
    */
   async duplicateField(source, fieldIndex, options = {}) {
@@ -830,19 +839,21 @@ export class FieldOverlayPublicMethods {
     const pointCount = this.pointCount;
     requireExactOptions(
       options,
-      new Set(['newKey']),
+      new Set(['newKey', 'signal']),
       'Field duplicate options'
     );
+    const signal = options.signal ?? null;
     if (field._isDeleted === true) {
       throw new Error('A deleted field cannot be duplicated');
     }
 
     // Ensure the source field has its heavy data materialized first.
     if (src === FieldSource.VAR) {
-      await this.ensureVarFieldLoaded(fieldIndex);
+      await this.ensureVarFieldLoaded(fieldIndex, { signal });
     } else {
-      await this.ensureFieldLoaded(fieldIndex);
+      await this.ensureFieldLoaded(fieldIndex, { signal });
     }
+    throwIfAborted(signal);
     const currentFields = requireInventory(this, src);
     if (
       readDatasetGeneration(this) !== datasetGeneration
@@ -1271,7 +1282,7 @@ export class FieldOverlayPublicMethods {
       const nextCategories = [...categories];
       this.ensureCategoryMetadata(existing);
       // Every view's copy of the column takes the new definition; each keeps
-      // the colour and visibility of every category it already had.
+      // the color and visibility of every category it already had.
       this._publishUserDefinedCategorical(fieldId, {
         categories: nextCategories,
         codes,
@@ -1283,7 +1294,7 @@ export class FieldOverlayPublicMethods {
 
       this._syncActiveContext();
       // Every view that shows the column, or hides some of its categories, is
-      // drawn again from its new codes: its colours, and its centroids, which
+      // drawn again from its new codes: its colors, and its centroids, which
       // a category gains with its first cell and loses with its last.
       this._redrawViewsUsingUserDefinedField(fieldId, { includeFocused: true });
       this._notifyFieldChange(

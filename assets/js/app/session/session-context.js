@@ -411,6 +411,9 @@ function describeOtherDataset(saved, current) {
   return `${savedName ?? 'another dataset'} and ${currentName ?? 'another one'} is open now`;
 }
 
+/** The mapping groups read within the modality, and on the var axis of the matrix, of their mapping. */
+const EXPRESSION_CONTEXT_GROUPS = new Set(['expression', 'geneNames', 'log1p', 'highlyVariable']);
+
 /**
  * The sentence naming the first way a saved data mapping cannot be restored
  * onto the open dataset, or null when it can.
@@ -427,7 +430,8 @@ function describeOtherDataset(saved, current) {
  *   describeEmbeddingRefusal: (ref: {key: string, columns: number[]}) => string|null,
  *   describeChoiceRefusal: (group: string, value: unknown) => string|null
  * }} readers - Why the open dataset cannot show one embedding, or use one
- *   value of one group, as a clause such as "this dataset does not have" (or
+ *   value of one group (in the context of `saved`: its modality and
+ *   matrix), as a clause such as "this dataset does not have" (or
  *   {@link UNCHANGEABLE_GROUP_CLAUSE}), or null when it can.
  * @returns {string|null}
  */
@@ -453,10 +457,17 @@ export function describeDataMappingMismatch(saved, current, readers) {
     );
   }
   // A multimodal dataset's expression groups are its modality's: the modality first.
+  // Gene names and highly variable genes are columns of the var axis of the
+  // session's matrix, and every expression group is its modality's: one the
+  // dataset shows too is checked again when the session reads it elsewhere.
+  const contextMoved = !sameJson(saved.modality, current.modality) || !sameJson(saved.expression, current.expression);
   for (const group of ['knn', 'modality', 'geneNames', 'expression', 'log1p', 'highlyVariable', 'latent', 'vectorFields']) {
-    if (sameJson(saved[group], current[group])) continue;
+    const same = sameJson(saved[group], current[group]);
+    if (same && !(contextMoved && EXPRESSION_CONTEXT_GROUPS.has(group))) continue;
     const refusal = describeChoiceRefusal(group, saved[group]);
-    if (refusal === null) continue;
+    // A group shown as saved that the dataset cannot change is no difference:
+    // the group that moved it (the matrix, the modality) is named instead.
+    if (refusal === null || (same && refusal === UNCHANGEABLE_GROUP_CLAUSE)) continue;
     if (refusal !== UNCHANGEABLE_GROUP_CLAUSE) {
       return (
         `This session uses ${describeMappingGroupValue(group, saved[group])} as its `
@@ -608,16 +619,13 @@ export async function verifySessionFingerprint(ctx, saved, { profile = null } = 
           'describeEmbeddingRefusal',
           'Session restore DataState'
         ).bind(ctx.state),
-        // Expression choices are those of the session's modality.
+        // Expression choices are those of the session's modality, and gene
+        // names and highly variable genes those of its matrix's var axis.
         describeChoiceRefusal: (group, value) => requireMethod(
-          ctx.state,
-          'withMappingModality',
-          'Session restore DataState'
-        ).call(ctx.state, saved.dataMapping.modality ?? null, () => requireMethod(
           ctx.state,
           'describeMappingChoiceRefusal',
           'Session restore DataState'
-        ).call(ctx.state, group, value)),
+        ).call(ctx.state, group, value, saved.dataMapping),
       }
     );
     if (mapping !== null) return mapping;

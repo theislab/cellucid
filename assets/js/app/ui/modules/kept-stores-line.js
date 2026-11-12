@@ -24,19 +24,20 @@ import { keptStoragePlace, listKeptStores, onKeptStoresChange } from '../../../d
 import { rememberedHosts } from '../../../data/host-link-memory.js';
 import { listSavedStates, onSavedStatesChange } from '../../history/autosave.js';
 import { getOpeningProgress } from '../../../data/opening-progress.js';
-import { formatBytes, formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { formatBytes, formatCountOf } from '../../../utils/format-units.js';
 
 /**
  * The summary of what is kept, beside Manage… on one line at the narrowest
  * panel (`text`), and the whole of it (`title`); both '' when nothing is.
  * The line names the datasets something is kept of (a converted copy, its
  * download, gene indexes and downloaded parts of one file are one dataset)
- * and the bytes all of it takes ("2 datasets · 540 MB kept"), and counts the
- * rest -- saved states of histories, hosts whose connection speed is
- * remembered -- as "more" ("2 datasets · 540 MB · 3 more"); with no
- * dataset, the one kind kept ("1 connection speed") or how many items ("3
- * items"). The title names each ("2 datasets · 540 MB · 2 saved states · 1
- * connection speed"), and Manage… lists them.
+ * and the bytes all of it takes ("2 datasets · 540 MB kept"); the rest --
+ * saved states of histories, hosts whose connection speed is remembered --
+ * are named in the title and listed by Manage… (a count of unlike things,
+ * "· 23 more", said nothing and ran under Manage…: found 2026-11-10); with
+ * no dataset, the one kind kept ("1 connection speed") or how many items
+ * ("3 items"). The title names each ("2 datasets · 540 MB · 2 saved states
+ * · 1 connection speed").
  *
  * @param {ReadonlyArray<import('../../../data/anndata/transcode/space.js').KeptItem>} items
  * @param {number} [hosts] - the hosts whose connection speed is remembered
@@ -57,7 +58,7 @@ export function summarizeKeptStores(items, hosts = 0, saved = 0) {
   const bytes = items.reduce((sum, item) => sum + item.bytes, 0);
   const kept = `${formatCountOf(datasets, 'dataset')} · ${formatBytes(bytes)}`;
   if (also.length === 0) return { text: `${kept} kept`, title: `${kept} kept` };
-  return { text: `${kept} · ${formatCount(others)} more`, title: [kept, ...also].join(' · ') };
+  return { text: `${kept} kept`, title: [kept, ...also].join(' · ') };
 }
 
 /** What the row says in a window that gives the site no storage that lasts. */

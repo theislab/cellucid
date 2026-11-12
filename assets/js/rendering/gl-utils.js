@@ -676,11 +676,11 @@ export function createCanvasResizeObserver(canvas, onChange = null) {
 }
 
 /**
- * Centre and scale positions in place so the largest axis range spans [-1, 1].
+ * Center and scale positions in place so the largest axis range spans [-1, 1].
  *
  * `dimension` is the number of components each cell holds (see
  * `position-layout.js`). An axis the embedding does not have is exactly zero,
- * so it contributes a zero range and a zero centre: normalizing a 2-D array
+ * so it contributes a zero range and a zero center: normalizing a 2-D array
  * gives bit-for-bit the x and y a zero-padded XYZ copy would have received.
  *
  * @param {Float32Array} positions

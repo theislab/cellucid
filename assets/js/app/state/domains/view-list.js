@@ -72,6 +72,24 @@ export function requireViewsFit(value, ids, what) {
   }
 }
 
+/** The `inEachView` visits under way (the page's one state). */
+let visits = 0;
+
+/**
+ * Whether a restore is visiting views one by one now (`inEachView`). Until
+ * it ends, the focused view is the visit's cursor, not the person's focus:
+ * it may be a live view the person removed (hidden while kept views remain,
+ * its own coloring and filters still restored), and an apply awaits field
+ * reads, so a frame can come in between. What redraws the view list and the
+ * sidebar from the focused view waits for the visit's end
+ * (`ui-coordinator.js`, `view-controls.js`): a frame in a visit of a hidden
+ * live view threw "A hidden live view cannot be the active view" when a
+ * saved lung analysis with its live view removed was reopened (L14-3).
+ */
+export function visitingViews() {
+  return visits > 0;
+}
+
 /**
  * Run `apply(viewId, index)` for each view `indices` names, each while that
  * view is focused, then focus the view that was focused before. The focus
@@ -87,6 +105,7 @@ export async function inEachView(state, ids, indices, apply) {
   const focused = state.getActiveViewId();
   // The focused view last: it is the one left focused, so it is drawn once.
   const order = [...indices].sort((a, b) => (ids[a] === focused) - (ids[b] === focused) || a - b);
+  visits += 1;
   try {
     for (const index of order) {
       const viewId = ids[index];
@@ -94,7 +113,11 @@ export async function inEachView(state, ids, indices, apply) {
       await apply(viewId, index);
     }
   } finally {
-    if (state.getActiveViewId() !== focused) state.setActiveView(focused);
+    try {
+      if (state.getActiveViewId() !== focused) state.setActiveView(focused);
+    } finally {
+      visits -= 1;
+    }
   }
 }
 
@@ -111,4 +134,20 @@ export function differingViews(current, target, same = sameValue) {
   const out = [];
   for (let i = 0; i < target.length; i++) if (!same(current[i], target[i])) out.push(i);
   return out;
+}
+
+/**
+ * The part of a per-view value (`{views: [...]}`) the view a step acted in
+ * reads: its entry at the `focus` of `views` (the `views` value the step ran
+ * with), or undefined when there is none. An owner's `readPart`
+ * (`actions/domains.js`): staleness compares this part, so keeping another
+ * view or changing another view's state never makes a step stale (F156).
+ *
+ * @param {{views?: unknown[]}|null|undefined} value
+ * @param {{focus?: number}|null|undefined} views
+ * @returns {unknown}
+ */
+export function viewReadPart(value, views) {
+  const focus = views?.focus;
+  return Number.isInteger(focus) && Array.isArray(value?.views) ? value.views[focus] : undefined;
 }

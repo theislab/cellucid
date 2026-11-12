@@ -15,7 +15,7 @@
  * - **Chunked** data: the chunk index (read once, on the first read) gives
  *   the chunks the selection intersects. Chunks already decoded come from the
  *   file's decoded-chunk cache; the rest are fetched at once (the byte reader
- *   merges neighbours), decoded as they arrive, and their intersecting part
+ *   merges neighbors), decoded as they arrive, and their intersecting part
  *   copied into place. Fetching stays within a memory budget, so reading a
  *   column through thousands of large chunks never holds them all at once.
  *   Concurrent reads needing the same chunk share one fetch and decode.
@@ -23,7 +23,7 @@
  *   so) whose part in the selection is one run of its bytes is not fetched
  *   whole: only that run is, as from contiguous data (a cell's row of a CSR
  *   matrix, a gene's entries of a CSC one), and the byte reader decides
- *   which neighbouring runs are worth one request.
+ *   which neighboring runs are worth one request.
  *
  * Elements never written read as the fill value.
  *
@@ -43,9 +43,9 @@ import { allocateTypedArray } from '../../data/sparse-column-index.js';
 const MiB = 1024 * 1024;
 
 /**
- * Stored bytes of neighbouring chunks decoded as one group: a group's fetched
+ * Stored bytes of neighboring chunks decoded as one group: a group's fetched
  * bytes stay alive until all its chunks are decoded, so groups stay small.
- * (The byte reader still merges neighbouring groups into larger requests.)
+ * (The byte reader still merges neighboring groups into larger requests.)
  * Chunks are grouped within the link's merge gap, as measured.
  */
 const GROUP_BYTES = shaping => Math.min(shaping.maxRequestBytes, CHUNK_GROUP_BYTES);
@@ -509,7 +509,7 @@ export class DatasetReader {
     }
     own.sort((a, b) => a.address - b.address);
 
-    // Neighbouring chunks are fetched as one request, within the link's
+    // Neighboring chunks are fetched as one request, within the link's
     // merge gap and maximum request size.
     const shaping = file.shaping;
     const mergeGapBytes = shaping.mergeGapBytes;
@@ -624,7 +624,7 @@ export class DatasetReader {
         next.done.catch(() => {}).finally(giveBack);
         if (next.work.abandoned) {
           // Every read waiting for it gave up before it started.
-          next.settle.reject(next.work.signal.reason);
+          next.settle.reject(abortReason(next.work.signal));
         } else {
           start(next);
         }

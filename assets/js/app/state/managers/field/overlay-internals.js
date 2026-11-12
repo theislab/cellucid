@@ -10,6 +10,38 @@ import { getFieldRegistry } from '../../../utils/field-registry.js';
 import { requireObjectRecord } from '../../../../utils/exact-record.js';
 import { formatBound } from '../../../../utils/format-units.js';
 import { hiddenCategoryCount } from '../../../utils/category-state.js';
+import { getCategoryColor } from '../../../../data/palettes.js';
+import { distinctColor } from '../../../../data/distinct-colors.js';
+
+/**
+ * A user field's own palette (`field.palette`: the colors its categories open
+ * with, a field made from highlight pages has its pages') carried into new
+ * categories by label, as a view's colors are: a category kept keeps its
+ * color, a new one, in order, the category palette's color of its place when
+ * that can be told apart from the kept ones and the new ones before it, else
+ * the next palette color that can (`distinct-colors.js`). Null when the field
+ * had none.
+ *
+ * @param {ReadonlyArray<ReadonlyArray<number>>|null|undefined} palette
+ * @param {ReadonlyArray<unknown>} before - The categories the palette is of
+ * @param {ReadonlyArray<unknown>} after
+ * @returns {Array<[number, number, number]>|null}
+ */
+function carriedPalette(palette, before, after) {
+  if (!Array.isArray(palette) || palette.length !== before.length) return null;
+  const byLabel = new Map(before.map((label, index) => [label, palette[index]]));
+  const carried = after.map(label => {
+    const kept = byLabel.get(label);
+    return kept === undefined ? null : [kept[0], kept[1], kept[2]];
+  });
+  const taken = carried.filter(color => color !== null);
+  return carried.map((color, index) => {
+    if (color !== null) return color;
+    const given = distinctColor(taken, getCategoryColor(index));
+    taken.push(given);
+    return given;
+  });
+}
 
 function requireSource(source) {
   if (source !== FieldSource.OBS && source !== FieldSource.VAR) {
@@ -436,8 +468,8 @@ export class FieldOverlayInternalMethods {
    * the registry holds one definition, a session saves it, and every view's
    * copy holds the same arrays and tables. A copy left holding the previous
    * ones went on drawing them, computed a new layout's centroids into a table
-   * it no longer shared, or met the new categories under colours indexed for
-   * the old ones. What belongs to a view, its colours and hidden categories,
+   * it no longer shared, or met the new categories under colors indexed for
+   * the old ones. What belongs to a view, its colors and hidden categories,
    * is carried into the new categories by `carryCategoryState`, from that
    * copy's own; what the previous definition derived (counts, outlier
    * quantiles, the record of renamed categories) is dropped from every copy.
@@ -458,7 +490,7 @@ export class FieldOverlayInternalMethods {
    *   categories: Array<string|number|boolean>,
    *   colors: Uint8Array,
    *   visible: Uint8Array
-   * }) => {colors: Uint8Array, visible: Uint8Array}} carryCategoryState - colours and
+   * }) => {colors: Uint8Array, visible: Uint8Array}} carryCategoryState - colors and
    *   visibility as `utils/category-state.js` holds them
    */
   _publishUserDefinedCategorical(fieldId, definition, carryCategoryState) {
@@ -481,6 +513,7 @@ export class FieldOverlayInternalMethods {
         visible: copy._categoryVisible,
       });
     });
+    const palette = carriedPalette(copies[0].palette, copies[0].categories, definition.categories);
     const updated = requireBoolean(
       this._userDefinedFields.updateField(fieldId, {
         categories: definition.categories,
@@ -503,6 +536,8 @@ export class FieldOverlayInternalMethods {
       copy._normalizedLayouts = template._normalizedLayouts;
       copy._sourceField = template._sourceField;
       copy._operation = template._operation;
+      if (palette === null) delete copy.palette;
+      else copy.palette = palette;
       copy.loaded = true;
       const state = carried[index];
       if (state !== null) {
@@ -521,10 +556,10 @@ export class FieldOverlayInternalMethods {
 
   /**
    * Draw again every view that uses a user-defined categorical whose
-   * definition changed: a view coloured by it, from its new codes, and a view
+   * definition changed: a view colored by it, from its new codes, and a view
    * that hides some of its categories, by its new visibility. Each other view
    * is drawn as the focused view, which then gets the focus back, as a new
-   * latent space recolours the views (`_recolourCategoricalViews`).
+   * latent space recolors the views (`_recolorCategoricalViews`).
    *
    * @param {string} fieldId
    * @param {{includeFocused: boolean}} options - Whether the focused view is
@@ -667,7 +702,7 @@ export class FieldOverlayInternalMethods {
   }
 
   /**
-   * Give `field` centroid tables labelled by its categories, after they
+   * Give `field` centroid tables labeled by its categories, after they
    * changed from `previousCategories` (position for position).
    *
    * A field's centroid tables, like its category list, are never written in

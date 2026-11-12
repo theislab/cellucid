@@ -8,7 +8,7 @@
 .notification-center {
   position: fixed;
   bottom: calc(var(--space-4) + max(var(--select-bar-block-size, 0px), var(--agent-dock-block-size, 0px)));
-  right: var(--space-4);
+  right: calc(var(--space-4) + var(--agent-panel-inline-size, 0px));
   z-index: var(--z-notification);
   display: flex;
   flex-direction: column-reverse;
@@ -24,10 +24,15 @@
 
 /* The welcome dialog is the one thing to act on at first start. On a short
    screen it fills the height, so startup notifications landed on its buttons;
-   there they wait beneath it and are seen once it closes. */
+   there they wait beneath its card (the cards live inside an open dialog,
+   ui/components/app-dialog.js) and are seen once it closes. */
 @media (max-height: 500px) {
-  body:has(#welcome-modal:not(.hidden)) .notification-center {
-    z-index: calc(var(--z-modal) - 1);
+  .welcome-modal > .notification-center {
+    z-index: 0;
+  }
+
+  .welcome-modal > .welcome-content {
+    z-index: 1;
   }
 
   /* A short screen (a phone on its side) holds two cards. The stack is
@@ -132,7 +137,7 @@
   /* Messages are written as several sentences, and two are a key/value list
      built with `bits.join('\n')`. The escaping on the way in leaves `\n`
      alone, so the break arrives here intact; without this it is folded into a
-     space and the sentences run together. `pre-line` honours the break and
+     space and the sentences run together. `pre-line` honors the break and
      still collapses the ordinary whitespace of concatenated source. */
   white-space: pre-line;
 }
@@ -296,10 +301,17 @@
 /* Responsive adjustments */
 @media (max-width: 480px) {
   /* A phone's community annotation dialog fills the screen and keeps its
-     form at the bottom, where the cards stack: they wait beneath it and are
-     seen once it closes (they were announced when they arrived). */
-  body:has(.community-annotation-modal-overlay) .notification-center {
-    z-index: calc(var(--z-modal) - 1);
+     form at the bottom, where the cards stack: inside the dialog (they are
+     kept above dialogs, ui/components/app-dialog.js) they wait beneath its
+     card and are seen once it closes (they were announced when they
+     arrived). */
+  .community-annotation-dialog > .notification-center {
+    z-index: 0;
+  }
+
+  .community-annotation-dialog > .community-annotation-modal {
+    position: relative;
+    z-index: 1;
   }
 
   .notification-center {
@@ -353,4 +365,9 @@
 
 .notification-overflow-item:last-child {
   border-bottom: none;
+}
+
+/* A retired card's follow-ups (its Show, its Retry), under its message. */
+.notification-overflow-item .notification-actions {
+  margin-top: var(--space-1);
 }

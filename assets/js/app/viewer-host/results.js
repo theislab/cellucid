@@ -5,8 +5,10 @@
  *
  * - every highlight group of every page (`highlight`);
  * - every user-defined obs field: categoricals -- labels, annotations,
- *   clusters, merged categories, community consensus -- (`categorical`) and
- *   continuous fields, copied or pushed (`continuous`);
+ *   clusters, merged categories, community consensus -- (`categorical`, with
+ *   the colors each category is shown in, in the view in focus, so a pull
+ *   writes them as `uns['<key>_colors']`) and continuous fields, copied or
+ *   pushed (`continuous`);
  * - the scores and gene sets the shown analyses hold, and the gene sets a
  *   notebook pushed (`registries/derived-results.js`);
  * - the cells the filters leave visible (`visibility`), and the cells open
@@ -46,6 +48,10 @@
 
 import { FieldKind, FieldSource } from '../utils/field-constants.js';
 import { geneIdentities } from '../analysis/shared/gene-sets.js';
+import { randomHex } from '../../utils/byte-text.js';
+import { defaultCategoryColors } from '../utils/category-state.js';
+import { hexOfBytes } from '../../utils/hex-color.js';
+import { debounce } from '../../utils/debounce.js';
 
 /** How long a burst of changes may go quiet before its results are sent. */
 const SETTLE_MS = 120;
@@ -90,10 +96,27 @@ function visibleCells(transparency) {
   return { cells, digest: `${visible}:${hash}` };
 }
 
+/**
+ * The colors a categorical field is shown in, in the view in focus (the
+ * fields `state.getFields()` gives are that view's), one `#rrggbb` a category
+ * in its order: the color the person or an agent gave a category there, else
+ * the one it opens with -- its `palette`, else Cellucid's own by position
+ * (`defaultCategoryColors`). The rule a session's apply writes
+ * `uns['<key>_colors']` by (`history/exports/anndata-copy.js`
+ * `shownCategoryColors`), read from what is drawn.
+ */
+function shownColors(field) {
+  const count = field.categories.length;
+  const own = field._categoryColors;
+  const bytes = own instanceof Uint8Array && own.length === count * 3 ? own : defaultCategoryColors(field);
+  const colors = new Array(count);
+  for (let index = 0; index < count; index++) colors[index] = hexOfBytes(bytes[index * 3], bytes[index * 3 + 1], bytes[index * 3 + 2]);
+  return colors;
+}
+
 /** A new epoch: 64 random bits as 16 lowercase hexadecimal characters. */
 function drawEpoch() {
-  const words = crypto.getRandomValues(new Uint32Array(2));
-  return Array.from(words, word => word.toString(16).padStart(8, '0')).join('');
+  return randomHex(8);
 }
 
 /**
@@ -113,7 +136,14 @@ export function createViewerHostResults({ state, viewerHostSource, getCellIdenti
   let revision = 0;
   /** @type {Map<string, {kind: string, id: string, revision: number, fingerprint: unknown[]}>} */
   const sent = new Map();
-  let timer = null;
+  // Results are sent once the changes settle (`SETTLE_MS` without another).
+  const flushWhenSettled = debounce(() => {
+    try {
+      flush();
+    } catch (error) {
+      console.error('[ViewerHostResults] Sending results to the host failed:', error);
+    }
+  }, SETTLE_MS);
   let visibilityDirty = true;
   let visibility = { cells: null, digest: 0 };
   let colorBy = null;
@@ -175,6 +205,8 @@ export function createViewerHostResults({ state, viewerHostSource, getCellIdenti
         const meta = {
           key: cleanText(field.key, field._userDefinedId),
           categories: field.categories.map(category => String(category)),
+          // In the fingerprint with the rest of meta: a recolor sends the field again.
+          colors: shownColors(field),
           origin: fieldOrigin(field),
         };
         items.push({
@@ -290,10 +322,7 @@ export function createViewerHostResults({ state, viewerHostSource, getCellIdenti
 
   /** Send every result that changed since it was last sent, and every removal. */
   function flush() {
-    if (timer !== null) {
-      clearTimeout(timer);
-      timer = null;
-    }
+    flushWhenSettled.cancel();
     if (!started || !viewerHostSource.isConnected()) return null;
     // Another dataset is open: nothing of it describes the host's cells.
     if (viewerHostSource.getShownHostDataset() === null) return null;
@@ -341,15 +370,7 @@ export function createViewerHostResults({ state, viewerHostSource, getCellIdenti
 
   function schedule() {
     if (!started) return;
-    if (timer !== null) clearTimeout(timer);
-    timer = setTimeout(() => {
-      timer = null;
-      try {
-        flush();
-      } catch (error) {
-        console.error('[ViewerHostResults] Sending results to the host failed:', error);
-      }
-    }, SETTLE_MS);
+    flushWhenSettled();
   }
 
   function inventory(identity, dataset) {
@@ -377,6 +398,10 @@ export function createViewerHostResults({ state, viewerHostSource, getCellIdenti
     state.on('highlight:changed', schedule),
     state.on('page:changed', schedule),
     state.on('field:changed', schedule),
+    // A category recolored (the legend, an undo, an agent, a notebook): a
+    // categorical result carries its colors. A change of the view in focus
+    // reaches the pass through `visibility:changed` (`setActiveView`).
+    state.on('colors:changed', schedule),
     // The gene shown read for more of the open cells (`color_by` `cells_read`).
     state.on('gene-sample:changed', schedule),
     state.on('visibility:changed', () => {
@@ -421,8 +446,7 @@ export function createViewerHostResults({ state, viewerHostSource, getCellIdenti
      * @returns {Promise<void>}
      */
     async datasetOpened() {
-      if (timer !== null) clearTimeout(timer);
-      timer = null;
+      flushWhenSettled.cancel();
       epoch = drawEpoch();
       revision = 0;
       sent.clear();
@@ -430,8 +454,7 @@ export function createViewerHostResults({ state, viewerHostSource, getCellIdenti
     },
 
     dispose() {
-      if (timer !== null) clearTimeout(timer);
-      timer = null;
+      flushWhenSettled.cancel();
       for (const unsubscribe of unsubscribers) unsubscribe();
     },
   });

@@ -1,7 +1,7 @@
 /**
  * @fileoverview The Data mapping disclosures after Embeddings: one per
  * mapping group the open dataset can change (genes and, for a dataset of
- * several modalities, their modality; neighbour graph, latent space, vector
+ * several modalities, their modality; neighbor graph, latent space, vector
  * fields), each naming its current choice in its header.
  *
  * Markup only, as `dom.js` is: the controller (`../data-mapping-controls.js`)
@@ -16,6 +16,7 @@ import {
   createStatusLine,
 } from '../../components/controls.js';
 import { setText } from './dom.js';
+import { setControlAvailability } from '../../core/control-availability.js';
 
 /** The value a menu uses for a group's null choice ("None"). */
 export const NONE_VALUE = '';
@@ -44,7 +45,7 @@ export const GROUP_SECTIONS = Object.freeze([
   }),
   Object.freeze({
     id: 'knn',
-    title: 'Neighbour graph',
+    title: 'Neighbor graph',
     tip: 'data-mapping-knn',
     fields: Object.freeze([
       Object.freeze({ group: 'knn', id: 'data-mapping-knn', label: 'Graph', analyticsId: 'data-mapping:knn' }),
@@ -132,7 +133,7 @@ function buildGroupDisclosure(section) {
 }
 
 /**
- * Build one group disclosure, once: one labelled select per field and their
+ * Build one group disclosure, once: one labeled select per field and their
  * error lines, and the hint line. The disclosure is built once and filled by
  * `renderGroupSection` on every render.
  *
@@ -205,9 +206,7 @@ export function renderGroupSection(node, { summary, fields, hint, hintDetail = '
       }));
     }
     if (select.value !== field.value) select.value = field.value;
-    select.disabled = field.disabled;
-    if (field.disabled) select.title = field.disabledReason;
-    else select.removeAttribute('title');
+    setControlAvailability(select, field.disabled ? field.disabledReason : null);
     error.set(field.error, 'danger');
   }
   node.hint.set(hint, 'muted');
@@ -263,7 +262,8 @@ export function renderVectorSection(node, { summary, groups, selected, disabled,
     // The same choices: only what is bound, and whether it can change.
     for (const input of node.list.querySelectorAll('.data-mapping-vector-input')) {
       input.checked = selected.has(input.value);
-      input.disabled = disabled || (input.dataset.usable !== 'true' && !input.checked);
+      setControlAvailability(input, disabled ? 'Applying the data mapping…'
+        : input.dataset.usable !== 'true' && !input.checked ? input.dataset.unusableReason : null);
     }
     return;
   }
@@ -283,8 +283,10 @@ export function renderVectorSection(node, { summary, groups, selected, disabled,
       input.type = 'checkbox';
       input.value = key;
       input.checked = selected.has(key);
-      input.disabled = disabled || (!option.usable && !input.checked);
       input.dataset.usable = String(option.usable);
+      input.dataset.unusableReason = option.reason ?? 'it cannot be drawn on this embedding';
+      setControlAvailability(input, disabled ? 'Applying the data mapping…'
+        : !option.usable && !input.checked ? input.dataset.unusableReason : null);
       input.dataset.mappingGroup = VECTOR_SECTION.group;
       input.dataset.analyticsId = VECTOR_SECTION.analyticsId;
       const text = option.usable ? option.label : `${option.label} · ${option.reason}`;

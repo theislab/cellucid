@@ -16,6 +16,7 @@
 import { FOG_GLSL } from './fog-shaders.js';
 import { LINEAR_TEXEL_GLSL } from '../linear-texture.js';
 import { UNPLACED_GLSL } from '../unplaced-positions.js';
+import { POINT_SPRITE_GLSL, pointScaleFor } from '../point-sprite.js';
 
 // ============================================================================
 // WEBGL2 SHADERS (GLSL ES 3.0)
@@ -24,7 +25,7 @@ import { UNPLACED_GLSL } from '../unplaced-positions.js';
 /**
  * Highest dimension level drawn without depth. Every 1-D and 2-D view lies in
  * one plane, where a depth test would only turn submission order into
- * artefacts, so those passes neither test nor write depth and draw with a
+ * artifacts, so those passes neither test nor write depth and draw with a
  * quality's `_NO_DEPTH` fragment shader. The viewer and the figure export
  * both decide by this one value, so an exported 2-D figure is drawn the way
  * the screen draws it.
@@ -33,8 +34,8 @@ export const NO_DEPTH_MAX_DIMENSION = 2;
 
 /**
  * The `full` quality's lighting: a lit sphere is `ambient + diffuse · N·L`
- * times its colour, plus a white highlight. The two weights sum to 1, so the
- * side facing the light shows the colour itself and the side away from it
+ * times its color, plus a white highlight. The two weights sum to 1, so the
+ * side facing the light shows the color itself and the side away from it
  * keeps `ambient` of it. Shared by the point passes, the `full` highlight
  * ring and the centroid markers, so they shade alike.
  */
@@ -78,19 +79,7 @@ layout(location = 1) in vec4 a_color; // RGBA packed, auto-normalized by WebGL
 
 uniform mat4 u_modelViewMatrix;
 uniform mat4 u_projectionMatrix;
-uniform float u_pointSize;
-// The largest sprite this pass may draw, in the pixels it is drawing into.
-// A figure export rasterises the same scene at a multiple of the screen
-// size, so a fixed cap would clamp a point at a different fraction of the
-// image than it occupies on screen, and the exported figure would stop
-// being the view it claims to reproduce. Zero means unset, and the floor
-// below keeps that behaving exactly as the fixed cap did.
-uniform float u_pointSizeMax;
-uniform float u_sizeAttenuation;
-// Pixels per world unit of point size at unit eye depth:
-// viewportHeight / (2 tan(fov / 2)) * 0.01.
-uniform float u_pointScale;
-
+${POINT_SPRITE_GLSL}
 ${FOG_GLSL}
 // Alpha in source order, one R8 texel a point, as a linear texture
 // (rendering/linear-texture.js), for alpha-only updates.
@@ -107,15 +96,15 @@ uniform int u_orderedSlots;
 // The first slot of the store segment drawn: gl_VertexID counts from it
 // (rendering/high-perf/point-store-segments.js).
 uniform int u_slotBase;
-// Which cells this pass draws, by the layer their colour's alpha byte names
-// (alpha-visibility.js): 0 every one; 1 the grey beneath the coloured cells
-// (BENEATH_ALPHA_BYTE, 254); 2 the coloured cells (255); 3 the cells not read
+// Which cells this pass draws, by the layer their color's alpha byte names
+// (alpha-visibility.js): 0 every one; 1 the grey beneath the colored cells
+// (BENEATH_ALPHA_BYTE, 254); 2 the colored cells (255); 3 the cells not read
 // (UNREAD_ALPHA_BYTE, 253). A field with lower layers is drawn a layer a
 // pass, bottom first (3, 1, 2), so each lies over the one before in 2-D
 // blending and wins depth ties in 3-D, at every level of detail and culled
 // range.
 uniform int u_drawPass;
-// The colour of a cell not read: the background's, faded toward the grey
+// The color of a cell not read: the background's, faded toward the grey
 // for 0 (rendering/read-cell-layer.js, unreadCellColor). Its own RGB bytes
 // are not drawn.
 uniform vec3 u_unreadColor;
@@ -136,7 +125,7 @@ flat out float v_alpha;
 flat out float v_radiusPx;
 // Fog transmittance (1 is unfogged), and the opacity it leaves a translucent
 // point (fog-shaders.js). Full thins the point by the opacity; Sculpted is
-// opaque and mixes its colour by the transmittance.
+// opaque and mixes its color by the transmittance.
 flat out float v_fogT;
 flat out float v_fogOpacity;
 
@@ -159,10 +148,8 @@ void main() {
     alpha = a_color.a;
   }
 
-  // Perspective point size with attenuation
-  float perspectiveSize = (u_pointSize * u_pointScale) / max(eyeDepth, 0.001);
-  gl_PointSize = mix(u_pointSize, perspectiveSize, u_sizeAttenuation);
-  gl_PointSize = clamp(gl_PointSize, 0.5, max(u_pointSizeMax, 128.0));
+  // The sprite: perspective size and the cap (rendering/point-sprite.js).
+  gl_PointSize = pointSpriteSize(eyeDepth);
 
   // Reject invisible points before rasterisation.
   //
@@ -190,8 +177,8 @@ void main() {
   v_fogT = fogTransmittance(length(eyePos.xyz));
   v_fogOpacity = fogOpacity(v_fogT);
 
-  // The passes of the lower layers draw them in their own colours (a
-  // figure's raster bakes those into the colours and draws in pass 0).
+  // The passes of the lower layers draw them in their own colors (a
+  // figure's raster bakes those into the colors and draws in pass 0).
   v_color = u_drawPass == 3 ? u_unreadColor : (u_drawPass == 1 ? u_zeroColor : a_color.rgb);
   v_alpha = alpha;
   // Sprite radius in pixels, for the antialiased rim of the no-depth fragment
@@ -208,7 +195,7 @@ void main() {
  * The disc edge here stays hard. A partially covered rim fragment would still
  * write depth, so every point drawn after it and behind it is rejected from
  * that pixel and the background shows through: in a dense cloud each disc
- * grew a light ring of background colour. Only a pass without depth can
+ * grew a light ring of background color. Only a pass without depth can
  * soften the edge, and the no-depth variants do.
  */
 export const HP_FS_FULL = `#version 300 es
@@ -230,7 +217,7 @@ void main() {
   float r2 = dot(coord, coord);
   // One discard for both cases — a hidden point (second line of defence
   // behind HP_VS_FULL's clip-volume rejection) and a sprite corner outside the
-  // disc. Two separate discards, the first ahead of everything else, cost 12 %
+  // disc. Two separate discards, the first ahead of everything else, cost 12%
   // of a dense antialiased 2-D frame (1M points, 4x MSAA, ANGLE Metal on an
   // Apple M1 Pro: 35.6 ms against 31.4 ms) for the same pixels.
   if (v_alpha < 0.01 || r2 > 1.0) discard;
@@ -258,7 +245,7 @@ void main() {
  * is the same pixel and cheaper.
  *
  * The rim is antialiased. Coverage is 1 inside the disc, falls across one
- * pixel centred on the edge, and is 0 beyond it. MSAA cannot smooth this edge
+ * pixel centered on the edge, and is 0 beyond it. MSAA cannot smooth this edge
  * itself, because a fragment shader runs once per pixel and a discard (or a
  * zero alpha) removes every sample of it, so the disc used to be a hard,
  * jagged staircase on a DPR-1 screen, antialiasing on or off. `(1 - r^2) / 2`
@@ -323,17 +310,7 @@ layout(location = 1) in vec4 a_color; // RGBA packed, auto-normalized by WebGL
 
 uniform mat4 u_modelViewMatrix;
 uniform mat4 u_projectionMatrix;
-uniform float u_pointSize;
-// The largest sprite this pass may draw, in the pixels it is drawing into.
-// A figure export rasterises the same scene at a multiple of the screen
-// size, so a fixed cap would clamp a point at a different fraction of the
-// image than it occupies on screen, and the exported figure would stop
-// being the view it claims to reproduce. Zero means unset, and the floor
-// below keeps that behaving exactly as the fixed cap did.
-uniform float u_pointSizeMax;
-uniform float u_sizeAttenuation;
-// Pixels per world unit of point size at unit eye depth; see HP_VS_FULL.
-uniform float u_pointScale;
+${POINT_SPRITE_GLSL}
 
 // Alpha in source order, one R8 texel a point, as a linear texture
 // (rendering/linear-texture.js), for alpha-only updates.
@@ -350,15 +327,15 @@ uniform int u_orderedSlots;
 // The first slot of the store segment drawn: gl_VertexID counts from it
 // (rendering/high-perf/point-store-segments.js).
 uniform int u_slotBase;
-// Which cells this pass draws, by the layer their colour's alpha byte names
-// (alpha-visibility.js): 0 every one; 1 the grey beneath the coloured cells
-// (BENEATH_ALPHA_BYTE, 254); 2 the coloured cells (255); 3 the cells not read
+// Which cells this pass draws, by the layer their color's alpha byte names
+// (alpha-visibility.js): 0 every one; 1 the grey beneath the colored cells
+// (BENEATH_ALPHA_BYTE, 254); 2 the colored cells (255); 3 the cells not read
 // (UNREAD_ALPHA_BYTE, 253). A field with lower layers is drawn a layer a
 // pass, bottom first (3, 1, 2), so each lies over the one before in 2-D
 // blending and wins depth ties in 3-D, at every level of detail and culled
 // range.
 uniform int u_drawPass;
-// The colour of a cell not read: the background's, faded toward the grey
+// The color of a cell not read: the background's, faded toward the grey
 // for 0 (rendering/read-cell-layer.js, unreadCellColor). Its own RGB bytes
 // are not drawn.
 uniform vec3 u_unreadColor;
@@ -400,16 +377,14 @@ void main() {
     alpha = a_color.a;
   }
 
-  float perspectiveSize = (u_pointSize * u_pointScale) / max(eyeDepth, 0.001);
-  gl_PointSize = mix(u_pointSize, perspectiveSize, u_sizeAttenuation);
-  // Identical bounds to HP_VS_FULL, and to the copy HP_VS_HIGHLIGHT keeps of
-  // this formula. Shader quality selects shading, never geometry: a higher
-  // ceiling here made "light" and "ultralight" draw larger points than "full"
-  // at close range, which is both a different picture and — because point area
-  // is quadratic in the size — more fill. The old 192.0 measured 1.23x the GPU
-  // frame time of this at point size 40 and 1.90x at 60, so the two faster
-  // shaders were the slower ones exactly where speed is wanted.
-  gl_PointSize = clamp(gl_PointSize, 0.5, max(u_pointSizeMax, 128.0));
+  // The same sprite as HP_VS_FULL and HP_VS_HIGHLIGHT (one GLSL function,
+  // rendering/point-sprite.js). Shader quality selects shading, never
+  // geometry: a higher ceiling here once made "light" and "ultralight" draw
+  // larger points than "full" at close range, which is both a different
+  // picture and — because point area is quadratic in the size — more fill
+  // (a ceiling of 192 measured 1.23x the GPU frame time at point size 40 and
+  // 1.90x at 60).
+  gl_PointSize = pointSpriteSize(eyeDepth);
 
   // Reject invisible points before rasterisation — see HP_VS_FULL. This shader
   // also backs the ultralight program, whose fragment shader does not discard,
@@ -430,8 +405,8 @@ void main() {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
   }
 
-  // The passes of the lower layers draw them in their own colours (a
-  // figure's raster bakes those into the colours and draws in pass 0).
+  // The passes of the lower layers draw them in their own colors (a
+  // figure's raster bakes those into the colors and draws in pass 0).
   v_color = u_drawPass == 3 ? u_unreadColor : (u_drawPass == 1 ? u_zeroColor : a_color.rgb);
   v_alpha = alpha;
   // Sprite radius in pixels, for the antialiased rim of the no-depth fragment
@@ -475,7 +450,7 @@ void main() {
  * the destination exactly as it was, so the frame is byte-identical. What
  * changes is the cost: a shader that may discard makes the GPU resolve each
  * fragment's coverage before it can blend the next one into the same pixel,
- * and in a dense 2-D embedding drawn with antialiasing that serialisation was
+ * and in a dense 2-D embedding drawn with antialiasing that serialization was
  * most of the frame (1M points, 4x MSAA: 30 ms with the discard, 17 ms
  * without, ANGLE Metal on an Apple M1 Pro).
  *
@@ -535,12 +510,12 @@ void main() {
 
 /**
  * The sculpted look's lighting constants, shared by the shaders below and by
- * `sculptedCenterShade`, which normalises the lighting so a sphere's centre
- * shows exactly the colour the legend shows.
+ * `sculptedCenterShade`, which normalizes the lighting so a sphere's center
+ * shows exactly the color the legend shows.
  *
- * Lighting is evaluated on linear colour, approximated as the square of the
+ * Lighting is evaluated on linear color, approximated as the square of the
  * display value and encoded back with a square root: an exact round trip, so
- * the centre's colour survives untouched, and two multiplies instead of two
+ * the center's color survives untouched, and two multiplies instead of two
  * `pow` calls per fragment.
  */
 const SCULPTED = Object.freeze({
@@ -613,9 +588,9 @@ vec3 sculptedColor(vec2 coord, float r2) {
 /**
  * Sculpted fragment shader for passes that test and write depth (3-D views).
  *
- * A sculpted point is opaque, so its depth pass replaces the colour rather
- * than blending it (`enterOpaquePointBlending`), and fog fades the colour
- * toward the fog colour rather than thinning the point. That is what lets the
+ * A sculpted point is opaque, so its depth pass replaces the color rather
+ * than blending it (`enterOpaquePointBlending`), and fog fades the color
+ * toward the fog color rather than thinning the point. That is what lets the
  * edge be antialiased with depth on.
  * With multisampling the pass enables SAMPLE_ALPHA_TO_COVERAGE and the
  * fragment's coverage of the disc becomes its sample mask: every sample keeps
@@ -687,9 +662,9 @@ void main() {
 `;
 
 /**
- * The sculpted shading of a sphere's centre (normal (0, 0, 1)) for this
- * light: its reciprocal is `u_invCenterShade`, which makes the centre of every
- * sculpted point exactly the colour the legend shows. Mirrors
+ * The sculpted shading of a sphere's center (normal (0, 0, 1)) for this
+ * light: its reciprocal is `u_invCenterShade`, which makes the center of every
+ * sculpted point exactly the color the legend shows. Mirrors
  * `sculptedShade` in SCULPTED_SHADING_GLSL.
  *
  * @param {ArrayLike<number>} lightDir - Unit light direction in eye space.
@@ -708,8 +683,6 @@ export function sculptedCenterShade(lightDir) {
     SCULPTED.diffuseWeight * wrapped * wrapped
   );
 }
-
-const FOV_SCALE_FLOOR = 1e-6;
 
 /**
  * Derive the per-draw uniforms the point shaders share (see the top of this
@@ -762,10 +735,7 @@ export function writePointShaderFrame(
     half[2] = 1;
   }
   target.invCenterShade = 1 / sculptedCenterShade(lightDir);
-  return (
-    viewportHeight /
-    Math.max(2 * Math.tan(fov * 0.5), FOV_SCALE_FLOOR)
-  ) * 0.01;
+  return pointScaleFor(viewportHeight, fov);
 }
 
 /**
@@ -783,6 +753,79 @@ export const HIGHLIGHT_STYLES_BY_QUALITY = Object.freeze({
   light: Object.freeze({ scale: 1.70, ringWidth: 0.44, haloStrength: 0.60, haloShape: 0.0, ringStyle: 1.0, animated: false }),
   ultralight: Object.freeze({ scale: 1.65, ringWidth: 0.46, haloStrength: 0.55, haloShape: 0.35, ringStyle: 2.0, animated: false }),
 });
+
+/**
+ * The color highlighted cells are drawn in (RGB, 0 to 1), on screen and in a
+ * figure alike: the viewer's highlight renderer, the figure's point raster and
+ * its vector points, and the figure legend's entry for the highlighted cells
+ * (F158) all read it here. Each highlighted cell is a dot of this color inside
+ * a ring of `highlightRingColorFor(HIGHLIGHT_COLOR)` (`HIGHLIGHT_RING_COLOR`).
+ */
+export const HIGHLIGHT_COLOR = Object.freeze([0.4, 0.85, 1.0]);
+
+const HIGHLIGHT_RING_BLACK = Object.freeze([0, 0, 0]);
+const HIGHLIGHT_RING_WHITE = Object.freeze([1, 1, 1]);
+
+const linearChannel = channel => (channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4);
+
+/**
+ * The ring a highlighted cell's dot is drawn inside: black or white, whichever
+ * has the higher contrast with the dot's color (WCAG relative luminance). One
+ * rule for every coloring, background, shader quality and figure format.
+ *
+ * Why (F162): a dot alone, in a fixed color, vanishes wherever the cells
+ * around it are colored like it: Garcia colored by LVL1, whose germ cells are
+ * sky blue, showed its 10,993 highlighted germ cells exactly as before. The
+ * cells' own colors cannot be known to the ring (a highlight is drawn over
+ * every coloring, categorical or continuous), so the pair is chosen to read
+ * against all of them: a light dot is ringed in black, a dark one in white,
+ * and the cyan in black keeps any color at least 0.42 (OKLab) from one of the
+ * two, five times the
+ * distance two colors need to be told apart (`data/distinct-colors.js`), and
+ * a background is one more such color (tests/highlight-ring-contrast.test.mjs).
+ *
+ * @param {ArrayLike<number>} dotColor - RGB, 0 to 1
+ * @returns {readonly [number, number, number]}
+ */
+export function highlightRingColorFor(dotColor) {
+  const luminance =
+    0.2126 * linearChannel(dotColor[0]) +
+    0.7152 * linearChannel(dotColor[1]) +
+    0.0722 * linearChannel(dotColor[2]);
+  // Contrast with black (L + 0.05) / 0.05 against white 1.05 / (L + 0.05).
+  return (luminance + 0.05) ** 2 >= 0.05 * 1.05 ? HIGHLIGHT_RING_BLACK : HIGHLIGHT_RING_WHITE;
+}
+
+/** The ring around a dot of `HIGHLIGHT_COLOR`: black. */
+export const HIGHLIGHT_RING_COLOR = highlightRingColorFor(HIGHLIGHT_COLOR);
+
+/** The ring's inner edge in dot radii, before the sprite bound (HP_FS_HIGHLIGHT `INNER_GAP`). */
+export const HIGHLIGHT_RING_INNER_GAP = 1.08;
+/** The ring's outer edge over its inner edge, before its width (HP_FS_HIGHLIGHT `RING_RATIO`). */
+export const HIGHLIGHT_RING_RATIO = 1.65;
+
+/**
+ * Where HP_FS_HIGHLIGHT draws a style's ring, in radii of the cell's dot: the
+ * highlight color fills the dot out to `inner` (the flat styles; the torus
+ * leaves the gap past the dot clear) and the ring color the band from `inner`
+ * to `outer`. The vector figure draws its rings by it, so they sit where the
+ * screen's do.
+ *
+ * @param {{ scale: number, ringWidth: number }} style - a HIGHLIGHT_STYLES_BY_QUALITY entry
+ * @returns {{ inner: number, outer: number }}
+ */
+export function highlightRingRadii({ scale, ringWidth }) {
+  // In sprite radii, as the shader computes them.
+  let inner = HIGHLIGHT_RING_INNER_GAP / scale;
+  const tube = (inner * HIGHLIGHT_RING_RATIO - inner) * 0.5 * (0.5 + ringWidth * 0.5);
+  let outer = inner + tube * 2;
+  if (outer > 0.95) {
+    const bound = 0.95 / outer;
+    inner *= bound;
+    outer *= bound;
+  }
+  return { inner: inner * scale, outer: outer * scale };
+}
 
 /**
  * The highlight pulse at `timeSeconds`: 0 is the resting look (it matches an
@@ -815,18 +858,10 @@ layout(location = 1) in vec4 a_color; // RGBA packed - we only use alpha for vis
 
 uniform mat4 u_modelViewMatrix;
 uniform mat4 u_projectionMatrix;
-uniform float u_pointSize;
-// The largest sprite this pass may draw, in the pixels it is drawing into.
-// A figure export rasterises the same scene at a multiple of the screen
-// size, so a fixed cap would clamp a point at a different fraction of the
-// image than it occupies on screen, and the exported figure would stop
-// being the view it claims to reproduce. Zero means unset, and the floor
-// below keeps that behaving exactly as the fixed cap did.
-uniform float u_pointSizeMax;
-uniform float u_sizeAttenuation;
-// Pixels per world unit of point size at unit eye depth; see HP_VS_FULL.
-uniform float u_pointScale;
+${POINT_SPRITE_GLSL}
 uniform float u_highlightScale; // How much larger the highlight ring is (e.g., 1.5)
+// The GPU's largest point (ALIASED_POINT_SIZE_RANGE[1]), in the pixels drawn into.
+uniform float u_gpuPointSizeMax;
 
 ${FOG_GLSL}
 ${UNPLACED_GLSL}
@@ -839,16 +874,13 @@ void main() {
 
   float eyeDepth = -eyePos.z;
 
-  // Calculate what the DOT size would be (same formula as main dot shader)
-  float dotPerspective = (u_pointSize * u_pointScale) / max(eyeDepth, 0.001);
-  float dotSize = mix(u_pointSize, dotPerspective, u_sizeAttenuation);
-  dotSize = clamp(dotSize, 0.5, max(u_pointSizeMax, 128.0)); // Same clamp as main dots!
+  // The dot's own sprite (rendering/point-sprite.js: the same function as
+  // the point shaders), so the ring sits on the dot at every depth.
+  float dotSize = pointSpriteSize(eyeDepth);
 
-  // Highlight sprite scales proportionally with dot using constant multiplier
-  // This ensures consistent visual appearance at all zoom levels
-  float highlightSize = dotSize * u_highlightScale;
-  highlightSize = clamp(highlightSize, 1.0, 256.0);
-  gl_PointSize = highlightSize;
+  // The ring is a constant multiple of the dot, within the GPU's largest
+  // point (u_gpuPointSizeMax: asking for more is undefined, not clamped).
+  gl_PointSize = clamp(dotSize * u_highlightScale, 1.0, u_gpuPointSizeMax);
 
   v_fogOpacity = fogOpacity(fogTransmittance(length(eyePos.xyz)));
 
@@ -886,7 +918,10 @@ precision highp float;
 flat in float v_alpha;
 flat in float v_fogOpacity; // The opacity fog leaves this ring (HP_VS_HIGHLIGHT)
 
-uniform vec3 u_highlightColor;
+uniform vec3 u_highlightColor; // The dot (HIGHLIGHT_COLOR)
+// The ring around it (highlightRingColorFor(u_highlightColor)): black around
+// a light dot, so the pair reads against any coloring (F162).
+uniform vec3 u_highlightRingColor;
 uniform float u_ringWidth;
 uniform float u_haloStrength;
 uniform float u_haloShape; // 0 = circle, 1 = square
@@ -920,8 +955,9 @@ void main() {
   // Outer radius = innerRadius * constant ring ratio
   // This ensures consistent proportions at ALL zoom levels
 
-  const float INNER_GAP = 1.08;      // 8% gap between dot edge and ring inner edge
-  const float RING_RATIO = 1.65;     // Outer radius is 55% larger than inner radius
+  // highlightRingRadii() is this geometry for a vector figure.
+  const float INNER_GAP = ${HIGHLIGHT_RING_INNER_GAP.toFixed(2)};      // 8% gap between dot edge and ring inner edge
+  const float RING_RATIO = ${HIGHLIGHT_RING_RATIO.toFixed(2)};     // Outer radius is 65% larger than inner radius
 
   // The dot occupies radius (1/u_highlightScale) in normalized sprite coords
   // Add small gap so ring doesn't touch the dot
@@ -1051,10 +1087,11 @@ void main() {
       specularBase *= specularBase;
       float specular = specularBase * 0.3;
 
-      // Lit color (same formula as HP_FS_FULL)
-      vec3 litColor = u_highlightColor * (ambient + diffuse) + vec3(specular);
+      // Lit ring color (same formula as HP_FS_FULL): a black ring keeps
+      // only its specular sheen.
+      vec3 litColor = u_highlightRingColor * (ambient + diffuse) + vec3(specular);
       // Apply lighting strength (same as HP_FS_FULL)
-      vec3 baseColor = mix(u_highlightColor, litColor, u_lightingStrength);
+      vec3 baseColor = mix(u_highlightRingColor, litColor, u_lightingStrength);
 
       // === GLOW ADDITIONS (only when glowFactor > 0) ===
       float facing = 1.0 - max(normal.z, 0.0);
@@ -1071,8 +1108,8 @@ void main() {
       float emission = glowFactor * 0.15;
 
       vec3 ringColor = baseColor * (1.0 + extraBrightness) + warmWhite * extraSpec;
-      ringColor = mix(ringColor, u_highlightColor * 1.3, rimGlow);
-      ringColor += u_highlightColor * emission;
+      ringColor = mix(ringColor, u_highlightRingColor * 1.3, rimGlow);
+      ringColor += u_highlightRingColor * emission;
 
       // Hard edge on tube boundary - no soft fade that creates white outline
       bool withinTube = distFromRing <= tubeRadius;
@@ -1111,9 +1148,9 @@ void main() {
     return;
   }
 
-  // RING AREA - flat fill, slightly darker than dot
+  // RING AREA - flat fill in the ring color
   if (baseR <= outerRadius) {
-    fragColor = vec4(u_highlightColor * 0.75, v_alpha * 0.95);
+    fragColor = vec4(u_highlightRingColor, v_alpha * 0.95);
     return;
   }
 

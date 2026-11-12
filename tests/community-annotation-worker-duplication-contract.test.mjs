@@ -1,7 +1,8 @@
 // What the community-annotation Worker and the Cellucid page must agree on has
 // one home each: `worker-contract.js` (the Worker's version, route inventory,
 // headers and callback fragment) and `utils/origin-allowlist.js` (the
-// ALLOWED_ORIGINS rule and its loopback hosts). The Worker bundles both; a
+// ALLOWED_ORIGINS rule, its loopback hosts `utils/loopback.js`
+// `isSecureContextLoopbackHost`). The Worker bundles both; a
 // page module imports the first instead of keeping a copy. The copies that
 // cannot import are held to the shared answers here: the agent relay
 // (`relay/http.js`, its own Worker) and the classic head script that takes
@@ -15,7 +16,8 @@ import { fileURLToPath } from 'node:url';
 
 import worker from '../assets/js/app/community-annotations/_worker-code.js';
 import * as contract from '../assets/js/app/community-annotations/worker-contract.js';
-import { isLoopbackHostname, parseOriginAllowlist } from '../assets/js/utils/origin-allowlist.js';
+import { parseOriginAllowlist } from '../assets/js/utils/origin-allowlist.js';
+import { isSecureContextLoopbackHost } from '../assets/js/utils/loopback.js';
 import * as relayHttp from '../relay/http.js';
 import { withMockedFetch } from './helpers/worker-fetch.mjs';
 
@@ -35,7 +37,7 @@ const SHARED_NAMES = Object.freeze([
   'AUTH_TOKEN_EXPIRES_PARAM',
   'AUTH_ERROR_PARAM',
 ]);
-const SHARED_FUNCTIONS = Object.freeze(['scrubAuthFragment', 'readFragmentParamName', 'isLoopbackHostname', 'parseAllowedOrigins']);
+const SHARED_FUNCTIONS = Object.freeze(['scrubAuthFragment', 'readFragmentParamName', 'isLoopbackHostname', 'isSecureContextLoopbackHost', 'parseAllowedOrigins']);
 
 function read(relative) {
   return readFileSync(path.join(ROOT, relative), 'utf8');
@@ -125,10 +127,11 @@ test('the head script takes out exactly the callback fragment\'s fields', () => 
 
 test('the agent relay\'s loopback hosts and ALLOWED_ORIGINS rule answer as the shared ones', () => {
   for (const hostname of [
-    'localhost', 'a.localhost', 'a.b.localhost', '127.0.0.1', '127.1.2.3', '127.255.255.255', '[::1]',
-    '0.0.0.0', '128.0.0.1', '[::2]', 'localhost.example', 'example.com', '127.0.0.1.example', 'xlocalhost',
+    'localhost', 'LOCALHOST', 'a.localhost', 'a.b.localhost', '127.0.0.1', '127.0.0.2', '127.1.2.3', '127.255.255.255',
+    '[::1]', '::1', '0.0.0.0', '128.0.0.1', '[::2]', '[::ffff:7f00:1]', 'localhost.example', 'localhost.evil.com',
+    'example.com', '127.0.0.1.example', '127.0.0.1.nip.io', 'xlocalhost', 'localhost.', '',
   ]) {
-    assert.equal(relayHttp.isLoopbackHostname(hostname), isLoopbackHostname(hostname), hostname);
+    assert.equal(relayHttp.isSecureContextLoopbackHost(hostname), isSecureContextLoopbackHost(hostname), hostname);
   }
   const bindings = { idFromName() {} };
   const relayAnswer = raw => {

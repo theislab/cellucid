@@ -18,6 +18,9 @@ import {
   requireSafeInteger
 } from './exact-contract.js';
 import { isCategoricalCodes, missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
+import { formatBound } from '../../../../utils/format-units.js';
+import { geneValueLabel } from '../../../../data/expression-transform.js';
+import { categoryDisplayName } from '../../../actions/targets/names.js';
 
 /**
  * Vertical travel, in CSS pixels, above which the renderer reports a drag as a
@@ -264,4 +267,59 @@ export function combineAnnotationCandidates(options) {
     return { candidates: candidates.clone().subtract(incoming), effectiveMode: 'subtract' };
   }
   return { candidates: candidates.clone().intersectWith(incoming), effectiveMode: 'intersect' };
+}
+
+/** How many names a group's name lists before saying how many more. */
+const NAMED_CATEGORIES = 3;
+
+/**
+ * What an annotation selection is, as the name of the highlight group it
+ * becomes: the categories its cells are of, most cells first (`NK + ILCP`,
+ * `A, B, C +2 more`), or the range of values they hold (`n_genes 120 – 340`;
+ * a gene's in the units of its values, `Ins1 · log1p(norm.) 0.5 – 2.1`,
+ * `geneValueLabel`), on `field`, the field its gestures were read on.
+ * Derived from the cells, so undo, redo and a tool switch never leave it
+ * naming other cells. Null when `field` names none of them (it is no longer
+ * the field of their gestures).
+ *
+ * @param {object|null} field
+ * @param {ArrayLike<number>} cellIndices
+ * @param {{normalize: boolean, log1p: boolean}|null} [valuesIn] - What a
+ *   continuous field's values are in (the legend model's `values`: the
+ *   Expression values shown, for a gene; null as stored)
+ * @returns {string|null}
+ */
+export function annotationGroupName(field, cellIndices, valuesIn = null) {
+  if (field === null || cellIndices.length === 0) return null;
+  if (field.kind === 'category') {
+    const codes = field.codes;
+    if (!isCategoricalCodes(codes)) return null;
+    const missing = missingCategoryCode(codes);
+    // One count per category (never per cell).
+    const counts = new Float64Array(field.categories.length);
+    for (let i = 0; i < cellIndices.length; i++) {
+      const code = codes[cellIndices[i]];
+      if (code === missing || code >= counts.length) return null;
+      counts[code]++;
+    }
+    const present = [];
+    for (let code = 0; code < counts.length; code++) if (counts[code] > 0) present.push(code);
+    const names = present.sort((a, b) => counts[b] - counts[a] || a - b).map(code => categoryDisplayName(field.categories[code]));
+    if (names.length <= NAMED_CATEGORIES) return names.join(' + ');
+    return `${names.slice(0, NAMED_CATEGORIES).join(', ')} +${names.length - NAMED_CATEGORIES} more`;
+  }
+  if (field.kind === 'continuous') {
+    const values = field.values;
+    if (!(values instanceof Float32Array) && !(values instanceof Float64Array)) return null;
+    let min = Infinity;
+    let max = -Infinity;
+    for (let i = 0; i < cellIndices.length; i++) {
+      const value = values[cellIndices[i]];
+      if (!Number.isFinite(value)) return null;
+      if (value < min) min = value;
+      if (value > max) max = value;
+    }
+    return `${geneValueLabel(field.key, valuesIn)} ${formatBound(min)} – ${formatBound(max)}`;
+  }
+  return null;
 }

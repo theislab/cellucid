@@ -335,7 +335,7 @@ test('crawlable text says what Cellucid is and links out without taking Tab stop
 test('the home page links its privacy policy, terms and accessibility statement', async () => {
   // Quiet footer links: Privacy (which Google's brand verification asks the
   // home page for) and Terms beside Docs, Cite and GitHub, Accessibility beside
-  // the licence, Contact (the project's address) beside who made it; a new tab
+  // the license, Contact (the project's address) beside who made it; a new tab
   // keeps the app's state. Each line fits the narrowest sidebar (260px).
   const footer = only(/<div id="copyright">([\s\S]*?)<\/div>/g, INDEX, 'footer');
   assert.match(footer, /GitHub<\/a> · <a href="privacy\.html" target="_blank" rel="noopener">Privacy<\/a> · <a href="terms\.html" target="_blank" rel="noopener">Terms<\/a><\/p>/);

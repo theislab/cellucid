@@ -3,7 +3,7 @@
  *
  * Context (`ui/analysis-types/dotplot-ui.js`):
  *   categoricalFields  [{key, name, categoryCount}]
- *   colorField         the categorical field the cells are coloured by, or null
+ *   colorField         the categorical field the cells are colored by, or null
  *   pages              [{id, name}] the highlight pages
  *   groupsFor(entry, record)  the groups of the chosen field
  *   getGenes(), getMarkerSets()  for the gene-set editor
@@ -12,7 +12,7 @@
  * @module analysis/options/dotplot-options
  */
 
-import { defineOptions } from './option-schema.js';
+import { CELL_SCOPE_MEANS, defineOptions } from './option-schema.js';
 import { defaultCellTypeField } from './composition-options.js';
 import { matrixOption } from './marker-options.js';
 
@@ -43,7 +43,7 @@ export const dotplotOptions = defineOptions({
       tip: 'dotplot-group-by',
       group: 'essentials',
       default: defaultCellTypeField,
-      defaultText: 'The coloring field when it is not named like a sample, else the first categorical field named like a cell type or cluster, else the first not named like a sample',
+      defaultText: 'The coloring field when it is not named like a sample, else the best field named like a cell type, annotation, lineage or cluster, else the first not named like a sample',
       choices: fieldChoices,
       check: value => (value === '' ? 'Choose the field to group the cells by' : null)
     },
@@ -70,6 +70,7 @@ export const dotplotOptions = defineOptions({
       label: 'Cells',
       tip: 'dotplot-groups',
       group: 'groups',
+      means: CELL_SCOPE_MEANS,
       default: 'all',
       defaultText: 'All cells',
       choices: cellChoices

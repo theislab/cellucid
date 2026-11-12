@@ -60,7 +60,7 @@ If you’re unsure where a bug belongs, open an issue in the repo you’re curre
 
 Include:
 - browser + version, OS
-- hosted (`https://www.cellucid.com`) vs local app (`http://localhost:8000`) vs Jupyter iframe
+- hosted (`https://www.cellucid.com`) vs local app (`http://localhost:4173`, `npm run serve`) vs Jupyter iframe
 - dataset source type (local-demo/local-user/remote/github/jupyter)
 - exact steps to reproduce
 - expected vs actual behavior
@@ -101,15 +101,20 @@ For deep developer documentation:
 From the `cellucid/` directory:
 
 ```bash
-python -m http.server 8000
+npm run serve
 ```
 
 Then open:
-- `http://localhost:8000`
+- `http://localhost:4173` (`CELLUCID_BROWSER_TEST_PORT=8000 npm run serve` moves it)
 
 Why:
 - the app uses native ES modules (`<script type="module">`)
 - `file://` access will break imports/fetches in confusing ways
+- every answer is `Cache-Control: no-store`, so a reload runs the module you
+  just edited. A server without cache headers (`python -m http.server`) lets
+  the browser keep a module it guessed fresh, and a reload runs the old code.
+- it answers byte ranges, and serves the same tree with CORS on the next port
+  (`http://localhost:4174/…`) for a dataset opened by link
 
 ### Enable debug logging (recommended)
 
@@ -137,7 +142,7 @@ High-level map:
 - `cellucid/assets/js/app/`: app layer (state + UI + sessions + analysis)
   - `app/main.js`: bootstrap orchestrator
   - `app/state/`: `DataState` + managers (fields/filters/colors/highlights/views); `app/state/domains/`: the state domains (what a step captures and puts back)
-  - `app/actions/`: the action catalogue and dispatcher: every change a control, an agent or a Python/R host makes is one action (see `app/actions/README.md` before adding a control)
+  - `app/actions/`: the action catalog and dispatcher: every change a control, an agent or a Python/R host makes is one action (see `app/actions/README.md` before adding a control)
   - `app/history/`: the action history (trackers, steps, undo/redo, the autosave in this browser, pseudocode/methods/report)
   - `app/ui/`: UI coordinator + sidebar modules
   - `app/session/`: `.cellucid-session` files (session format 4: the history)
@@ -152,7 +157,7 @@ High-level map:
 - `cellucid/assets/js/workers/`: `worker-script.js`, where every worker starts from (`startWorker`)
 - `cellucid/assets/workers/`: generated worker bundles and `scripts.js` (never edited; see Testing & validation)
 - `cellucid/assets/page/`: the generated page bundle a deployed site loads (`scripts/build-page-bundle.mjs`; never edited)
-- `cellucid/assets/wasm/`: `codecs.wasm`, the zstd, lz4 and c-blosc decoders built from pinned sources by `scripts/build-wasm-codecs.mjs` (never edited), with their licences
+- `cellucid/assets/wasm/`: `codecs.wasm`, the zstd, lz4 and c-blosc decoders built from pinned sources by `scripts/build-wasm-codecs.mjs` (never edited), with their licenses
 - `cellucid/assets/css/`: design system (tokens/themes/components)
 
 ---
@@ -260,7 +265,7 @@ contract file is picked up by adding it, with nothing to register. A file that
 hangs is stopped once it has finished no test for 5 minutes and fails naming the
 last test it finished; a slower machine that is still finishing tests never
 fails for its speed. Each file runs in a process group of its own, so an
-interrupted run (Ctrl-C, a cancelled CI job) stops every file it started
+interrupted run (Ctrl-C, a canceled CI job) stops every file it started
 before it ends. These are
 the same commands `.github/workflows/test.yml` runs, so a green local run is the
 same check CI applies:

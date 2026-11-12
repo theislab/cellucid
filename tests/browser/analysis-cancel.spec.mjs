@@ -1,12 +1,12 @@
 /**
- * Every analysis run can be cancelled, and a cancel is a real stop and never a
+ * Every analysis run can be canceled, and a cancel is a real stop and never a
  * failure (`app/jobs/cancellable-job.js`).
  *
  * The dataset is served over HTTP with every read of it held back while a
- * test says so, so a run is still reading genes when it is cancelled: the
+ * test says so, so a run is still reading genes when it is canceled: the
  * running box under the form names the run and offers Cancel; Cancel (there,
  * or in the run's progress notification) stops the reads, leaves a calm
- * "cancelled" box with Run again and no result; Run again then completes.
+ * "canceled" box with Run again and no result; Run again then completes.
  */
 import { expect, test } from './helpers/test.mjs';
 import { anndataZarrZip, fulfillFile } from './helpers/anndata-zarr-zip.mjs';
@@ -36,7 +36,7 @@ function expression() {
 /**
  * Serve the dataset; while `hold.gate` is set each read of the file waits
  * until the test releases it (`holdReads`), `hold.held` counts them, and
- * `hold.cutOff` counts the reads the page says it cancelled. That is the
+ * `hold.cutOff` counts the reads the page says it canceled (`(canceled)`). That is the
  * read log's line, not the network event: the reads run in the reader
  * worker, and Firefox reports a worker fetch aborted mid-response as
  * finished, not failed.
@@ -83,7 +83,7 @@ async function serveDataset(page, hold) {
   });
   page.on('console', message => {
     // A quick read ends in one debug entry with others, a line each.
-    hold.cutOff += message.text().match(/^\[cellucid:read\] .*\(cancelled\)$/gm)?.length ?? 0;
+    hold.cutOff += message.text().match(/^\[cellucid:read\] .*\(canceled\)$/gm)?.length ?? 0;
   });
 }
 
@@ -170,7 +170,7 @@ test('differential expression: Cancel stops the run, keeps nothing, and Run agai
   await expect.poll(() => hold.held).toBeGreaterThan(0);
 
   await status.getByRole('button', { name: 'Cancel' }).click();
-  await expect(status.locator('.job-status-title')).toHaveText('Differential expression cancelled');
+  await expect(status.locator('.job-status-title')).toHaveText('Differential expression canceled');
   await expect(status.locator('.job-status-detail')).toContainText('Nothing was kept');
   await expect(run).toHaveText(runLabel);
   await expect(run).toBeEnabled();
@@ -208,7 +208,7 @@ test('marker genes: Cancel from the notification stops discovery, keeps nothing,
   const notification = page.locator('.notification', { hasText: 'Marker genes:' });
   await expect(notification).toHaveCount(1);
   await notification.locator('[data-role="cancel"]').click();
-  await expect(status.locator('.job-status-title')).toHaveText('Marker genes cancelled');
+  await expect(status.locator('.job-status-title')).toHaveText('Marker genes canceled');
   await expect(notification).toHaveCount(0);
   await expect(run).toBeEnabled();
   await expect(panel.locator('.js-plotly-plot')).toHaveCount(0);

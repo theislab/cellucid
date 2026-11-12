@@ -30,6 +30,7 @@ import { createSlicedYield } from '../shared/concurrency-utils.js';
 import { ANALYSIS_PHASES } from './constants.js';
 import { benjaminiHochbergAdjusted, bonferroniAdjusted } from '../stats/statistical-tests.js';
 import { createRunTunerFor, runGeneStream, taskGenes } from '../shared/gene-stream-runner.js';
+import { runScale, taskTransform } from '../compute/task-values.js';
 import { isCategoricalCodes, missingCategoryCode } from '../../../data/categorical-storage-contract.js';
 import { P_CONVENTIONS, TEST_METHODS } from '../compute/gene-statistics.js';
 import { formatCount, formatCountOf } from '../../../utils/format-units.js';
@@ -109,6 +110,12 @@ async function acquireMarkerContextLease(signal) {
 }
 
 const CORRECTIONS = Object.freeze(['bh', 'bonferroni']);
+/**
+ * The id of a marker run's cell factors in the workers (its values
+ * normalized, `compute/task-values.js`): one marker run holds the workers at
+ * a time (the context lease).
+ */
+const MARKER_SCALE_ID = 'markers-normalize';
 
 /**
  * What one analysis worker holds for a marker run's groups: the codes sent
@@ -171,6 +178,11 @@ export class MarkerDiscoveryEngine {
    * @param {string|null} [options.readOwner]
    * @param {string} [options.matrix='mapped'] - The expression matrix the
    *   genes are read from (`DataLayer.readGeneColumn`)
+   * @param {import('../data/data-layer.js').RunValues|null} [options.values] -
+   *   The run's values (`DataLayer.runValues`, the expression transform):
+   *   genes read here come in them, and delivered genes are put in them by
+   *   the workers (normalized by the cells' factors, which each worker
+   *   holds for the run); null: as stored; the matrix's now when omitted
    * @param {(gene: string, moments: {mean: number, m2: number, nonZero: number, n: number}) => void} [options.onGeneMoments] -
    *   Each gene's moments over every cell, which the same pass computes
    *   (`shared/gene-moments-cache.js`)
@@ -196,6 +208,7 @@ export class MarkerDiscoveryEngine {
       signal,
       readOwner = null,
       matrix = 'mapped',
+      values: asked = undefined,
       onGeneMoments = null
     } = options;
 
@@ -231,6 +244,11 @@ export class MarkerDiscoveryEngine {
     if (scope !== null && (!(scope instanceof Uint8Array) || scope.length !== pointCount)) {
       throw new TypeError('[MarkerDiscoveryEngine] grouping scope must be one byte per cell or null');
     }
+    const values = asked === undefined ? await this.dataLayer.runValues(matrix, { signal: signal ?? null, owner: readOwner }) : asked;
+    const scale = runScale(values);
+    if (scale !== null && scale.length !== pointCount) {
+      throw new TypeError('[MarkerDiscoveryEngine] the cells\' factors must be one Float32 a cell');
+    }
     throwIfAborted(signal);
 
     const geneCount = genes.length;
@@ -260,7 +278,7 @@ export class MarkerDiscoveryEngine {
           tested: tested.slice(),
           reference
         }),
-        // A worker replaced after a cancelled task gets the context again.
+        // A worker replaced after a canceled task gets the context again.
         // Each worker holds the codes while it builds each cell's group
         // index from them (two bytes a cell, four past 32,767 groups) and its
         // tables (`data-worker.js` `setMarkerContext`, `createGroupingContext`):
@@ -268,6 +286,16 @@ export class MarkerDiscoveryEngine {
         { signal: signal ?? null, retainAs: 'markers', heldBytes: markerContextBytes(workerCodes, groupCount) }
       );
       throwIfAborted(signal);
+      // Normalized values: each worker holds the cells' factors for the run
+      // and normalizes every gene delivered to it before testing it.
+      if (scale !== null) {
+        await pool.broadcast(
+          'SET_CELL_SCALE',
+          () => ({ scaleId: MARKER_SCALE_ID, scale: scale.slice() }),
+          { signal: signal ?? null, retainAs: MARKER_SCALE_ID, heldBytes: scale.byteLength }
+        );
+        throwIfAborted(signal);
+      }
 
       // A lane per tested group; the groups not tested (the reference, small
       // groups skipped) share one lane of NaN per statistic, never written:
@@ -297,16 +325,18 @@ export class MarkerDiscoveryEngine {
         job?.items(0, geneCount, 'genes');
         let completed = 0;
         const payloadBase = { method, minCells: minCellsPerSide, pConvention, foldChange };
+        const transform = taskTransform(values, scale === null ? null : MARKER_SCALE_ID);
         await runGeneStream({
           dataLayer: this.dataLayer,
           genes,
           tuner,
           route,
           matrix,
+          values,
           owner: readOwner,
           signal: signal ?? null,
           dispatch: (task, onTiming) => {
-            const payload = { ...payloadBase, ...taskGenes(task) };
+            const payload = { ...payloadBase, ...taskGenes(task, transform) };
             const execution = { transfer: true, signal: signal ?? null, onTiming };
             return task.worker === null
               ? pool.execute('MARKERS_COMPUTE_GENES', payload, execution)
@@ -376,6 +406,10 @@ export class MarkerDiscoveryEngine {
       if (pool.isReady()) {
         void pool.broadcast('MARKERS_CLEAR_CONTEXT', () => ({}), { releases: 'markers' })
           .catch(error => console.warn('[MarkerDiscovery] Releasing the worker groups failed:', error));
+        if (scale !== null) {
+          void pool.broadcast('CLEAR_CELL_SCALE', () => ({ scaleId: MARKER_SCALE_ID }), { releases: MARKER_SCALE_ID })
+            .catch(error => console.warn('[MarkerDiscovery] Releasing the cells\' factors failed:', error));
+        }
       }
       releaseMarkerContext();
     }

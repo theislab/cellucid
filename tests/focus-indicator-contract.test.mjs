@@ -163,3 +163,49 @@ test('the analysis option slider has no competing definition of its own', async 
     + 'slider definition here silently diverges from components/_forms.css.',
   );
 });
+
+/* A native input laid invisibly (`opacity: 0`) over the control it edits — a
+   color input over its swatch, a range input over a drawn timeline — takes
+   keyboard focus, and the ring the shared rule draws on it is invisible too:
+   the legend's and the highlight pages' color swatches showed no focus at all
+   (lens-a11y LF-1). Each such input names, in a `:has()` rule, the drawn
+   element that paints its ring instead. */
+const INVISIBLE_INPUT_OWNERS = Object.freeze({
+  // The scrubber's container draws the ring for the scrubber and its markers.
+  'cinematic-timeline-scrubber': /\.cinematic-timeline-container:has\(:focus-visible\)/,
+});
+
+test('an invisible input hands its focus ring to the control it is laid over', async () => {
+  const rules = [];
+  for (const absolute of cssFiles) {
+    const css = stripComments(await readFile(absolute, 'utf8'));
+    for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      rules.push({ selector: match[1].trim().replace(/\s+/g, ' '), body: match[2] });
+    }
+  }
+  const hidden = new Set();
+  for (const { selector, body } of rules) {
+    if (!/(?:^|;)\s*opacity:\s*(?:0|var\(--opacity-0\))\s*(?:;|$)/.test(body)) continue;
+    for (const part of selector.split(',')) {
+      const last = part.trim().split(/[\s>+~]+/).pop();
+      const input = last.match(/\.([\w-]*(?:input|scrubber)[\w-]*)$/);
+      if (input !== null) hidden.add(input[1]);
+    }
+  }
+  assert.deepEqual(
+    [...hidden].sort(),
+    ['cinematic-timeline-scrubber', 'color-swatch-input', 'legend-color-input'],
+    'An invisible input was added or removed: give a new one a :has(> .input:focus-visible) owner rule.',
+  );
+  const selectors = rules.map(rule => rule.selector);
+  for (const name of hidden) {
+    const owner = INVISIBLE_INPUT_OWNERS[name]
+      ?? new RegExp(`:has\\(\\s*>?\\s*\\.${name}:focus-visible\\s*\\)`);
+    const painting = rules.filter(rule => owner.test(rule.selector) && /\boutline\s*:/.test(rule.body));
+    assert.ok(
+      painting.length > 0,
+      `.${name} is invisible and focusable; no rule paints its focus ring on the control it covers `
+      + `(expected a selector matching ${owner}). Selectors seen: ${selectors.filter(s => s.includes(name)).join(' | ')}`,
+    );
+  }
+});

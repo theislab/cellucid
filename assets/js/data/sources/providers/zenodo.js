@@ -20,7 +20,7 @@
  * @module data/sources/providers/zenodo
  */
 
-import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy, hostFaultOfResponse } from '../../data-source.js';
+import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy, hostFaultFailure, hostFaultOfResponse } from '../../data-source.js';
 import { chooseOpenableFile, describeRemoteFile } from '../remote-file.js';
 import { keptAtAddress } from '../../anndata/transcode/space.js';
 import { fileFormatOfName, readsFromHead } from '../../input-formats.js';
@@ -55,7 +55,9 @@ function parseZenodo(input, explicit = true) {
   }
   const host = url.hostname.toLowerCase();
   if (host !== 'zenodo.org' && host !== 'www.zenodo.org') return null;
-  const match = /^\/(?:api\/)?records?\/([1-9][0-9]*)(?:\/files\/([^/]+)(?:\/content)?)?\/?$/
+  // A record, one of its files (`files/<name>`, the API's
+  // `files/<name>/content`), or a file's preview page (`preview/<name>`).
+  const match = /^\/(?:api\/)?records?\/([1-9][0-9]*)(?:\/(?:files|preview)\/([^/]+)(?:\/content)?)?\/?$/
     .exec(url.pathname);
   if (match === null) return null;
   if (match[2] === undefined) return match[1];
@@ -117,6 +119,13 @@ export default Object.freeze({
       cancel(early, 'superseded', 'The record could not be read.');
       const fault = hostFaultOfResponse(response, `record ${recordId}`, { url: `${API}${recordId}`, recordId });
       if (fault !== null) throw fault;
+      // Every record's description is public (a restricted record's files
+      // are not; a deleted one is 410): a 401 or 403 for it is Zenodo
+      // refusing this network for now ("unusual traffic"), not the link.
+      if (response.status === 401 || response.status === 403) {
+        throw hostFaultFailure({ kind: 'refusing', host: 'zenodo.org', status: response.status, what: `record ${recordId}`, service: 'Zenodo' },
+          { url: `${API}${recordId}`, recordId });
+      }
       throw new DataSourceError(
         response.status === 404 || response.status === 410
           ? `Zenodo record ${recordId} does not exist or is not public.`

@@ -20,10 +20,10 @@ import {
 // `crypto.subtle` is secure-context only and has no non-secure counterpart, so
 // verifying a published state's advertised digest through it fails on exactly
 // the plain-HTTP LAN address the Python package is built to serve from.
-import { sha256Hex } from '../utils/sha256.js';
+import { sha256Hex } from '../../utils/sha256.js';
 import { requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
-import { throwIfAborted, cancellationKind } from '../../utils/abort.js';
+import { throwIfAborted, cancellationKind, requireSignal } from '../../utils/abort.js';
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const DESCRIPTOR_KEYS = Object.freeze([
@@ -60,15 +60,6 @@ export function classifyAdvertisedDatasetStateRestoreError(
     return Object.freeze({ status: 'ready-state-canceled' });
   }
   return null;
-}
-
-function assertAbortSignal(value) {
-  if (!(value instanceof AbortSignal)) {
-    throw new TypeError(
-      'Default session signal must be an AbortSignal.'
-    );
-  }
-  return value;
 }
 
 function assertOwner(value, label) {
@@ -277,11 +268,7 @@ async function fetchBoundedArtifact({
 }) {
   throwIfAborted(signal);
   return requestStep(url, async stepSignal => {
-    if (!(stepSignal instanceof AbortSignal)) {
-      throw new TypeError(
-        `${owner} request step must provide an AbortSignal.`
-      );
-    }
+    requireSignal(stepSignal, `${owner} request step signal`);
     const requestSignal = AbortSignal.any([signal, stepSignal]);
     const response = assertResponse(
       // Revalidated like every catalog file (CATALOG_FILE_CACHE in
@@ -335,7 +322,7 @@ export async function restoreCurrentDatasetState(options) {
       'Dataset state restore refreshUi must be a function.'
     );
   }
-  const signal = assertAbortSignal(options.signal);
+  const signal = requireSignal(options.signal, 'Default session signal');
   const publicationRevision = options.getPublicationRevision();
   if (
     !Number.isSafeInteger(publicationRevision)

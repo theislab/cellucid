@@ -14,12 +14,13 @@
 
 import { getNotificationCenter } from '../../notification-center.js';
 import { beginOpening } from '../../../data/opening-progress.js';
-import { describeSessionDataset } from '../../session/session-serializer.js';
+import { describeLoadFailure, describeSessionDataset } from '../../session/session-serializer.js';
 import {
   describeDatasetSourceRecord
 } from '../../session/dataset-source-record.js';
 import { cancellationKind } from '../../../utils/abort.js';
 import { isReported } from '../../../utils/errors.js';
+import { upperFirst } from '../../../utils/text-case.js';
 
 /**
  * @param {object} options
@@ -59,6 +60,31 @@ import { isReported } from '../../../utils/errors.js';
  *   into the shown history.
  * @param {(() => Promise<void>|void)|undefined} options.onAfterLoad
  */
+/** The page's session file opener (`initSessionControls`), or null on a page without one. */
+let pageSessionFileOpener = null;
+
+function registerSessionFileOpener(opener) {
+  pageSessionFileOpener = opener;
+  return () => {
+    if (pageSessionFileOpener === opener) pageSessionFileOpener = null;
+  };
+}
+
+/**
+ * Load a session file given to the page (dropped on it, chosen in Open… ›
+ * File…) as Load… › Open a session file… loads one: its dataset opens when
+ * another is shown, then its history is loaded beside the person's (bug hunt
+ * L25-8: a dropped session file was refused with directions).
+ *
+ * @param {File} file
+ * @returns {boolean} whether the page could take it (false: no session controls here)
+ */
+export function openSessionFile(file) {
+  if (pageSessionFileOpener === null) return false;
+  void pageSessionFileOpener(file);
+  return true;
+}
+
 export function initSessionControls({
   dom,
   sessionSerializer,
@@ -70,6 +96,7 @@ export function initSessionControls({
   reopenDataset,
   restoreGeneSample = async () => {},
   savedStates = null,
+  holdHistoryOffers = null,
   onAfterLoad,
 }) {
   if (
@@ -82,6 +109,9 @@ export function initSessionControls({
     throw new TypeError(
       'Session controls require the dataset-change coordinator.'
     );
+  }
+  if (holdHistoryOffers !== null && typeof holdHistoryOffers !== 'function') {
+    throw new TypeError('Session controls holdHistoryOffers must be a function or null.');
   }
   if (
     typeof currentDatasetIdentityId !== 'function' ||
@@ -116,7 +146,9 @@ export function initSessionControls({
     }, { signal: lifecycleController.signal });
   }
 
+  /** A session load (its dataset, then its history): tracked, and no offer to continue another history meanwhile. */
   function trackOperation(task) {
+    holdHistoryOffers?.(task);
     activeOperations.add(task);
     void task.then(
       () => activeOperations.delete(task),
@@ -184,15 +216,19 @@ export function initSessionControls({
    *   of, and its load into the history
    * @param {number} operationGeneration
    * @param {number} sessionLoad
+   * @param {{problem: string|null, code: string|null}|null} [why] - Told why
+   *   when the dataset waits for the person (the offer to reopen a file of
+   *   this computer, `code` `needs-person`): `problem`, one sentence for
+   *   whoever asked for the opening
    * @returns {Promise<boolean>} Whether this session is still the one to restore.
    */
-  async function prepareDatasetForSession(session, operationGeneration, sessionLoad) {
+  async function prepareDatasetForSession(session, operationGeneration, sessionLoad, why = null) {
     const current = () =>
       ownsOperation(operationGeneration) && sessionLoad === loadGeneration;
     if (!await awaitDatasetForSession(operationGeneration, sessionLoad)) {
       return false;
     }
-    const { datasetId, source, cells, genes } = await session.describe();
+    const { datasetId, name, source, cells, genes } = await session.describe();
     if (!current()) return false;
     if (source?.kind === 'file' && currentDatasetIdentityId() !== datasetId) {
       const kept = await localFiles.kept(source.dataset);
@@ -203,6 +239,11 @@ export function initSessionControls({
       }
       if (kept !== null) {
         offerLocalReopen(session, source.dataset, kept, operationGeneration, sessionLoad);
+        if (why !== null) {
+          why.problem = `It was saved on "${kept.name}", opened from this computer, which the browser lets only the person read again: `
+            + `the page now offers them "Reopen ${kept.name}", after which it opens.`;
+          why.code = 'needs-person';
+        }
         return false;
       }
     }
@@ -220,7 +261,7 @@ export function initSessionControls({
     // open it join this opening, and a failure is said where it happened:
     // the joined layer says how the opening ends (`saysOutcome: false`).
     const opening = beginOpening({
-      title: `the session's dataset from ${describeDatasetSourceRecord(source)}`,
+      title: `the session's dataset${typeof name === 'string' && name !== '' ? ` "${name}"` : ''} from ${describeDatasetSourceRecord(source)}`,
       saysOutcome: false
     });
     let opened = false;
@@ -277,12 +318,8 @@ export function initSessionControls({
     // already shown this sentence, prefixed with what it was doing.
     // Announcing it again puts the identical text on screen twice.
     if (isReported(err)) return;
-    const message = (
-      err instanceof Error && err.message.length > 0
-    )
-      ? err.message
-      : 'Failed to load session';
-    showSessionStatus(message, true);
+    const { message, details } = describeLoadFailure(err);
+    showSessionStatus(upperFirst(message), true, details);
   }
 
   /** The notification offering *Reopen <name>* for a session, while it stands. */
@@ -327,22 +364,29 @@ export function initSessionControls({
     });
   }
 
-  if (loadStateBtn && sessionSerializer) {
-    listen(loadStateBtn, 'click', () => {
-      // IMPORTANT:
-      // File pickers must be opened synchronously in the click handler (without
-      // awaiting other work) or some browsers will block the dialog.
-      const operationGeneration = generation;
-      // A newer session file replaces the offer of the last one's file.
-      if (localReopenOffer !== null) {
-        getNotificationCenter().dismiss(localReopenOffer);
-        localReopenOffer = null;
-      }
-      const operation = (async () => {
+  /**
+   * Load a session file: `file` (dropped on the page, chosen in Open… ›
+   * File…), or, when null, the one the person picks now (Load… › Open a
+   * session file…). Its dataset opens first when another is shown (its
+   * source, its cells), then its history is loaded beside the person's.
+   * @param {File|null} file
+   */
+  function loadSessionFile(file) {
+    // IMPORTANT:
+    // File pickers must be opened synchronously in the click handler (without
+    // awaiting other work) or some browsers will block the dialog.
+    const operationGeneration = generation;
+    // A newer session file replaces the offer of the last one's file.
+    if (localReopenOffer !== null) {
+      getNotificationCenter().dismiss(localReopenOffer);
+      localReopenOffer = null;
+    }
+    const operation = (async () => {
       try {
         const picked = await sessionSerializer.loadSessionFromFile({
-          beforeRestore: file => prepareDatasetForSession(
-            sessionFile(file),
+          file,
+          beforeRestore: chosen => prepareDatasetForSession(
+            sessionFile(chosen),
             operationGeneration,
             ++loadGeneration
           )
@@ -357,10 +401,15 @@ export function initSessionControls({
         if (!ownsOperation(operationGeneration)) return;
         reportLoadFailure(err);
       }
-      })();
-      return trackOperation(operation);
-    });
+    })();
+    return trackOperation(operation);
   }
+
+  if (loadStateBtn && sessionSerializer) {
+    listen(loadStateBtn, 'click', () => loadSessionFile(null));
+  }
+  // A session file dropped on the page or chosen in Open… › File… loads as Load…'s does (L25-8).
+  const unregisterSessionFiles = sessionSerializer ? registerSessionFileOpener(file => loadSessionFile(file)) : () => {};
 
   /** A session file as a session to open: its dataset from its manifest, its load. */
   function sessionFile(file) {
@@ -371,15 +420,25 @@ export function initSessionControls({
   }
 
   /**
-   * Open a saved state of this browser (the State section's list, the
-   * Continue offer): its dataset first, as a session file's (its source, its
-   * cells), then its history. Resolves whether it was opened; a failure is
-   * said once.
+   * Open a saved state of this browser (Load…'s Open, the Continue offer, My
+   * datasets, an agent's `history.saved.open`): its dataset first, as a
+   * session file's (its source, its cells), then its history. A failure is
+   * said once, on the page; the outcome also says why to whoever asked
+   * (`problem`), unless it was said where it happened (the opening's own
+   * progress) or a newer choice replaced it (`problem` null). `code`: why in
+   * a word: `needs-person` (the page offers the person to reopen its file),
+   * `cancelled`, `failed`, or null.
    *
    * @param {string} id
-   * @returns {Promise<boolean>}
+   * `notRestored`: opened, the parts it could not restore in the words the
+   * person was told (`describeUnrestored`), or null when every part was.
+   *
+   * @returns {Promise<{opened: boolean, problem: string|null, code: 'needs-person'|'canceled'|'failed'|null, notRestored?: string|null}>}
    */
-  function openSavedState(id) {
+  /** A saved state not opened, why said where it happened (or replaced by a newer choice). */
+  const NOT_OPENED = Object.freeze({ opened: false, problem: null, code: null });
+
+  function openSavedState(id, { heavy = null, signal = null } = {}) {
     if (savedStates === null) return Promise.reject(new Error('Saved states are not available on this page.'));
     const operationGeneration = generation;
     if (localReopenOffer !== null) {
@@ -392,18 +451,23 @@ export function initSessionControls({
         const source = await savedStates.read(id);
         const session = {
           describe: async () => describeSessionDataset(source.header),
-          load: () => savedStates.load(source),
+          // `signal`: an agent's Stop (`history.saved.open`) stops the history's restore.
+          load: () => savedStates.load(source, { heavy, signal }),
         };
-        if (!await prepareDatasetForSession(session, operationGeneration, sessionLoad)) return false;
-        await session.load();
-        if (!ownsOperation(operationGeneration)) return false;
+        const why = { problem: null, code: null };
+        if (!await prepareDatasetForSession(session, operationGeneration, sessionLoad, why)) return { opened: false, ...why };
+        const loaded = await session.load();
+        if (!ownsOperation(operationGeneration)) return NOT_OPENED;
         if (typeof onAfterLoad === 'function') await onAfterLoad();
-        return true;
+        // The parts it could not restore, as the person was told (F155), or null.
+        return { opened: true, problem: null, code: null, notRestored: loaded?.notRestored ?? null };
       } catch (err) {
-        if (!ownsOperation(operationGeneration)) return false;
-        if (cancellationKind(err) === 'user' || cancellationKind(err) === 'superseded') return false;
+        if (!ownsOperation(operationGeneration)) return NOT_OPENED;
+        if (cancellationKind(err) === 'user') return { opened: false, problem: 'Its loading was canceled.', code: 'canceled' };
+        if (cancellationKind(err) === 'superseded') return NOT_OPENED;
         reportLoadFailure(err);
-        return false;
+        const { message } = describeLoadFailure(err);
+        return { opened: false, problem: upperFirst(message), code: 'failed' };
       }
     })());
   }
@@ -412,6 +476,7 @@ export function initSessionControls({
     if (destructionPromise !== null) return destructionPromise;
     destroyed = true;
     generation += 1;
+    unregisterSessionFiles();
     lifecycleController.abort();
     const ownedOperations = [...activeOperations];
     destructionPromise = Promise.allSettled(ownedOperations).then(() => {});

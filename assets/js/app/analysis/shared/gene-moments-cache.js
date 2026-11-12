@@ -1,6 +1,6 @@
 /**
  * @fileoverview Every gene's moments over every cell of the open dataset —
- * the mean and centred sum of squares of its finite values
+ * the mean and centered sum of squares of its finite values
  * (`gene-statistics.js` `columnMoments`: a constant gene's sum of squares is
  * exactly 0), its non-zero values, its finite values — kept for the load
  * they were read from.
@@ -51,6 +51,19 @@ export function geneMomentsFor(generation, matrix = 'mapped') {
       return moments.size;
     },
   };
+}
+
+/**
+ * The key moments are kept under for the mapped matrix's values a run reads:
+ * as stored, or in the expression transform (`data/expression-transform.js`
+ * `valuesRecord`: normalized by the cells' totals from one source, log1p).
+ *
+ * @param {{normalize: boolean, log1p: boolean, totals: string|null}|null} values
+ * @returns {string}
+ */
+export function momentsMatrixOf(values) {
+  if (values === null) return 'mapped';
+  return `mapped${values.normalize ? ` normalized by ${values.totals}` : ''}${values.log1p ? ' log1p' : ''}`;
 }
 
 /** Mean of a gene's finite values over every cell. */

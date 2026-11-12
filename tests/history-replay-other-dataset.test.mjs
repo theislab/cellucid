@@ -24,9 +24,9 @@ import { HEADER } from './helpers/history-fixtures.mjs';
 
 const DEFINITIONS = [
   defineAction({
-    type: 'color.by', title: 'Colour by', summary: 'Colour by a field.', group: 'Colours',
+    type: 'color.by', title: 'Color by', summary: 'Color by a field.', group: 'Colors',
     params: { type: 'object', additionalProperties: false, required: ['field'], properties: { field: { type: 'string' } } },
-    touches: ['colors'], reads: [], effect: 'view', describe: p => `Coloured by ${p.field}`, code: p => `color_by(${JSON.stringify(p.field)})`,
+    touches: ['colors'], reads: [], effect: 'view', describe: p => `Colored by ${p.field}`, code: p => `color_by(${JSON.stringify(p.field)})`,
   }),
   defineAction({
     type: 'filter.hide', title: 'Hide a category', summary: 'Hide a category of a field.', group: 'Filters',
@@ -96,7 +96,7 @@ let trackerNumber = 0;
 const A_FIELDS = { cell_type: ['alpha', 'beta', 'gamma'], score: [] };
 const B_FIELDS = { cell_type: ['gamma', 'zz-1'], score: [] };
 
-/** Dataset A's recorded history: colour, hide beta, hide gamma, a change made outside, colour by a gene A has. */
+/** Dataset A's recorded history: color, hide beta, hide gamma, a change made outside, color by a gene A has. */
 async function recordedOnA() {
   const a = datasetPage({ id: 'dataset-a', name: 'Dataset A', fields: { ...A_FIELDS, CD3E: [] } });
   await a.history.startTracker({ name: 'Annotation' });
@@ -126,7 +126,7 @@ test('a saved history\'s plan is its main branch (or one named), root left out, 
   await a.dispatcher.dispatch('color.by', { field: 'score' });
   const plan = replayPlanOf(a.history.snapshot());
   assert.deepEqual(plan.steps.map(step => step.label), [
-    'Coloured by cell_type', 'Hid beta of cell_type', 'Hid gamma of cell_type', 'Changed outside the history', 'Coloured by CD3E',
+    'Colored by cell_type', 'Hid beta of cell_type', 'Hid gamma of cell_type', 'Changed outside the history', 'Colored by CD3E',
   ]);
   assert.deepEqual(plan.from, {
     dataset: { id: 'dataset-a', name: 'Dataset A' },
@@ -135,7 +135,7 @@ test('a saved history\'s plan is its main branch (or one named), root left out, 
     step: tip, file: null, saved: null,
   });
   const other = replayPlanOf(a.history.snapshot(), { branch: 'Branch 1' });
-  assert.equal(other.steps.at(-1).label, 'Coloured by score');
+  assert.equal(other.steps.at(-1).label, 'Colored by score');
   assert.throws(() => replayPlanOf(a.history.snapshot(), { branch: 'Nope' }), /has no branch "Nope"; its branches are "Main", "Branch 1"/);
   assert.equal(plan.name, 'Replay of Dataset A');
   assert.throws(() => replayPlanOf({ activeTracker: 'nope', trackers: [] }), /active tracker it does not hold/);
@@ -170,11 +170,11 @@ test('replaying on another dataset: a new tracker linked to the original, every 
     ['color.by', 'cell_type', 'replay'], ['filter.hide', 'beta', 'replay'], ['filter.hide', 'gamma', 'replay'], ['color.by', 'CD3E', 'replay'],
   ]);
   assert.deepEqual(report.map(entry => [entry.label, entry.outcome, entry.reason]), [
-    ['Coloured by cell_type', 'applied', null],
+    ['Colored by cell_type', 'applied', null],
     ['Hid beta of cell_type', 'unmatched', 'There is no category "beta" in cell_type; its categories are "gamma", "zz-1".'],
     ['Hid gamma of cell_type', 'applied', null],
     ['Changed outside the history', 'skipped', 'A change made outside the recorded steps names no action to apply again on another dataset.'],
-    ['Coloured by CD3E', 'unmatched', 'There is no field "CD3E"; the fields are "cell_type", "score".'],
+    ['Colored by CD3E', 'unmatched', 'There is no field "CD3E"; the fields are "cell_type", "score".'],
   ]);
   assert.deepEqual(seen, [['applied', 0, 5], ['unmatched', 1, 5], ['applied', 2, 5], ['skipped', 3, 5], ['unmatched', 4, 5]]);
 
@@ -185,17 +185,17 @@ test('replaying on another dataset: a new tracker linked to the original, every 
   // The new tracker holds every replayed step, the unmatched ones flagged with the reason and no change.
   const steps = [...tree.steps.values()].slice(1);
   assert.deepEqual(steps.map(step => [step.label, step.by.origin, step.status, step.reason, step.touches]), [
-    ['Coloured by cell_type', 'replay', 'applied', null, ['colors']],
+    ['Colored by cell_type', 'replay', 'applied', null, ['colors']],
     ['Hid beta of cell_type', 'replay', 'unapplicable', report[1].reason, []],
     ['Hid gamma of cell_type', 'replay', 'applied', null, ['filters']],
-    ['Coloured by CD3E', 'replay', 'unapplicable', report[4].reason, []],
+    ['Colored by CD3E', 'replay', 'unapplicable', report[4].reason, []],
   ]);
   assert.deepEqual(report.map(entry => entry.step), [steps[0].id, steps[1].id, steps[2].id, null, steps[3].id]);
   // Each replayed step names the step it was made from.
   assert.deepEqual(steps.map(step => step.replayOf.step), [report[0].source, report[1].source, report[2].source, report[4].source]);
   assert.deepEqual(replayedFrom(tree), {
     dataset: 'Dataset A', tracker: 'Annotation', replayed: 4,
-    unmatched: [{ id: steps[1].id, label: 'Hid beta of cell_type', note: report[1].reason }, { id: steps[3].id, label: 'Coloured by CD3E', note: report[4].reason }],
+    unmatched: [{ id: steps[1].id, label: 'Hid beta of cell_type', note: report[1].reason }, { id: steps[3].id, label: 'Colored by CD3E', note: report[4].reason }],
   });
   assert.equal(replayedFrom(b.history.trackers().find(t => t.name === 'Mine')), null);
   assert.deepEqual(summarizeReplay(report), {
@@ -273,7 +273,7 @@ test('a stopped replay keeps the steps applied before the stop, and the step sto
   assert.deepEqual(report.map(entry => entry.outcome), ['applied', 'stopped', 'stopped']);
   assert.deepEqual(b.state.filters, { hidden: [] }, 'nothing of the stopped step is left');
   assert.deepEqual(b.state.colors, { by: 'cell_type' });
-  assert.deepEqual([...b.history.active.steps.values()].slice(1).map(step => step.label), ['Coloured by cell_type']);
+  assert.deepEqual([...b.history.active.steps.values()].slice(1).map(step => step.label), ['Colored by cell_type']);
   assert.equal(summarizeReplay(report).text, 'Replay stopped: 1 of 3 steps applied.');
   assert.equal(b.calls.some(([type]) => type === 'filter.hide'), false, 'nothing after the stop is dispatched');
 });
@@ -302,8 +302,8 @@ test('a person\'s action waits until the replay ends, so it never lands between 
   const mine = b.dispatcher.dispatch('color.by', { field: 'score' });
   await Promise.all([replaying, mine]);
   const labels = [...b.history.active.steps.values()].slice(1).map(step => step.label);
-  assert.equal(labels.at(-1), 'Coloured by score');
-  assert.deepEqual(labels.slice(0, -1), ['Coloured by cell_type', 'Hid beta of cell_type', 'Hid gamma of cell_type', 'Coloured by CD3E']);
+  assert.equal(labels.at(-1), 'Colored by score');
+  assert.deepEqual(labels.slice(0, -1), ['Colored by cell_type', 'Hid beta of cell_type', 'Hid gamma of cell_type', 'Colored by CD3E']);
 });
 
 test('a session file of another dataset is read whole, checked as a file, and replayed by name; nothing of its values is put back', async () => {
@@ -319,7 +319,7 @@ test('a session file of another dataset is read whole, checked as a file, and re
   const { report } = await b.history.replay(plan);
   assert.deepEqual(report.map(entry => entry.outcome), ['applied', 'unmatched', 'applied', 'skipped', 'unmatched']);
   assert.deepEqual(b.state.colors, { by: 'cell_type' });
-  // The colour A's outside change left is A's own value: B never holds it.
+  // The color A's outside change left is A's own value: B never holds it.
   const outside = a.history.snapshot().trackers[0].steps.find(step => step.label === 'Changed outside the history');
   assert.equal(b.history.pool.has(outside.after.colors), false);
 

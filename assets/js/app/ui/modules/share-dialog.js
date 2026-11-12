@@ -22,26 +22,20 @@
  */
 
 import { dataLinkLeavesOutAccess, readDataSourceUrlParameters } from '../../url-state.js';
-import { copyWithFeedback, wireAppDialog } from '../components/app-dialog.js';
+import { wireAppDialog } from '../components/app-dialog.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
+import { isLoopbackHostname } from '../../../utils/loopback.js';
+import { escapeHtml } from '../../utils/dom-utils.js';
+import { copyText } from '../../utils/clipboard.js';
 
 export const PUBLIC_APP_URL = 'https://www.cellucid.com/';
 export const BADGE_IMAGE_URL = `${PUBLIC_APP_URL}assets/img/open-in-cellucid.svg`;
 const SHAREABLE_SOURCE_TYPES = new Set(['local-demo', 'remote', 'link']);
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '0.0.0.0']);
-
-function escapeAttribute(text) {
-  return text
-    .replaceAll('&', '&amp;')
-    .replaceAll('"', '&quot;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;');
-}
 
 function isLoopbackServer(serverUrl) {
   try {
     const { hostname } = new URL(serverUrl);
-    return LOOPBACK_HOSTS.has(hostname) || hostname.endsWith('.localhost');
+    return isLoopbackHostname(hostname);
   } catch {
     return true;
   }
@@ -82,7 +76,7 @@ export function badgeMarkdown(shareUrl) {
 
 export function embedHtml(shareUrl, datasetName) {
   const title = datasetName ? `Cellucid: ${datasetName}` : 'Cellucid';
-  return `<iframe src="${escapeAttribute(shareUrl)}" title="${escapeAttribute(title)}" `
+  return `<iframe src="${escapeHtml(shareUrl)}" title="${escapeHtml(title)}" `
     + 'width="100%" height="640" style="border: 0;" allow="fullscreen" loading="lazy"></iframe>';
 }
 
@@ -140,7 +134,8 @@ export function initShareDialog({ ownerDocument = document, dataSourceManager, a
   for (const copy of dialog.querySelectorAll('[data-copy-from]')) {
     copy.addEventListener('click', () => {
       const source = byId(copy.dataset.copyFrom);
-      void copyWithFeedback(copy, source.value);
+      const what = { 'share-link': 'the link', 'share-badge': 'the badge', 'share-embed': 'the embed code' }[copy.dataset.copyFrom] ?? 'the text';
+      void copyText(source.value, { what, button: copy });
     }, { signal: controller.signal });
   }
   // Selecting a field selects all of it, so a manual copy takes the whole snippet.

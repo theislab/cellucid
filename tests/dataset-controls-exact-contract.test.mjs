@@ -418,7 +418,8 @@ function makeHarness(catalog) {
   const callbackCalls = [];
   const statuses = [];
   const callbacks = {
-    clearGeneSelection: () => callbackCalls.push('clearGeneSelection'),
+    // As the gene selector's: a choice, a promise (the dataset refresh waits for nobody).
+    clearGeneSelection: () => { callbackCalls.push('clearGeneSelection'); return Promise.resolve(null); },
     initGeneExpressionDropdown: () =>
       callbackCalls.push('initGeneExpressionDropdown'),
     refreshUIForActiveView: () =>
@@ -868,7 +869,7 @@ test('selection reloads in place and None clears every exact runtime owner', asy
   assert.equal(harness.browser.historyCalls.length, 0);
   assert.deepEqual(harness.clearCalls, ['clear']);
   assert.deepEqual(harness.statuses.at(-1), {
-    message: 'No dataset selected',
+    message: 'No dataset is open.',
     isError: false
   });
 });
@@ -1614,11 +1615,24 @@ test('the sample catalog lists its entries while the startup dataset opens and m
 
   listing.resolve(catalog);
   assert.deepEqual(await controls.catalogReady, { status: 'ready' });
+  // The chosen sample says its name alone while the picker is at rest (the
+  // Dataset card says its cells: F8); its cells come back when the picker is
+  // reached for.
+  assert.deepEqual(
+    texts(),
+    ['None', 'Suo atlas · opening…', 'Garcia (3.4K cells)']
+  );
+  assert.equal(harness.select.value, 'dataset:local-demo:suo');
+  harness.select.listeners.get('focus')({ currentTarget: harness.select });
   assert.deepEqual(
     texts(),
     ['None', 'Suo atlas (1.2K cells) · opening…', 'Garcia (3.4K cells)']
   );
-  assert.equal(harness.select.value, 'dataset:local-demo:suo');
+  harness.select.listeners.get('blur')({ currentTarget: harness.select });
+  assert.deepEqual(
+    texts(),
+    ['None', 'Suo atlas · opening…', 'Garcia (3.4K cells)']
+  );
 
   await harness.manager.switchToDataset('local-demo', 'suo', {
     loadMethod: 'dataset-dropdown'
@@ -1627,9 +1641,69 @@ test('the sample catalog lists its entries while the startup dataset opens and m
   assert.equal(await startup, 'ready');
   assert.deepEqual(
     texts(),
-    ['None', 'Suo atlas (1.2K cells)', 'Garcia (3.4K cells)']
+    ['None', 'Suo atlas', 'Garcia (3.4K cells)']
   );
   assert.equal(harness.select.value, 'dataset:local-demo:suo');
+});
+
+test('a listing that settles after a failed switch keeps the switch\'s notice', async t => {
+  // F71: the samples' listing reads their files after the first view; a
+  // person who picks a sample meanwhile, whose file then fails to open, must
+  // keep the explanation and its retry when the listing settles after it.
+  const suo = makeIdentity('suo', 'Suo atlas', 1200);
+  const garcia = makeIdentity('garcia', 'Garcia', 3400);
+  const catalog = [
+    { sourceType: 'local-demo', datasets: [suo, garcia], error: null }
+  ];
+  const harness = makeHarness(catalog);
+  t.after(harness.browser.restore);
+  const listing = createDeferred();
+  harness.manager.getAllDatasets = () => listing.promise;
+  harness.manager.getSource = sourceType => ({
+    getType: () => sourceType,
+    isAvailable: async () => sourceType === 'local-demo',
+    ...(sourceType === 'local-demo'
+      ? {
+          listCatalogEntries: async () => [
+            { id: 'suo', name: 'suo' },
+            { id: 'garcia', name: 'garcia' }
+          ]
+        }
+      : {})
+  });
+  const { initDatasetControls } = await import(moduleUrl);
+  const controls = initDatasetControls({
+    dom: harness.dom,
+    datasetCard: harness.card,
+    dataSourceManager: harness.manager,
+    datasetChanges: harness.datasetChanges,
+    clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
+    reloadDataset: async selection => {
+      if (selection.datasetId !== 'suo') throw new Error('garcia.zarr.zip is damaged');
+      await harness.manager.switchToDataset('local-demo', 'suo', { loadMethod: 'dataset-dropdown' });
+      return true;
+    },
+    callbacks: harness.callbacks
+  });
+  assert.equal(await controls.loadStartupDataset({
+    datasetId: 'suo',
+    loadMethod: 'dataset-dropdown',
+    sourceType: 'local-demo'
+  }), 'ready');
+
+  assert.equal(await controls.selectDataset('garcia', 'local-demo', 'dataset-dropdown'), false);
+  const { notice, messageEl } = harness.catalogNotice();
+  assert.equal(notice.hidden, false);
+  const explanation = messageEl.textContent;
+  assert.match(explanation, /could not be opened.* "Suo atlas" is still open\.$/);
+
+  listing.resolve(catalog);
+  assert.deepEqual(await controls.catalogReady, { status: 'ready' });
+  assert.equal(notice.hidden, false, 'the settled listing must not retire the switch\'s failure');
+  assert.equal(messageEl.textContent, explanation);
+  assert.equal(harness.select.value, 'dataset:local-demo:suo');
+  await controls.destroy();
 });
 
 test('while a link holds the dataset, the samples are listed by their entries and their files read only once the picker is reached for', async t => {
@@ -1781,4 +1855,48 @@ test('a dataset no listing named yet is "the dataset", never its id', async t =>
   assert.equal(reloads[1].label, 'Loading atlas…');
   assert.equal(harness.statuses.some(status => status.message.includes(id)), false);
   await controls.destroy();
+});
+
+test('a change the person stops while it is the newest puts the Dataset box and the select back, saying nothing more (R9W-2)', async t => {
+  // Kept by the person (the unkept-work question's Cancel, an agent's opening they denied, the
+  // opening's Cancel): the Dataset box kept saying "Loading …" and the select the other dataset,
+  // and a cancelled pick said "A newer dataset selection is now active."
+  const shown = makeIdentity('shown', 'Shown data', 0);
+  const other = makeIdentity('other', 'Other data', 1);
+  const harness = makeHarness([
+    { sourceType: 'local-demo', datasets: [shown, other], error: null }
+  ]);
+  t.after(harness.browser.restore);
+  const { initDatasetControls } = await import(moduleUrl);
+  let keep = false;
+  const controls = initDatasetControls({
+    dom: harness.dom,
+    datasetCard: harness.card,
+    dataSourceManager: harness.manager,
+    datasetChanges: harness.datasetChanges,
+    clearDataset: harness.clearDataset,
+    resizeOpenCells: async () => ({ inPlace: false }),
+    reloadDataset: async selection => {
+      if (keep) {
+        selection.transaction.cancel();
+        throw cancelled('user', 'The person kept the dataset shown.');
+      }
+      return harness.reloadDataset(selection);
+    },
+    callbacks: harness.callbacks
+  });
+  assert.deepEqual(await controls.catalogReady, { status: 'ready' });
+  assert.equal(await controls.selectDataset('shown', 'local-demo'), true);
+  keep = true;
+  const before = harness.statuses.length;
+  await controls.selectDataset('other', 'local-demo').catch(() => false);
+  assert.equal(harness.card.state, 'ready');
+  assert.equal(harness.card.name, 'Shown data');
+  assert.equal(harness.select.value, 'dataset:local-demo:shown');
+  // The select's own pick, stopped the same way, says nothing either.
+  harness.select.value = 'dataset:local-demo:other';
+  await harness.select.listeners.get('change')({ type: 'change', target: harness.select });
+  assert.equal(harness.select.value, 'dataset:local-demo:shown');
+  assert.equal(harness.statuses.slice(before).some(status => /newer dataset selection/.test(status.message)), false);
+  assert.equal(harness.card.name, 'Shown data');
 });

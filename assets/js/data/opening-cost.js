@@ -10,7 +10,7 @@
  * cells shown already is not an opening and is not recorded: an in-place
  * resize (`app/open-cells-resize.js`) keeps the GPU stores of the cells it
  * keeps, appends only the cells it adds and makes every open cell's
- * colours and filters again, so its time is neither its added cells' cost
+ * colors and filters again, so its time is neither its added cells' cost
  * nor its open cells' on an opening (measured, a 20M-cell store in
  * Chromium: raising 10M cells to 20M took 340-380 ms to its first frame,
  * 34-38 ns an added cell, against an opening's 9 ns a cell below).
@@ -37,6 +37,7 @@
 
 import { onAbort } from '../utils/abort.js';
 import { isHeld, measureOf } from '../utils/machine.js';
+import { webStorage } from '../utils/web-storage.js';
 
 /**
  * How soon a first view should show: the response time below which a
@@ -63,11 +64,7 @@ let loaded = false;
 const SUM_KEYS = ['w', 'x', 'y', 'xx', 'xy'];
 
 function storage() {
-  try {
-    return typeof localStorage === 'undefined' ? null : localStorage;
-  } catch {
-    return null;
-  }
+  return webStorage('localStorage');
 }
 
 function isSums(value) {

@@ -28,6 +28,7 @@ import {
   send,
   serveTab,
   startAuthorization,
+  claimCode,
   tabRequest,
   tabSecret,
   waitAnswer,
@@ -124,7 +125,7 @@ test('health names the contract and the endpoints; a missing or weak secret or a
   const env = freshEnv();
   const health = await (await send(worker, env, '/health')).json();
   assert.equal(health.status, 'ok');
-  assert.equal(health.contractVersion, 1);
+  assert.equal(health.contractVersion, 2);
   assert.equal(health.mcp, RESOURCE);
   assert.match(health.catalog, /^sha256-[0-9a-f]{64}$/);
   assert.ok(health.endpoints.includes('/') && health.endpoints.includes('/tab') && !health.endpoints.includes('/mcp'));
@@ -216,7 +217,7 @@ test('client metadata documents: Claude Code and ChatGPT are fetched with no red
   assert.match(started.response.headers.get('Content-Security-Policy'), /script-src 'self'/);
 
   const tab = await connectTab(worker, env);
-  const claimed = await tabRequest(tab.socket, { type: 'claim', code: started.code });
+  const claimed = await claimCode(worker, env, { code: started.code, cookie: started.cookie });
   assert.deepEqual(claimed.value.client, {
     agent: 'Claude', name: 'Claude Code', host: 'claude.ai', redirectHost: 'localhost', loopback: true, known: true, registration: 'document',
   });
@@ -224,7 +225,7 @@ test('client metadata documents: Claude Code and ChatGPT are fetched with no red
   // ChatGPT declares private_key_jwt and none; the relay's metadata offers none, so it is a public client here.
   const chat = await startAuthorization(worker, env, { clientId: CHATGPT_DOCUMENT, redirectUri: 'https://chatgpt.com/connector_platform_oauth_redirect', challenge });
   assert.equal(chat.response.status, 200, chat.html);
-  const chatClaim = await tabRequest(tab.socket, { type: 'claim', code: chat.code });
+  const chatClaim = await claimCode(worker, env, { code: chat.code, cookie: chat.cookie });
   assert.equal(chatClaim.value.client.agent, 'ChatGPT');
   assert.equal(chatClaim.value.client.loopback, false);
 
@@ -356,9 +357,36 @@ test('authorization requests: a bad client or redirect URI gets a page; a bad re
   }
 });
 
+test('a bad request from an app the relay cannot vouch for is answered by a page with a link, never a redirect (no open redirect, RFC 9700 4.11.2)', async () => {
+  const env = freshEnv();
+  // Anyone can register a client whose redirect URI is a site of their own.
+  const target = 'https://phish.example/login';
+  const clientId = await register(worker, env, { redirectUris: [target], name: 'Anything' });
+  const { challenge } = await pkce();
+  for (const change of [{ responseType: 'token' }, { method: 'plain' }, { challenge: 'short' }, { resource: 'https://other.example' }]) {
+    const response = await send(worker, env, authorizeUrl({ clientId, redirectUri: target, challenge, ...change }), { redirect: 'manual' });
+    assert.equal(response.status, 400, JSON.stringify(change));
+    assert.equal(response.headers.get('Location'), null, JSON.stringify(change));
+    assert.match(response.headers.get('Content-Security-Policy'), /frame-ancestors 'none'/);
+    const html = await response.text();
+    const href = /<a href="([^"]+)" rel="noreferrer">Return to phish\.example<\/a>/.exec(html)?.[1];
+    assert.ok(href, html);
+    const link = new URL(href.replaceAll('&amp;', '&'));
+    assert.equal(`${link.origin}${link.pathname}`, target);
+    assert.equal(link.searchParams.get('state'), 'state-1');
+    assert.equal(link.searchParams.get('iss'), RELAY);
+    assert.ok(link.searchParams.get('error'));
+  }
+  // A page cannot carry markup into the link or the message.
+  const hostile = await register(worker, env, { redirectUris: ['https://phish.example/"><script>x</script>'] });
+  const escaped = await send(worker, env, authorizeUrl({ clientId: hostile, redirectUri: 'https://phish.example/"><script>x</script>', challenge, responseType: 'token' }));
+  assert.equal(escaped.status, 400);
+  assert.doesNotMatch(await escaped.text(), /<script>/);
+});
+
 test('authorize, approve in the tab, exchange with PKCE: the tokens are bound to the relay\'s resource and to the pairing', async () => {
   const env = freshEnv();
-  const { tokens, redirect, tab } = await connectAgent(worker, env);
+  const { tokens, redirect, tab, clientId } = await connectAgent(worker, env);
   assert.equal(redirect.searchParams.get('state'), 'state-1');
   assert.equal(redirect.searchParams.get('iss'), RELAY);
   assert.match(redirect.searchParams.get('code'), /^ac1\.[0-9A-Z]{8}\.[A-Za-z0-9_-]{43}$/);
@@ -371,6 +399,13 @@ test('authorize, approve in the tab, exchange with PKCE: the tokens are bound to
   assert.equal(payload.aud, RESOURCE);
   assert.equal(payload.iss, RELAY);
   assert.match(payload.sub, /^[0-9a-f]{64}$/);
+
+  // The connection keeps the client id's digest, never the id (a registered one is up to 8 KiB of the registrant's text).
+  const stored = [...env.PAIRING.object(payload.sub).ctx.storage.values.values()];
+  assert.equal(stored.length, 1);
+  assert.deepEqual(Object.keys(stored[0]).sort(), ['agent', 'clientDigest', 'clientHost', 'clientName', 'createdAt', 'expiresAt', 'generation', 'known', 'lastUsedAt', 'scope']);
+  assert.match(stored[0].clientDigest, /^[A-Za-z0-9_-]{43}$/);
+  assert.ok(!JSON.stringify(stored).includes(clientId.split('.')[1]));
 
   const initialize = await mcp(worker, env, tokens.access_token, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'claude-ai', version: '1' } } });
   assert.equal(initialize.status, 200);
@@ -390,7 +425,7 @@ test('a wrong PKCE verifier is refused and uses the code up; a replayed code is 
   const { verifier, challenge } = await pkce();
   const started = await startAuthorization(worker, env, { clientId, challenge });
   const { socket } = await connectTab(worker, env);
-  await tabRequest(socket, { type: 'claim', code: started.code });
+  await claimCode(worker, env, { code: started.code, cookie: started.cookie });
   await tabRequest(socket, { type: 'decide', code: started.code, allow: true });
   const code = new URL((await waitAnswer(worker, env, started)).body.redirect).searchParams.get('code');
   const fields = { grant_type: 'authorization_code', code, client_id: clientId, redirect_uri: CLAUDE_REDIRECT, code_verifier: 'w'.repeat(50) };
@@ -401,7 +436,7 @@ test('a wrong PKCE verifier is refused and uses the code up; a replayed code is 
   assert.equal((await after.json()).error_description, 'The authorization code was used already');
 
   const second = await startAuthorization(worker, env, { clientId, challenge });
-  await tabRequest(socket, { type: 'claim', code: second.code });
+  await claimCode(worker, env, { code: second.code, cookie: second.cookie });
   await tabRequest(socket, { type: 'decide', code: second.code, allow: true });
   const secondCode = new URL((await waitAnswer(worker, env, second)).body.redirect).searchParams.get('code');
   const good = { ...fields, code: secondCode, code_verifier: verifier };
@@ -412,7 +447,7 @@ test('a wrong PKCE verifier is refused and uses the code up; a replayed code is 
 
   // Another client, another redirect URI or a missing verifier are refused too.
   const third = await startAuthorization(worker, env, { clientId, challenge });
-  await tabRequest(socket, { type: 'claim', code: third.code });
+  await claimCode(worker, env, { code: third.code, cookie: third.cookie });
   await tabRequest(socket, { type: 'decide', code: third.code, allow: true });
   const thirdCode = new URL((await waitAnswer(worker, env, third)).body.redirect).searchParams.get('code');
   const other = await exchange(worker, env, { ...good, code: thirdCode, client_id: await register(worker, env, { redirectUris: ['https://elsewhere.example/cb'] }) });
@@ -432,13 +467,13 @@ test('codes expire: an unanswered request after ten minutes, an approved code af
 
   const late = await startAuthorization(worker, env, { clientId, challenge });
   t.mock.timers.tick(APPROVAL_SECONDS * 1000);
-  const claim = await tabRequest(socket, { type: 'claim', code: late.code });
+  const claim = await claimCode(worker, env, { code: late.code, cookie: late.cookie });
   assert.equal(claim.ok, false);
   assert.equal(claim.error.code, 'unknown');
   assert.deepEqual((await waitAnswer(worker, env, late)).body, { status: 'expired' });
 
   const slow = await startAuthorization(worker, env, { clientId, challenge });
-  await tabRequest(socket, { type: 'claim', code: slow.code });
+  await claimCode(worker, env, { code: slow.code, cookie: slow.cookie });
   await tabRequest(socket, { type: 'decide', code: slow.code, allow: true });
   const code = new URL((await waitAnswer(worker, env, slow)).body.redirect).searchParams.get('code');
   t.mock.timers.tick(AUTHORIZATION_CODE_SECONDS * 1000);
@@ -459,7 +494,7 @@ test('the person declines in the tab or cancels on the page: the client gets acc
   const { socket } = await connectTab(worker, env);
 
   const declined = await startAuthorization(worker, env, { clientId, challenge });
-  await tabRequest(socket, { type: 'claim', code: declined.code });
+  await claimCode(worker, env, { code: declined.code, cookie: declined.cookie });
   const waiting = waitAnswer(worker, env, { ...declined, seen: 'claimed' });
   await tabRequest(socket, { type: 'decide', code: declined.code, allow: false });
   const answer = (await waiting).body;
@@ -470,7 +505,7 @@ test('the person declines in the tab or cancels on the page: the client gets acc
   assert.equal(location.searchParams.get('iss'), RELAY);
 
   const cancelled = await startAuthorization(worker, env, { clientId, challenge });
-  await tabRequest(socket, { type: 'claim', code: cancelled.code });
+  await claimCode(worker, env, { code: cancelled.code, cookie: cancelled.cookie });
   const cancelAnswer = await waitAnswer(worker, env, { ...cancelled, cancel: true });
   assert.equal(cancelAnswer.body.status, 'denied');
   const late = await tabRequest(socket, { type: 'decide', code: cancelled.code, allow: true });
@@ -496,13 +531,156 @@ test('a code claimed by one browser cannot be decided by another, and an unclaim
   const theirs = await connectTab(worker, env, { secret: tabSecret(2) });
   const unclaimed = await tabRequest(theirs.socket, { type: 'decide', code: started.code, allow: true });
   assert.equal(unclaimed.error.code, 'not-claimed');
-  assert.equal((await tabRequest(mine.socket, { type: 'claim', code: started.code })).ok, true);
-  const elsewhere = await tabRequest(theirs.socket, { type: 'claim', code: started.code });
+  assert.equal((await claimCode(worker, env, { code: started.code, secret: tabSecret(1), cookie: started.cookie })).ok, true);
+  // A second pairing in the same browser (another profile's secret, the same cookie jar) comes too late.
+  const elsewhere = await claimCode(worker, env, { code: started.code, secret: tabSecret(2), cookie: started.cookie });
   assert.equal(elsewhere.error.code, 'claimed-elsewhere');
   const hijack = await tabRequest(theirs.socket, { type: 'decide', code: started.code, allow: true });
   assert.equal(hijack.ok, false);
-  const unknown = await tabRequest(mine.socket, { type: 'claim', code: '00000000' });
+  const unknown = await claimCode(worker, env, { code: '00000000', cookie: started.cookie });
   assert.equal(unknown.error.code, 'unknown');
+});
+
+test('R9Z-1: a connect link or code started in another browser attaches nothing: the claim needs the approver cookie of the browser that shows the page', async () => {
+  const env = freshEnv();
+  const clientId = await register(worker, env);
+  const { challenge } = await pkce();
+  // The attacker's browser shows the waiting page; they send its link (or code) to the person.
+  const attacker = await startAuthorization(worker, env, { clientId, challenge });
+  assert.match(attacker.setCookie, /^__Host-cellucid-approver=[A-Za-z0-9_-]{43}; Path=\/; Max-Age=600; Secure; HttpOnly; SameSite=Strict$/);
+  // The person's own browser holds an approver cookie of its own from an earlier connection.
+  const earlier = await startAuthorization(worker, env, { clientId, challenge });
+  const victim = await connectTab(worker, env, { secret: tabSecret(9) });
+  serveTab(victim.socket, { handler: () => ({ result: { content: [{ type: 'text', text: 'the person\'s data' }], isError: false } }) });
+  for (const cookie of [null, earlier.cookie, `${attacker.cookie.split('=')[0]}=${'A'.repeat(43)}`, 'unrelated=1']) {
+    const claimed = await claimCode(worker, env, { code: attacker.code, secret: tabSecret(9), cookie });
+    assert.equal(claimed.status, 200, String(cookie));
+    assert.equal(claimed.ok, false, String(cookie));
+    assert.equal(claimed.error.code, 'other-browser');
+    assert.match(claimed.error.message, /started in another browser/);
+  }
+  // A claim never made, the decision is refused, and the attacker's page has nothing to send on.
+  const decided = await tabRequest(victim.socket, { type: 'decide', code: attacker.code, allow: true });
+  assert.equal(decided.error.code, 'not-claimed');
+  assert.deepEqual((await waitAnswer(worker, env, { ...attacker, seen: null })).body, { status: 'waiting' });
+  // The old way (a claim on the socket) is gone: it is not answered and binds nothing.
+  victim.socket.send(JSON.stringify({ type: 'claim', ref: 999, code: attacker.code }));
+  await victim.socket.settle();
+  assert.equal(victim.socket.messages().some(message => message.type === 'reply' && message.ref === 999), false);
+  assert.equal((await tabRequest(victim.socket, { type: 'decide', code: attacker.code, allow: true })).error.code, 'not-claimed');
+  // The attacker's own browser can still approve it, into the attacker's own pairing only.
+  const own = await claimCode(worker, env, { code: attacker.code, secret: tabSecret(3), cookie: attacker.cookie });
+  assert.equal(own.ok, true);
+});
+
+test('the approver cookie: kept across a browser\'s authorizations, replaced when malformed, never sent without a Cellucid page\'s origin', async () => {
+  const env = freshEnv();
+  const clientId = await register(worker, env);
+  const { challenge } = await pkce();
+  const first = await startAuthorization(worker, env, { clientId, challenge });
+  const second = await startAuthorization(worker, env, { clientId, challenge, cookie: first.cookie });
+  assert.equal(second.cookie, first.cookie, 'two pages waiting in one browser share its cookie');
+  assert.notEqual(second.code, first.code);
+  for (const started of [first, second]) {
+    assert.equal((await claimCode(worker, env, { code: started.code, cookie: first.cookie })).ok, true);
+  }
+  const malformed = await startAuthorization(worker, env, { clientId, challenge, cookie: '__Host-cellucid-approver=short' });
+  assert.notEqual(malformed.cookie, '__Host-cellucid-approver=short');
+  assert.match(malformed.cookie, /^__Host-cellucid-approver=[A-Za-z0-9_-]{43}$/);
+  // The cookie is the relay host's own: no Domain (the __Host- prefix forbids one), the whole path.
+  assert.doesNotMatch(malformed.setCookie, /Domain=/i);
+
+  // Only a Cellucid page (an allowed Origin) claims; its preflight and answer allow its credentials, for its origin alone.
+  const third = await startAuthorization(worker, env, { clientId, challenge });
+  assert.equal((await claimCode(worker, env, { code: third.code, cookie: third.cookie, origin: null })).status, 403);
+  assert.equal((await claimCode(worker, env, { code: third.code, cookie: third.cookie, origin: 'https://evil.example' })).status, 403);
+  const preflight = await send(worker, env, '/oauth/claim', {
+    method: 'OPTIONS', headers: { Origin: APP_ORIGIN, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type' },
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get('Access-Control-Allow-Origin'), APP_ORIGIN);
+  assert.equal(preflight.headers.get('Access-Control-Allow-Credentials'), 'true');
+  const claimed = await claimCode(worker, env, { code: third.code, cookie: third.cookie });
+  assert.equal(claimed.response.headers.get('Access-Control-Allow-Origin'), APP_ORIGIN);
+  assert.equal(claimed.response.headers.get('Access-Control-Allow-Credentials'), 'true');
+  assert.equal(claimed.response.headers.get('Vary'), 'Origin');
+  // A malformed claim says why, with the same headers.
+  for (const body of [{ code: 'nope', secret: tabSecret(1) }, { code: third.code, secret: 'short' }]) {
+    const answer = await send(worker, env, '/oauth/claim', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Origin: APP_ORIGIN, Cookie: third.cookie }, body: JSON.stringify(body),
+    });
+    assert.equal(answer.status, 400);
+    assert.equal(answer.headers.get('Access-Control-Allow-Origin'), APP_ORIGIN);
+  }
+});
+
+test('a local relay (http://127.0.0.1) sets the same __Host- cookie, which loopback browsers keep (localhost counts as secure)', async () => {
+  const env = freshEnv({ ALLOWED_ORIGINS: 'http://127.0.0.1:5000' });
+  const local = 'http://127.0.0.1:8797';
+  const registered = await worker.fetch(new Request(`${local}/oauth/register`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ redirect_uris: [CLAUDE_REDIRECT], client_name: 'Claude' }),
+  }), env);
+  const clientId = (await registered.json()).client_id;
+  const { challenge } = await pkce();
+  const url = new URL(authorizeUrl({ clientId, challenge, resource: local }).replace(RELAY, local));
+  const page = await worker.fetch(new Request(url.href), env);
+  assert.equal(page.status, 200);
+  const cookie = page.headers.get('Set-Cookie');
+  assert.match(cookie, /^__Host-cellucid-approver=[A-Za-z0-9_-]{43}; Path=\/; Max-Age=600; Secure; HttpOnly; SameSite=Strict$/);
+  const code = /data-code="([^"]+)"/.exec(await page.text())[1];
+  const claimed = await worker.fetch(new Request(`${local}/oauth/claim`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'http://127.0.0.1:5000', Cookie: cookie.split(';')[0] },
+    body: JSON.stringify({ code, secret: tabSecret(1) }),
+  }), env);
+  assert.equal(claimed.status, 200);
+});
+
+test('F122: an app the relay cannot vouch for that calls itself "Claude" is named by its host on the page, in the approval, the connections and its calls', async () => {
+  const env = freshEnv();
+  const fake = await register(worker, env, { redirectUris: ['https://evil.example/callback'], name: 'Claude' });
+  const { challenge } = await pkce();
+  const started = await startAuthorization(worker, env, { clientId: fake, redirectUri: 'https://evil.example/callback', challenge });
+  assert.match(started.html, /<h1>Connect evil\.example to Cellucid<\/h1>/);
+  assert.match(started.html, /evil\.example, which calls itself <q>Claude<\/q>, asks to work/);
+  assert.doesNotMatch(started.html, /Connect Claude/);
+  const tab = await connectTab(worker, env);
+  const claimed = await claimCode(worker, env, { code: started.code, cookie: started.cookie });
+  assert.deepEqual(claimed.value.client, {
+    agent: 'evil.example', name: 'Claude', host: 'evil.example', redirectHost: 'evil.example', loopback: false, known: false, registration: 'registered',
+  });
+  // An app on this computer (a loopback redirect, no client document) that calls itself "Claude Code".
+  const local = await register(worker, env, { redirectUris: ['http://127.0.0.1/callback'], name: 'Claude Code' });
+  const localStarted = await startAuthorization(worker, env, { clientId: local, redirectUri: 'http://127.0.0.1:4545/callback', challenge });
+  assert.match(localStarted.html, /<h1>Connect an app on this computer to Cellucid<\/h1>/);
+  assert.match(localStarted.html, /An app on this computer, which calls itself <q>Claude Code<\/q>, asks/);
+  assert.equal((await claimCode(worker, env, { code: localStarted.code, cookie: localStarted.cookie })).value.client.agent, 'An app on this computer');
+
+  const { tokens } = await connectAgent(worker, env, { clientId: fake, redirectUri: 'https://evil.example/callback', tab });
+  const listed = await tabRequest(tab.socket, { type: 'connections' });
+  const row = listed.value.find(each => each.agent === 'evil.example');
+  assert.deepEqual({ agent: row.agent, client: row.client, host: row.host, known: row.known }, { agent: 'evil.example', client: 'Claude', host: 'evil.example', known: false });
+  // Its calls reach the tab as evil.example's (the history records them so); its own name goes as unvouched (`known` false), which the tab only quotes.
+  const calls = serveTab(tab.socket, { handler: () => ({ result: { content: [{ type: 'text', text: '{}' }], isError: false } }) });
+  await mcp(worker, env, tokens.access_token, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'fields_list', arguments: {} } });
+  assert.deepEqual({ agent: calls[0].agent, client: calls[0].client, host: calls[0].host, known: calls[0].known },
+    { agent: 'evil.example', client: 'Claude', host: 'evil.example', known: false });
+});
+
+test('a tab names an approval only by a connect code: any other text is refused before an approval object is asked', async () => {
+  const env = freshEnv();
+  const { socket } = await connectTab(worker, env);
+  const before = env.APPROVAL.objects.size;
+  for (const code of ['', 'abcd-efgh', 'ABCD-EFGH', '0000000', '000000000', 'UUUUUUUU', 'x'.repeat(100_000), 7, null]) {
+    const decided = await tabRequest(socket, { type: 'decide', code, allow: true });
+    assert.equal(decided.ok, false, `decide ${String(code).slice(0, 12)}`);
+    assert.equal(decided.error.code, 'not-a-code');
+    const claimed = await claimCode(worker, env, { code });
+    assert.equal(claimed.ok, false, `claim ${String(code).slice(0, 12)}`);
+    // A body past the OAuth bound is refused before it is read.
+    assert.equal(claimed.error.code, typeof code === 'string' && code.length > 64 * 1024 ? 'malformed' : 'not-a-code');
+  }
+  assert.equal(env.APPROVAL.objects.size, before);
 });
 
 test('refresh tokens rotate: each works once, and a reused one closes the connection', async () => {
@@ -529,6 +707,15 @@ test('refresh tokens rotate: each works once, and a reused one closes the connec
   const revoked = await mcp(worker, env, latest.access_token, { jsonrpc: '2.0', id: 2, method: 'tools/list' });
   assert.equal(revoked.status, 401);
   assert.match(revoked.headers.get('WWW-Authenticate'), /error="invalid_token"/);
+
+  // A refresh by another client is refused.
+  const thirdConnection = await connectAgent(worker, env, { secret: tabSecret(5) });
+  const otherClient = await register(worker, env, { redirectUris: ['https://elsewhere.example/cb'] });
+  const stolen = await exchange(worker, env, { grant_type: 'refresh_token', client_id: otherClient, refresh_token: thirdConnection.tokens.refresh_token });
+  assert.equal(stolen.status, 400);
+  assert.equal((await stolen.json()).error_description, 'This refresh token was issued to another client.');
+  const own = await exchange(worker, env, { grant_type: 'refresh_token', client_id: thirdConnection.clientId, refresh_token: thirdConnection.tokens.refresh_token });
+  assert.equal(own.status, 200);
 
   const garbage = await refresh({ refresh_token: 'rt1.e30.AAAA' });
   assert.equal((await garbage.json()).error, 'invalid_grant');

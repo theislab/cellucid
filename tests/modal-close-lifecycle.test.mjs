@@ -210,6 +210,11 @@ class FakeElement {
     this.attributes.delete(String(name));
   }
 
+  // What focus asks of a target (`app-dialog.js` `canTakeFocus`).
+  matches(selector) {
+    return selector === ':disabled' ? this.disabled === true : false;
+  }
+
   removeEventListener(type, listener) {
     const listeners = this.listeners.get(type) ?? [];
     this.listeners.set(
@@ -339,11 +344,37 @@ class FakeElement {
   }
 }
 
+/**
+ * A `<dialog>` as the analysis view uses it (`wireAppDialog`): opened
+ * modally, closed with a `close` event, as the browser does (Escape is the
+ * browser's `cancel`, then `close`).
+ */
+class FakeDialog extends FakeElement {
+  constructor(ownerDocument) {
+    super('dialog', ownerDocument);
+    this.open = false;
+    this.modal = false;
+  }
+
+  showModal() {
+    this.open = true;
+    this.modal = true;
+  }
+
+  close() {
+    if (!this.open) return;
+    this.open = false;
+    this.modal = false;
+    this.dispatchEvent({ type: 'close' });
+  }
+}
+
 async function withFakeDOM(run) {
   const originalGlobals = {
     cancelAnimationFrame: globalThis.cancelAnimationFrame,
     document: globalThis.document,
     HTMLElement: globalThis.HTMLElement,
+    HTMLDialogElement: globalThis.HTMLDialogElement,
     requestAnimationFrame: globalThis.requestAnimationFrame,
     ResizeObserver: globalThis.ResizeObserver,
     window: globalThis.window,
@@ -354,7 +385,7 @@ async function withFakeDOM(run) {
     activeElement: null,
     body: null,
     createElement(tagName) {
-      return new FakeElement(tagName, document);
+      return tagName === 'dialog' ? new FakeDialog(document) : new FakeElement(tagName, document);
     },
     addEventListener(type, listener) {
       const listeners = documentListeners.get(type) ?? [];
@@ -420,6 +451,7 @@ async function withFakeDOM(run) {
 
   globalThis.document = document;
   globalThis.HTMLElement = FakeElement;
+  globalThis.HTMLDialogElement = FakeDialog;
   globalThis.ResizeObserver = FakeResizeObserver;
   globalThis.requestAnimationFrame = () => 1;
   globalThis.cancelAnimationFrame = () => {};
@@ -441,12 +473,15 @@ function createBareModal({
   parentNode = null,
 } = {}) {
   return {
+    // Never opened, so no app dialog (`openModal` wires one).
+    _appDialog: null,
     _beforeClose: beforeClose,
     _cleanupDone: false,
     _cleanupFns: [],
     _closePromise: null,
     _onClose: onClose,
     classList: {
+      add() {},
       remove() {},
     },
     parentNode,
@@ -507,7 +542,8 @@ test('button, backdrop, Escape, and direct close share one awaited hook', { conc
       modal.querySelector('.analysis-modal-backdrop').dispatchEvent({
         type: 'click',
       });
-      document.dispatchEvent({ key: 'Escape', type: 'keydown' });
+      // Escape: the browser closes the dialog (`cancel`, then `close`).
+      modal.close();
       const repeatedDirectClose = closeModal(modal);
 
       await waitFor(() => beforeCloseCalls > 0, 'shared beforeClose');
@@ -530,7 +566,7 @@ test('button, backdrop, Escape, and direct close share one awaited hook', { conc
   });
 });
 
-test('analysis modal publishes dialog semantics, traps Tab, and restores trigger focus', { concurrency: false }, async () => {
+test('analysis modal is a <dialog> opened modally (the browser holds Tab and Escape), and restores trigger focus', { concurrency: false }, async () => {
   await withControlledTimers(async ({ runAllTimers }) => {
     await withFakeDOM(async ({ document }) => {
       const trigger = document.createElement('button');
@@ -540,35 +576,28 @@ test('analysis modal publishes dialog semantics, traps Tab, and restores trigger
       const modal = createAnalysisModal();
       const title = modal.querySelector('.analysis-modal-title');
       const closeButton = modal.querySelector('.analysis-modal-close');
-      assert.equal(modal.getAttribute('role'), 'dialog');
-      assert.equal(modal.getAttribute('aria-modal'), 'true');
+      // A real modal (the page behind inert), never `aria-modal` on a div.
+      assert.equal(modal.tagName, 'DIALOG');
+      assert.equal(modal.getAttribute('aria-modal'), null);
       assert.equal(modal.getAttribute('aria-labelledby'), title.id);
       assert.equal(closeButton.getAttribute('aria-label'), 'Close analysis');
 
       openModal(modal);
-      assert.equal(document.activeElement, closeButton);
-
-      let preventedTabs = 0;
-      document.dispatchEvent({
-        key: 'Tab',
-        preventDefault() {
-          preventedTabs++;
-        },
-        shiftKey: false,
-        type: 'keydown'
-      });
-      document.dispatchEvent({
-        key: 'Tab',
-        preventDefault() {
-          preventedTabs++;
-        },
-        shiftKey: true,
-        type: 'keydown'
-      });
-      assert.equal(preventedTabs, 2);
+      assert.equal(modal.open, true);
+      assert.equal(modal.modal, true);
       assert.equal(document.activeElement, closeButton);
 
       const closing = closeModal(modal);
+      // Closed at once: out of the top layer (the page usable, focus back), the view inert while
+      // it fades, before it is detached. Left open for the fade, it held the page inert and its
+      // controls in reach after the person closed it (the control walk clicked its × twice).
+      await settleMicrotasks();
+      assert.equal(modal.open, false);
+      assert.equal(modal.modal, false);
+      assert.equal(modal.inert, true);
+      assert.equal(modal.classList.contains('closing'), true);
+      assert.equal(modal.isConnected, true);
+      assert.equal(document.activeElement, trigger);
       runAllTimers();
       await closing;
       assert.equal(document.activeElement, trigger);

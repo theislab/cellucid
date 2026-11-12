@@ -7,7 +7,7 @@
  * | Id            | Family  | Tone  | What it is                                         |
  * | ------------- | ------- | ----- | -------------------------------------------------- |
  * | `atelier`     | atelier | light | Infinite paper cyclorama with a baked contact shadow |
- * | `nebula`      | atelier | dark  | Deep-field nebula skybox, tinted by the data colours |
+ * | `nebula`      | atelier | dark  | Deep-field nebula skybox, tinted by the data colors |
  * | `abyss`       | abyss   | light | Sunlit shallows: rays, caustics, drifting motes    |
  * | `abyss-dark`  | abyss   | dark  | Deep ocean: god rays and glowing marine snow       |
  * | `aurora`      | aurora  | light | Aurora Dawn: high-key sky, clouds and sun haze     |
@@ -18,7 +18,7 @@
  *
  * THE DATA STAYS THE HERO
  * The category palettes span CIE L* 41..90 (`data/palettes.js`, the first 24
- * category colours). Every look keeps its large areas outside that band:
+ * category colors). Every look keeps its large areas outside that band:
  * dark looks below `DARK_BAND_MAX_LSTAR`, light looks above
  * `LIGHT_BAND_MIN_LSTAR`. Only point-like highlights (star cores, motes) may
  * cross it, and they cover a negligible fraction of the frame. Twins share
@@ -40,9 +40,9 @@ export const BACKDROP_AMBIENT_MAX_HZ = 30;
 /**
  * One look.
  *
- * - `surface`: exact 8-bit sRGB colour of the canvas clear, the CSS page and
+ * - `surface`: exact 8-bit sRGB color of the canvas clear, the CSS page and
  *   the look before its bake lands.
- * - `defaultTints`: sRGB 0..1 tints used before (or without) data colours.
+ * - `defaultTints`: sRGB 0..1 tints used before (or without) data colors.
  *
  * Figure export redraws a look with the same renderer from the screen's
  * frozen state (`components/backdrop-look-export.js`).
@@ -139,14 +139,14 @@ export function isBackdropLook(value) {
   return typeof value === 'string' && Object.prototype.hasOwnProperty.call(BACKDROP_LOOKS, value);
 }
 
-/** A look's surface colour as the 0..1 triple WebGL takes. */
+/** A look's surface color as the 0..1 triple WebGL takes. */
 export function backdropLookSurface01(id) {
   const rgb = BACKDROP_LOOKS[id].surface;
   return [rgb[0] / 255, rgb[1] / 255, rgb[2] / 255];
 }
 
 // ---------------------------------------------------------------------------
-// Colour helpers
+// Color helpers
 // ---------------------------------------------------------------------------
 
 /** sRGB channel (0..1) to linear. */
@@ -166,13 +166,13 @@ export function lstarOfSrgb(rgb) {
 }
 
 /**
- * A data colour shaped into a backdrop tint: its hue kept, its saturation
- * scaled by `saturation`, its luminance normalised to 1, in linear RGB. The
+ * A data color shaped into a backdrop tint: its hue kept, its saturation
+ * scaled by `saturation`, its luminance normalized to 1, in linear RGB. The
  * shader scales it to the look's own brightness, so a tint can never push a
  * large area into the palette band.
  *
  * @param {readonly number[]} srgb - 0..1
- * @param {number} saturation - 0 (grey) .. 1 (the colour's own)
+ * @param {number} saturation - 0 (gray) .. 1 (the color's own)
  * @param {number[]} [out]
  * @returns {number[]}
  */
@@ -183,18 +183,18 @@ export function shapeBackdropTint(srgb, saturation, out = [0, 0, 0]) {
     const normalized = linear[i] / y;
     out[i] = 1 + (normalized - 1) * saturation;
   }
-  // Renormalise: mixing with grey keeps luminance at 1 only approximately.
+  // Renormalize: mixing with gray keeps luminance at 1 only approximately.
   const y2 = Math.max(linearLuminance(out), 1e-4);
   for (let i = 0; i < 3; i++) out[i] = Math.max(0, out[i] / y2);
   return out;
 }
 
 /**
- * The dominant colours of a view's points: a weighted 5-bit-per-channel
+ * The dominant colors of a view's points: a weighted 5-bit-per-channel
  * histogram over at most `maxSamples` evenly strided visible points, peaks
- * picked greedily with neighbouring bins suppressed, so three distinct
- * colours come back even when one category dominates. Near-grey colours
- * (the "unassigned" greys) are down-weighted.
+ * picked greedily with neighboring bins suppressed, so three distinct
+ * colors come back even when one category dominates. Near-gray colors
+ * (the "unassigned" grays) are down-weighted.
  *
  * Pure and allocation-bounded: one 32768-bin Float32Array.
  *
@@ -219,7 +219,7 @@ export function extractDominantColors(colors, visibility, count = 3, maxSamples 
     const b = colors[i * 4 + 2];
     const max = Math.max(r, g, b);
     const min = Math.min(r, g, b);
-    // Chroma weighting: greys say little about the field's hue.
+    // Chroma weighting: grays say little about the field's hue.
     const chroma = (max - min) / 255;
     const weight = 0.15 + chroma;
     const bin = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
@@ -248,7 +248,7 @@ export function extractDominantColors(colors, visibility, count = 3, maxSamples 
       sums[best * 3 + 2] / w / 255,
     ]);
     weights.push(w);
-    // Suppress the neighbourhood so the next pick is a distinct colour.
+    // Suppress the neighborhood so the next pick is a distinct color.
     const br = best >> 10;
     const bg = (best >> 5) & 31;
     const bb = best & 31;
@@ -283,7 +283,7 @@ export const ATELIER_KEY_LIGHT = Object.freeze((() => {
 
 /**
  * The floor window the shadow map covers, from the pane geometry
- * (`resolveStudioPaneGeometry`): centred on the stage, wide enough for the
+ * (`resolveStudioPaneGeometry`): centered on the stage, wide enough for the
  * cast shadow of the highest cell and the blur. For a flat pane the "floor"
  * is the paper plane behind the data and the map is in x/y.
  *

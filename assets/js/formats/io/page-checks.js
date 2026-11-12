@@ -24,7 +24,7 @@ import { formatCountOf } from '../../utils/format-units.js';
 /**
  * The bytes one checksum covers. A read reads whole pages, so a page is the
  * largest extra a read pays on each side; the table costs 4 bytes a page
- * (0.025 % of the file), read once when the copy is opened.
+ * (0.025% of the file), read once when the copy is opened.
  */
 export const CHECK_PAGE_BYTES = 16 * 1024;
 

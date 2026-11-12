@@ -1,5 +1,5 @@
 /**
- * The action catalogue document that Python and R are generated from.
+ * The action catalog document that Python and R are generated from.
  *
  * `tests/fixtures/action-catalog.json` is `catalogDocument` of every action
  * definition as canonical JSON (`scripts/generate-action-catalog.mjs`), and
@@ -32,7 +32,7 @@ import { ACTION_DEFINITIONS } from '../assets/js/app/actions/definitions/index.j
  * (`tests/test_action_catalog.py`) and cellucid-r
  * (`tests/testthat/test-actions.R`) pin the same one.
  */
-const ACTION_CATALOG_SHA256 = 'a805685f10d2625d649d61f7c516f811c624cfd751566267f3cd0bed0cded688';
+const ACTION_CATALOG_SHA256 = '725d32e5357cebbcff332be5a599667cf42ebb63ce55bd73e39ce4a1469556c4';
 
 const REGENERATE = 'Run node scripts/generate-action-catalog.mjs (it writes the three copies and prints the digest), '
   + 'then python scripts/generate_actions.py in cellucid-python and Rscript tools/generate-actions.R in cellucid-r, '

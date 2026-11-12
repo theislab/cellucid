@@ -18,7 +18,7 @@
  */
 
 import { ReadWitness, witnessHolds } from './read-witness.js';
-import { onAbort, abortReason, awaitWithSignal, cancel } from '../../utils/abort.js';
+import { onAbort, abortReason, awaitWithSignal, cancel, throwIfAborted } from '../../utils/abort.js';
 import { isHostUrl, routedFetch } from './host-fetch.js';
 import { ResponseClock } from './link.js';
 import { MAX_QUIET_MS, budgetOf, HostNotAnswering, realmHosts, retryAfterMilliseconds } from './hosts.js';
@@ -26,6 +26,7 @@ import { formatDuration, formatCountOf } from '../../utils/format-units.js';
 import { createMirrorSet } from './mirrors.js';
 import { KeptCopyDamage, checkedRead } from './page-checks.js';
 import { publicLink, textWithPublicLinks } from '../../data/sources/link-credentials.js';
+import { fnv1a32 } from '../../utils/fnv1a.js';
 
 /**
  * How reads to a source should be shaped. None of these limits what can be
@@ -110,7 +111,7 @@ const MiB = 1024 * KiB;
 
 /**
  * A file on a web host, until its link is measured: every request may cost a
- * round trip, so neighbouring metadata is fetched together and large reads
+ * round trip, so neighboring metadata is fetched together and large reads
  * are split to run in parallel. Six requests in flight is what a browser
  * keeps open per HTTP/1.1 host; over HTTP/2 or HTTP/3 a host answers as many
  * at once as its `SETTINGS_MAX_CONCURRENT_STREAMS`, which RFC 9113 (6.5.2)
@@ -301,6 +302,19 @@ function sleep(milliseconds, signal, after) {
   });
 }
 
+/** How often a read waiting for this computer to be online again looks (`navigator.onLine`). */
+const ONLINE_POLL_MS = 500;
+
+/**
+ * Waits until this computer says it is online again (`online()`), looked at
+ * every `ONLINE_POLL_MS` on the timers `after`: a dedicated worker is not
+ * reliably told by an `online` event (Chromium, measured 2026-11-11), so it
+ * looks. `signal` ends the wait.
+ */
+async function untilOnline(online, signal, after) {
+  while (!online()) await sleep(ONLINE_POLL_MS, signal, after);
+}
+
 /**
  * How a transient failure is asked again: as TCP retransmits, the waits are
  * the link's own measure, not a schedule. The first wait is the link's
@@ -347,8 +361,7 @@ export function retryWaitMs(n, timeoutMs, random = Math.random) {
  */
 export function spreadOf(what) {
   // FNV-1a over the text, then a 32-bit avalanche per draw.
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < what.length; i++) hash = Math.imul(hash ^ what.charCodeAt(i), 0x01000193);
+  const hash = fnv1a32(what);
   let draw = 0;
   return () => {
     let x = (hash + Math.imul(++draw, 0x9e3779b9)) >>> 0;
@@ -424,12 +437,37 @@ const STATUS_WORDS = new Map([
  *   sites all stopped answering at once (`hosts.js` `connectionDown`): this
  *   computer's connection, or a network in between, most likely.
  */
-export const HOST_FAULTS = Object.freeze(['failing', 'limiting', 'refusing', 'refused', 'missing', 'offline', 'connection']);
+export const HOST_FAULTS = Object.freeze(['failing', 'limiting', 'refusing', 'silent', 'refused', 'missing', 'offline', 'connection']);
 
 /** The fault a status stands for, or null when it names none: any 5xx and 408 failing, 429 limiting. */
 export function hostFaultOfStatus(status) {
   if (status === 429) return 'limiting';
   return isHostSideStatus(status) ? 'failing' : null;
+}
+
+/**
+ * What a progress line says while a request that failed is asked again
+ * (`withRetries`): the host, what it answered, and when it is asked again.
+ * The one sentence every retrying transport reports through its `onWait`
+ * (a reader's activity line, an opening, a community annotation Pull), so a
+ * long wait that is really retrying never reads as plain progress (R9A-4).
+ *
+ * @param {{host: string|null, status?: number|null, service?: string|null,
+ *   stalled?: boolean, waitMs?: number|null, attempt: number}} retry -
+ *   `attempt`: the attempt about to be made (2 for the first repeat)
+ * @returns {string}
+ */
+export function hostRetrySentence({ host, status = null, service = null, stalled = false, waitMs = null, attempt }) {
+  const named = host ?? 'The host';
+  const where = service === null ? named : host === null ? service : `${service} (${host})`;
+  const words = STATUS_WORDS.get(status) ?? (status >= 500 ? 'a server error' : null);
+  const what = stalled
+    ? 'stopped sending'
+    : Number.isInteger(status)
+    ? `is answering with errors (HTTP ${status}${words === null ? '' : `, ${words}`})`
+    : 'did not answer';
+  const when = waitMs !== null && waitMs >= 1000 ? ` in ${formatDuration(waitMs)}` : '';
+  return `${where} ${what}; trying again${when} (attempt ${attempt})…`;
 }
 
 /**
@@ -462,6 +500,10 @@ export function hostFaultSentence({ kind, host, status = null, what, service = n
       return `${where} is refusing requests from this network for now${answer} for ${what}, which it gives ` +
         `everyone: a problem on ${owner}'s side (an outage, or a block after many requests from one network), not ` +
         'with the link or with Cellucid. Try again later.';
+    case 'silent':
+      return `${where} stopped answering this site, which it answered before (${what}): it may be refusing ` +
+        'requests from this network for now (hosts do so for a while after many requests from one network), or ' +
+        'failing, or this computer lost its connection. Try again later.';
     case 'refused':
       return `${where} refused ${what}${answer}: it is private or deleted, or the link has expired. This is the ` +
         `link's permissions, not a fault of ${owner} or Cellucid. Ask its owner for a public link.`;
@@ -478,6 +520,34 @@ export function hostFaultSentence({ kind, host, status = null, what, service = n
     default:
       throw new TypeError(`Unknown host fault "${kind}".`);
   }
+}
+
+/**
+ * The host fault (`HOST_FAULTS`) a request no answer arrived for stands for
+ * (`unansweredFailure`), or null where nobody can tell: this computer offline
+ * (`offline`); every host asked lately silent at once (`connection`,
+ * `hosts.connectionDown`); a host that answered this site before now silent
+ * (`silent`: it refuses this network for now, fails, or the connection
+ * dropped; its own sentence says all three). A host never
+ * answered may be a typo or a site that does not let others read it: said as
+ * it was. (Found 2026-11-10: a sample that stopped answering was said with the
+ * generic "Try again", its URL-led sentence being unshowable.)
+ *
+ * @param {ByteSourceError} error
+ * @param {{connectionDown: (url: string) => boolean}} hosts
+ * @returns {{kind: string, host: string, status: null, what: string, service: null, retryAfterMs: null}|null}
+ */
+export function unansweredFault(error, hosts) {
+  if (error?.code !== BYTE_SOURCE_FAILURES.NETWORK) return null;
+  const host = error.details?.host ?? null;
+  if (typeof host !== 'string' || host === '') return null;
+  const url = typeof error.details?.url === 'string' && URL.canParse(error.details.url) ? error.details.url : `https://${host}/`;
+  const what = askedFor(error.details?.asked ?? url);
+  const fault = kind => ({ kind, host, status: null, what, service: null, retryAfterMs: null });
+  if (!hosts.online()) return fault('offline');
+  if (hosts.connectionDown(url)) return fault('connection');
+  if (error.details?.answeredBefore === true) return fault('silent');
+  return null;
 }
 
 /**
@@ -513,6 +583,28 @@ export function isTransientStatus(status) {
 const RATE_LIMITING_REASONS = new Set(['rateLimitExceeded', 'userRateLimitExceeded', 'RATE_LIMIT_EXCEEDED']);
 
 /** The reason a JSON error body names (`{error: {errors: [{reason}]}}` or `{error: {details: [{reason}]}}`), or null. */
+/**
+ * A `409` answer to a read (`said`: its plain-text body, when it sent one):
+ * the file the bytes come from changed where they are served while it was
+ * open, as Cellucid's servers answer (`cellucid serve` and R's
+ * `cellucid_serve()`: a file written again or replaced on disk, its server's
+ * own sentence saying what to do). Refused as a change (`CHANGED`), never
+ * asked again; the server's sentence is said as it is.
+ *
+ * @param {string} name - The file or store, as it is said
+ * @param {string|null} said
+ * @param {Object} [details]
+ * @returns {ByteSourceError}
+ */
+export function changedWhereServed(name, said, details = {}) {
+  const own = typeof said === 'string' && said.length > 0 && said.length <= 400 && !/[<>{}]/.test(said) ? said.trim() : null;
+  return new ByteSourceError(
+    BYTE_SOURCE_FAILURES.CHANGED,
+    own ?? `${name} changed where it is served while it was open (HTTP 409): serve it again, or open it again, to read it as it is now.`,
+    { status: 409, ...details }
+  );
+}
+
 export function errorReasonOf(said) {
   if (typeof said !== 'string') return null;
   let body;
@@ -641,7 +733,9 @@ export function isTransientFailure(error) {
  * without CORS headers). A body cut short was answered.
  */
 export function isUnanswered(error) {
-  return error instanceof ByteSourceError &&
+  // Also one rebuilt on this side of a worker (`utils/error-wire.js`: its
+  // name, code and details kept, its class not).
+  return (error instanceof ByteSourceError || error?.name === 'ByteSourceError') &&
     (error.code === BYTE_SOURCE_FAILURES.STALLED || error.code === BYTE_SOURCE_FAILURES.NETWORK) &&
     error.details?.phase === 'answer';
 }
@@ -676,7 +770,7 @@ async function readBody(response, onBytes) {
 /**
  * The body of an answer the caller does not read (an error), when it says
  * something a page can use: a `text/plain` or JSON body (a host's words, an
- * API's error reason) of the length the host states. Any other is cancelled
+ * API's error reason) of the length the host states. Any other is canceled
  * unread.
  */
 async function saidOf(response) {
@@ -920,7 +1014,7 @@ export async function fetchOnce(url, init, { fetchImpl, signal = null, clock = n
     return { response, bytes, said: null };
   } catch (cause) {
     // A request with no answer a page may read is lost (`hosts.js`); one
-    // cancelled or ended as stalled is not.
+    // canceled or ended as stalled is not.
     tellHost(null, { lost: phase === 'answer' && silentMs === null && !signal?.aborted && !(cause instanceof ByteSourceError) });
     if (signal?.aborted) throw abortReason(signal);
     throw failureOf(cause);
@@ -1035,11 +1129,26 @@ export function refusesForNow(error) {
  *   so far; `clock`, the link whose retransmission timeout the waits grow
  *   from and whose timers they run on (`ResponseClock`; a fresh one, of
  *   real time, by default); `random`, what stretches each wait
- *   (`retryWaitMs`; tests give a fixed one)
+ *   (`retryWaitMs`; tests give a fixed one); `online`, whether this computer
+ *   says it is online (the book of hosts': `hosts.js` `createHostBook`);
+ *   `service`, the provider the host serves ("GitHub"), named in the line
+ *   each repeat says through `onWait` (`hostRetrySentence`)
  * @returns {Promise<T>}
  */
-export async function withRetries(attempt, { signal = null, retryable = isTransientFailure, onRetry = null, onWait = null, clock = new ResponseClock(), random = Math.random, delivered = () => false } = {}) {
+export async function withRetries(attempt, { signal = null, retryable = isTransientFailure, onRetry = null, onWait = null, clock = new ResponseClock(), random = Math.random, delivered = () => false, hosts = realmHosts, online = () => hosts.online(), service = null } = {}) {
   const failures = [];
+  // Whoever owns the request's progress line hears its waits and repeats:
+  // the caller's `onWait`, else the link the request runs on (`clock.onWait`,
+  // `anndata/open.js` publishes it to its opening).
+  const tell = wait => (onWait ?? clock.onWait ?? null)?.(wait);
+  // A repeat said on the progress line (`hostRetrySentence`) until the
+  // request it repeats settles.
+  let retrySaid = false;
+  const settleRetry = () => {
+    if (!retrySaid) return;
+    retrySaid = false;
+    tell(null);
+  };
   // Repeats counted against the patience (RFC 1122 R1, R2), and their waits.
   let repeats = 0;
   let waited = 0;
@@ -1047,8 +1156,11 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
   let refusals = 0;
   for (let n = 0; ; n++) {
     try {
-      return await attempt(n);
+      const value = await attempt(n);
+      settleRetry();
+      return value;
     } catch (error) {
+      settleRetry();
       if (signal?.aborted) throw abortReason(signal);
       if (!retryable(error)) throw error;
       const named = error.details?.namedWaitMs ?? null;
@@ -1056,14 +1168,29 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
         // The host said when: no failure. A limit's wait is its budget's.
         if (error.details.limiting !== true) {
           const host = error.details.host ?? null;
-          onWait?.({
+          tell({
             host,
             untilMs: named,
             text: error.details.words ?? `${host ?? 'The host'} asked to be asked again in ${formatDuration(named)}.`,
           });
           await sleep(named, signal, clock.after);
-          onWait?.(null);
+          tell(null);
         }
+        continue;
+      }
+      if (refusesForNow(error) && delivered(error) && !online()) {
+        // This computer is offline: no host refuses anything. The read waits
+        // for the connection, not a back-off, and is asked again the moment
+        // it is back (round 9, R9P-7: a read waited up to 20 s more after an
+        // 18 s outage ended).
+        const host = error.details?.host ?? hostOf(error.details?.url ?? '') ?? null;
+        tell({
+          host,
+          untilMs: null,
+          text: 'This computer is offline: reading goes on as soon as it is back; what was read is kept.',
+        });
+        await untilOnline(online, signal, clock.after);
+        tell(null);
         continue;
       }
       if (refusesForNow(error) && delivered(error)) {
@@ -1077,7 +1204,7 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
         // cells) goes on where it was instead of failing whole.
         const wait = Math.min(MAX_QUIET_MS, retryWaitMs(refusals++, clock.timeoutMs, random));
         const host = error.details?.host ?? hostOf(error.details?.url ?? '') ?? null;
-        onWait?.({
+        tell({
           host,
           untilMs: wait,
           text: `${host ?? 'The host'} stopped answering this site, which it answered before: it may be refusing requests ` +
@@ -1085,7 +1212,7 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
             'what was read is kept.',
         });
         await sleep(wait, signal, clock.after);
-        onWait?.(null);
+        tell(null);
         continue;
       }
       const again = worthAskingAgain(error, failures);
@@ -1114,20 +1241,35 @@ export async function withRetries(attempt, { signal = null, retryable = isTransi
             hostFault: fault,
           });
         }
+        // A request no answer arrived for keeps its own words (they name its
+        // address, for Details) and says whose problem it is where that is
+        // known (`unansweredFault`), for a sentence without the address.
+        const unanswered = unansweredFault(error, hosts);
         throw new ByteSourceError(error.code, asked, {
           ...error.details,
           cause: error.details?.cause ?? error.cause,
           attempts: n + 1,
+          ...(unanswered === null ? {} : { hostFault: unanswered }),
         });
       }
       onRetry?.(error, n + 1);
       repeats++;
-      if (error.code === BYTE_SOURCE_FAILURES.STALLED) {
+      const stalled = error.code === BYTE_SOURCE_FAILURES.STALLED;
+      // A `Retry-After` under a second asks again no sooner than the link's own wait would.
+      const wait = stalled ? null : Math.max(retryAfterMilliseconds(error.details?.retryAfter) ?? 0, retryWaitMs(repeats - 1, clock.timeoutMs, random));
+      // Said on whatever progress line owns the request: a wait that is
+      // really asking again never reads as plain progress (R9A-4).
+      const host = error.details?.host ?? hostOf(error.details?.url ?? '') ?? null;
+      tell({
+        host,
+        untilMs: wait,
+        text: hostRetrySentence({ host, status: error.details?.status ?? null, service, stalled, waitMs: wait, attempt: n + 2 }),
+      });
+      retrySaid = true;
+      if (stalled) {
         waited += error.details?.silentMs ?? 0;
         continue;
       }
-      // A `Retry-After` under a second asks again no sooner than the link's own wait would.
-      const wait = Math.max(retryAfterMilliseconds(error.details?.retryAfter) ?? 0, retryWaitMs(repeats - 1, clock.timeoutMs, random));
       waited += wait;
       await sleep(wait, signal, clock.after);
     }
@@ -1541,6 +1683,15 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
         { status }
       );
     }
+    if ((status === 200 || status === 206) && isWebPageAnswer(response, bytes)) {
+      // A sign-in, preview or error page in place of the file: no read of
+      // this link gets the file, whatever range it asks for.
+      throw new ByteSourceError(
+        BYTE_SOURCE_FAILURES.UNREADABLE,
+        webPageInsteadOf(fileName, hostOf(originalUrl)),
+        { status, url: originalUrl, explained: true }
+      );
+    }
     if (status === 200 && !(offset === 0 && length === size)) {
       throw new ByteSourceError(
         BYTE_SOURCE_FAILURES.RANGE_IGNORED,
@@ -1553,6 +1704,7 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
       if (failure.details.limiting && limitedText !== null) throw new ByteSourceError(failure.code, `${fileName}: ${limitedText}`, failure.details);
       throw failure;
     }
+    if (status === 409) throw changedWhereServed(fileName, said, { url: originalUrl });
     if (status !== 206 && status !== 200) {
       const reason = errorReasonOf(said);
       throw new ByteSourceError(
@@ -1653,6 +1805,7 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
         // This file's ranges were delivered before: a refusal now is the
         // host refusing this network for now, waited out (`refusesForNow`).
         delivered: () => rangesDelivered > 0,
+        hosts,
       });
       if (unreadableText === null) return attempts(signal, null);
       // The provider is asked once the read gets no answer; its evidence
@@ -1671,7 +1824,7 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
         return await attempts(attemptSignal, onUnanswered);
       } catch (error) {
         if (signal?.aborted) throw abortReason(signal);
-        if (confirmed.signal.aborted) throw confirmed.signal.reason;
+        throwIfAborted(confirmed.signal);
         // Repeats spent before the check answered: its answer names the failure.
         if (check !== null && isTransientFailure(error) && await awaitWithSignal(check, signal)) throw unreadableError(error);
         throw error;
@@ -1679,6 +1832,60 @@ export function httpByteSource({ url, size, name, identity = null, etag: knownTa
     },
   };
   return Object.freeze(source);
+}
+
+/** How a web page's text starts, after a byte order mark, white space and comments. */
+const WEB_PAGE_START = /^(?:\s|<!--[\s\S]*?-->)*<(?:!doctype\s+html|html|head|body)[\s>]/i;
+/** How much of a body is looked at to tell a web page. */
+const WEB_PAGE_SNIFF_BYTES = 1024;
+
+/**
+ * Whether bytes are a web page (an HTML document) rather than data: a
+ * sign-in or preview page a link answered with, a site's page a host sends
+ * for any path it has nothing at (a single-page site answers every unknown
+ * path with its own page), or a page
+ * saved from a browser under a data file's name. No format Cellucid reads
+ * starts as one does, so its first bytes decide.
+ *
+ * @param {Uint8Array|null} bytes - The first bytes (any number)
+ * @returns {boolean}
+ */
+export function looksLikeWebPage(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.length === 0) return false;
+  const text = new TextDecoder('utf-8', { fatal: false })
+    .decode(bytes.subarray(0, WEB_PAGE_SNIFF_BYTES))
+    .replace(/^﻿/, '');
+  return WEB_PAGE_START.test(text);
+}
+
+/**
+ * Whether a host answered a request with a web page instead of the object
+ * asked for: the answer says it is HTML (`Content-Type`) and, where its body
+ * is at hand, the body is one (`looksLikeWebPage`); an answer whose body was
+ * not read (a range the host ignored) is judged by its type alone. A data
+ * file or a Zarr object is never served as HTML.
+ *
+ * @param {Response} response
+ * @param {Uint8Array|null} [bytes] - Its body, when read
+ * @returns {boolean}
+ */
+export function isWebPageAnswer(response, bytes = null) {
+  const type = response?.headers?.get?.('Content-Type') ?? '';
+  if (!/^\s*(?:text\/html|application\/xhtml\+xml)\s*(?:;|$)/i.test(type)) return false;
+  return !(bytes instanceof Uint8Array) || bytes.length === 0 || looksLikeWebPage(bytes);
+}
+
+/**
+ * What a person reads when a link answers with a web page instead of the
+ * file it names (`isWebPageAnswer`): whose answer it was, and what to do.
+ *
+ * @param {string} name - The file asked for
+ * @param {string|null} host - The host that answered
+ * @returns {string}
+ */
+export function webPageInsteadOf(name, host) {
+  return `${name}: ${host ?? 'its host'} answered with a web page instead of the file (a sign-in, preview or error page). ` +
+    "Open the file's direct download link instead.";
 }
 
 /**
@@ -1774,7 +1981,7 @@ export function isByteSource(value) {
 /**
  * The head of a file (`[0, length)`) read with a plain range request, timed:
  * `{response, bytes, ms}`, `bytes` null unless the host answered the range.
- * A host that ignores ranges is never read whole: its body is cancelled.
+ * A host that ignores ranges is never read whole: its body is canceled.
  * `once`: asked once, a failure reported as it is, for a caller that tells
  * the failures apart itself (Google Drive's hold of downloads without a
  * sign-in looks like a stall, then a failed connection).
@@ -1936,6 +2143,11 @@ async function probeOnce(url, { signal = null, fetchImpl = routedFetch, headByte
       failure = error;
     }
     const asked = Math.min(size, Math.max(1, headBytes));
+    // A head whose body stopped coming (the host stalled, asked again until
+    // the read's patience ran out) says nothing of how the host codes the
+    // file: that host stalls, and is said to (it was read as content-coded
+    // and downloaded whole, which stalled again).
+    if (failure?.code === BYTE_SOURCE_FAILURES.STALLED) throw failure;
     if (failure !== null || headOf.response.status !== 206 || headOf.bytes?.length !== asked) {
       if ((await wholeIsReadable(finalUrl, signal, fetchImpl)) !== null) {
         return { url: finalUrl, size, etag, lastModified, rangeSupported: false, contentCoded: true, head: null };

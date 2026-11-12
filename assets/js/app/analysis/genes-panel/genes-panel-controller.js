@@ -23,9 +23,11 @@ import { ANALYSIS_PHASES, ERROR_MESSAGES, formatError } from './constants.js';
 import { getDataSourceManager } from '../../../data/data-source-manager.js';
 import { residencyBudgetBytes } from '../../../data/memory-budget.js';
 import { createGeneIndex, filterGenes, geneIdentities, parseGeneText, resolveGenes } from '../shared/gene-sets.js';
-import { geneMomentsFor } from '../shared/gene-moments-cache.js';
+import { geneMomentsFor, momentsMatrixOf } from '../shared/gene-moments-cache.js';
+import { RAW_VALUES } from '../../../data/expression-transform.js';
 import { formatCount, formatCountOf } from '../../../utils/format-units.js';
 import { cellsReadFor, geneSampleUse, maskReadFor } from '../shared/gene-sample-cells.js';
+import { throwIfAborted } from '../../../utils/abort.js';
 
 /** Synthetic id of a category's group. */
 export const GROUP_ID_PREFIX = 'category-code:';
@@ -303,14 +305,20 @@ export class GenesPanelController {
 
   /**
    * The fold change a run reports: undoing log1p when asked, or when the
-   * file says its matrix is log1p'd (`uns['log1p']`) and "Automatic" is
-   * chosen; as stored otherwise.
+   * values are log1p and "Automatic" is chosen -- the run's values in the
+   * expression transform's log1p (natural log), else the file's record of
+   * its matrix (`uns['log1p']`); as stored otherwise (normalized counts
+   * without the log: a ratio of means).
    * @param {'auto'|'log1p'|'stored'} choice
    * @param {string} [matrix='mapped'] - The expression matrix read: its own
    *   log1p record is the one that counts
+   * @param {{normalize: boolean, log1p: boolean}} [transform] - The run's
+   *   expression transform (`DataLayer.runValues`)
    * @returns {{mode: 'stored'|'log1p', base: number|null}}
    */
-  foldChangeOf(choice, matrix = 'mapped') {
+  foldChangeOf(choice, matrix = 'mapped', transform = RAW_VALUES) {
+    if (transform.log1p) return choice === 'stored' ? { mode: 'stored', base: null } : { mode: 'log1p', base: null };
+    if (transform.normalize) return choice === 'log1p' ? { mode: 'log1p', base: null } : { mode: 'stored', base: null };
     const loader = this.dataLayer.state?.varFieldLoader ?? null;
     const read = matrix === 'mapped' ? null : this.dataLayer.resolveExpressionMatrix(matrix).matrix;
     const log1p = loader === null ? null : loader.log1p(read === null ? {} : { matrix: read });
@@ -342,18 +350,24 @@ export class GenesPanelController {
     // A first pass (`shared/progressive-cells.js`): the scope's cells in the sample.
     const scope = sample === null ? this.scopeOf(options.cells) : sample.mask(this.scopeOf(options.cells));
     const described = await this.describeGroups(options.groupBy, scope);
-    if (signal?.aborted) throw signal.reason;
+    throwIfAborted(signal);
     // Genes read for a sample of the open cells: each group's cells in the
     // scope's every open cell too, for the result to say how many of them
     // it used (`geneSampleUse`) and why a group is skipped.
     const geneSample = this.dataLayer.state?.getGeneSample?.() ?? null;
     const whole = geneSample === null ? null : await this.describeGroups(options.groupBy, this.scopeOf(options.cells, null));
-    if (signal?.aborted) throw signal.reason;
+    throwIfAborted(signal);
     const plan = this.plan(options, described);
     if (plan.blocker !== null) throw new Error(plan.blocker);
     const genes = await this.genesToTest(options);
     if (genes.length === 0) throw new Error(formatError(ERROR_MESSAGES.NO_GENES_TO_TEST));
-    const foldChange = this.foldChangeOf(options.foldChange, options.matrix);
+    // The run's values (Data mapping › Expression values): each cell's
+    // library size read before the genes are tested when they are
+    // normalized (an obs total, else one pass over the matrix).
+    const holdsCounts = this.dataLayer.matrixHoldsCounts(options.matrix);
+    const values = await this.dataLayer.runValues(options.matrix, { readTo: geneSample?.cells ?? null, signal, owner: job?.id ?? null });
+    throwIfAborted(signal);
+    const foldChange = this.foldChangeOf(options.foldChange, options.matrix, values.transform);
     const matrix = this.dataLayer.resolveExpressionMatrix(options.matrix);
     const allGenes = await this.dataLayer.getGeneKeys(options.matrix);
 
@@ -378,6 +392,7 @@ export class GenesPanelController {
       correction: options.correction,
       foldChange,
       matrix: matrix.read ?? 'mapped',
+      values: [values.key, values.sizes?.source ?? null, values.sizes?.readTo ?? null],
       genes: genes.length === allGenes.length ? 'all' : genes
     };
     job?.setPlan(describeMarkerRun({ geneCount: genes.length, testedCount: plan.testedCount, groupCount: columns.length }));
@@ -389,7 +404,7 @@ export class GenesPanelController {
       // (over every cell: not while genes are read for a sample of them,
       // whose moments the module score reads over the sample's cells).
       const moments = matrix.read === null && (this.dataLayer.state?.getGeneSample?.() ?? null) === null
-        ? geneMomentsFor(this.dataLayer.getDatasetGeneration())
+        ? geneMomentsFor(this.dataLayer.getDatasetGeneration(), momentsMatrixOf(values.record))
         : null;
       stats = await this._engine.discoverMarkers({
         grouping: {
@@ -410,6 +425,7 @@ export class GenesPanelController {
         signal,
         readOwner: job?.id ?? null,
         matrix: options.matrix,
+        values,
         onGeneMoments: moments === null ? null : (gene, value) => moments.set(gene, value)
       });
       stats.groups = columns.map(group => ({
@@ -424,7 +440,7 @@ export class GenesPanelController {
       }));
       this._cache.set(cacheParams, stats);
     }
-    if (signal?.aborted) throw signal.reason;
+    throwIfAborted(signal);
 
     return {
       stats,
@@ -433,6 +449,8 @@ export class GenesPanelController {
         groupBy: options.groupBy,
         matrix: options.matrix,
         matrixLabel: matrix.label,
+        counts: holdsCounts,
+        values: values.record,
         // The cells genes are read for, when a sample (the scope is within
         // it), and each group's cells among them of its cells in the scope.
         geneSample: geneSampleUse(geneSample, whole === null ? [] : groupsInGeneSample(columns, whole.groups)),

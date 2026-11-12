@@ -101,7 +101,7 @@ test('each host fault is one sentence: who is at fault, the status, what to do',
   assert.equal(hostFaultOfStatus(429), 'limiting');
   for (const status of [200, 206, 400, 401, 403, 404, 410, 416, null, '500']) assert.equal(hostFaultOfStatus(status), null, String(status));
   for (const status of [500, 503, 408, 429]) assert.equal(isHostSideStatus(status), true);
-  assert.deepEqual(HOST_FAULTS, ['failing', 'limiting', 'refusing', 'refused', 'missing', 'offline', 'connection']);
+  assert.deepEqual(HOST_FAULTS, ['failing', 'limiting', 'refusing', 'silent', 'refused', 'missing', 'offline', 'connection']);
 
   const say = fault => hostFaultSentence({ host: 'zenodo.org', service: 'Zenodo', what: 'record 1', ...fault });
   assert.equal(say({ kind: 'failing', status: 503 }),
@@ -114,6 +114,11 @@ test('each host fault is one sentence: who is at fault, the status, what to do',
     'Zenodo (zenodo.org) is refusing requests from this network for now (HTTP 403, forbidden) for record 1, which it ' +
     'gives everyone: a problem on Zenodo\'s side (an outage, or a block after many requests from one network), not ' +
     'with the link or with Cellucid. Try again later.');
+  // A host that answered this site before, now silent: no status, three possible reasons, no address.
+  assert.equal(say({ kind: 'silent' }),
+    'Zenodo (zenodo.org) stopped answering this site, which it answered before (record 1): it may be refusing ' +
+    'requests from this network for now (hosts do so for a while after many requests from one network), or failing, ' +
+    'or this computer lost its connection. Try again later.');
   assert.equal(say({ kind: 'refused', status: 403 }),
     'Zenodo (zenodo.org) refused record 1 (HTTP 403, forbidden): it is private or deleted, or the link has expired. ' +
     'This is the link\'s permissions, not a fault of Zenodo or Cellucid. Ask its owner for a public link.');
@@ -128,10 +133,10 @@ test('each host fault is one sentence: who is at fault, the status, what to do',
     /^data\.example\.org is not answering \(HTTP 500, a server error\) for a\.h5ad: a problem on data\.example\.org's side/);
 
   // Codes and settling: what may pass offers Try again first; permissions and a missing file are settled.
-  const expected = { failing: ['NETWORK_ERROR', false], limiting: ['NETWORK_ERROR', false], refusing: ['NETWORK_ERROR', false],
+  const expected = { failing: ['NETWORK_ERROR', false], limiting: ['NETWORK_ERROR', false], refusing: ['NETWORK_ERROR', false], silent: ['NETWORK_ERROR', false],
     refused: ['PERMISSION_DENIED', true], missing: ['NOT_FOUND', true], offline: ['NETWORK_ERROR', false] };
   for (const [kind, [code, settled]] of Object.entries(expected)) {
-    const failure = hostFaultFailure({ kind, host: 'h.test', status: kind === 'offline' ? null : 403, what: 'a.h5ad' });
+    const failure = hostFaultFailure({ kind, host: 'h.test', status: kind === 'offline' || kind === 'silent' ? null : 403, what: 'a.h5ad' });
     assert.equal(failure.code, DataSourceErrorCode[code], kind);
     assert.equal(isExplainedFailure(failure), true, kind);
     assert.equal(describeOpeningFailure('x.', failure, { withoutLink: true }).settled, settled, kind);
@@ -348,4 +353,25 @@ test('a Retry-After on a successful answer is a budget header, never a wait (Zen
   // The same header on a 429 holds the host for what it names.
   await fetchOnce(url, {}, { fetchImpl: async () => new Response('', { status: 429, headers: { 'Retry-After': '60' } }), hosts, wantsBody: () => false });
   assert.ok(hosts.heldForMs(url) > 50_000, `held for ${hosts.heldForMs(url)} ms`);
+});
+
+test('a request no answer arrived for says whose problem it is where that is known, and keeps its own words', async () => {
+  const { unansweredFault, BYTE_SOURCE_FAILURES } = await import('../assets/js/formats/io/byte-source.js');
+  const { describeDataSourceFailure } = await import('../assets/js/app/ui/modules/dataset-connections.js');
+  const lost = (answeredBefore) => Object.assign(new Error('https://127.0.0.1:54683/anndata/garcia.zarr/.zmetadata: no answer'), {
+    code: BYTE_SOURCE_FAILURES.NETWORK,
+    details: { host: '127.0.0.1:54683', url: 'https://127.0.0.1:54683/anndata/garcia.zarr/.zmetadata', answeredBefore },
+  });
+  // The book of hosts says whether this computer is online (`hosts.online`, the one source).
+  const quiet = { connectionDown: () => false, online: () => true };
+  assert.equal(unansweredFault(lost(true), quiet).kind, 'silent');
+  assert.equal(unansweredFault(lost(true), { ...quiet, online: () => false }).kind, 'offline');
+  assert.equal(unansweredFault(lost(false), quiet), null, 'a host never answered: a typo or a site others may not read');
+  assert.equal(unansweredFault(lost(false), { connectionDown: () => true, online: () => true }).kind, 'connection');
+  assert.equal(unansweredFault(Object.assign(lost(true), { code: BYTE_SOURCE_FAILURES.HTTP }), quiet), null);
+  // Said in the samples' notice by its fault, never by its address (F51, F58).
+  const error = Object.assign(lost(true), { details: { ...lost(true).details, hostFault: unansweredFault(lost(true), quiet) } });
+  const sentence = describeDataSourceFailure('Sample datasets', 'could not be loaded', error);
+  assert.match(sentence, /^Sample datasets could not be loaded: 127\.0\.0\.1:54683 stopped answering this site, which it answered before \(garcia\.zarr\/\.zmetadata\)/);
+  assert.doesNotMatch(sentence, /https?:/);
 });

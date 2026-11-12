@@ -3,7 +3,7 @@
   "name": "com.cellucid/cellucid",
   "title": "Cellucid",
   "description": "Explore single-cell data in your open Cellucid tab: color, filter, compare and export views.",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "websiteUrl": "https://www.cellucid.com/",
   "repository": {
     "url": "https://github.com/theislab/cellucid",

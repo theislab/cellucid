@@ -7,6 +7,7 @@ import {
   computeLeftOcclusionRatio,
 } from '../assets/js/rendering/viewport-center.js';
 import {
+  getPresentedGridColumns,
   getPresentedPane,
   getPresentedPaneAtCssPoint,
   resolvePresentedLayout,
@@ -102,7 +103,7 @@ test('single view keeps the full canvas and centres its principal point on the p
   assert.equal(pane.scissorEnabled, false);
   assert.equal(pane.visibleCssLeft, 290);
   assert.equal(pane.visibleCssWidth, 1150);
-  // The principal point lands on the presented area's centre.
+  // The principal point lands on the presented area's center.
   const principalX = ((pane.projectionCenterNdcX + 1) / 2) * pane.cssWidth;
   assert.ok(Math.abs(principalX - (290 + 1440) / 2) < 1e-9);
   assert.deepEqual(layout.presentedArea, {
@@ -250,4 +251,47 @@ test('the selection bar is placed from the presented layout, not its own occlusi
 test('the hidden sidebar is inert', async () => {
   const source = await readFile(SIDEBAR_CONTROLS_URL, 'utf8');
   assert.match(source, /sidebar\.inert = isHidden;/);
+});
+
+test('grid panes keep a usable size: the arrangement follows the presented area\'s shape (phone upright, wide screen)', () => {
+  // A 390 × 700 phone held upright, no sidebar over the canvas: three views
+  // stack, each the full width (found 2026-11-11: three ~120 px panes in one row).
+  const phone = (viewIds, leftOcclusionRatio = 0) => resolvePresentedLayout({
+    canvasHeight: 2100, canvasWidth: 1170, cssHeight: 700, cssWidth: 390,
+    focusedViewId: viewIds[0], leftOcclusionRatio, mode: 'grid', viewIds,
+  });
+  const three = phone(['live', 'snap_1', 'snap_2']);
+  assert.deepEqual([three.cols, three.rows], [1, 3]);
+  for (const pane of three.panes) {
+    assert.equal(pane.cssWidth, 390);
+    assert.ok(pane.cssHeight >= 233, `${pane.viewId} is ${pane.cssHeight} px tall`);
+  }
+  assert.deepEqual([phone(['live', 'snap_1']).cols, phone(['live', 'snap_1']).rows], [1, 2]);
+  // Four: 2 × 2 (195 px a side) beats four rows of 175 px.
+  const four = phone(['live', 'snap_1', 'snap_2', 'snap_3']);
+  assert.deepEqual([four.cols, four.rows], [2, 2]);
+  // The same phone turned sideways: side by side again.
+  const landscape = resolvePresentedLayout({
+    canvasHeight: 1170, canvasWidth: 2532, cssHeight: 390, cssWidth: 844,
+    focusedViewId: 'live', leftOcclusionRatio: 0, mode: 'grid', viewIds: ['live', 'snap_1', 'snap_2'],
+  });
+  assert.deepEqual([landscape.cols, landscape.rows], [3, 1]);
+  // A 1440 × 900 screen beside a 290 px sidebar (1150 × 900): 2 side by side,
+  // 3 and 4 as 2 × 2 (450 px a side, against 383 px for three slivers),
+  // 5, 6 and 9 as three columns.
+  for (const [count, cols] of [[2, 2], [3, 2], [4, 2], [5, 3], [6, 3], [9, 3]]) {
+    const viewIds = Array.from({ length: count }, (_, i) => `view_${i}`);
+    assert.equal(layoutFor({ focusedViewId: viewIds[0], viewIds }).cols, cols, `${count} views`);
+  }
+  // A wide one (1600 × 600): three side by side.
+  assert.equal(getPresentedGridColumns(3, 1600, 600), 3);
+  // Every arrangement's panes are at least as large (shorter side) as any other's.
+  for (const [width, height] of [[390, 700], [844, 390], [1150, 900], [300, 1200], [1600, 300]]) {
+    for (let count = 1; count <= 9; count += 1) {
+      const cols = getPresentedGridColumns(count, width, height);
+      const side = c => Math.min(width / c, height / Math.ceil(count / c));
+      for (let other = 1; other <= count; other += 1) assert.ok(side(cols) >= side(other) - 1e-9, `${count} in ${width}×${height}`);
+    }
+  }
+  assert.throws(() => getPresentedGridColumns(3), /area width/);
 });

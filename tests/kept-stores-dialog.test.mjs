@@ -15,7 +15,6 @@ import {
   describeKeptKind,
   describeSavedState,
   describeMyDatasets,
-  describeWhen,
   describeDecoderDecisions,
   describeRememberedHosts,
   describeRemoval,
@@ -41,10 +40,11 @@ const item = overrides => ({
 });
 
 test('a kept item says what it is, its size, when last used, whether a tab uses it and what it spares', () => {
+  // When, in the words of every list of the app (`state/model.js` `formatAgo`, one implementation).
   assert.deepEqual(describeKeptItem(item({}), NOW), {
     name: 'Converted copy',
     size: '3.0 MB',
-    meta: 'used today',
+    meta: 'used 1 minute ago',
     removable: true,
   });
   assert.deepEqual(describeKeptItem(item({ kind: 'download', held: 'other-tab', used: NOW - 3 * DAY }), NOW), {
@@ -54,7 +54,8 @@ test('a kept item says what it is, its size, when last used, whether a tab uses 
     removable: false,
   });
   const index = item({ kind: 'gene-index', matrix: 'X', order: { order: 'priority', nObs: 10, method: 'blocks', seed: 0, blockSize: 19 }, held: 'this-tab', used: NOW - DAY });
-  assert.deepEqual(describeKeptItem(index, NOW), { name: 'Gene index (X, blocks of 19, seed 0)', size: '3.0 MB', meta: 'used yesterday · in use by this tab', removable: false });
+  assert.deepEqual(describeKeptItem(index, NOW), { name: 'Gene index (X, blocks of 19, seed 0)', size: '3.0 MB', meta: 'used 1 day ago · in use by this tab', removable: false });
+  assert.equal(describeKeptItem(item({ used: 0 }), NOW).meta, 'not used yet');
   assert.equal(describeKeptKind(item({ kind: 'gene-index', matrix: 'layers/counts', order: { order: 'file' } })), 'Gene index (layers/counts, every cell)');
   assert.equal(describeKeptKind(item({ kind: 'gene-index' })), 'Gene index');
   // A kind that knows what it spares the next opening says it.
@@ -76,25 +77,20 @@ test('kept items are grouped by dataset: its name and host, its kinds in order, 
   assert.equal(groupKeptItems([item({ name: null })])[0].name, 'Unnamed file');
 });
 
-test('when an item was last used or saved, in words', () => {
-  assert.equal(describeWhen('used', 0, NOW), '', 'not known');
-  assert.equal(describeWhen('used', NOW, NOW), 'used today');
-  assert.equal(describeWhen('used', NOW - DAY, NOW), 'used yesterday');
-  assert.equal(describeWhen('saved', NOW - 6 * DAY, NOW), 'saved 6 days ago');
-  assert.equal(describeWhen('used', new Date(2026, 0, 5).getTime(), NOW, 'en-GB'), 'used 5 Jan 2026');
-});
-
 test('a saved state is a row of its dataset: its size, what it is, how many steps, when saved', () => {
-  const state = { id: 'a', kind: 'autosave', name: null, dataset: { id: 'atlas', name: 'Lung atlas' }, steps: 3, bytes: 2048, updatedAt: NOW - DAY, openable: true };
+  // An autosave by its latest step, as Load… and My datasets name it (L10-10: eight read
+  // "History kept in this browser · saved today" alike).
+  const state = { id: 'a', kind: 'autosave', name: null, lastStep: 'Colored by gene SOX9', dataset: { id: 'atlas', name: 'Lung atlas' }, steps: 3, bytes: 2048, updatedAt: NOW - 2 * 60 * 60 * 1000, openable: true };
   assert.deepEqual(describeSavedState(state, NOW), {
     name: 'Lung atlas',
     size: '2.0 KB',
-    meta: 'History kept in this browser · 3 steps · saved yesterday',
+    meta: 'Autosave at “Colored by gene SOX9” · 3 steps · changed 2 hours ago',
   });
+  assert.equal(describeSavedState({ ...state, lastStep: null }, NOW).meta, 'Autosave · 3 steps · changed 2 hours ago');
   const named = { ...state, kind: 'named', name: 'Before clustering', dataset: { id: 'x', name: null }, steps: 1, updatedAt: 0 };
   assert.equal(describeSavedState(named, NOW).name, 'Unnamed dataset');
-  assert.equal(describeSavedState(named, NOW).meta, 'Saved as "Before clustering" · 1 step');
-  assert.equal(describeSavedState({ ...named, openable: false }, NOW).meta, 'Saved as "Before clustering" · 1 step · kept by another version');
+  assert.equal(describeSavedState(named, NOW).meta, '"Before clustering" · 1 step');
+  assert.equal(describeSavedState({ ...named, openable: false }, NOW).meta, '"Before clustering" · 1 step · kept by another version');
 });
 
 test('My datasets is one row: how many datasets it lists, and the files to reopen among them; none while it holds nothing', () => {
@@ -149,14 +145,16 @@ test('the Stored row: the datasets kept and their bytes; with none, the hosts re
   // One line beside Manage… at the narrowest panel; the whole of it in its title.
   const said = (...args) => { const { text, title } = summarizeKeptStores(...args); return [text, title]; };
   assert.deepEqual(said(items), ['2 datasets · 540 MB kept', '2 datasets · 540 MB kept']);
-  assert.deepEqual(said(items, 3), ['2 datasets · 540 MB · 3 more', '2 datasets · 540 MB · 3 connection speeds']);
+  // The other kinds are named in the title, not counted on the line (found 2026-11-10: "· 28 more"
+  // said nothing and, at 30 characters, ran under Manage…).
+  assert.deepEqual(said(items, 3), ['2 datasets · 540 MB kept', '2 datasets · 540 MB · 3 connection speeds']);
   assert.deepEqual(said([], 1), ['1 connection speed', '1 connection speed']);
-  assert.deepEqual(said(items, 1, 2), ['2 datasets · 540 MB · 3 more', '2 datasets · 540 MB · 2 saved states · 1 connection speed']);
+  assert.deepEqual(said(items, 1, 2), ['2 datasets · 540 MB kept', '2 datasets · 540 MB · 2 saved states · 1 connection speed']);
   assert.deepEqual(said([], 0, 1), ['1 saved state', '1 saved state']);
   assert.deepEqual(said([], 2, 1), ['3 items', '1 saved state · 2 connection speeds']);
   assert.deepEqual(said([], 0), ['', '']);
   // Never longer than the row holds beside Manage… (the longest wording, with every count large).
-  assert.ok(said(items, 99, 99)[0].length <= 30, said(items, 99, 99)[0]);
+  assert.ok(said(items, 99, 99)[0].length <= 26, said(items, 99, 99)[0]);
 
   const dom = () => {
     const listeners = new Map();
@@ -175,7 +173,7 @@ test('the Stored row: the datasets kept and their bytes; with none, the hosts re
   const kept = dom();
   const keptLine = initKeptStoresLine(kept, { opening, changes, list: async () => items, place: async () => available, hosts: () => remembered });
   await keptLine.refresh();
-  assert.equal(kept.text.textContent, '2 datasets · 540 MB · 1 more', 'one line beside Manage… (`white-space: nowrap`)');
+  assert.equal(kept.text.textContent, '2 datasets · 540 MB kept', 'one line beside Manage… (`white-space: nowrap`)');
   assert.equal(kept.text.title, '2 datasets · 540 MB · 1 connection speed');
   assert.equal(kept.root.hidden, false);
 

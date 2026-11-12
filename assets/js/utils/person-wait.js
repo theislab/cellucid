@@ -12,17 +12,13 @@
  * @module utils/person-wait
  */
 
+import { createListenerSet } from './listener-set.js';
+
 let open = 0;
-const listeners = new Set();
+const listeners = createListenerSet('a wait on the person');
 
 function publish(waiting) {
-  for (const listener of listeners) {
-    try {
-      listener(waiting);
-    } catch (error) {
-      console.error('[cellucid:person-wait] A listener failed:', error);
-    }
-  }
+  listeners.notify(waiting);
 }
 
 /**
@@ -60,8 +56,7 @@ export function isWaitingOnPerson() {
  * @returns {() => void} Stops listening
  */
 export function onWaitingOnPerson(listener) {
-  if (typeof listener !== 'function') throw new TypeError('A person-wait listener is a function.');
-  listeners.add(listener);
+  const stop = listeners.add(listener);
   listener(open > 0);
-  return () => listeners.delete(listener);
+  return stop;
 }

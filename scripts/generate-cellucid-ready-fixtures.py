@@ -112,7 +112,7 @@ def main() -> None:
         zarr.consolidate_metadata(str(folder))
         zip_folder(folder, FIXTURE_DIRECTORY / "ready.zarr.zip")
 
-    unknown = {**CELLUCID, "colour": "blue"}
+    unknown = {**CELLUCID, "color": "blue"}
     build(unknown).write_h5ad(FIXTURE_DIRECTORY / "unknown-key.h5ad")
     build({**CELLUCID, "id": "other-dataset"}).write_h5ad(FIXTURE_DIRECTORY / "other-id.h5ad")
 

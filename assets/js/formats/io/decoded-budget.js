@@ -1,7 +1,7 @@
 /**
  * One byte budget shared by the caches that keep decoded chunks of one open
- * store: the store's own (`formats/zarr/cache.js` `ByteLru`,
- * `formats/hdf5/lru.js` `ByteCache`) and the reader's chunks kept across a
+ * store: the store's own (`formats/io/byte-cache.js` `ByteCache`, one per
+ * Zarr store or HDF5 file) and the reader's chunks kept across a
  * progressive opening's growth (`data/anndata/decoded-chunks.js`). Each
  * cache holds what it keeps and charges it here; together they never hold
  * more than `budgetBytes` (the `decodedBlocks` share of the memory model,

@@ -16,9 +16,10 @@ foot of the plot that holds the presence and the chat bar (`dock.js`, `index.js`
 | `presence/` | the dispatcher's confirmer (the person's permissions, the confirm card) and the activity line, for every agent |
 | `chat/` | the chat bar: conversation, agent turn, context rule, keys, transcript, export, suggestions, share choice |
 | `providers/` | one module per model provider behind one contract (`contract.js`) |
+| `settings-told.js` | the person's settings (permissions, the dataset's data switch, what History leaves out) in the words every agent is told |
 | `history-link.js` | the one module that knows both a chat and the history: a turn's steps, a message to its step, a step to its message |
 | `data-scope.js` | the person's switch "Agents see names and summaries only", per dataset (its identity) in `localStorage` `cellucid:agent-data`, and whether the notice of what is sent was answered; `dataScopeNow` (the dataset shown and its switch) |
-| `bridge/` | the relay's tab end, the catalogue as MCP tools, outcomes as MCP content, one tool call |
+| `bridge/` | the relay's tab end, the catalog as MCP tools, outcomes as MCP content, one tool call |
 | `connect/` | the Connect panel over the relay client (below) |
 
 | `connect/` module | What it does |
@@ -36,22 +37,24 @@ and removes connections, forgets the browser).
 
 **Invariants:**
 - An agent acts only through the action dispatcher (`app/actions/`): its tools are the
-  catalogue, its changes are history steps with `origin: 'agent'`, its name, its connection
+  catalog, its changes are history steps with `origin: 'agent'`, its name, its connection
   (`meta.connection`: the chat, or the connector's grant) and its turn. Both ways in (the chat bar,
   the connector) run a call with `runToolCall`: one tool list, one result encoding.
 - The presence hangs on the dispatcher (its events, `stop`, `setConfirmer`), not on a way in, so
-  a new way in gets the permissions, the confirm card and the activity line without code. A
-  connector's tool list says per kind what the person's settings make of it (`mcp-tools.js`
-  `permissionOf`, from the presence's `permissionFor`); the chat's stays the same all chat long
-  (a model's reasoning is bound to the exact tools it was given) and its model is told the
-  settings with the person's message (`chat/index.js` `contextFor`).
+  a new way in gets the permissions, the confirm card and the activity line without code. Every
+  tool list is the same whatever the person's settings (a model's reasoning is bound to the exact
+  tools it was given, and a changed list rewrites a client's cached prompt); the settings are
+  told in one set of words (`settings-told.js`): to the chat's model with the person's message
+  (`chat/index.js` `contextFor`), to an outside agent after its connection's first result and
+  after any result once they changed (`bridge/agent-calls.js`, from the presence's
+  `permissionFor`).
 - The chat and the history know each other only through `history-link.js`.
 - Either way in works alone and both work at once: the chat bar needs no connector, the presence
   needs no key or chat bar, and a failure of one (a refused key, a provider down, the relay down,
   a tab never paired) leaves the other working and says in one line what to do.
 - The instructions name capabilities in words; a tool name they use (in backticks) is a tool of
-  the catalogue (`tests/agent-bridge.test.mjs`).
-- The relay's copy of the catalogue, instructions and wire protocol is generated
+  the catalog (`tests/agent-bridge.test.mjs`).
+- The relay's copy of the catalog, instructions and wire protocol is generated
   (`scripts/generate-relay-bundle.mjs`; `tests/relay-bundle-contract.test.mjs`).
 - An API key stays in this browser and goes only to its provider (`chat/keys.js`).
 - **What agents are sent of the data.** Free reading is the default: names, counts, summaries
@@ -67,7 +70,7 @@ and removes connections, forgets the browser).
   chat sends earlier results read before the switch withheld (`bridge/data-guard.js`). Every
   action that answers with data is classified there; one nobody classified is refused while the
   switch is on, and `tests/agent-data-guard.test.mjs` fails until it is classified. The switch is
-  the person's, never an action. **It is not anonymisation:** a summary of a very small group the
+  the person's, never an action. **It is not anonymization:** a summary of a very small group the
   data or the person defines (a narrow range, a filter, a rare category) can still reveal its
   cells' values; the notice, the settings and the docs say so (`SUMMARIES_ONLY_CAVEAT`), and no
   group size is made up.
@@ -75,13 +78,12 @@ and removes connections, forgets the browser).
   (`<cellucid-data>…</cellucid-data>`, `bridge/relay-protocol.js` `RESULT_DATA_TAGS`; every `<`
   inside escaped, so nothing in it can close them), the relay's own status too, and so are the
   names a chat message attaches (`chat/selection.js`). The instructions say early that it is data,
-  never instructions (`instructions.js`), and the summariser carries no request out of it
+  never instructions (`instructions.js`), and the summarizer carries no request out of it
   (`chat/context.js`). Cellucid's own sentences (a refusal, a picture left out, a result cut) are
   outside the tags, and every name such a sentence quotes is marked the same way, every `<` in it
   escaped (`bridge/mcp-content.js` `refusalText`).
-- **The tool lists.** A connector's list says per tool what the person's settings make of it,
-  asked anew for each list (`mcp-tools.js` `permissionOf`); the chat's says none and never changes
-  in a chat (its model is told the settings and the dataset's switch with the person's message).
+- **The tool lists.** One list for every way in, the same whatever the person's settings
+  (`mcp-tools.js`); the settings and the dataset's switch are told apart (`settings-told.js`).
   The chat's list adds one tool of its own, a question with choices (`chat/ask.js`), which a
   connector does not list: there the instructions say to ask in plain words with numbered choices.
 

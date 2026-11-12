@@ -54,9 +54,10 @@ test('Cells to open is a step: undo reads the cells shown before again, redo the
   await waitForHistory(page);
   const tracker = (await historyFacts(page)).tracker;
 
-  // Set up before the share: coloured by cell_type, gamma hidden.
+  // Set up before the share: colored by score, gamma hidden. (The dataset opens colored by
+  // cell_type, its first coloring: score is a step.)
   await takeSteps(page, [
-    ['color.by', { field: CELL_TYPE }],
+    ['color.by', { field: { source: 'obs', key: 'score' } }],
     ['filter.category.visibility', { field: CELL_TYPE, categories: ['gamma'], visible: false }],
   ]);
   expect(await cellsValue(page)).toEqual({ open: null, genes: null });
@@ -78,11 +79,11 @@ test('Cells to open is a step: undo reads the cells shown before again, redo the
   expect(facts.tracker).toBe(tracker);
   expect(await page.evaluate(() => window._cellucidHistories.current().active.id)).toBe(historyBefore);
   expect(facts.labels[facts.head]).toBe('Opened 60 cells (uniform)');
-  expect(Object.values(facts.labels)).toEqual(['Opened', 'Coloured by cell_type', 'Hid gamma of cell_type', 'Opened 60 cells (uniform)']);
+  expect(Object.values(facts.labels)).toEqual(['Opened', 'Colored by score', 'Hid gamma of cell_type', 'Opened 60 cells (uniform)']);
   expect(await cellsValue(page)).toEqual({ open: { method: 'uniform', k: 60, seed: 1 }, genes: null });
   // What was set up came with the cells.
   expect(await hiddenOf(page, 'cell_type')).toEqual(['gamma']);
-  expect(await page.evaluate(() => window._cellucidState.getActiveField()?.key)).toBe('cell_type');
+  expect(await page.evaluate(() => window._cellucidState.getActiveField()?.key)).toBe('score');
 
   // Undo: every cell is read again, and the history is the same one.
   await page.locator('#history-undo-btn').click();
@@ -105,6 +106,7 @@ test('Cells to open is a step: undo reads the cells shown before again, redo the
   await page.evaluate(() => window._cellucidHistories.current().jump(window._cellucidHistories.current().active.rootId));
   expect(await openCells(page)).toEqual(every);
   expect(await hiddenOf(page, 'cell_type')).toEqual([]);
+  expect(await page.evaluate(() => window._cellucidState.getActiveField()?.key)).toBe('cell_type');
   await page.evaluate(id => window._cellucidHistories.current().jump(id), opened);
   expect(await openCells(page)).toEqual(share);
   expect(await hiddenOf(page, 'cell_type')).toEqual(['gamma']);

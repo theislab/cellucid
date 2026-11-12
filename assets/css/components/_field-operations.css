@@ -123,30 +123,12 @@
 }
 
 /* ------------------------------------------------------------------------
-   Confirm dialog (destructive actions)
+   Confirm dialog (confirm-dialog.js): an app dialog (components/_modals.css,
+   App dialogs) a little narrower, its answers in a footer band.
    --------------------------------------------------------------------- */
 
-.confirm-dialog-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: calc(var(--z-modal) + 20);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: var(--space-5);
-  background: var(--color-surface-overlay);
-  backdrop-filter: blur(2px);
-}
-
-.confirm-dialog {
-  width: 100%;
-  max-width: 440px;
-  max-height: 100%;
-  overflow-y: auto;
-  background: var(--color-surface-elevated);
-  border: var(--border-default);
-  box-shadow: var(--shadow-lg);
-  border-radius: var(--radius-none);
+.app-dialog.confirm-dialog {
+  width: min(440px, calc(100vw - 2 * var(--space-4)));
 }
 
 /* The header band and title are the shared dialog chrome (_modals.css). */
@@ -281,15 +263,24 @@ input.confirm-dialog-textarea {
   user-select: none;
 }
 
+/* The label box takes the row; the page it comes from gives way first. */
 .dropzone-item-label {
   flex: 1 1 auto;
-  min-width: 0;
+  min-width: 6ch;
 }
 
 .dropzone-item-source {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-size: var(--type-hint);
   color: var(--color-text-tertiary);
   white-space: nowrap;
+}
+
+.dropzone-item-source[hidden] {
+  display: none;
 }
 
 .dropzone-item-count {

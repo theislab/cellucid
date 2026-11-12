@@ -1,0 +1,166 @@
+{
+  "_about": "Cellucid's one spelling: US. Each pattern is a British form a person or an agent must not read anywhere: the web app's strings, pages and catalog, the Python and R packages' messages and help, and the documentation. A pattern matches a whole word in prose, never part of an identifier, a path, a flag or a backtick span; each suite adds that boundary in its own regular-expression dialect. Kept byte for byte in cellucid (tests/fixtures/spelling.json), cellucid-python (tests/fixtures/spelling.json) and cellucid-r (tests/testthat/fixtures/spelling.json); each pins its SHA-256. Change all three together.",
+  "version": 1,
+  "british": [
+    {
+      "pattern": "colour\\w*",
+      "us": "color, colored, coloring"
+    },
+    {
+      "pattern": "neighbour\\w*",
+      "us": "neighbor, neighboring, neighborhood"
+    },
+    {
+      "pattern": "grey(?:s|ed|ing|ish|scale)?",
+      "us": "gray, grayed, grayscale"
+    },
+    {
+      "pattern": "behaviour\\w*",
+      "us": "behavior"
+    },
+    {
+      "pattern": "favour\\w*",
+      "us": "favor"
+    },
+    {
+      "pattern": "honour\\w*",
+      "us": "honor"
+    },
+    {
+      "pattern": "tumours?",
+      "us": "tumor"
+    },
+    {
+      "pattern": "centre[sd]?",
+      "us": "center, centered"
+    },
+    {
+      "pattern": "centring",
+      "us": "centering"
+    },
+    {
+      "pattern": "catalogues?",
+      "us": "catalog"
+    },
+    {
+      "pattern": "(?:re|un)?labell(?:ed|ing)",
+      "us": "labeled, labeling, relabeled, unlabeled"
+    },
+    {
+      "pattern": "modell(?:ed|ing)",
+      "us": "modeled, modeling"
+    },
+    {
+      "pattern": "cancell(?:ed|ing)",
+      "us": "canceled, canceling (cancellation keeps its two)"
+    },
+    {
+      "pattern": "travell(?:ed|ing|ers?)",
+      "us": "traveled, traveling"
+    },
+    {
+      "pattern": "levell(?:ed|ing)",
+      "us": "leveled"
+    },
+    {
+      "pattern": "signall(?:ed|ing)",
+      "us": "signaled, signaling"
+    },
+    {
+      "pattern": "totall(?:ed|ing)",
+      "us": "totaled"
+    },
+    {
+      "pattern": "fuell(?:ed|ing)",
+      "us": "fueled"
+    },
+    {
+      "pattern": "focuss(?:ed|ing|es)",
+      "us": "focused"
+    },
+    {
+      "pattern": "programmes?",
+      "us": "program"
+    },
+    {
+      "pattern": "fibres?",
+      "us": "fiber"
+    },
+    {
+      "pattern": "lustre",
+      "us": "luster"
+    },
+    {
+      "pattern": "metres?",
+      "us": "meter"
+    },
+    {
+      "pattern": "litres?",
+      "us": "liter"
+    },
+    {
+      "pattern": "licences?",
+      "us": "license"
+    },
+    {
+      "pattern": "defence",
+      "us": "defense"
+    },
+    {
+      "pattern": "offence",
+      "us": "offense"
+    },
+    {
+      "pattern": "judgements?",
+      "us": "judgment"
+    },
+    {
+      "pattern": "acknowledgements?",
+      "us": "acknowledgment"
+    },
+    {
+      "pattern": "ageing",
+      "us": "aging"
+    },
+    {
+      "pattern": "whilst",
+      "us": "while"
+    },
+    {
+      "pattern": "learnt",
+      "us": "learned"
+    },
+    {
+      "pattern": "spelt",
+      "us": "spelled"
+    },
+    {
+      "pattern": "foetal",
+      "us": "fetal"
+    },
+    {
+      "pattern": "artefacts?",
+      "us": "artifact"
+    },
+    {
+      "pattern": "enrolments?",
+      "us": "enrollment"
+    },
+    {
+      "pattern": "fulfil(?:s|ment)?",
+      "us": "fulfill, fulfills, fulfillment"
+    },
+    {
+      "pattern": "analys(?:e|ed|ing)",
+      "us": "analyze, analyzed, analyzing (analyses is the plural of analysis)"
+    },
+    {
+      "pattern": "(?:un|re|de)?(?:normal|summar|organ|recogn|random|anonym|synchron|raster|optim|initial|serial|visual|personal|custom|priorit|minim|maxim|author|util|standard|categor|general|apolog|local|token|vector|digit|stabil|regular|harmon|central|emphas|memor|final)is(?:e|ed|es|ing|ation|ations|er|ers|able)",
+      "us": "-ize, -ized, -ization: normalize, summarize, recognize, organization, serializable"
+    },
+    {
+      "pattern": "\\w+isations?",
+      "us": "-ization"
+    }
+  ]
+}

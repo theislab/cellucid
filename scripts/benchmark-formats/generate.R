@@ -1,12 +1,12 @@
 # The R objects `npm run bench:formats` measures, built from the arrays
 # generate.py writes (`cells-<n>-r-arrays/`): a Seurat v5 object (counts and
-# log-normalised data, PCA, UMAP, an SNN graph of 30 neighbours per cell,
+# log-normalized data, PCA, UMAP, an SNN graph of 30 neighbors per cell,
 # clusters) saved with saveRDS() and with save(), and a SingleCellExperiment
 # (counts, logcounts, PCA, UMAP, colData) saved with saveRDS(). R's defaults
 # (gzip), as GEO and most shared objects come.
 #
 # Usage: Rscript generate.R <arrays-dir> <out-dir> [seurat,sce,rda] [counts-only]
-# `counts-only` leaves the log-normalised layer out (an object of half the
+# `counts-only` leaves the log-normalized layer out (an object of half the
 # size, for sizes whose two layers R cannot hold at once on the machine).
 args <- commandArgs(TRUE)
 arrays <- args[1]

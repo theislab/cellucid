@@ -177,7 +177,7 @@ export function assertGenerationResponse(response, expectedCount) {
     response.colors.length !== expectedCount * 4
   ) {
     throw new TypeError(
-      `Generation response must carry ${expectedCount * 4} Uint8 colour ` +
+      `Generation response must carry ${expectedCount * 4} Uint8 color ` +
       'components.'
     );
   }

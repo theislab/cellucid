@@ -55,18 +55,20 @@ import {
 } from '../compute/csv-export.js';
 import { analysisWorkerCount } from '../shared/performance-config.js';
 import { selectablePageIdSet } from '../shared/page-derivation-utils.js';
-import { createAnalysisModal, openModal, closeModal } from './components/modal.js';
+import { closeModal } from './components/modal.js';
 import { createControlScope } from './components/control-accessibility.js';
 import { purgePlot, downloadImage } from '../plots/plotly-loader.js';
 import { CancellableJob, createRequestIdTracker } from '../../jobs/cancellable-job.js';
-import { isCancellation } from '../../../utils/abort.js';
+import { isCancellation, onAbort, throwIfAborted } from '../../../utils/abort.js';
 import { createJobStatusView } from '../../jobs/job-status-view.js';
 import { createStatusLine } from '../../ui/components/controls.js';
 import { describeCellsUsed } from '../shared/progressive-cells.js';
 import { describeOpenCellChoice } from '../shared/open-cell-choice.js';
 import { createGeneReadNote } from '../../ui/modules/gene-read-control.js';
 import { isPlainRecord, requireExactKeys } from '../../../utils/exact-record.js';
-import { failureText } from '../../../utils/errors.js';
+import { failureDetails, joinFailure, sayFailure } from '../../../utils/errors.js';
+import { noDatasetOpenTo } from '../../ui/no-dataset.js';
+import { debounce } from '../../../utils/debounce.js';
 
 /**
  * A per-cell CSV file written by the analysis workers (compute/csv-export.js),
@@ -83,12 +85,12 @@ import { failureText } from '../../../utils/errors.js';
  *
  * @param {'page-data'|'signature-scores'} layout
  * @param {Array<{pageName: string, values: ArrayLike<unknown>, cellIndices?: ArrayLike<number>, categories?: string[], missingCode?: number}>} pageData
- * @param {string|undefined} variableName
+ * @param {string} column - 'page-data': the value column's name; 'signature-scores': `page` or `group` (`perCellCSVHeader`)
  * @param {import('../../../data/cell-identity.js').CellIdentity} identity - The open dataset's cells
  * @returns {Promise<Blob>}
  */
-export async function writePerCellCSV(layout, pageData, variableName, identity) {
-  const header = perCellCSVHeader(layout, variableName);
+export async function writePerCellCSV(layout, pageData, column, identity) {
+  const header = perCellCSVHeader(layout, column);
   const pages = pageData.map(pd => {
     const { values, cellIndices } = pageInOriginalOrder(pd, identity);
     return {
@@ -272,9 +274,6 @@ export class BaseAnalysisUI {
     // Loading state
     this._isLoading = false;
 
-    // Debounce timer
-    this._updateTimer = null;
-
     // Lifecycle guard (prevents async work from updating after teardown)
     this._isDestroyed = false;
 
@@ -340,6 +339,11 @@ export class BaseAnalysisUI {
    * @returns {{ valid: boolean, error?: string }}
    */
   validateDataRequirements() {
+    // Nothing to analyze: said as such, never as a missing kind of data
+    // (R9E-8: "Requires gene expression data." with no dataset open).
+    if (!(this.dataLayer.state.pointCount > 0)) {
+      return { valid: false, noDataset: true, error: noDatasetOpenTo('analyze it') };
+    }
     const requirements = this.constructor.getRequirements();
     if (requirements?.geneExpression !== true) return { valid: true };
     // A dataset just shown reads its genes after its first view
@@ -353,7 +357,7 @@ export class BaseAnalysisUI {
         valid: false,
         error: failure === null
           ? 'Requires gene expression data.'
-          : `The gene names could not be read: ${failureText(failure)}`
+          : `${joinFailure(`The gene names could not be read`, sayFailure(failure))}`
       };
     }
     return { valid: true };
@@ -366,6 +370,14 @@ export class BaseAnalysisUI {
    * (`FormBasedAnalysisUI.onGenesListed`).
    */
   onGenesListed() {}
+
+  /**
+   * A field was created, renamed, deleted or had its categories edited
+   * (`field:changed`). Nothing here keeps a list of fields (Quick insights
+   * and Detailed read them when they use them); a form offers them again
+   * (`FormBasedAnalysisUI.onFieldsChanged`).
+   */
+  onFieldsChanged() {}
 
   /**
    * Get human-readable requirement text for this analysis type
@@ -781,18 +793,47 @@ export class BaseAnalysisUI {
    * Resolves once this analysis's interactive work has settled (a display
    * redraw, a re-cluster: `_trackInteractiveTask`), work started meanwhile
    * included. Work started in the same turn as the call is waited for too.
+   *
+   * `signal`: what stops the change that waits (an action's Stop, F147).
+   * When it aborts, the work under way is stopped (`_stopInteractiveWork`:
+   * its run's job canceled, an update still in its delay dropped), and once
+   * that work has ended the wait throws why it stopped: the change ends
+   * promptly, and nothing it set off lands after it is put back.
+   * @param {{signal?: AbortSignal|null}} [how]
    * @returns {Promise<void>}
    */
-  async whenSettled() {
+  async whenSettled({ signal = null } = {}) {
     await Promise.resolve();
-    // Each task once: a destroyed analysis keeps a failed task for its owner.
-    const awaited = new Set();
-    for (;;) {
-      const pending = [...(this._interactiveTasks ?? [])].filter(task => !awaited.has(task));
-      if (pending.length === 0) return;
-      for (const task of pending) awaited.add(task);
-      await Promise.allSettled(pending);
+    const stop = onAbort(signal, () => this._stopInteractiveWork());
+    try {
+      // Each task once: a destroyed analysis keeps a failed task for its owner.
+      const awaited = new Set();
+      for (;;) {
+        const pending = [...(this._interactiveTasks ?? [])].filter(task => !awaited.has(task));
+        if (pending.length === 0) break;
+        for (const task of pending) awaited.add(task);
+        await Promise.allSettled(pending);
+      }
+    } finally {
+      stop();
     }
+    throwIfAborted(signal);
+  }
+
+  /**
+   * Stop the work this analysis has under way, as a newer input would: the
+   * request is invalidated (its job canceled: its reads and worker tasks
+   * end, nothing of it is published) and an update still waiting for its
+   * delay never runs. What `whenSettled` does when the change waiting on it
+   * is stopped; an analysis with work of its own besides the request
+   * (Quick insights' job) stops that too.
+   * @protected
+   */
+  _stopInteractiveWork() {
+    this._invalidateAnalysisRequest();
+    this._pendingUpdate.cancel();
+    this._settleScheduledUpdate?.();
+    this._settleScheduledUpdate = null;
   }
 
   /**
@@ -820,26 +861,13 @@ export class BaseAnalysisUI {
   }
 
   /**
-   * Schedule an update with debouncing
-   * @param {number} delay - Debounce delay in ms (default 300)
+   * The update waiting for its delay (`_scheduleUpdate`): the one debounce,
+   * made when first asked for (an analysis is also made without its
+   * constructor, from its prototype).
+   * @protected
    */
-  _scheduleUpdate(delay = 300) {
-    if (this._isDestroyed) return;
-    const requestId = this._beginAnalysisIntent();
-    if (this._updateTimer) {
-      clearTimeout(this._updateTimer);
-    }
-    // The update waiting for its delay is this analysis's work already, so
-    // `whenSettled` (a step, an agent's action) waits for it, not only for
-    // the update once it starts: what it changes belongs to the change that
-    // scheduled it. A newer schedule replaces it (one pending at a time).
-    this._settleScheduledUpdate?.();
-    let settle;
-    const scheduled = new Promise(resolve => { settle = resolve; });
-    this._settleScheduledUpdate = settle;
-    this._trackInteractiveTask(scheduled, 'Scheduled analysis update');
-    this._updateTimer = setTimeout(() => {
-      this._updateTimer = null;
+  get _pendingUpdate() {
+    this._pendingUpdateDebounce ??= debounce((requestId, settle) => {
       if (this._settleScheduledUpdate === settle) this._settleScheduledUpdate = null;
       if (!this._isCurrentAnalysisIntent(requestId)) {
         settle();
@@ -850,7 +878,27 @@ export class BaseAnalysisUI {
         'Scheduled analysis update'
       );
       update.then(settle, settle);
-    }, delay);
+    }, (_requestId, _settle, delay) => delay);
+    return this._pendingUpdateDebounce;
+  }
+
+  /**
+   * Schedule an update once the choices settle (`_pendingUpdate`).
+   * @param {number} delay - Debounce delay in ms (default 300)
+   */
+  _scheduleUpdate(delay = 300) {
+    if (this._isDestroyed) return;
+    const requestId = this._beginAnalysisIntent();
+    // The update waiting for its delay is this analysis's work already, so
+    // `whenSettled` (a step, an agent's action) waits for it, not only for
+    // the update once it starts: what it changes belongs to the change that
+    // scheduled it. A newer schedule replaces it (one pending at a time).
+    this._settleScheduledUpdate?.();
+    let settle;
+    const scheduled = new Promise(resolve => { settle = resolve; });
+    this._settleScheduledUpdate = settle;
+    this._trackInteractiveTask(scheduled, 'Scheduled analysis update');
+    this._pendingUpdate(requestId, settle, delay);
   }
 
   /**
@@ -880,10 +928,8 @@ export class BaseAnalysisUI {
         releaseTask();
         try {
           this._notifications.error(
-            `${context} failed: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-            { category: 'analysis', title: 'Analysis error' }
+            `${context} failed: ${sayFailure(error)}`,
+            { ...failureDetails(error), category: 'analysis', title: 'Analysis error' }
           );
         } catch (reportingError) {
           this._interactiveFailures ??= [];
@@ -1027,7 +1073,7 @@ export class BaseAnalysisUI {
   // ===========================================================================
 
   /**
-   * The view of this UI's running, cancelled or failed job (Cancel, Run
+   * The view of this UI's running, canceled or failed job (Cancel, Run
    * again), created on first use; the UI places `root` where its result
    * appears.
    * @returns {ReturnType<typeof createJobStatusView>}
@@ -1166,7 +1212,7 @@ export class BaseAnalysisUI {
   }
 
   /**
-   * Run the analysis again after it was cancelled or failed (Run again).
+   * Run the analysis again after it was canceled or failed (Run again).
    * @protected
    */
   _runAgain() {
@@ -1179,7 +1225,7 @@ export class BaseAnalysisUI {
    * (`app/jobs/cancellable-job.js`): its signal goes to every read and worker
    * task; Cancel (in the status view or the job's notification), a new
    * request, closing the window or switching the dataset cancel it.
-   * Cancelling invalidates the request, so nothing of it is published.
+   * Canceling invalidates the request, so nothing of it is published.
    *
    * @param {number} requestId
    * @param {{title: string, plan?: string|null}} options
@@ -1206,7 +1252,7 @@ export class BaseAnalysisUI {
   /**
    * End `job` by the outcome of its request: a failure is shown in the
    * status view and its notification (once), a cancellation is a calm
-   * Cancelled. Returns whether it failed.
+   * Canceled. Returns whether it failed.
    *
    * @param {CancellableJob} job
    * @param {unknown} error
@@ -1436,7 +1482,7 @@ export class BaseAnalysisUI {
       });
       this._notifications.success('Plot exported as PNG', { category: 'download' });
     } catch (err) {
-      this._notifications.error('PNG export failed: ' + failureText(err), { category: 'download' });
+      this._notifications.error('PNG export failed: ' + sayFailure(err), { ...failureDetails(err), category: 'download' });
     }
   }
 
@@ -1460,69 +1506,32 @@ export class BaseAnalysisUI {
       });
       this._notifications.success('Plot exported as SVG', { category: 'download' });
     } catch (err) {
-      this._notifications.error('SVG export failed: ' + failureText(err), { category: 'download' });
+      this._notifications.error('SVG export failed: ' + sayFailure(err), { ...failureDetails(err), category: 'download' });
     }
   }
 
   /**
    * Export data as CSV
    * @param {Object[]} pageData - Page data to export
-   * @param {string} variableName - Variable name for header
+   * @param {string} valueLabel - The value column's header: what the pages
+   *   hold, a gene's values with their units (`BasePlot.getValueLabel`)
    * @param {string} [filename] - Output filename
    */
-  async _exportCSV(pageData, variableName, filename = 'analysis-data.csv') {
+  async _exportCSV(pageData, valueLabel, filename = 'analysis-data.csv') {
     if (!pageData || pageData.length === 0) return;
 
     try {
-      const csv = await writePerCellCSV('page-data', pageData, variableName || 'value', this.dataLayer.state.cellIdentity);
+      const csv = await writePerCellCSV('page-data', pageData, valueLabel, this.dataLayer.state.cellIdentity);
       const baseName = String(filename || 'analysis-data').replace(/\.csv$/i, '');
       downloadCSV(csv, baseName, this._notifications);
     } catch (err) {
-      this._notifications.error('CSV export failed: ' + failureText(err), { category: 'download' });
+      this._notifications.error('CSV export failed: ' + sayFailure(err), { ...failureDetails(err), category: 'download' });
     }
   }
 
   // ===========================================================================
   // Modal Management
   // ===========================================================================
-
-  /**
-   * Create and open an analysis modal
-   * @param {Object} config - Modal configuration
-   * @returns {Object} Modal instance
-   */
-  _createModal(config = {}) {
-    this._modal = createAnalysisModal({
-      onClose: () => { this._modal = null; },
-      onExportPNG: () => this._trackInteractiveTask(
-        this._exportPNG(),
-        'PNG export'
-      ),
-      onExportSVG: () => this._trackInteractiveTask(
-        this._exportSVG(),
-        'SVG export'
-      ),
-      onExportCSV: () => this._trackInteractiveTask(
-        this._exportCSV(
-          this._currentPageData,
-          this._currentConfig.dataSource.variable
-        ),
-        'CSV export'
-      ),
-      ...config
-    });
-
-    return this._modal;
-  }
-
-  /**
-   * Open the modal
-   */
-  _openModal() {
-    if (this._modal) {
-      openModal(this._modal);
-    }
-  }
 
   /**
    * Close the modal
@@ -1622,14 +1631,7 @@ export class BaseAnalysisUI {
     this._jobStatus?.destroy();
     this._jobStatus = null;
     this._shownJob = null;
-    if (this._updateTimer) {
-      try {
-        clearTimeout(this._updateTimer);
-      } catch (error) {
-        errors.push(error);
-      }
-      this._updateTimer = null;
-    }
+    this._pendingUpdate.cancel();
     // The update that will not run now is settled, so nothing waits for it.
     this._settleScheduledUpdate?.();
     this._settleScheduledUpdate = null;

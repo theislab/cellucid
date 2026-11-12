@@ -22,7 +22,7 @@ import { expectPerformance, performanceState, recordFrameCost } from './helpers/
  * time (every frame `GPU_MS`) gains nothing from drawing fewer cells; a
  * time that follows the cells the live view drew (`perThousandCellsMs`)
  * does. Every verdict is therefore exact, the same on every runner: before
- * the fixture, fences that signalled at a simulated time still let the
+ * the fixture, fences that signaled at a simulated time still let the
  * runner's software GL and late polls decide (a frame measured 150 ms
  * faster was called no faster, Web contracts run 41307458156; a flat 60 ms
  * measured faster on Linux and not on a Mac, run 41255961977).

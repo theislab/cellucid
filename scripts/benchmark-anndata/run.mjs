@@ -99,7 +99,7 @@ function localPathOfUrl(url) {
 if (mode === 'remote') {
   globalThis.fetch = async (url, init = {}) => {
     await connection();
-    // A request cancelled while it waited for a connection is never sent,
+    // A request canceled while it waited for a connection is never sent,
     // as a browser drops it from its queue.
     if (init.signal?.aborted) {
       releaseConnection();
@@ -288,7 +288,7 @@ try {
     const cells = Array.from({ length: 1000 }, (_, i) => Math.floor((i * 104729) % snapshot.nObs));
     await step('1000 cells (rows)', () => call('readMatrixRows', 'X', cells));
   }
-  await step('neighbour graph', () => call('getConnectivityEdges', 'connectivities'));
+  await step('neighbor graph', () => call('getConnectivityEdges', 'connectivities'));
   // Differential expression between two large groups, as the analysis reads
   // it (`readCellSubset`): every gene in the cells of the two largest
   // categories of the first categorical obs field that has two.

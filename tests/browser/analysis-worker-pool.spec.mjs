@@ -74,7 +74,7 @@ test('analysis worker pool initializes and computes the exact result', async ({ 
     idleWorkers: 1,
     pendingRequests: 0,
     queuedTasks: 0,
-    // No task was cancelled, so no worker was replaced.
+    // No task was canceled, so no worker was replaced.
     replacedWorkers: 0,
     lastReplacementMs: null
   });

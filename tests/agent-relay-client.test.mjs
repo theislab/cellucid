@@ -123,9 +123,9 @@ const DEFINITIONS = [
     params: NO_PARAMS, reads: [], effect: 'read', describe: () => 'Listed fields', code: () => 'fields()',
   }),
   defineAction({
-    type: 'color.by', title: 'Colour by a field', summary: 'Colour the cells by a field.', group: 'Colouring',
+    type: 'color.by', title: 'Color by a field', summary: 'Color the cells by a field.', group: 'Coloring',
     params: { type: 'object', additionalProperties: false, required: ['field'], properties: { field: { type: 'string' } } },
-    touches: ['active-field'], reads: [], effect: 'view', describe: params => `Coloured by ${params.field}`, code: params => `color_by("${params.field}")`,
+    touches: ['active-field'], reads: [], effect: 'view', describe: params => `Colored by ${params.field}`, code: params => `color_by("${params.field}")`,
   }),
   defineAction({
     type: 'analysis.run', title: 'Run an analysis', summary: 'Run one analysis.', group: 'Analysis',
@@ -136,6 +136,26 @@ const DEFINITIONS = [
     params: NO_PARAMS, touches: ['layout'], reads: [], effect: 'state', confirm: 'writes-file', describe: () => 'Saved', code: () => 'save()',
   }),
 ];
+
+/**
+ * The relay's claim endpoint as the page reaches it: every request is kept
+ * (`calls`, with its init), and answered when the test says (`answer(index,
+ * status, body)`), or it never is.
+ */
+function claimEndpoint() {
+  const calls = [];
+  const impl = (url, init) => new Promise((resolve, reject) => {
+    calls.push({ url, init, body: JSON.parse(init.body), resolve, reject });
+    init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  });
+  return {
+    calls,
+    impl,
+    answer(index, status, body) {
+      calls[index].resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }));
+    },
+  };
+}
 
 function setup({ secret = true, storage = memoryStorage(), fields = null, permissionFor = undefined } = {}) {
   FakeWebSocket.made = [];
@@ -171,11 +191,13 @@ function setup({ secret = true, storage = memoryStorage(), fields = null, permis
   const clock = manualClock();
   const { win, doc } = page();
   const events = { approvals: [], statuses: [], connections: 0 };
+  const claims = claimEndpoint();
   const client = createRelayClient({
     relayOrigin: RELAY,
     actions,
     secrets: { read: () => readTabSecret({ storage }), ensure: () => ensureTabSecret({ storage }), forget: () => forgetTabSecret({ storage }) },
     WebSocketImpl: FakeWebSocket,
+    fetchImpl: claims.impl,
     win,
     doc,
     version: '0.9.6',
@@ -186,14 +208,17 @@ function setup({ secret = true, storage = memoryStorage(), fields = null, permis
     onConnectionsChanged: () => { events.connections += 1; },
     clock,
   });
-  return { client, actions, seen, clock, win, doc, storage, events, release: value => release(value) };
+  return { client, actions, seen, clock, win, doc, storage, events, claims, release: value => release(value) };
 }
 
 async function flush() {
   for (let index = 0; index < 20; index += 1) await new Promise(resolve => setImmediate(resolve));
 }
 
+const ORIGINAL_FETCH = globalThis.fetch;
+
 afterEach(() => {
+  globalThis.fetch = ORIGINAL_FETCH;
   delete globalThis.window;
   delete globalThis.document;
   delete globalThis.WebSocket;
@@ -211,7 +236,7 @@ test('a browser that never paired stays off; connect() pairs it and proves the s
   assert.match(secret, /^[A-Za-z0-9_-]{43}$/);
   const [socket] = FakeWebSocket.made;
   assert.equal(socket.url, 'wss://relay.test/tab');
-  assert.deepEqual(socket.protocols, ['cellucid-relay.1', `cellucid-secret.${secret}`]);
+  assert.deepEqual(socket.protocols, ['cellucid-relay.2', `cellucid-secret.${secret}`]);
   assert.equal(client.status().state, 'connecting');
 });
 
@@ -239,7 +264,15 @@ test('a call runs its action as the agent and answers with the step it made', as
   const [result] = socket.json('result');
   assert.deepEqual(result, {
     type: 'result', id: 'c1',
-    result: { content: [{ type: 'text', text: '<cellucid-data>{"step":{"id":"s1","label":"Coloured by cell_type"},"result":{"field":"cell_type"}}</cellucid-data>' }], isError: false },
+    result: {
+      content: [{
+        type: 'text',
+        // The connection's first result: the person's settings follow it (L26-9).
+        text: '<cellucid-data>{"step":{"id":"s1","label":"Colored by cell_type"},"result":{"field":"cell_type"}}</cellucid-data>\n'
+          + '[Cellucid: the person\'s settings for you now. Reads of this dataset are not limited (values of cells and pictures of the plot included).]',
+      }],
+      isError: false,
+    },
   });
   assert.equal(seen[0].meta.origin, 'agent');
   assert.equal(seen[0].meta.agent, 'Claude');
@@ -259,7 +292,7 @@ test('a call runs its action as the agent and answers with the step it made', as
   assert.deepEqual(answers.c3.error, { code: 'unknown-tool', message: 'Cellucid has no tool "nothing_here"' });
   assert.deepEqual(answers.c4.result, { content: [{ type: 'text', text: 'There is no field <cellucid-data>"nope"</cellucid-data>; the fields are cell_type, leiden' }], isError: true });
   assert.equal(answers.c5.result.isError, true);
-  assert.match(answers.c5.result.content[0].text, /colour/);
+  assert.match(answers.c5.result.content[0].text, /color/);
   // No confirmer on this page: an action that asks first is refused, not run.
   assert.equal(answers.c6.result.isError, true);
   assert.match(answers.c6.result.content[0].text, /needs the person's go-ahead/);
@@ -415,18 +448,25 @@ test('the relay forgets the pairing or speaks another protocol: the tab stops in
   assert.equal(FakeWebSocket.made.length, 1);
 });
 
-test('approvals: a claimed code says who asks; allow and deny answer it; a refused claim says why', async () => {
-  const { client, clock, events } = setup();
+test('approvals: a code is claimed as this browser (its cookies and tab secret); allow and deny answer it; a refused claim says why', async () => {
+  const { client, clock, events, claims, storage } = setup();
   client.start();
   const [socket] = FakeWebSocket.made;
-  // A claim made before the welcome is sent once the link is up.
+  // The claim is a credentialed request to the relay, never a socket message: the
+  // relay answers only the browser whose cookie the waiting page set (R9Z-1).
   const claiming = client.claim('abcd efgh', { via: 'typed' });
+  assert.equal(claims.calls.length, 1);
+  const [claim] = claims.calls;
+  assert.equal(claim.url, `${RELAY}/oauth/claim`);
+  assert.equal(claim.init.method, 'POST');
+  assert.equal(claim.init.credentials, 'include');
+  assert.equal(claim.init.cache, 'no-store');
+  assert.deepEqual(claim.body, { code: 'ABCDEFGH', secret: storage.values.get(TAB_SECRET_STORAGE_KEY) });
   assert.equal(socket.json('claim').length, 0);
   socket.welcome();
-  const [claim] = socket.json('claim');
-  assert.equal(claim.code, 'ABCDEFGH');
+  assert.equal(socket.json('claim').length, 0);
   const client2 = { agent: 'Claude', name: 'Claude', host: 'claude.ai', redirectHost: 'claude.ai', loopback: false, known: true, registration: 'registered' };
-  socket.receive({ type: 'reply', ref: claim.ref, ok: true, value: { client: client2, expiresAt: clock.now() + 600_000 } });
+  claims.answer(0, 200, { ok: true, value: { client: client2, expiresAt: clock.now() + 600_000 } });
   const approval = await claiming;
   assert.equal(approval.display, 'ABCD-EFGH');
   assert.equal(approval.via, 'typed');
@@ -442,25 +482,48 @@ test('approvals: a claimed code says who asks; allow and deny answer it; a refus
   assert.deepEqual(client.status().approvals, []);
 
   const refused = client.claim('00000000');
-  const failed = socket.json('claim').at(-1);
-  socket.receive({ type: 'reply', ref: failed.ref, ok: false, error: { code: 'unknown', message: 'This connect code is unknown or has expired.' } });
+  claims.answer(1, 200, { ok: false, error: { code: 'unknown', message: 'This connect code is unknown or has expired.' } });
   await assert.rejects(refused, { code: 'unknown', message: 'This connect code is unknown or has expired.' });
+  const elsewhere = client.claim('22223333', { via: 'link' });
+  claims.answer(2, 200, { ok: false, error: { code: 'other-browser', message: 'This connect code was started in another browser, so it cannot connect this one.' } });
+  await assert.rejects(elsewhere, { code: 'other-browser', message: /started in another browser/ });
+  const malformed = client.claim('55556666');
+  claims.answer(3, 403, { error: 'Only a Cellucid page claims a connect code' });
+  await assert.rejects(malformed, { code: 'refused' });
   await assert.rejects(client.claim('ABC-123'), { code: 'not-a-code' });
   await assert.rejects(client.claim('ABCD-EFGU'), { code: 'not-a-code' }, 'U is not a code symbol');
+  assert.equal(claims.calls.length, 4, 'a text that is no code is never sent');
 
   // An approval nobody answers is dropped when its code expires.
   const expiring = client.claim('11112222');
-  const third = socket.json('claim').at(-1);
-  socket.receive({ type: 'reply', ref: third.ref, ok: true, value: { client: client2, expiresAt: clock.now() + 1000 } });
+  claims.answer(4, 200, { ok: true, value: { client: client2, expiresAt: clock.now() + 1000 } });
   await expiring;
   assert.equal(client.status().approvals.length, 1);
   clock.advance(1000);
   assert.equal(client.status().approvals.length, 0);
 
-  // A relay that does not answer: the request fails after a while.
+  // A relay that does not answer: the claim, and a decision, fail after a while.
+  const unanswered = client.claim('44445555');
+  clock.advance(20_000);
+  await assert.rejects(unanswered, { code: 'relay-unanswered' });
   const silent = client.deny('33334444');
   clock.advance(20_000);
   await assert.rejects(silent, { code: 'relay-unanswered' });
+});
+
+test('L26-4 / F122: an app no site vouches for acts under the name Manage… gives it; two of them are told apart', async () => {
+  const { client, seen } = setup();
+  client.start();
+  const [socket] = FakeWebSocket.made;
+  socket.welcome();
+  socket.receive({ type: 'call', id: 'u1', tool: 'color_by', args: { field: 'cell_type' }, agent: 'An app on this computer', grant: 'g1', client: 'Claude', host: null, known: false });
+  socket.receive({ type: 'call', id: 'u2', tool: 'color_by', args: { field: 'leiden' }, agent: 'An app on this computer', grant: 'g2', client: 'Claude on my phone', host: null, known: false });
+  socket.receive({ type: 'call', id: 'v1', tool: 'color_by', args: { field: 'cell_type' }, agent: 'Claude', grant: 'g3', client: 'Claude Desktop', host: 'claude.ai', known: true });
+  await flush();
+  assert.deepEqual(seen.filter(each => each.type === 'color.by').map(each => each.meta.agent), [
+    'An app on this computer (calls itself “Claude”)', 'An app on this computer (calls itself “Claude on my phone”)', 'Claude',
+  ]);
+  client.destroy();
 });
 
 test('connections, disconnect and forget', async () => {
@@ -527,6 +590,11 @@ test('the relay address: the deployed one, or a development override on a develo
   assert.equal(relayOriginForPage(globalThis.window), 'http://localhost:8787');
   globalThis.window.__CELLUCID_RELAY_ORIGIN__ = 'http://relay.example';
   assert.throws(() => relayOriginForPage(globalThis.window), /exact https/);
+  // Plain http only on a loopback host a browser trusts: never 0.0.0.0 (the tab secret goes there).
+  globalThis.window.__CELLUCID_RELAY_ORIGIN__ = 'http://0.0.0.0:8787';
+  assert.throws(() => relayOriginForPage(globalThis.window), /exact https/);
+  globalThis.window.__CELLUCID_RELAY_ORIGIN__ = 'http://127.0.0.1:8787';
+  assert.equal(relayOriginForPage(globalThis.window), 'http://127.0.0.1:8787');
   assert.throws(() => createRelayClient({ relayOrigin: 'https://relay.test/', actions: { catalog: createActionCatalog([]), subscribe: () => () => {} } }), /not exact/);
 });
 
@@ -543,16 +611,20 @@ test('the page wiring claims the code the page was opened with, pairing the brow
   FakeWebSocket.made = [];
   const actions = createActionDispatcher({ catalog: createActionCatalog(DEFINITIONS) });
   const approvals = [];
+  const claims = claimEndpoint();
+  globalThis.fetch = claims.impl;
   const client = startRelayClientForPage({ actions, onApproval: approval => approvals.push(approval) });
   assert.equal(win.cellucidConnectFragment, undefined, 'the code is taken once');
   assert.match(storage.values.get(TAB_SECRET_STORAGE_KEY), /^[A-Za-z0-9_-]{43}$/);
   const [socket] = FakeWebSocket.made;
   assert.equal(socket.url, `${DEFAULT_RELAY_ORIGIN.replace('https', 'wss')}/tab`);
   socket.welcome();
-  const [claim] = socket.json('claim');
-  assert.equal(claim.code, 'WXYZ2345');
+  const [claim] = claims.calls;
+  assert.equal(claim.url, `${DEFAULT_RELAY_ORIGIN}/oauth/claim`);
+  assert.equal(claim.init.credentials, 'include');
+  assert.equal(claim.body.code, 'WXYZ2345');
   assert.equal(socket.json('state')[0].version, '0.9.6');
-  socket.receive({ type: 'reply', ref: claim.ref, ok: true, value: { client: { agent: 'ChatGPT' }, expiresAt: Date.now() + 60_000 } });
+  claims.answer(0, 200, { ok: true, value: { client: { agent: 'ChatGPT' }, expiresAt: Date.now() + 60_000 } });
   await flush();
   assert.equal(approvals[0].via, 'link');
   client.destroy();
@@ -584,9 +656,9 @@ test('a call names its connection; the person asked about it is heard by the rel
   client.start();
   const [socket] = FakeWebSocket.made;
   socket.welcome();
-  socket.receive({ type: 'call', id: 'w1', tool: 'session_save', args: {}, agent: 'Claude', grant: 'g1', client: 'Claude Code', host: 'claude.ai' });
+  socket.receive({ type: 'call', id: 'w1', tool: 'session_save', args: {}, agent: 'Claude', grant: 'g1', client: 'Claude Code', host: 'claude.ai', known: true });
   await flush();
-  assert.deepEqual(asked, [{ connection: { id: 'g1', kind: 'connector', client: 'Claude Code', host: 'claude.ai' }, detail: null }]);
+  assert.deepEqual(asked, [{ connection: { id: 'g1', kind: 'connector', client: 'Claude Code', host: 'claude.ai', known: true }, detail: null }]);
   assert.deepEqual(socket.json('asking'), [{ type: 'asking', id: 'w1', detail: null }]);
   // The agent's time ran out: detached. The link dropping then does not withdraw the question.
   socket.receive({ type: 'detach', id: 'w1' });
@@ -598,31 +670,34 @@ test('a call names its connection; the person asked about it is heard by the rel
   assert.equal(done[0].meta.connection.id, 'g1');
 });
 
-test('the tool list says what the person\'s settings make of each question, for the connection asking', async () => {
+test('one tool list for every connection whatever its settings; each connection is told its settings after its results (L26-9)', async () => {
+  let writes = 'ask';
   const { client } = setup({
     permissionFor: ({ kind, connection }) => {
-      if (connection.id === 'g2' && kind === 'writes-file') return 'allow';
-      if (connection.id === 'g3' && kind === 'writes-file') return 'deny';
-      if (connection.id === 'g4') return kind === 'change' ? 'deny' : 'ask';
-      if (connection.id === 'g5' && kind === 'change') return 'ask';
-      return null;
+      if (kind === 'writes-file') return connection.id === 'g2' ? 'allow' : writes;
+      return kind === 'change' ? 'allow' : 'ask';
     },
   });
   client.start();
   const [socket] = FakeWebSocket.made;
   socket.welcome();
-  const description = (list, name) => list.tools.find(tool => tool.name === name).description;
-  for (const [id, grant] of [['l1', 'g1'], ['l2', 'g2'], ['l3', 'g3'], ['l4', 'g4'], ['l5', 'g5']]) socket.receive({ type: 'list', id, grant });
+  for (const [id, grant] of [['l1', 'g1'], ['l2', 'g2']]) socket.receive({ type: 'list', id, grant });
   await flush();
-  const lists = Object.fromEntries(socket.json('tools').map(message => [message.id, message]));
-  assert.match(description(lists.l1, 'session_save'), /Cellucid asks the person before it writes the file\.$/);
-  assert.match(description(lists.l2, 'session_save'), /The person's settings let this run without asking\.$/);
-  assert.match(description(lists.l3, 'session_save'), /The person's settings refuse this for you: do not call it; tell the person, who can change it in Cellucid\.$/);
-  // A change reads as the settings make changes for that connection: runs (the default), refused, asked.
-  assert.equal(description(lists.l1, 'color_by'), description(lists.l3, 'color_by'));
-  assert.match(description(lists.l1, 'color_by'), /it can be undone\.$/);
-  assert.match(description(lists.l4, 'color_by'), /The person's settings refuse this for you: do not call it; tell the person, who can change it in Cellucid\.$/);
-  assert.match(description(lists.l5, 'color_by'), /The person's settings ask them before each change: Cellucid asks, and you wait for the answer\.$/);
-  // A read reads the same whatever the settings.
-  assert.equal(description(lists.l1, 'fields_list'), description(lists.l4, 'fields_list'));
+  const lists = socket.json('tools');
+  assert.deepEqual(lists[0].tools, lists[1].tools);
+  assert.doesNotMatch(JSON.stringify(lists[0].tools), /person's settings|Cellucid asks the person before/);
+  const told = id => socket.json('result').find(message => message.id === id).result.content[0].text.split('\n').slice(1).join('\n');
+  socket.receive({ type: 'call', id: 'c1', tool: 'fields_list', args: {}, agent: 'Claude', grant: 'g1' });
+  socket.receive({ type: 'call', id: 'c2', tool: 'fields_list', args: {}, agent: 'Claude', grant: 'g2' });
+  await flush();
+  assert.match(told('c1'), /writing files[^.]*: are asked of the person first/);
+  assert.match(told('c2'), /writing files[^.]*: run without asking|run without asking[^.]*writing files/);
+  socket.receive({ type: 'call', id: 'c3', tool: 'fields_list', args: {}, agent: 'Claude', grant: 'g1' });
+  await flush();
+  assert.equal(told('c3'), '', 'told once while unchanged');
+  writes = 'deny';
+  socket.receive({ type: 'call', id: 'c4', tool: 'fields_list', args: {}, agent: 'Claude', grant: 'g1' });
+  await flush();
+  assert.match(told('c4'), /writing files: are refused/);
 });
+

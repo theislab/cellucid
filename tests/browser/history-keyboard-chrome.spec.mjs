@@ -177,9 +177,10 @@ test.describe('keys and chrome in the history', () => {
     // settling before it moves (the dispatcher's settlers).
     const errors = productErrors(page);
     await openDataset(page);
+    // The step before the drag (the dataset opens colored by cell_type, its first coloring: score is a step).
     await page.evaluate(async () => {
       const { getActions } = await import('/assets/js/app/actions/index.js');
-      await getActions().dispatch('color.by', { field: { source: 'obs', key: 'cell_type' } });
+      await getActions().dispatch('color.by', { field: { source: 'obs', key: 'score' } });
     });
     const before = await settle(page);
     const centre = await page.evaluate(() => {
@@ -194,7 +195,7 @@ test.describe('keys and chrome in the history', () => {
     // The person presses undo at once, as soon as the mouse is up.
     await page.keyboard.press('ControlOrMeta+z');
     const after = await settle(page);
-    // The drag is undone, the colouring stays, and no branch was made.
+    // The drag is undone, the coloring stays, and no branch was made.
     expect(after.head).toBe(before.head);
     expect(after.fingerprint).toEqual(before.fingerprint);
     expect(after.steps.map(step => step.type)).toEqual([...before.steps.map(step => step.type), 'camera.set']);
@@ -264,6 +265,10 @@ test.describe('keys and chrome in the history', () => {
       } else {
         await page.keyboard.press(key);
       }
+      // ? moves focus to the Keyboard shortcuts panel's header (that is what
+      // it is for), where Space would fold the panel: the rest are pressed on
+      // the plot again, as a person clicks back on it.
+      if (key === 'Shift+Slash') await page.locator('#glcanvas').focus();
       const after = await settle(page);
       outcomes.push(`${key}: ${verdict(facts, after)}${newTypes(facts, after).length ? ` (${newTypes(facts, after).join(', ')})` : ''}`);
       facts = after;
@@ -325,10 +330,10 @@ test.describe('keys and chrome in the history', () => {
     expect(verdict(closed, reopened)).toBe('nothing');
 
     // A step taken in the sheet, then Undo in the sheet: the step is undone
-    // and the sheet stays open.
-    await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
-    const coloured = await settle(page);
-    expect(newTypes(reopened, coloured)).toEqual(['color.by']);
+    // and the sheet stays open. (The dataset opens colored by cell_type, its first coloring: score is a step.)
+    await page.locator('#continuous-field').selectOption({ label: 'score' });
+    const colored = await settle(page);
+    expect(newTypes(reopened, colored)).toEqual(['color.by']);
     const undo = page.locator('#history-undo-btn');
     await undo.click();
     const undone = await settle(page);

@@ -24,7 +24,7 @@
 
 import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy, hostFaultOfResponse } from '../../data-source.js';
 import { chooseOpenableFile, describeRemoteFile } from '../remote-file.js';
-import { folderFormatOfName, titleOfName } from '../../input-formats.js';
+import { folderFormatOfName, storeFolderOfPath, titleOfName } from '../../input-formats.js';
 
 const HUB = 'https://huggingface.co';
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -54,7 +54,8 @@ function parseHf(input, explicit = true) {
     // a short form
   }
   if (url !== null) {
-    if (url.hostname.toLowerCase() !== 'huggingface.co') return null;
+    // `hf.co` is the Hub's short address (it redirects to huggingface.co).
+    if (!['huggingface.co', 'www.huggingface.co', 'hf.co'].includes(url.hostname.toLowerCase())) return null;
     const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
     if (parts[0] !== 'datasets' || parts.length < 3) return null;
     [, user, repo] = parts;
@@ -73,7 +74,8 @@ function parseHf(input, explicit = true) {
   }
   if (!NAME.test(user) || !NAME.test(repo) || !REVISION.test(revision)) return null;
   if (path !== '' && !safePath(path)) return null;
-  return { user, repo, revision, path };
+  // A link to what is inside a store folder (its `.zmetadata`) is the store.
+  return { user, repo, revision, path: storeFolderOfPath(path) ?? path };
 }
 
 function canonical({ user, repo, revision, path }) {

@@ -8,10 +8,16 @@
  * - **Deleting a saved state of this browser** (`history.saved.delete`,
  *   effect `outside`, asked of an agent as `deletes-saved`): nothing in the
  *   history shown changes, and nothing brings it back.
+ * - **Opening a saved state to continue it** (`history.saved.open`, effect
+ *   `dataset`: Load…'s Open, its dataset first when another is shown, then
+ *   its history; a whole-file download asked of an agent as
+ *   `large-download`): provided with the dataset opening
+ *   (`ui/modules/dataset-open-action.js`), whose download gate and opening
+ *   it shares.
  * - **Moves** (effect `history`, nothing to undo but the move itself):
  *   undo, redo, a jump, switching branch, using another tracker, starting a
  *   branch from a step (`history.branch.create`, which names the branch the
- *   next step starts) and cancelling it; the recording switch
+ *   next step starts) and canceling it; the recording switch
  *   (`history.recording.pause`: changes apply without a step, asked of an
  *   agent as `pauses-recording`; `history.recording.resume`: one squashed
  *   step holds what differs, never asked).
@@ -73,8 +79,9 @@
 import { defineAction } from '../catalog.js';
 import { PLAIN_QUOTE } from '../targets/names.js';
 import { DOMAIN_IDS } from '../domains.js';
+import { ACTION_HOSTS } from '../dispatcher.js';
 import {
-  APPLY_ROW_KINDS, APPLY_ROW_STATUSES, BY_ORIGINS, HISTORY_HOSTS, HISTORY_ID_PATTERNS, REPLAY_MISSING_KINDS, REPLAY_OUTCOMES, SHARE_CONTENTS, SHARE_RESULTS, SHARE_SOURCES,
+  APPLY_ROW_KINDS, APPLY_ROW_STATUSES, BY_ORIGINS, HISTORY_ID_PATTERNS, idNumber, REPLAY_MISSING_KINDS, REPLAY_OUTCOMES, SHARE_CONTENTS, SHARE_RESULTS, SHARE_SOURCES,
   SHARE_TIMES, SQUASH_CAUSES, STEP_KINDS, STEP_STATUSES, TRACKER_START_KINDS,
 } from '../../history/model.js';
 import { RESULT_TEXT_CHARS } from '../../agent/bridge/relay-protocol.js';
@@ -120,7 +127,7 @@ const GROUP_REF = Object.freeze({
   type: 'string', minLength: 1, examples: ['QC'],
   description: 'A group by its name or its id (history_summary lists them).',
 });
-const TURN_ID = Object.freeze({ type: 'string', minLength: 1, examples: ['turn-1'], description: 'A turn, by its id (history_summary lists them).' });
+const TURN_ID = Object.freeze({ type: 'string', minLength: 1, examples: ['turn-1'], description: 'A turn, by its id: each change an agent makes names its turn in its result (step.turn); history_summary lists them all.' });
 const TEXT = Object.freeze({
   type: 'string', minLength: 1, examples: ['Top hits match the paper.'],
   description: 'Markdown: emphasis, inline code and http(s) links; shown without HTML.',
@@ -138,7 +145,7 @@ const BY = Object.freeze({
     origin: { enum: [...BY_ORIGINS], description: 'user (the person), agent, host (a notebook), session, replay, startup, or outside (not recorded as an action).' },
     agent: { type: ['string', 'null'], description: 'The agent, for an agent.' },
     model: { type: ['string', 'null'], description: 'The agent\'s model, when known.' },
-    host: { enum: [...HISTORY_HOSTS, null], description: 'The notebook language, for a host.' },
+    host: { enum: [...ACTION_HOSTS, null], description: 'The notebook language, for a host.' },
     person: { type: ['string', 'null'], description: 'The person\'s name, only when they chose to record it.' },
     turn: { type: ['string', 'null'], description: 'The turn it belongs to.' },
   },
@@ -305,8 +312,22 @@ function onTracker(params, quote = PLAIN_QUOTE) {
   return params.tracker === undefined ? '' : ` of tracker ${quote(params.tracker)}`;
 }
 
+/**
+ * A step as the person reads it in the State panel: "step 3" (its number),
+ * never its id ("s3"), which only an agent's calls use; a step named another
+ * way (a bookmark) by its name.
+ */
+function stepWords(step, quote = PLAIN_QUOTE) {
+  return HISTORY_ID_PATTERNS.step.test(step) ? `step ${idNumber(step)}` : `step ${quote(step)}`;
+}
+
+/** Steps `from` to `to` as the person reads them ("steps 4 to 9"). */
+function stepsWords(from, to, quote = PLAIN_QUOTE) {
+  return `steps ${stepWords(from, quote).slice(5)} to ${stepWords(to, quote).slice(5)}`;
+}
+
 function targetText(target, quote = PLAIN_QUOTE) {
-  if (target.step !== undefined) return `step ${target.step}`;
+  if (target.step !== undefined) return stepWords(target.step, quote);
   if (target.branch !== undefined) return `branch ${quote(target.branch)}`;
   if (target.turn !== undefined) return 'a turn';
   return `tracker ${quote(target.tracker)}`;
@@ -372,16 +393,17 @@ export const historyActions = Object.freeze([
   }),
   defineAction({
     type: 'history.summary',
-    title: 'Summarise the history',
-    summary: 'The history at a glance: trackers, branches (fork step, tip, steps, main, locked, archived), bookmarks, turns with their summaries, stale results and Recently deleted, without the steps. Read it before acting on the history.',
+    title: 'Summarize the history',
+    summary: 'The history at a glance: trackers, branches (fork step, tip, steps, main, locked, archived), bookmarks, turns, stale results and Recently deleted, without the steps; the notes on the tracker, each branch, group and turn in full (a shared session\'s notes are its sender\'s account). Read it before acting on the history.',
     group: GROUP,
     params: object([], { tracker: TRACKER }),
     reads: [],
     effect: 'read',
     result: object(
-      ['tracker', 'trackers', 'head', 'active_branch', 'main_branch', 'recording', 'pending', 'steps', 'branches', 'groups', 'bookmarks', 'turns', 'stale', 'recently_deleted'],
+      ['tracker', 'notes', 'trackers', 'head', 'active_branch', 'main_branch', 'recording', 'pending', 'steps', 'branches', 'groups', 'bookmarks', 'turns', 'stale', 'recently_deleted'],
       {
         tracker: ID_NAME,
+        notes: { type: 'array', items: NOTE, description: 'The notes on the tracker itself (the methods paragraph\'s opening).' },
         trackers: {
           type: 'array', description: 'Every tracker not removed.',
           items: object(['id', 'name', 'active', 'steps', 'start'], {
@@ -410,7 +432,7 @@ export const historyActions = Object.freeze([
             base: { type: ['string', 'null'], description: 'The step it forks from.' },
             tip: { type: 'string' }, steps: { type: 'integer', description: 'Its own steps.' },
             main: { type: 'boolean' }, locked: { type: 'boolean' }, archived: { type: 'boolean' }, active: { type: 'boolean' },
-            notes: { type: 'integer' },
+            notes: { type: 'array', items: NOTE },
           }),
         },
         groups: {
@@ -418,15 +440,15 @@ export const historyActions = Object.freeze([
           items: object(['id', 'name', 'branch', 'first', 'last', 'steps', 'notes'], {
             id: { type: 'string' }, name: { type: 'string' }, branch: { type: 'string' },
             first: { type: 'string', description: 'Its first step.' }, last: { type: 'string', description: 'Its last step.' },
-            steps: { type: 'integer' }, notes: { type: 'integer' },
+            steps: { type: 'integer' }, notes: { type: 'array', items: NOTE },
           }),
         },
         bookmarks: { type: 'array', items: object(['name', 'step'], { name: { type: 'string' }, step: { type: 'string' } }) },
         turns: {
           type: 'array',
-          items: object(['id', 'label', 'by', 'steps', 'branch', 'summary'], {
+          items: object(['id', 'label', 'by', 'steps', 'branch', 'notes'], {
             id: { type: 'string' }, label: { type: 'string' }, by: BY, steps: { type: 'integer' },
-            branch: { type: 'string' }, summary: { type: ['string', 'null'], description: 'Its first note.' },
+            branch: { type: 'string' }, notes: { type: 'array', items: NOTE, description: 'Its notes; the first is its summary.' },
           }),
         },
         stale: { type: 'integer', description: 'Results whose inputs changed since (history_stale lists them).' },
@@ -479,7 +501,7 @@ export const historyActions = Object.freeze([
         shown: { type: 'boolean', description: 'On the path to the step shown now.' },
       },
     ),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Read step ${quote.bare(params.step)}`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Read ${stepWords(params.step, quote)}`,
     code: params => `history_step(${args(params, ['step', 'tracker'])})`,
   }),
   defineAction({
@@ -504,7 +526,7 @@ export const historyActions = Object.freeze([
         }),
       },
     }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Compared step ${quote.bare(params.a.step)} with step ${quote.bare(params.b.step)}`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Compared ${stepWords(params.a.step, quote)} with ${stepWords(params.b.step, quote)}`,
     code: params => `history_diff(${JSON.stringify(params.a.step)}, ${JSON.stringify(params.b.step)})`,
   }),
   defineAction({
@@ -623,6 +645,30 @@ export const historyActions = Object.freeze([
     code: params => `history_saved_delete(${JSON.stringify(params.saved)})`,
   }),
   defineAction({
+    type: 'history.saved.open',
+    title: 'Open a saved state',
+    summary: 'Open one saved state of this browser (by its id from history_saved_list) to continue it, as Load…\'s Open does: its dataset first when another is shown (with the cells it was saved on), then its history, which goes on where it left off (an autosave keeps being written; a named save stays as it was and the history goes on as a new autosave). The history shown before stays kept in this browser while Autosave keeps it (steps it does not keep are asked about first). To apply its steps to the dataset shown instead, use history_replay. A whole-file download is asked about first.',
+    group: GROUP,
+    params: object(['saved'], {
+      saved: { type: 'string', minLength: 1, examples: ['state-1'], description: 'Its id (history_saved_list).' },
+    }),
+    reads: [],
+    effect: 'dataset',
+    confirm: 'large-download',
+    confirmAt: 'handler',
+    result: object(['saved', 'name', 'dataset', 'steps', 'dataset_opened', 'already_shown', 'not_restored'], {
+      saved: { type: 'string' },
+      name: { type: ['string', 'null'], description: 'Its name; null for an autosave.' },
+      dataset: { type: ['string', 'null'], description: 'The name of its dataset, now open.' },
+      steps: { type: 'integer' },
+      dataset_opened: { type: 'boolean', description: 'Its dataset was opened first (another one was shown).' },
+      already_shown: { type: 'boolean', description: 'It is the history shown already, which goes on; nothing was opened.' },
+      not_restored: { type: ['string', 'null'], description: 'Null when every part was restored. Otherwise each part that could not be (a state domain such as the Expression values, a tracker\'s steps), one sentence each, as the person was told: that part is left as it was shown (a part saved by another version of Cellucid that this one cannot read says so), the rest is restored, and the saved state is kept as it was while the history goes on beside it.' },
+    }),
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Opened the saved state ${quote.bare(params.saved)}`,
+    code: params => `history_saved_open(${JSON.stringify(params.saved)})`,
+  }),
+  defineAction({
     type: 'history.undo',
     title: 'Undo',
     summary: 'Show the state before the step shown now, as the State panel\'s Undo does; the step stays in the history, to redo.',
@@ -665,7 +711,7 @@ export const historyActions = Object.freeze([
     reads: [],
     effect: 'history',
     result: object(['head'], { head: HEAD }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => (params.step !== undefined ? `Showed step ${quote.bare(params.step)}`
+    describe: (params, outcome, quote = PLAIN_QUOTE) => (params.step !== undefined ? `Showed ${stepWords(params.step, quote)}`
       : params.bookmark !== undefined ? `Showed the bookmark ${quote(params.bookmark)}` : 'Showed the step at a time'),
     code: params => `jump(${args(params, ['step', 'bookmark', 'at'])})`,
   }),
@@ -692,7 +738,7 @@ export const historyActions = Object.freeze([
     result: object(['pending', 'from', 'head'], {
       pending: { type: 'string', description: 'The name the next change\'s branch takes.' }, from: { type: 'string' }, head: HEAD,
     }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => (params.name === undefined ? `Branched from step ${quote.bare(params.step)}` : `Branched ${quote(params.name)} from step ${quote.bare(params.step)}`),
+    describe: (params, outcome, quote = PLAIN_QUOTE) => (params.name === undefined ? `Branched from ${stepWords(params.step, quote)}` : `Branched ${quote(params.name)} from ${stepWords(params.step, quote)}`),
     code: params => `branch_here(${args(params, ['step', 'name'])})`,
   }),
   defineAction({
@@ -704,7 +750,7 @@ export const historyActions = Object.freeze([
     reads: [],
     effect: 'history',
     result: object(['cancelled'], { cancelled: { type: ['string', 'null'], description: 'The name forgotten; null when none was set.' } }),
-    describe: () => 'Cancelled the new branch',
+    describe: () => 'Canceled the new branch',
     code: () => 'cancel_branch()',
   }),
   defineAction({
@@ -790,7 +836,7 @@ export const historyActions = Object.freeze([
     reads: [],
     effect: 'history',
     result: NEW_BRANCH,
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Branched without step ${quote.bare(params.step)}`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Branched without ${stepWords(params.step, quote)}`,
     code: params => `branch_without(${args(params, ['step', 'name'])})`,
   }),
   defineAction({
@@ -848,7 +894,7 @@ export const historyActions = Object.freeze([
       head: HEAD,
       journal: { type: 'string', description: 'Its Recently deleted entry.' },
     }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Deleted step ${quote.bare(params.step)}`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Deleted ${stepWords(params.step, quote)}`,
     code: params => `delete_step(${JSON.stringify(params.step)})`,
   }),
   defineAction({
@@ -861,7 +907,7 @@ export const historyActions = Object.freeze([
     reads: [],
     context: ['history'],
     effect: 'state',
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Reverted step ${quote.bare(params.step)}`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Reverted ${stepWords(params.step, quote)}`,
     code: params => `revert_step(${JSON.stringify(params.step)})`,
   }),
   defineAction({
@@ -883,7 +929,7 @@ export const historyActions = Object.freeze([
       head: HEAD,
       journal: { type: 'string', description: 'Its Recently deleted entry.' },
     }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Merged steps ${quote.bare(params.from)} to ${quote.bare(params.to)} into one`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Merged ${stepsWords(params.from, params.to, quote)} into one`,
     code: params => `squash(${JSON.stringify(params.from)}, ${JSON.stringify(params.to)})`,
   }),
   defineAction({
@@ -908,7 +954,7 @@ export const historyActions = Object.freeze([
   defineAction({
     type: 'history.recording.pause',
     title: 'Pause recording',
-    summary: 'Pause the history of a tracker: changes still apply but make no step until it is resumed, and an agent\'s change cannot be undone on its own meanwhile. Ask the person first.',
+    summary: 'Pause the history of a tracker: changes still apply but make no step until it is resumed, and an agent\'s change cannot be undone on its own meanwhile.',
     group: GROUP,
     params: object([], { tracker: TRACKER }),
     reads: [],
@@ -951,7 +997,7 @@ export const historyActions = Object.freeze([
     result: object(['group', 'steps', 'journal'], {
       group: ID_NAME, steps: { type: 'integer', description: 'Steps in it.' }, journal: { type: 'string', description: 'Its Recently changed entry.' },
     }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Grouped steps ${quote.bare(params.from)} to ${quote.bare(params.to)} as ${quote(params.name)}`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Grouped ${stepsWords(params.from, params.to, quote)} as ${quote(params.name)}`,
     code: params => `group_steps(${JSON.stringify(params.from)}, ${JSON.stringify(params.to)}, ${JSON.stringify(params.name)})`,
   }),
   defineAction({
@@ -969,7 +1015,7 @@ export const historyActions = Object.freeze([
   defineAction({
     type: 'history.group.extend',
     title: 'Add steps to a group',
-    summary: 'Extend a group to a later step of its branch, taking in every step between (whole turns, none of another group).',
+    summary: 'Extend a group to a later step of its branch, taking in every step between (whole turns, none of another group). A turn\'s later steps join its group by themselves.',
     group: GROUP,
     params: object(['group', 'to'], {
       group: GROUP_REF,
@@ -979,7 +1025,7 @@ export const historyActions = Object.freeze([
     reads: [],
     effect: 'history',
     result: object(['group', 'steps', 'journal'], { group: ID_NAME, steps: { type: 'integer', description: 'Steps in it now.' }, journal: { type: 'string' } }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Extended the group ${quote(params.group)} to step ${quote.bare(params.to)}${onTracker(params, quote)}`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Extended the group ${quote(params.group)} to ${stepWords(params.to, quote)}${onTracker(params, quote)}`,
     code: params => `extend_group(${args(params, ['group', 'to', 'tracker'])})`,
   }),
   defineAction({
@@ -1018,7 +1064,7 @@ export const historyActions = Object.freeze([
     reads: [],
     effect: 'history',
     result: object(['note', 'journal'], { note: { type: 'string' }, journal: { type: 'string' } }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Edited note ${quote.bare(params.note)}`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => 'Edited a note',
     code: params => `edit_note(${args(params, ['note', 'text', 'tracker'])})`,
   }),
   defineAction({
@@ -1030,7 +1076,7 @@ export const historyActions = Object.freeze([
     reads: [],
     effect: 'history',
     result: object(['note', 'journal'], { note: { type: 'string' }, journal: { type: 'string' } }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Removed note ${quote.bare(params.note)}`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => 'Removed a note',
     code: params => `remove_note(${args(params, ['note', 'tracker'])})`,
   }),
   defineAction({
@@ -1045,7 +1091,7 @@ export const historyActions = Object.freeze([
     reads: [],
     effect: 'history',
     result: object(['step', 'bookmark', 'journal'], { step: { type: 'string' }, bookmark: { type: ['string', 'null'] }, journal: { type: 'string' } }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => (params.name === null ? `Removed the bookmark of step ${quote.bare(params.step)}` : `Bookmarked step ${quote.bare(params.step)} ${quote(params.name)}`),
+    describe: (params, outcome, quote = PLAIN_QUOTE) => (params.name === null ? `Removed the bookmark of ${stepWords(params.step, quote)}` : `Bookmarked ${stepWords(params.step, quote)} as ${quote(params.name)}`),
     code: params => `bookmark(${JSON.stringify(params.step)}, ${JSON.stringify(params.name)})`,
   }),
   defineAction({
@@ -1135,7 +1181,7 @@ export const historyActions = Object.freeze([
       branch: { oneOf: [ID_NAME, { type: 'null', description: 'Restored exactly, or no step was applied again.' }], description: 'The first branch a restore as new made of the steps it applied again.' },
       report: { ...REPLAY_REPORT, description: 'The steps a restore as new applied again and what became of each (empty for an exact restore).' },
     }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Restored ${quote.bare(params.entry)}${onTracker(params, quote)}`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Restored an entry of Recently deleted${onTracker(params, quote)}`,
     code: params => `restore(${args(params, ['entry', 'tracker'])})`,
   }),
   defineAction({
@@ -1148,7 +1194,7 @@ export const historyActions = Object.freeze([
     effect: 'history',
     confirm: 'deletes-saved',
     result: object(['purged', 'bytes'], { purged: { type: 'integer' }, bytes: { type: 'integer', description: 'Memory freed.' } }),
-    describe: (params, outcome, quote = PLAIN_QUOTE) => (params.entry === undefined ? 'Emptied Recently deleted' : `Emptied ${quote.bare(params.entry)} from Recently deleted`),
+    describe: (params, outcome, quote = PLAIN_QUOTE) => (params.entry === undefined ? 'Emptied Recently deleted' : 'Emptied an entry of Recently deleted'),
     code: params => `empty_recently_deleted(${args(params, ['entry', 'tracker'])})`,
   }),
   defineAction({
@@ -1334,7 +1380,7 @@ export const historyActions = Object.freeze([
 
 /**
  * What a `history.share` or `history.save` writes, from its parameters (the
- * catalogue's defaults applied): one rule for the panel, agents, Python and R.
+ * catalog's defaults applied): one rule for the panel, agents, Python and R.
  * A state names nobody and keeps no notes, conversations, Recently deleted or
  * times unless asked; steps only never hold results.
  *

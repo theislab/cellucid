@@ -14,26 +14,28 @@
  * @module ui/core/visibility-gate
  */
 
+import { createListenerSet } from '../../../utils/listener-set.js';
+
 const SIDEBAR_ID = 'sidebar';
 
 /** One observer of the sidebar's `hidden` class, shared by every gate. */
-const sidebarListeners = new Set();
+const sidebarListeners = createListenerSet('the sidebar shown or hidden');
 let sidebarObserver = null;
 
 function watchSidebar(ownerDocument, listener) {
-  sidebarListeners.add(listener);
+  const unsubscribe = sidebarListeners.add(listener);
   if (sidebarObserver === null) {
     const sidebar = ownerDocument.getElementById(SIDEBAR_ID);
     const View = ownerDocument.defaultView;
     if (sidebar !== null && typeof View?.MutationObserver === 'function') {
       sidebarObserver = new View.MutationObserver(() => {
-        for (const notify of [...sidebarListeners]) notify();
+        sidebarListeners.notify();
       });
       sidebarObserver.observe(sidebar, { attributes: true, attributeFilter: ['class'] });
     }
   }
   return () => {
-    sidebarListeners.delete(listener);
+    unsubscribe();
     if (sidebarListeners.size === 0 && sidebarObserver !== null) {
       sidebarObserver.disconnect();
       sidebarObserver = null;

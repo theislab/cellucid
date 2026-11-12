@@ -41,6 +41,7 @@ import {
   pairwiseDistanceRows
 } from './hierarchical-clustering.js';
 import { markerStatisticsCSV, perCellCSVRows } from './csv-export.js';
+import { clearCellScale, setCellScale } from './task-values.js';
 import {
   plotlyViolinDensitySlice,
   plotlyViolinPlan
@@ -69,7 +70,7 @@ export function computeCorrelation(payload) {
     return { r: NaN, pValue: NaN, n: 0, method };
   }
 
-  // Centred two-pass moments over the finite pairs: one-pass sums cancel to a
+  // Centered two-pass moments over the finite pairs: one-pass sums cancel to a
   // negative variance for a constant non-dyadic variable (r = NaN) and lose
   // every digit under a large offset.
   const moments = pairedCentredMoments(xValues, yValues);
@@ -543,7 +544,7 @@ export function computeCsvExport(payload) {
 
 /**
  * One gene column's moments over every cell (`gene-statistics.js`
- * `columnMoments`: the mean and centred sum of squares of its finite values,
+ * `columnMoments`: the mean and centered sum of squares of its finite values,
  * exactly 0 for a constant column; its non-zero finite values; its finite
  * values `n`) -- every cell genes are read for, when they are read for the
  * first `readCells` open cells only (`shared/gene-sample-cells.js`): a
@@ -646,6 +647,10 @@ export function executeOperation(operationType, payload) {
       return computeGroupSummaryOfGenes(payload);
     case OperationType.GROUP_SUMMARY_CLEAR_CONTEXT:
       return clearGroupSummaryContext(payload);
+    case OperationType.SET_CELL_SCALE:
+      return setCellScale(payload);
+    case OperationType.CLEAR_CELL_SCALE:
+      return clearCellScale(payload);
     default:
       throw new Error(`Unknown operation type: ${operationType}`);
   }
@@ -689,7 +694,7 @@ export function setGroupSummaryContext(payload) {
 }
 
 /**
- * Summarise a run of genes over the held groups.
+ * Summarize a run of genes over the held groups.
  *
  * @param {{contextId: string, columns: Array<Float32Array|{length: number, indices: Uint32Array, values: Float32Array}>, cutoff: number, bins: number}} payload
  */

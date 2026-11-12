@@ -10,7 +10,7 @@
  * 2. Atmospheric fog. `fogDensity` starts at 0.5 and the `full` point shader
  *    fades and thins every point with distance, which is the depth cue a 3D
  *    scatter reads by. The `full-vector` and `optimized-vector` SVG strategies
- *    emitted raw colours, flattening the depth axis with no warning.
+ *    emitted raw colors, flattening the depth axis with no warning.
  * 3. The velocity vector field. Connectivity edges block the export; the
  *    velocity overlay, which is equally a data layer, did not.
  *
@@ -187,6 +187,8 @@ function cameraRenderState(eye, overrides = {}) {
     },
     bgColor: Float32Array.from([0.965, 0.965, 0.970]),
     cameraDistance: Math.hypot(eye[0], eye[1], eye[2]),
+    // The sprite cap (rendering/point-sprite.js).
+    pointSizeMax: 160,
     cameraPosition: [...eye],
     far,
     fogColor: Float32Array.from([0.965, 0.965, 0.970]),
@@ -414,7 +416,7 @@ test('only the planes facing the camera are drawn', () => {
   );
 });
 
-test('every rule carries a positive stroke width and an exact hex colour', () => {
+test('every rule carries a positive stroke width and an exact hex color', () => {
   for (const segment of gridModel().segments) {
     assert.ok(segment.widthPx > 0);
     assert.match(segment.color, /^#[0-9a-f]{6}$/);
@@ -423,7 +425,7 @@ test('every rule carries a positive stroke width and an exact hex colour', () =>
   }
 });
 
-test('each rule class carries the exact colour the shader computes', () => {
+test('each rule class carries the exact color the shader computes', () => {
   // A second implementation, transcribed straight from GRID_FS_SOURCE rather
   // than reused from the export module, so agreement means the arithmetic is
   // right and not merely self-consistent.
@@ -457,7 +459,7 @@ test('each rule class carries the exact colour the shader computes', () => {
   const colors = new Set(model.segments.map((segment) => segment.color));
 
   // Minor-only rule.
-  assert.ok(colors.has(rule(minorStrength)), 'minor rule colour');
+  assert.ok(colors.has(rule(minorStrength)), 'minor rule color');
   // A major coordinate is also a minor coordinate, so the strengths add.
   assert.ok(colors.has(rule(minorStrength + majorStrength)), 'major rule core');
   // The box edge is minor + major + frame in its core, frame alone in its wings.
@@ -466,7 +468,7 @@ test('each rule class carries the exact colour the shader computes', () => {
     'frame rule core'
   );
   assert.ok(colors.has(rule(frameStrength)), 'frame rule wing');
-  // The X origin rule runs along x, so it takes the X axis colour.
+  // The X origin rule runs along x, so it takes the X axis color.
   assert.ok(
     colors.has(rule(minorStrength + majorStrength, { axis: true })),
     'origin axis core'
@@ -671,6 +673,7 @@ function gridPayload({ referenceGrid, strategy = 'full-vector', background = 'vi
     data: {
       centroidColors: null,
       centroidFlags: { labels: false, points: false },
+      vectorField: null,
       centroidLabelTexts: [],
       centroidPositions: null,
       colors: Uint8Array.from([220, 30, 30, 255, 30, 30, 220, 255]),
@@ -681,6 +684,7 @@ function gridPayload({ referenceGrid, strategy = 'full-vector', background = 'vi
     },
     id: 'live',
     label: 'Live',
+    name: null,
     renderState,
     scientificState: {
       datasetGeneration: 3,
@@ -701,6 +705,7 @@ function gridPayload({ referenceGrid, strategy = 'full-vector', background = 'vi
     dpi: null,
     format: 'svg',
     height,
+    gridColumns: 1,
     meta: {
       datasetName: 'Suo',
       datasetId: 'suo-2022',
@@ -711,6 +716,8 @@ function gridPayload({ referenceGrid, strategy = 'full-vector', background = 'vi
         filters: [],
         id: 'live',
         label: 'Live',
+        name: null,
+        vectorField: null,
       }],
     },
     options: {
@@ -740,7 +747,7 @@ function gridPayload({ referenceGrid, strategy = 'full-vector', background = 'vi
       xLabel: 'UMAP 1',
       yLabel: 'UMAP 2',
     },
-    selection: { highlightArray: null, totalCount: 0, visibleCount: 0 },
+    selection: { highlightArray: null, pageName: null, totalCount: 0, visibleCount: 0 },
     title: '',
     views: [view],
     width,
@@ -838,8 +845,8 @@ test('the fog evaluator reproduces the shader formula', async () => {
   assert.ok(Math.abs(fog.transmittanceAt(0, 0, -1.5) - far) < 1e-6);
   assert.ok(far < near, 'the farther point must be more attenuated');
 
-  // Over a backdrop of the fog colour the opacity law draws exactly what the
-  // colour-mixing law drew: a T c + (1 - a T) bg with a = 0.1 + 0.9 T.
+  // Over a backdrop of the fog color the opacity law draws exactly what the
+  // color-mixing law drew: a T c + (1 - a T) bg with a = 0.1 + 0.9 T.
   for (const t of [0, 0.3, 0.75, 1]) {
     assert.ok(Math.abs(applyFogAlpha(t, 0.8) - (0.1 + 0.9 * t) * t * 0.8) < 1e-12);
   }
@@ -858,8 +865,8 @@ test('shader qualities without fog get no fog', () => {
   assert.equal(createFogEvaluator(null), null);
 });
 
-test('sculpted points take the fog colour but stay opaque', () => {
-  // HP_FS_SCULPTED fades the colour toward the fog colour and never thins the
+test('sculpted points take the fog color but stay opaque', () => {
+  // HP_FS_SCULPTED fades the color toward the fog color and never thins the
   // point; `full` does both. The vector strategies must follow each.
   const sculpted = createFogEvaluator(lookDownZRenderState({ shaderQuality: 'sculpted' }));
   const full = createFogEvaluator(lookDownZRenderState({ shaderQuality: 'full' }));
@@ -882,7 +889,7 @@ test('full-vector SVG fades distant points exactly as the viewer does', async ()
   )];
   assert.equal(circles.length, 2, 'both points are drawn');
 
-  // Fog thins a circle toward the paper; its colour is its own.
+  // Fog thins a circle toward the paper; its color is its own.
   const fog = createFogEvaluator(lookDownZRenderState());
   const expected = [
     { z: 1.5, rgb: [220, 30, 30] },
@@ -923,7 +930,7 @@ test('optimized-vector SVG carries the same fog as full-vector', async () => {
   };
   const optimized = await read('optimized-vector');
   assert.deepEqual(optimized, await read('full-vector'));
-  // Both strategies used to emit the source colours at full opacity.
+  // Both strategies used to emit the source colors at full opacity.
   assert.equal(optimized.some((entry) => entry.endsWith('@1')), false);
 });
 
@@ -950,7 +957,7 @@ test('the PNG renderer draws the same reference grid the SVG does', async () => 
 
 test('a white figure fogs toward the paper, not the viewer background', async () => {
   // Fog is opacity, so whatever the paper is, a fogged circle fades into it:
-  // the circle keeps its own colour and carries the fog in fill-opacity.
+  // the circle keeps its own color and carries the fog in fill-opacity.
   const svg = await new Response(
     await renderFigureToSvgBlob({
       payload: gridPayload({ referenceGrid: null, background: 'white' }),
@@ -959,7 +966,7 @@ test('a white figure fogs toward the paper, not the viewer background', async ()
   const fog = createFogEvaluator(lookDownZRenderState());
   const alpha = applyFogAlpha(fog.transmittanceAt(0, 0, -1.5), 1);
   const match = svg.match(/fill="rgb\(30,30,220\)" fill-opacity="([\d.]+)"/);
-  assert.ok(match, 'the far circle keeps its colour');
+  assert.ok(match, 'the far circle keeps its color');
   assert.ok(Math.abs(Number(match[1]) - alpha) < 0.001);
 });
 
@@ -984,7 +991,7 @@ test('the velocity overlay state is read from the control that owns it', () => {
   assert.equal(readVelocityOverlayEnabled(null), null);
 });
 
-test('an enabled velocity field blocks the export, as connectivity already does', () => {
+test('a shown vector field is drawn, not blocked; the edges still block (R9V-10)', () => {
   const off = documentWith({ 'velocity-overlay-enabled': { checked: false } });
   const on = documentWith({ 'velocity-overlay-enabled': { checked: true } });
 
@@ -992,20 +999,17 @@ test('an enabled velocity field blocks the export, as connectivity already does'
     buildOverlayFidelityWarnings({ documentRef: off, connectivityVisible: false }),
     []
   );
-
-  const velocity = buildOverlayFidelityWarnings({
-    documentRef: on,
-    connectivityVisible: false,
-  });
-  assert.equal(velocity.length, 1);
-  assert.match(velocity[0].title, /Velocity overlay not exported/);
-  assert.match(velocity[0].detail, /point layer only/i);
+  // The figure draws it as arrows on a grid (components/vector-field-figure.js).
+  assert.deepEqual(
+    buildOverlayFidelityWarnings({ documentRef: on, connectivityVisible: false }),
+    []
+  );
 
   const both = buildOverlayFidelityWarnings({
     documentRef: on,
     connectivityVisible: true,
   });
-  assert.equal(both.length, 2);
+  assert.equal(both.length, 1);
   assert.match(both[0].title, /Connectivity overlay not exported/);
 
   const unreadable = buildOverlayFidelityWarnings({
@@ -1045,7 +1049,7 @@ test('annotation ink follows the figure background, not a fixed near-black', () 
   assert.ok(luma(light.mutedText) < luma('#f6f6f7'));
   assert.ok(luma(dark.mutedText) > luma('#141719'));
 
-  // A transparent figure lands on paper of unknown colour; light is the safe
+  // A transparent figure lands on paper of unknown color; light is the safe
   // assumption and the one the label halo already makes.
   assert.equal(
     resolveFigureInk({ background: 'transparent', backgroundColor: '#000000' }).scheme,

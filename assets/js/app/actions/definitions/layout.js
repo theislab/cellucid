@@ -5,7 +5,7 @@
  *
  * A section is named by its title as the sidebar shows it ("Visualization")
  * or by its id. The owners provide the implementations: the dockable panels
- * (`app/dockable-accordions.js`: float, dock, place; their buttons dispatch,
+ * (`app/dockable-accordions.js`: float, dock, dock all, place; their buttons dispatch,
  * a drag or a resize is recorded when it ends), the sidebar
  * (`ui/modules/sidebar-controls.js`: shown, width), the sections and the
  * theme (`ui/modules/layout-actions.js`, recorded by observation of the
@@ -96,6 +96,20 @@ export const layoutActions = Object.freeze([
     code: params => `dock_panel(${JSON.stringify(params.panel)})`,
   }),
   defineAction({
+    type: 'layout.panel.dock-all',
+    title: 'Dock every section',
+    summary: 'Put every floating sidebar section back into the sidebar, each where it was (the sidebar\'s Dock all button).',
+    group: 'Layout',
+    params: { type: 'object', additionalProperties: false, properties: {} },
+    touches: ['layout'],
+    reads: [],
+    effect: 'layout',
+    describe: (params, outcome) => (Array.isArray(outcome?.panels)
+      ? `Docked ${formatCountOf(outcome.panels.length, 'section')}`
+      : 'Docked every section'),
+    code: () => 'dock_all_panels()',
+  }),
+  defineAction({
     type: 'layout.panel.place',
     title: 'Move or resize a floating section',
     summary: 'Give a floating sidebar section a place and size; it is kept inside the window.',
@@ -171,7 +185,9 @@ export const layoutActions = Object.freeze([
       type: 'object', additionalProperties: false, required: ['theme'],
       properties: { theme: { type: 'string', enum: ['light', 'dark'] } },
     },
-    touches: ['layout'],
+    // A viewer background never chosen follows the theme (`render-controls.js`
+    // `followTheme`): the step holds that change of the settings too.
+    touches: ['layout', 'settings'],
     reads: [],
     effect: 'layout',
     describe: params => `Chose the ${params.theme} theme`,

@@ -19,6 +19,7 @@
 
 import {
   ICONS,
+  buttonClassName,
   createDisclosure,
   createIconButton
 } from '../../../ui/components/controls.js';
@@ -129,7 +130,7 @@ export function createGeneSetEditor({
   const linkButton = (text, onClick, title) => {
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = 'analysis-link-btn';
+    button.className = buttonClassName('quiet');
     button.textContent = text;
     if (title) button.title = title;
     button.addEventListener('click', onClick, { signal });

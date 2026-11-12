@@ -1,12 +1,12 @@
 /**
- * A category filter or colour names a category by its label, and the
- * category it names has to be the one a restore hides or recolours.
+ * A category filter or color names a category by its label, and the
+ * category it names has to be the one a restore hides or recolors.
  *
  * A category's position in `field.categories` is not pinned by anything a
  * saved state can check: the dataset fingerprint covers the cells, not the
  * category inventory, so exporting the same cells with one more category
  * shifts every category after it. Restoring by position would then hide the
- * wrong cells and recolour the wrong ones, with nothing on screen saying so.
+ * wrong cells and recolor the wrong ones, with nothing on screen saying so.
  * The `filters` and `colors` state domains (`app/state/domains/filters.js`,
  * `colors.js`) hold labels, and put them back through a real DataState.
  */
@@ -80,7 +80,7 @@ function createHarness(categories) {
   };
 }
 
-/** Hide "T cell" and recolour "Monocyte", then take both values. */
+/** Hide "T cell" and recolor "Monocyte", then take both values. */
 function savedState() {
   const saving = createHarness(['B cell', 'T cell', 'Monocyte']);
   saving.state.setVisibilityForCategory(saving.cellType, 1, false);
@@ -88,7 +88,7 @@ function savedState() {
   return structuredClone({ filters: saving.filters.capture(), colors: saving.colors.capture() });
 }
 
-/** The hex a category's colour is held as (its drawn bytes). */
+/** The hex a category's color is held as (its drawn bytes). */
 function hexOf(rgb) {
   return `#${drawn(rgb).map(channel => Math.round(channel * 255).toString(16).padStart(2, '0')).join('')}`;
 }
@@ -98,7 +98,7 @@ async function restoreBoth(harness, saved) {
   await harness.colors.restore(saved.colors);
 }
 
-test('a category filter and colour record the category label, not its position', () => {
+test('a category filter and color record the category label, not its position', () => {
   const saved = savedState();
   assert.deepEqual(saved.filters, {
     views: [[{ field: { source: 'obs', key: 'cell_type' }, hidden: ['T cell'] }]],
@@ -135,11 +135,11 @@ test('a category added before the saved ones does not move what is hidden', asyn
     (_name, index) => loading.cellType._categoryVisible[index] === 0,
   );
   const wanted = drawn([0.1, 0.2, 0.3]);
-  const recoloured = loading.cellType.categories.filter(
+  const recolored = loading.cellType.categories.filter(
     (_name, index) => rgbAt(loading.cellType, index).every((channel, at) => channel === wanted[at]),
   );
   assert.deepEqual(hidden, ['T cell']);
-  assert.deepEqual(recoloured, ['Monocyte']);
+  assert.deepEqual(recolored, ['Monocyte']);
 });
 
 test('a category removed before the saved ones does not move what is hidden', async () => {
@@ -170,7 +170,7 @@ test('a renamed category is refused by name, not applied by position', async () 
   assert.equal(loading.cellType._categoryColors, undefined);
 });
 
-test('a recoloured category that is gone is refused by name', async () => {
+test('a recolored category that is gone is refused by name', async () => {
   const saved = savedState();
   const loading = createHarness(['B cell', 'T cell']);
 
@@ -308,9 +308,9 @@ test('hidden cells without a category are a filter of their own, and restored (K
 /**
  * A text or boolean column (`discovered`): its categories are the labels its
  * open cells hold, so a state restored on a subsample may name a category no
- * open cell holds. That category's legend visibility and colour are held
+ * open cell holds. That category's legend visibility and color are held
  * (`state/managers/field/pending-categories.js`) as part of the filters and
- * colours values, and applied when cells holding it open and the column
+ * colors values, and applied when cells holding it open and the column
  * grows it (`category-growth.js`).
  */
 async function restoreDiscovered() {
@@ -331,7 +331,7 @@ test('a discovered column restores the saved categories its open cells hold, and
   assert.deepEqual(loading.colors.capture(), saved.colors);
 
   // More cells open, holding "Monocyte": the column grows it, and the
-  // colour the saved state gave it applies.
+  // color the saved state gave it applies.
   loading.state._applyCategoryOverlay = () => {};
   growFieldCategories(loading.state, loading.cellType, {
     categories: ['B cell', 'Monocyte', 'T cell'],

@@ -218,7 +218,7 @@ function centroidAccumulator(codes, categories, positions, dim) {
       const out = [];
       for (let catIdx = 0; catIdx < numCategories; catIdx++) {
         const count = counts[catIdx];
-        // A category no cell holds has no centre, so it has no centroid.
+        // A category no cell holds has no center, so it has no centroid.
         if (count === 0) continue;
         const slot = catIdx * 3;
         const x = sums[slot] / count;

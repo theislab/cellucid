@@ -1,0 +1,25 @@
+{
+  "examples": [
+    {
+      "branch": "Main",
+      "name": "Early"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "branch": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "name": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "type": "view.keep",
+  "version": 2
+}

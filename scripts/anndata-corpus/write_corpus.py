@@ -1066,7 +1066,7 @@ def obsp_varp_variants():
 # ---------------------------------------------------------------- uns
 
 
-@variant("uns: title, nested dicts, numeric scalars, string array, numeric arrays, colours list, empty dict.",
+@variant("uns: title, nested dicts, numeric scalars, string array, numeric arrays, colors list, empty dict.",
          ["uns", "uns:nested", "uns:arrays"])
 def uns_basic():
     uns = {

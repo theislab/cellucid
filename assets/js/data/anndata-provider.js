@@ -584,6 +584,22 @@ export function anndataGeneSample(url) {
  * @param {string} url
  * @returns {Readonly<Object>|null}
  */
+/**
+ * The obs fields the AnnData file behind `url` names as its cells' totals
+ * (`uns['cellucid']['totalCounts']`: by modality, null for a file of one),
+ * or null when it names none or is not open.
+ *
+ * @param {string} url
+ * @returns {ReadonlyMap<string|null, {field: string, over: 'all genes'|'source panel'|'stored genes'}>|null}
+ */
+export function anndataStoredTotals(url) {
+  try {
+    return getAnnDataBinding(url, null).adapter.getFileMetadata?.()?.totalCounts ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function anndataLinkMeasurement(url) {
   let binding;
   try {
@@ -781,8 +797,11 @@ export async function anndataLoadConnectivity(
   options,
   candidateBinding = null
 ) {
+  const plain = options !== null && typeof options === 'object' && !Array.isArray(options);
+  if (!plain) getMetadataLoadSignal(options, 'Direct AnnData connectivity payload');
+  const { readKey = null, ...signalOptions } = options;
   const signal = getMetadataLoadSignal(
-    options,
+    signalOptions,
     'Direct AnnData connectivity payload'
   );
   if (signal === null) {
@@ -801,15 +820,15 @@ export async function anndataLoadConnectivity(
   // (`obsp`) names the graph the file opens with.
   const obspIndex = parseMappingGraphPath(parsed.path);
   const edgeOptions = obspIndex === null
-    ? { signal }
-    : { signal, key: requireMappedObspKey(adapter, obspIndex) };
+    ? { signal, readKey }
+    : { signal, readKey, key: requireMappedObspKey(adapter, obspIndex) };
   const edges = await awaitWithSignal(adapter.getConnectivityEdges(edgeOptions), signal);
   throwIfAborted(signal);
   return edges;
 }
 
 /**
- * Some open cells' neighbours in a neighbour graph of an AnnData source (the
+ * Some open cells' neighbors in a neighbor graph of an AnnData source (the
  * file's own, `obsp`, or a mapped one, `obsp/{p}`), read from the file by
  * row (`BaseAnnDataAdapter.getConnectivityRows`): the k-NN tool's frontier.
  *
@@ -836,7 +855,7 @@ export async function anndataLoadConnectivityRows(url, cells, options, candidate
 }
 
 /**
- * The summary of one neighbour graph of an AnnData source: the file's own
+ * The summary of one neighbor graph of an AnnData source: the file's own
  * (`obsp`) or a mapped one (`obsp/{p}`).
  * @param {string} url - Explicit direct AnnData URL
  * @param {{signal?: AbortSignal|null}} [options]

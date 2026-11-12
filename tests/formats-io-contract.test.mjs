@@ -910,7 +910,7 @@ test('request shaping follows the measured link: priors until measured, then mer
   // A gap is worth what transfers in the share of a round trip one request costs.
   assert.equal(link.mergeGapBytes, Math.floor(link.bytesPerMs * link.latencyMs / 2));
   // A request carries one round trip's worth of the whole link's bandwidth
-  // (more would only serialise on one connection), never less than the prior.
+  // (more would only serialize on one connection), never less than the prior.
   assert.equal(link.maxRequestBytes, Math.max(1 << 20, Math.floor(link.bytesPerMs * link.latencyMs)));
   assert.equal(link.readsAhead, false, 'a 1 MB/s link is fetched on demand');
 
@@ -1523,7 +1523,7 @@ test('a page that does not answer holds a read for at most one round trip of the
   assert.deepEqual(givenMs, [40], 'no wait without a link');
   assert.equal(asked.length, 1);
   assert.deepEqual(source.calls, [[0, 10], [30, 10], [10, 10]]);
-  // Cancelled while it waits for the page (a wait of an hour): stops at once.
+  // Canceled while it waits for the page (a wait of an hour): stops at once.
   const controller = new AbortController();
   const reading = withRangeCache(source, 'another key').read(20, 10, { link: { latencyMs: 3_600_000 }, signal: controller.signal });
   queueMicrotask(() => controller.abort(new DOMException('stop', 'AbortError')));
@@ -1590,4 +1590,30 @@ test('a file described from an ETag-less host is refused when its first read say
   // last answer here seeds the reader's stall timeout.
   const known = await describeRemoteFile({ url: 'https://example.org/files/b.h5ad', id: 'b', name: 'b.h5ad', size: 100, version: 'zenodo:1:md5:b', attribution: { title: 'b', url: 'https://example.org' } });
   assert.ok(Number.isFinite(known.resource.answeredMs), 'the answer of an earlier request to the host is carried');
+});
+
+test('a file its server says changed on disk (409) is refused as changed, in the server\'s words (R9S-9)', async () => {
+  const bytes = pattern(5000);
+  const why = 'served.h5ad changed while it was read';
+  const changed = fakeHost(bytes, () => new Response(why, { status: 409, headers: { 'Content-Type': 'text/plain', 'Content-Length': String(why.length) } }));
+  const source = httpByteSource({ url: 'http://127.0.0.1:8765/_cellucid/anndata/served.h5ad', size: 5000 }, { fetch: changed.fetch });
+  await assert.rejects(source.read(10, 20), error => error.code === BYTE_SOURCE_FAILURES.CHANGED && error.message === why);
+});
+
+test('a probe whose head stops coming says the host stalls; it is not read as a content-coded file to download whole (R9S-11)', async () => {
+  // A host that sent half a range and stopped was read as content-coding
+  // its files (the whole file's first bytes came): the opening downloaded
+  // it whole, which stalled again, and said nothing of a stall.
+  const { ByteSourceError: Failure } = await import('../assets/js/formats/io/byte-source.js');
+  let wholes = 0;
+  const fetchImpl = async (url, init = {}) => {
+    if (init.method === 'HEAD') return new Response(null, { status: 206, headers: { 'Content-Range': 'bytes 0-99/100', 'Content-Length': '100' } });
+    if (new Headers(init.headers ?? {}).get('Range') === null) {
+      wholes++;
+      return new Response(new Uint8Array(100), { status: 200, headers: { 'Content-Length': '100' } });
+    }
+    throw new Failure(BYTE_SOURCE_FAILURES.STALLED, `${url}: no more bytes for 3.0 s.`, { url, phase: 'body', silentMs: 3000 });
+  };
+  await assert.rejects(probeHttpResource('https://stall.example/a.h5ad', { fetchImpl, headBytes: 64 }), { code: BYTE_SOURCE_FAILURES.STALLED });
+  assert.equal(wholes, 0, 'the whole file is not asked for');
 });

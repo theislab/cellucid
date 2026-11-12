@@ -216,7 +216,7 @@
   display: none;
 }
 
-/* A question: drawn with the emphasised edge, since the agent waits for it. */
+/* A question: drawn with the emphasized edge, since the agent waits for it. */
 .agent-confirm {
   display: flex;
   flex-direction: column;
@@ -604,12 +604,17 @@ textarea.obs-select.agent-chat-instructions {
   margin: 0 0 var(--space-1-5);
 }
 
+/* A cell breaks between words, never inside one: `break-word` (unlike the
+   message body's `anywhere`) leaves a word's width in the table's min-content,
+   so the columns of numbers keep "0.04%" and "Adjusted" whole while a long
+   first column takes the wrapping (a 6-column result table in the dock read
+   "Adjuste|d p" and "0.04|%"). A single word wider than its column still breaks. */
 .agent-md-table table {
   width: 100%;
   border-collapse: collapse;
   font-size: var(--type-control);
   font-variant-numeric: tabular-nums;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .agent-md-table th,
@@ -681,6 +686,20 @@ textarea.obs-select.agent-chat-instructions {
 
 .agent-tool-body {
   padding: var(--space-1) 0 0 var(--space-3-5);
+}
+
+/* A note the model wrote between its calls (what it found, what it does next): a quiet line before the call. */
+.agent-tool-note {
+  margin: 0;
+  font-size: var(--type-hint);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.agent-msg-notes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
 }
 
 .agent-msg-note {
@@ -881,4 +900,158 @@ textarea.obs-select.agent-chat-input {
 
 .agent-permission-data .field-help {
   margin: 0;
+}
+
+/* ---------------------------------------------------------- Side panel */
+
+/* The open chat on a wide window (app/agent/dock.js, data-layout="side"):
+   a full-height column on the right that the plot gives its width up to
+   (the canvas is narrowed by --agent-panel-inline-size, base/_global.css),
+   so the chat never covers a cell. The chat fills the column; the agents'
+   presence (the notice of what is sent, questions, other agents' activity)
+   sits under it, next to the message field the person is looking at. */
+.agent-dock[data-layout="side"] {
+  pointer-events: auto;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: auto;
+  width: var(--agent-panel-inline-size);
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 0;
+  padding: 0;
+  border-left: var(--border-default);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-md);
+}
+
+.agent-dock[data-layout="side"] .agent-presence,
+.agent-dock[data-layout="side"] .agent-chat-panel {
+  width: 100%;
+}
+
+.agent-dock[data-layout="side"] .agent-chat-panel {
+  order: 1;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  border: 0;
+  box-shadow: none;
+  background: transparent;
+}
+
+.agent-dock[data-layout="side"] .agent-presence {
+  order: 2;
+  flex: none;
+  max-height: 45%;
+  overflow-y: auto;
+  padding: 0 var(--space-2-5) var(--space-2-5);
+}
+
+/* In the column, the presence's cards are part of it: no floating shadow. */
+.agent-dock[data-layout="side"] .agent-notice,
+.agent-dock[data-layout="side"] .agent-confirm,
+.agent-dock[data-layout="side"] .agent-activity {
+  box-shadow: none;
+}
+
+.agent-dock[data-layout="side"] .agent-chat-header {
+  min-height: calc(var(--control-height) + var(--space-3));
+  padding: var(--space-1-5) var(--space-1-5) var(--space-1-5) var(--space-3);
+}
+
+.agent-dock[data-layout="side"] .agent-chat-log {
+  max-height: none;
+  padding: var(--space-3);
+  gap: var(--space-3);
+}
+
+.agent-dock[data-layout="side"] .agent-chat-settings {
+  max-height: 55%;
+  overflow-y: auto;
+  margin: 0;
+  padding: var(--space-2-5) var(--space-3);
+  border-width: 0 0 1px;
+}
+
+.agent-dock[data-layout="side"] .agent-chat-composer {
+  padding: var(--space-2) var(--space-3) var(--space-3);
+}
+
+/* Collapsing the column folds it to the right: the chevron points there. */
+.agent-dock[data-layout="side"] #agent-chat-collapse svg {
+  transform: rotate(-90deg);
+}
+
+/* The column's left edge: a grip a few pixels wide, its line shown on
+   hover, focus and while dragging; the guide follows the pointer and the
+   width is taken on release. */
+.agent-dock-grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(-1 * var(--space-1));
+  z-index: 1;
+  width: var(--space-2);
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.agent-dock-grip[hidden] {
+  display: none;
+}
+
+.agent-dock-grip::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(50% - 1px);
+  width: 2px;
+  background: transparent;
+  transition: background-color var(--duration-fast) var(--easing-standard);
+}
+
+.agent-dock-grip:hover::after,
+.agent-dock-grip:focus-visible::after,
+.agent-dock[data-resizing="true"] .agent-dock-grip::after {
+  background: var(--color-accent);
+}
+
+.agent-dock[data-resizing="true"]::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  right: var(--agent-panel-guide, var(--agent-panel-inline-size));
+  width: 2px;
+  background: var(--color-accent);
+  pointer-events: none;
+}
+
+body:has(.agent-dock[data-resizing="true"]) {
+  cursor: col-resize;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* --------------------------------------------- One agent, one name */
+
+/* Calls an agent makes one after another read as one message: its name is
+   said once (chat/transcript-view.js marks the rest data-continued), and
+   their rows follow each other closely. Copy stays on its message, on hover. */
+.agent-msg[data-continued="true"] {
+  position: relative;
+  margin-top: calc(-1 * var(--space-2));
+}
+
+.agent-msg[data-continued="true"] .agent-msg-who {
+  display: none;
+}
+
+.agent-msg[data-continued="true"] > .agent-msg-head {
+  position: absolute;
+  top: 0;
+  right: 0;
 }

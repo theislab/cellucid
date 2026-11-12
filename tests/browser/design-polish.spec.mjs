@@ -1,7 +1,7 @@
 /**
  * Visual-consistency defects found by screenshotting every panel at desktop,
  * tablet, phone and phone-landscape sizes in both themes. Each test pins the
- * geometry or colour that was wrong, never a pixel snapshot.
+ * geometry or color that was wrong, never a pixel snapshot.
  *
  * - Touch layouts drew controls for a cursor: 24-29px text buttons and
  *   fields, 13px checkboxes behind 19px labels, and 11px field text that makes
@@ -235,7 +235,7 @@ test('analysis rows keep one rhythm and the page chips stay legible', async ({
   expect(gaps.afterSelector).toBeGreaterThanOrEqual(4);
   expect(Math.abs(gaps.afterSelector - gaps.betweenRows)).toBeLessThanOrEqual(1);
 
-  // A selected derived chip keeps its selected colours under the pointer and
+  // A selected derived chip keeps its selected colors under the pointer and
   // shows its whole name.
   const chip = panel.locator('.chip.chip-derived[aria-pressed="true"]').first();
   await expect(chip).toBeVisible();
@@ -342,7 +342,7 @@ test.describe('short screen', () => {
     );
     // Startup's own progress is the opening overlay; a notification published
     // while the dialog is open (an outcome, a refusal) must still stay behind
-    // it.
+    // its card.
     await page.evaluate(async () => {
       const { getNotificationCenter } = await import(
         '/assets/js/app/notification-center.js'
@@ -350,23 +350,46 @@ test.describe('short screen', () => {
       getNotificationCenter().info('A notice during the welcome dialog', { duration: 0 });
     });
     await expect(page.locator('.notification').first()).toBeAttached();
+    // The test's own card, in place (it slides in), meets the welcome card here: else the check
+    // below would check nothing.
+    await expect.poll(() => page.evaluate(() => {
+      const card = document.querySelector('#welcome-modal .welcome-content').getBoundingClientRect();
+      return [...document.querySelectorAll('.notification')].some(note => {
+        const { transform } = getComputedStyle(note);
+        const inPlace = transform === 'none' || new DOMMatrixReadOnly(transform).m41 === 0;
+        const box = note.getBoundingClientRect();
+        return inPlace && box.left < card.right && box.right > card.left && box.top < card.bottom && box.bottom > card.top;
+      });
+    })).toBe(true);
+    // The cards are kept inside the open dialog (app-dialog.js keepAboveModals), beside its card,
+    // where a short screen puts them under the card: wherever a card and the welcome card meet,
+    // the welcome card is what is drawn. Every point of each overlap is hit-tested on a grid.
     const covering = await page.evaluate(() => {
       const dialog = document.querySelector('#welcome-modal .welcome-content');
+      const card = dialog.getBoundingClientRect();
       // Touch layouts let taps through notifications; hit-test what is drawn.
       const probe = document.createElement('style');
       probe.textContent = '.notification { pointer-events: auto !important; }';
       document.head.appendChild(probe);
-      return [...document.querySelectorAll('.notification')].filter(note => {
+      const over = [];
+      for (const note of document.querySelectorAll('.notification')) {
         const box = note.getBoundingClientRect();
-        if (box.width === 0 || box.height === 0) return false;
-        const hit = document.elementFromPoint(
-          box.left + box.width / 2,
-          box.top + box.height / 2,
-        );
-        return hit !== null && note.contains(hit) && !dialog.contains(hit);
-      }).length + (probe.remove(), 0);
+        const left = Math.max(box.left, card.left) + 1;
+        const right = Math.min(box.right, card.right) - 1;
+        const top = Math.max(box.top, card.top) + 1;
+        const bottom = Math.min(box.bottom, card.bottom) - 1;
+        if (right <= left || bottom <= top) continue;
+        for (let i = 0; i <= 8; i += 1) {
+          for (let j = 0; j <= 8; j += 1) {
+            const hit = document.elementFromPoint(left + ((right - left) * i) / 8, top + ((bottom - top) * j) / 8);
+            if (hit !== null && note.contains(hit)) over.push(note.textContent.trim());
+          }
+        }
+      }
+      probe.remove();
+      return [...new Set(over)];
     });
-    expect(covering).toBe(0);
+    expect(covering, 'a notification drawn over the welcome card').toEqual([]);
     await dismissWelcome(page);
     await openCollapsedPanels(page);
     // With the dialog gone the notification layer shows again. The startup

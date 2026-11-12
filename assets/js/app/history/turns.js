@@ -14,7 +14,6 @@
 import { ActionRefused } from '../actions/dispatcher.js';
 import { createOutsideAct, createTurn, HISTORY_SENTENCES } from './model.js';
 import { branchOf, pathTo, stepOf } from './tree.js';
-import { quoteName } from '../actions/targets/names.js';
 
 /** The `By` of a dispatch's meta (who acted), with the person's name only when they chose to record it. */
 export function byOfMeta(meta, person = null) {
@@ -107,8 +106,7 @@ export function noteTurnOutside(tracker, act, meta, by) {
 export function turnUndoPlan(tracker, turnId) {
   const turn = tracker.turns.get(turnId);
   if (turn === undefined) {
-    const known = [...tracker.turns.values()].map(each => each.id);
-    throw new ActionRefused(`There is no turn ${quoteName(turnId)} in the tracker ${quoteName(tracker.name)}${known.length ? `; the turns are ${known.map(id => `${quoteName(id)}`).join(', ')}` : ''}.`, { code: 'no-target' });
+    throw new ActionRefused(HISTORY_SENTENCES.noTurn({ turn: turnId, tracker: tracker.name, then: 'nothing to undo' }), { code: 'no-target' });
   }
   const path = pathTo(tracker, tracker.headId);
   const at = path.findIndex(step => step.by.turn === turnId);

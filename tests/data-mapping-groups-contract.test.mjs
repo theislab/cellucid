@@ -221,7 +221,7 @@ test('a refused graph changes nothing and stays unusable with its reason', async
   // Asking again is refused before anything is read.
   assert.equal(
     state.describeDataMappingRefusal({ ...before, knn: 'distances' }),
-    "This mapping uses obsp['distances'] as its neighbour graph, which this dataset "
+    "This mapping uses obsp['distances'] as its neighbor graph, which this dataset "
       + 'cannot use (not symmetric — choose a connectivities matrix).'
   );
   assert.equal(

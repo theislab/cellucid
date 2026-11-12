@@ -2,8 +2,8 @@
  * What a viewer publication touches is what it changed.
  *
  * - Another dataset: a built smoke volume is a function of one dataset's
- *   positions, colours and visibility (`captureSmokeInputs` keeps the
- *   positions and copies of the colours, alpha and outlier quantiles to
+ *   positions, colors and visibility (`captureSmokeInputs` keeps the
+ *   positions and copies of the colors, alpha and outlier quantiles to
  *   answer an identical rebuild without GPU work). The viewer drops it
  *   (`clearVolume`) in the same publication, so a 2M-cell dataset's ~10 MB of
  *   copies, its positions and its 3D textures do not stay resident until

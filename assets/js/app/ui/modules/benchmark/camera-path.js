@@ -139,7 +139,7 @@ export class BenchmarkCameraPath {
   /**
    * @param {Object} options - Exact path description.
    * @param {number} options.baseRadius - Fitted camera radius, > 0.
-   * @param {number[]} [options.center] - Orbit centre, three finite numbers.
+   * @param {number[]} [options.center] - Orbit center, three finite numbers.
    * @param {number} [options.seed] - Integer seed for the phase offsets.
    * @param {number} [options.periodFrames] - Frames in one full path cycle.
    * @param {number} [options.nearFactor] - Closest radius / baseRadius.

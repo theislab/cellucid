@@ -10,6 +10,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 import { expectFloatingSettled, openPhoneSheet } from './helpers/panels.mjs';
 
 const DATASET_URL =
@@ -103,6 +104,11 @@ test('a phone starts with the plot, and the panel opens from its peek bar and cl
 test('an upward swipe on the peek bar opens the panel', async ({ page }) => {
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
+  // The bar is in the page's markup, so it shows before the code that makes
+  // it work has run: the events below are dispatched as they are, with no
+  // wait of their own, and on a slow start they reached a bar nobody listened
+  // on yet (Linux WebKit, CI run 43120770230: the sidebar stayed hidden).
+  await waitForPageAtRest(page);
   const bar = await page.locator('#phone-sheet-bar').boundingBox();
   const x = bar.x + bar.width / 2;
   const y = bar.y + bar.height / 2;
@@ -202,10 +208,41 @@ test('a screen without hover shows the controls that wait for one', async ({
   for (const opacity of opacities) expect(opacity).toBeGreaterThanOrEqual(0.9);
 });
 
-test('a finger moves a floating panel by its header', async ({ page }) => {
-  // Floating panels ignored touch: once undocked on a touch screen a panel
-  // could be docked back but never moved or resized, because the drag handlers
-  // returned early for every touch pointer.
+/**
+ * Where a floating panel stands against the area windows may use: the screen
+ * below the sidebar's toggle (while it shows) and above the panel's bar
+ * (while it shows), and how its content scrolls inside it.
+ */
+function floatingFit(page, panelId) {
+  return page.evaluate((id) => {
+    const frame = document.querySelector(`.accordion-panel:has(> #${id})`);
+    const content = frame.querySelector('.accordion-content');
+    const shown = element => element !== null && element.getClientRects().length > 0;
+    const bar = document.getElementById('phone-sheet-bar');
+    const toggle = document.getElementById('sidebar-toggle');
+    const box = frame.getBoundingClientRect();
+    const areaTop = shown(toggle) ? toggle.getBoundingClientRect().bottom : 0;
+    const areaBottom = shown(bar) ? bar.getBoundingClientRect().top : innerHeight;
+    return {
+      inside: box.left >= 8 - 0.5 && box.right <= innerWidth - 8 + 0.5
+        && box.top >= areaTop + 8 - 0.5 && box.bottom <= areaBottom - 8 + 0.5,
+      contentInside: content.getBoundingClientRect().bottom <= box.bottom + 0.5,
+      // What does not fit scrolls inside the window.
+      scrollsWhenCut: content.scrollHeight <= content.clientHeight + 1
+        || getComputedStyle(content).overflowY === 'auto',
+      cut: content.scrollHeight > content.clientHeight + 1,
+    };
+  }, panelId);
+}
+
+test('a floating panel as tall as a phone fits it, upright and turned, its content scrolling inside', async ({
+  page,
+}) => {
+  // F126 (bug hunt): the Keyboard shortcuts list (with the history's and the
+  // chat's keys) is about as tall as a phone's screen, and taller than a
+  // turned one. A floating window is never taller than the area windows may
+  // use — below the toggle, above the panel's bar — and what it cannot show
+  // scrolls inside it, upright, turned and back.
   await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
   await dismissWelcome(page);
   await openPhoneSheet(page);
@@ -213,6 +250,38 @@ test('a finger moves a floating panel by its header', async ({ page }) => {
     'Current UI fixture',
   );
   const panel = page.locator('.accordion-panel:has(> #shortcuts-section)');
+  await panel.locator('> .accordion-panel-actions > .accordion-undock-btn').click();
+  await expectFloatingSettled(panel);
+  const fits = { inside: true, contentInside: true, scrollsWhenCut: true };
+  const fitOf = async () => {
+    const { cut: _cut, ...rest } = await floatingFit(page, 'shortcuts-section');
+    return rest;
+  };
+  await expect.poll(fitOf).toEqual(fits);
+  await page.locator('#sidebar-toggle').click();
+  await expect(page.locator('#sidebar')).toHaveClass(/\bhidden\b/);
+  await expect.poll(fitOf).toEqual(fits);
+  await page.setViewportSize({ width: 844, height: 390 });
+  // Turned, the list is cut by the screen: it scrolls inside the window.
+  await expect.poll(() => floatingFit(page, 'shortcuts-section'), { message: 'inside 844 × 390' })
+    .toEqual({ ...fits, cut: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(fitOf, { message: 'inside 390 × 844 again' }).toEqual(fits);
+});
+
+test('a finger moves a floating panel by its header', async ({ page }) => {
+  // Floating panels ignored touch: once undocked on a touch screen a panel
+  // could be docked back but never moved or resized, because the drag handlers
+  // returned early for every touch pointer. The panel is one shorter than the
+  // screen (Navigation), so a drag has room to move it; one as tall as the
+  // area (Keyboard shortcuts, above) is held at its top.
+  await page.goto(DATASET_URL, { waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await openPhoneSheet(page);
+  await expect(page.locator('#dataset-name')).toHaveText(
+    'Current UI fixture',
+  );
+  const panel = page.locator('.accordion-panel:has(> #navigation-section)');
   await panel.locator('> .accordion-panel-actions > .accordion-undock-btn').click();
   // The start position is read once the lift, which scales the frame, is over.
   await expectFloatingSettled(panel);
@@ -229,7 +298,7 @@ test('a finger moves a floating panel by its header', async ({ page }) => {
 
   const before = await panel.boundingBox();
   await page.evaluate(() => {
-    const summary = document.querySelector('#shortcuts-section > summary');
+    const summary = document.querySelector('#navigation-section > summary');
     const box = summary.getBoundingClientRect();
     const start = { x: box.left + 40, y: box.top + box.height / 2 };
     const fire = (type, dx, dy) => summary.dispatchEvent(new PointerEvent(type, {
@@ -244,19 +313,15 @@ test('a finger moves a floating panel by its header', async ({ page }) => {
       clientY: start.y + dy,
     }));
     fire('pointerdown', 0, 0);
-    // Undocking leaves the panel against the bottom edge; drag it upward.
     for (let step = 1; step <= 6; step++) fire('pointermove', step * 4, step * -25);
     fire('pointerup', 24, -150);
   });
-  // It moves up by the drag, as far as the top margin (8 px) lets it: the
-  // panel, kept above the panel's bar at the foot of the screen, may start
-  // less than the drag's 150 px from the top (the shortcuts list, with the
-  // history's keys, is most of the screen tall), but below the margin.
+  // It moves up by the drag, as far as the top margin (8 px) lets it.
   expect(before.y).toBeGreaterThan(8 + 8);
   await expect.poll(async () => Math.round((await panel.boundingBox()).y))
     .toBe(Math.round(Math.max(8, before.y - 150)));
   expect(await page.evaluate(() => getComputedStyle(
-    document.querySelector('#shortcuts-section > summary'),
+    document.querySelector('#navigation-section > summary'),
   ).touchAction)).toBe('none');
 });
 
@@ -353,7 +418,7 @@ test('the selection bar hides while the full-screen menu is open', async ({
   await page.locator('#sidebar-toggle').tap();
   await expect(page.locator('#sidebar')).toHaveClass(/\bhidden\b/);
   await expect(bar).toBeVisible();
-  // With Select mode off it is only the switch, centred at the bottom.
+  // With Select mode off it is only the switch, centered at the bottom.
   await expect(page.locator('#select-bar-hint')).toBeHidden();
   await expect(page.locator('#select-bar-combine')).toBeHidden();
   // The bar is placed from the viewer's presented layout, which is published

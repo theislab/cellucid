@@ -3,14 +3,14 @@
 //
 // The published volume is RGBA8:
 //   r   = density (summed trilinear weight, normalized to [0,1]);
-//   gba = the mean display colour of the cells there, premultiplied by that
-//         density, so trilinear filtering and mipmapping average colour by
+//   gba = the mean display color of the cells there, premultiplied by that
+//         density, so trilinear filtering and mipmapping average color by
 //         the cells that produced it and the cloud carries the active
-//         field's colours.
-// Density and colour are accumulated in two passes over the same staged
+//         field's colors.
+// Density and color are accumulated in two passes over the same staged
 // batch: density into an R32F atlas with the eight trilinear corners of every
-// cell, colour into an RGBA32F atlas with one vertex per cell at its nearest
-// voxel. Colour is a mean, which one sample per cell already determines;
+// cell, color into an RGBA32F atlas with one vertex per cell at its nearest
+// voxel. Color is a mean, which one sample per cell already determines;
 // splatting it with eight float4 corners would cost eight times the blending
 // bandwidth of density for no visible difference.
 
@@ -146,16 +146,16 @@ void main() {
 }
 `;
 
-// Colour pass: one vertex per cell at its nearest voxel, accumulating
-// (rgb, 1) so the normalize pass can divide out the mean colour.
+// Color pass: one vertex per cell at its nearest voxel, accumulating
+// (rgb, 1) so the normalize pass can divide out the mean color.
 export const SPLAT_COLOR_VS = `#version 300 es
 precision highp float;
 
 layout(location = 0) in vec3 a_position;
-// Per-cell display colour (normalized RGBA8; its alpha byte names the cell's
+// Per-cell display color (normalized RGBA8; its alpha byte names the cell's
 // layer, rendering/alpha-visibility.js).
 layout(location = 1) in vec4 a_color;
-// The colours of the lower layers, made from the view's background
+// The colors of the lower layers, made from the view's background
 // (rendering/read-cell-layer.js, cellLayerColors): the grey of the cells with
 // no value (254) and the fade of the cells not read (253). Their own RGB bytes
 // are not drawn.
@@ -256,7 +256,7 @@ void main() {
   float result = pow(clamp(normalized, 0.0, 1.0), u_gamma);
   float quantized = floor(result * 255.0 + 0.5) / 255.0;
 
-  // Mean display colour of the cells nearest this voxel. A voxel that holds
+  // Mean display color of the cells nearest this voxel. A voxel that holds
   // trilinear density from a neighbouring cell but is nobody's nearest voxel
   // takes the mean over its 3x3x3 neighbourhood, which always contains the
   // nearest voxel of every cell that reaches it.
@@ -288,7 +288,7 @@ void main() {
 // For every lighting voxel this integrates the density (in density x world
 // units) along two kinds of path, once per density build, instead of once per
 // ray-march sample every frame:
-//   r = optical depth towards the key light, i.e. its shadow;
+//   r = optical depth toward the key light, i.e. its shadow;
 //   g = mean optical depth over a fixed hemisphere of sky directions, the
 //       ambient occlusion that keeps the inside of a dense cluster darker than
 //       its rim.

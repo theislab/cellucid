@@ -4,7 +4,7 @@
  * why), or it changes a state domain's value and names the actions that own
  * the change. A method added to a `DataState` mixin or to the viewer's public
  * API without a classification fails here, naming it and what to do; so does
- * a classification of a method that is gone, an action the catalogue lacks,
+ * a classification of a method that is gone, an action the catalog lacks,
  * a read named as an owner, an owner that does not touch the domain the
  * method changes, and an internal method with no known reason.
  *

@@ -18,6 +18,7 @@
  * | `history_applied` | the record of each saved history the Python or R package applied to the data (`apply_cellucid_session_to_anndata`, `cellucid_apply_session()`): JSON text; never read |
  * | `gene_sets` | the gene sets a package pulled from the viewer or wrote from an applied history, by name; never read |
  * | `pulled` | what each column a package's pull wrote came from, by column; never read |
+ * | `totalCounts` | `{field, over}`: the obs field holding each cell's total count (its library size), `over` `'all genes'` (the writer's caller's column, before any gene was selected), `'source panel'` (the writer's caller's column, over every gene of the source's gene panel: more than the file stores, not the whole transcriptome) or `'stored genes'` (the sum of X's rows as written); a MuData's maps each modality to its own record, `field` named as the viewer shows it (`rna:total_counts`) |
  * | `priority` | `{seed, specVersion, nObs, levels}`: the file stores its cells in priority order (`anndata/priority-layout.js`): the subsampling specification's `uniform` rank under `seed`, `specVersion` that specification's version, `nObs` the cell count it was written with, `levels` the ascending prefix sizes `varm['cellucid_prefix_counts']` counts at |
  *
  * Every key is optional, and a file without `uns['cellucid']` opens exactly as
@@ -45,11 +46,37 @@ export const CELLUCID_UNS_SCHEMA = 1;
 
 /** The keys `uns['cellucid']` may hold (a copy's changes are checked against them, `anndata/write/copy.js`). */
 export const CELLUCID_UNS_KEYS = Object.freeze([
-  'schema', 'id', 'name', 'description', 'citation', 'source', 'defaults', 'outlierQuantiles', 'priority',
+  'schema', 'id', 'name', 'description', 'citation', 'source', 'defaults', 'outlierQuantiles', 'totalCounts', 'priority',
   'history_applied', 'gene_sets', 'pulled',
 ]);
+const TOTAL_COUNTS_KEYS = Object.freeze(['field', 'over']);
+/**
+ * What a record of the cells' totals covers (`uns['cellucid']['totalCounts']['over']`): every gene
+ * measured (`all genes`), every gene of the source's gene panel, more than the file stores but not
+ * the whole transcriptome (`source panel`), or the genes the file stores (`stored genes`).
+ */
+export const TOTAL_COUNTS_OVER = Object.freeze(['all genes', 'source panel', 'stored genes']);
 const OUTLIER_KEYS = Object.freeze(['latentKey', 'minPoints', 'fields']);
 const CITATION_KEYS = Object.freeze(['text', 'url']);
+
+/**
+ * A dataset's citation as one line of text, as the methods paragraph, the
+ * history report, a figure's provenance and the agents' `dataset_summary`
+ * quote it: the open dataset's metadata `citation` (`{text, url}`, from
+ * `uns['cellucid']` or the provider that served the file) — its text, then
+ * its address unless the text already carries it. Null without a citation.
+ * (A dataset's `source` is where the data comes from and never holds the
+ * citation: the identity check refuses a citation inside the source.)
+ *
+ * @param {{text?: unknown, url?: unknown}|null|undefined} citation
+ * @returns {string|null}
+ */
+export function citationText(citation) {
+  const text = typeof citation?.text === 'string' ? citation.text.trim() : '';
+  if (text === '') return null;
+  const url = typeof citation.url === 'string' ? citation.url.trim() : '';
+  return url === '' || text.includes(url) ? text : `${text} ${url}`;
+}
 const SOURCE_KEYS = Object.freeze(['name', 'url']);
 
 /**
@@ -119,6 +146,50 @@ function requireText(value, label, sourceType, { allowEmpty = false } = {}) {
   return text;
 }
 
+/**
+ * The white space prose loses at either end (the writers' and the reader's one
+ * set: ASCII white space, the Unicode space separators, the line and paragraph
+ * separators and the byte order mark). cellucid-python `_contracts.PROSE_EDGE`,
+ * cellucid-r `.prose_edge_pattern`.
+ */
+const PROSE_EDGE = /^[\t\n\v\f\r\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+|[\t\n\v\f\r\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+$/g;
+
+/**
+ * Descriptive text (`name`, `description`, citation text, source name): read
+ * trimmed, as the writers write it, never refused for a space at either end
+ * -- a paragraph typed by hand often ends in one. Identifiers (`id`, keys,
+ * fields) keep `requireText`'s strict rule. What remains is checked as any
+ * text is: drawable as stored.
+ */
+export function proseText(text) {
+  return text.replace(PROSE_EDGE, '');
+}
+
+/**
+ * The descriptive text of a `uns['cellucid']` record as a writer writes it:
+ * `name`, `description`, `citation.text`, `source.name` trimmed (`proseText`),
+ * every other key as given. A fresh record; the caller's is not changed.
+ *
+ * @param {Record<string, unknown>} record
+ * @returns {Record<string, unknown>}
+ */
+export function withProseTrimmed(record) {
+  const out = { ...record };
+  for (const key of ['name', 'description']) if (typeof out[key] === 'string') out[key] = proseText(out[key]);
+  for (const [key, field] of [['citation', 'text'], ['source', 'name']]) {
+    const linked = out[key];
+    if (linked !== null && typeof linked === 'object' && !Array.isArray(linked) && typeof linked[field] === 'string') {
+      out[key] = { ...linked, [field]: proseText(linked[field]) };
+    }
+  }
+  return out;
+}
+
+function requireProse(value, label, sourceType, { allowEmpty = false } = {}) {
+  const text = single(value);
+  return requireText(typeof text === 'string' ? proseText(text) : value, label, sourceType, { allowEmpty });
+}
+
 function requireUrl(value, label, sourceType) {
   const text = requireText(value, label, sourceType);
   let url;
@@ -134,7 +205,7 @@ function requireUrl(value, label, sourceType) {
 }
 
 /**
- * Normalise the launch defaults as stored to the values
+ * Normalize the launch defaults as stored to the values
  * `requireAnnDataLaunchDefaults` checks: a text default stored as a
  * one-element list is its text, and a `{key, columns}` embedding default keeps
  * its column list.
@@ -184,6 +255,37 @@ function storedOutlierQuantilesOf(value, sourceType) {
   return Object.freeze({ latentKey, minPoints, fields });
 }
 
+function totalCountsRecordOf(value, label, sourceType) {
+  requireMetadataKeys(value, TOTAL_COUNTS_KEYS, label, sourceType);
+  for (const key of TOTAL_COUNTS_KEYS) {
+    if (value[key] === undefined) throw refuse(`${label} must hold '${key}'`, sourceType);
+  }
+  const field = requireText(value.field, `${label}['field']`, sourceType);
+  const over = requireText(value.over, `${label}['over']`, sourceType);
+  if (!TOTAL_COUNTS_OVER.includes(over)) {
+    const allowed = TOTAL_COUNTS_OVER.map(describe);
+    throw refuse(`${label}['over'] must be ${allowed.slice(0, -1).join(', ')} or ${allowed.at(-1)}; got ${describe(over)}`, sourceType);
+  }
+  return Object.freeze({ field, over });
+}
+
+/**
+ * `totalCounts`: each matrix's record of its cells' totals, by modality (null
+ * for an AnnData's one `X`). Which obs field holds them is checked when the
+ * fields are known (`data/library-sizes.js`), not here.
+ */
+function totalCountsOf(value, sourceType) {
+  const label = "uns['cellucid']['totalCounts']";
+  if (!isObjectRecord(value)) throw refuse(`${label} must be a mapping; got ${describe(value)}`, sourceType);
+  if (Object.hasOwn(value, 'field')) return new Map([[null, totalCountsRecordOf(value, label, sourceType)]]);
+  const records = new Map();
+  for (const [modality, record] of Object.entries(value)) {
+    if (!isObjectRecord(record)) throw refuse(`${label}['${modality}'] must be a mapping {field, over}; got ${describe(record)}`, sourceType);
+    records.set(modality, totalCountsRecordOf(record, `${label}['${modality}']`, sourceType));
+  }
+  return records;
+}
+
 /**
  * @typedef {Object} CellucidFileMetadata
  * @property {string|null} id
@@ -191,10 +293,12 @@ function storedOutlierQuantilesOf(value, sourceType) {
  * @property {string|null} description
  * @property {{text: string, url: string|null}|null} citation
  * @property {{name: string, url: string|null}|null} source
- * @property {Object} defaults - Launch defaults as stored, normalised; the
+ * @property {Object} defaults - Launch defaults as stored, normalized; the
  *   adapter checks them with `requireAnnDataLaunchDefaults`
  * @property {StoredOutlierQuantiles|null} outlierQuantiles - What the file
  *   stores of outlier quantiles, described (no values are read at open)
+ * @property {ReadonlyMap<string|null, {field: string, over: 'all genes'|'source panel'|'stored genes'}>|null} totalCounts -
+ *   The record of each matrix's cell totals, by modality (null: an AnnData's X)
  */
 
 /**
@@ -214,7 +318,7 @@ function storedOutlierQuantilesOf(value, sourceType) {
  * @returns {Readonly<CellucidFileMetadata>}
  */
 export function requireCellucidFileMetadata(value, sourceType) {
-  const empty = { id: null, name: null, description: null, citation: null, source: null, defaults: {}, outlierQuantiles: null };
+  const empty = { id: null, name: null, description: null, citation: null, source: null, defaults: {}, outlierQuantiles: null, totalCounts: null };
   if (value === null) return Object.freeze(empty);
   requireMetadataKeys(value, CELLUCID_UNS_KEYS, "uns['cellucid']", sourceType);
   if (Object.hasOwn(value, 'schema')) {
@@ -235,21 +339,21 @@ export function requireCellucidFileMetadata(value, sourceType) {
     }
     metadata.id = id;
   }
-  if (Object.hasOwn(value, 'name')) metadata.name = requireText(value.name, "uns['cellucid']['name']", sourceType);
+  if (Object.hasOwn(value, 'name')) metadata.name = requireProse(value.name, "uns['cellucid']['name']", sourceType);
   if (Object.hasOwn(value, 'description')) {
-    metadata.description = requireText(value.description, "uns['cellucid']['description']", sourceType, { allowEmpty: true });
+    metadata.description = requireProse(value.description, "uns['cellucid']['description']", sourceType, { allowEmpty: true });
   }
   if (Object.hasOwn(value, 'citation')) {
     const citation = requireMetadataKeys(value.citation, CITATION_KEYS, "uns['cellucid']['citation']", sourceType);
     metadata.citation = Object.freeze({
-      text: requireText(citation.text, "uns['cellucid']['citation']['text']", sourceType),
+      text: requireProse(citation.text, "uns['cellucid']['citation']['text']", sourceType),
       url: Object.hasOwn(citation, 'url') ? requireUrl(citation.url, "uns['cellucid']['citation']['url']", sourceType) : null,
     });
   }
   if (Object.hasOwn(value, 'source')) {
     const source = requireMetadataKeys(value.source, SOURCE_KEYS, "uns['cellucid']['source']", sourceType);
     metadata.source = Object.freeze({
-      name: requireText(source.name, "uns['cellucid']['source']['name']", sourceType),
+      name: requireProse(source.name, "uns['cellucid']['source']['name']", sourceType),
       url: Object.hasOwn(source, 'url') ? requireUrl(source.url, "uns['cellucid']['source']['url']", sourceType) : null,
     });
   }
@@ -257,5 +361,6 @@ export function requireCellucidFileMetadata(value, sourceType) {
   if (Object.hasOwn(value, 'outlierQuantiles')) {
     metadata.outlierQuantiles = storedOutlierQuantilesOf(value.outlierQuantiles, sourceType);
   }
+  if (Object.hasOwn(value, 'totalCounts')) metadata.totalCounts = totalCountsOf(value.totalCounts, sourceType);
   return Object.freeze(metadata);
 }

@@ -4,7 +4,7 @@
  * how they were chosen and the cell-set digest the Session panel shows. A
  * figure of every cell makes no such claim.
  *
- * Fixture: `data-mapping-full.h5ad` (300 cells), opened at 40 %, uniform, seed 7.
+ * Fixture: `data-mapping-full.h5ad` (300 cells), opened at 40%, uniform, seed 7.
  */
 
 import path from 'node:path';

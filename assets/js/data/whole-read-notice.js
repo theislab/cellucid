@@ -19,6 +19,7 @@
 import { inputFormat, isInputFormatId } from './input-formats.js';
 import { PLACES, placePath } from '../app/ui/place-names.js';
 import { formatBytes } from '../utils/format-units.js';
+import { upperFirst } from '../utils/text-case.js';
 
 /** What is read in parts instead of a format that is one stream. */
 export const READ_IN_PARTS_INSTEAD =
@@ -59,7 +60,7 @@ export function wholeReadNote({ format, bytes = null, kept, persistent, reused }
     return `Opened from this browser's storage, where it was kept when it was first read whole: none of the ${label} is read again.`;
   }
   const subject = withArticle(label);
-  return `${subject[0].toUpperCase()}${subject.slice(1)} cannot be read in parts: ${howMuch(bytes)} is read once, ` +
+  return `${upperFirst(subject)} cannot be read in parts: ${howMuch(bytes)} is read once, ` +
     `and what Cellucid shows of it is ${keptClause({ kept, persistent })}. ${READ_IN_PARTS_INSTEAD}`;
 }
 
@@ -131,7 +132,7 @@ export function wholeReadKept(conversion) {
   }
   const where = "In this browser's storage (the origin-private file system)";
   const until = conversion.persistent === true
-    ? ` until it is cleared (${placePath(PLACES.session, PLACES.stored)}, Clear) or the browser needs the room`
+    ? ` until it is removed (${placePath(PLACES.session, PLACES.stored)} › Manage…) or the browser needs the room`
     : ' until this tab closes';
   return conversion.reused ? `${where}${until}; read when it was first opened, not again` : `${where}${until}`;
 }

@@ -1,7 +1,7 @@
 # `data/`: sources, the reader worker, cells, memory, mappings
 
 `data/` has 65 modules at its root. They are not grouped into folders yet
-(the staged reorganisation in
+(the staged reorganization in
 `cellucid-private/plans/audit-2026-10-28/code-organisation.md` §B, stage 3,
 moves them; do not move files outside that plan: the kept-data revision
 guards digest module paths). Until then, this table is the map. Subfolders:
@@ -26,17 +26,16 @@ The end-to-end read path (source → bytes → formats → reader → share plan
 | **Gene reads and column indexes** | `sparse-column-index.js` (the column index of a cell-major matrix, memory and disk stores; also exports `allocateTypedArray`), `column-store-placement.js` (where index stores live: memory budget and OPFS spill), `column-forms.js`, `gene-read-plan.js` (what a person is told before a cell-major gene read), `gene-names.js`, `continuous-values.js`, `continuous-payload-diagnosis.js`, `discovered-categories.js` (categories of text columns found in the worker), `categorical-storage-contract.js` |
 | **Memory** | `memory-budget.js` (the one memory model: device, census, working set, ledger, refusals), `memory-census.js` (other Cellucid pages of this origin) |
 | **Mappings and layouts** | `data-mapping.js` (which stored arrays are plotted and read), `data-mapping-candidates.js`, `dataset-mapping.js`, `representation-names.js`, `dimension-manager.js` (the layout registry), `embedding-payload.js` (coordinates made in the worker), `vector-field-manager.js` |
-| **Derived data** | `connectivity-edges.js` (neighbour graph → forward adjacency), `connectivity-summary-contract.js`, `latent-outliers.js`, `latent-outliers-stream.js`, `outlier-quantile-source.js` |
-| **Small contracts** | `metadata-load-contract.js`, `dataset-lifecycle-errors.js`, `palettes.js` |
+| **Derived data** | `connectivity-edges.js` (neighbor graph → forward adjacency), `connectivity-summary-contract.js`, `latent-outliers.js`, `latent-outliers-stream.js`, `outlier-quantile-source.js` |
+| **Small contracts** | `metadata-load-contract.js`, `dataset-lifecycle-errors.js`, `palettes.js`, `distinct-colors.js` (the one rule for a color the app picks: told apart from the others) |
 
 ## Known wrong-way imports (do not add more)
 
 `gene-read-plan.js` and `transfer-log.js` import `app/ui/place-names.js`;
-`memory-census.js` and `anndata-reader-worker.js` import
-`app/utils/opaque-id.js`; `dimension-manager.js` and `vector-field-manager.js`
+`dimension-manager.js` and `vector-field-manager.js`
 import `rendering/unplaced-positions.js`. They are listed in
 `cellucid-private/plans/audit-2026-10-28/tidiness-2026-10-30.md` and
-resolved by the reorganisation (stage 1).
+resolved by the reorganization (stage 1).
 
 ## Tests
 

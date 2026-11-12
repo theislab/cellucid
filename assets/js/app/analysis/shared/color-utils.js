@@ -7,34 +7,7 @@
  * @module shared/color-utils
  */
 
-/**
- * Parse a hex color (#RRGGBB) into RGB ints.
- * @param {string} hex
- * @returns {{r: number, g: number, b: number} | null}
- */
-function parseHexColor(hex) {
-  if (typeof hex !== 'string') return null;
-  const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex.trim());
-  if (!match) return null;
-  return {
-    r: parseInt(match[1], 16),
-    g: parseInt(match[2], 16),
-    b: parseInt(match[3], 16)
-  };
-}
-
-/**
- * Convert RGB ints (0-255) to #RRGGBB.
- * @param {number} r
- * @param {number} g
- * @param {number} b
- * @returns {string}
- */
-function rgbToHex(r, g, b) {
-  const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
-  const toHex = (v) => clamp(v).toString(16).padStart(2, '0');
-  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
-}
+import { bytesOfHex, hexOfBytes } from '../../../utils/hex-color.js';
 
 /**
  * Mix two hex colors.
@@ -44,15 +17,12 @@ function rgbToHex(r, g, b) {
  * @returns {string}
  */
 function mixHex(hexA, hexB, t) {
-  const a = parseHexColor(hexA);
-  const b = parseHexColor(hexB);
+  const a = bytesOfHex(hexA);
+  const b = bytesOfHex(hexB);
   if (!a || !b) return typeof hexA === 'string' ? hexA : '#888888';
   const tt = Number.isFinite(t) ? Math.max(0, Math.min(1, t)) : 0.5;
-  return rgbToHex(
-    a.r + (b.r - a.r) * tt,
-    a.g + (b.g - a.g) * tt,
-    a.b + (b.b - a.b) * tt
-  );
+  const mix = channel => Math.round(a[channel] + (b[channel] - a[channel]) * tt);
+  return hexOfBytes(mix(0), mix(1), mix(2));
 }
 
 /**
@@ -60,7 +30,7 @@ function mixHex(hexA, hexB, t) {
  * Default strategy: mix base with white.
  * @param {string} baseHex
  * @param {Object} [options]
- * @param {number} [options.mix=0.55] - 0..1 mix ratio towards white
+ * @param {number} [options.mix=0.55] - 0..1 mix ratio toward white
  * @returns {string}
  */
 export function deriveRestOfColor(baseHex, options = {}) {

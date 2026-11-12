@@ -470,7 +470,7 @@ test('a share in its cell order is read again, and grows by its first cells, in 
 });
 
 test('a share lowered and raised back reads genes for the sample the same cells were read for, in their order: never every cell unless a person read them', async () => {
-  // The raise (Apply 100 %, `{mode: 'all'}`) names no sample: before, it was
+  // The raise (Apply 100%, `{mode: 'all'}`) names no sample: before, it was
   // fitted again over the link as measured then -- a 50M-cell store's sample
   // of 4.49M became every cell after a round trip (markers 15.4 → 62.3 s, a
   // reader worker of 8.7 GB), a 2M-cell `.h5ad` over an emulated 40 MB/s
@@ -518,7 +518,7 @@ test('a share lowered and raised back reads genes for the sample the same cells 
   assert.equal(raisedGrown.geneSample.cells, fitted.cells + 100);
   assert.equal(raisedGrown.geneSample.fit?.limit, 'geneTime');
 
-  // A person's count stays theirs; a person's read of every open cell (Genes read for at 100 %) stays every cell, in its order.
+  // A person's count stays theirs; a person's read of every open cell (Genes read for at 100%) stays every cell, in its order.
   const chosen = await open({ mode: 'auto' });
   assert.equal((await chosen.growGeneSample('X', fitted.cells + 50, { gene: 0 })).fit, null);
   const raisedChosen = await roundTrip(chosen);
@@ -596,6 +596,9 @@ test('differential expression tests each group\'s cells among the gene sample, a
   const analysis = new MultiVariableAnalysis({
     state: { pointCount: 10 },
     geneCellsOf: async () => ({ cells: 6, of: 10 }),
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
     getGeneKeys: async () => [],
   });
@@ -663,13 +666,13 @@ test('a session records the gene sample as the cells it is, and refuses one out 
   assert.throws(() => decodeGeneSampleRecord({ ...record, digest: 'x' }, 10, 'genes'), /digest/);
 });
 
-test('a figure of a gene read for a sample says so under its colour bar', async () => {
+test('a figure of a gene read for a sample says so under its color bar', async () => {
   const { buildColorScaleNote } = await import('../assets/js/app/ui/modules/figure-export/components/legend-builder.js');
   // Gray for zero off (the default): the faded cells only.
   assert.equal(buildColorScaleNote({ geneSample: { cells: 40_000, of: 455_000 }, zeroGray: { enabled: false, applies: true, drawn: false } }, 0, 1), 'Gene read for 40,000 of 455,000 cells. Faded: not read');
   // On (or a log scale): the gray for 0 too.
   assert.equal(buildColorScaleNote({ geneSample: { cells: 40_000, of: 455_000 }, zeroGray: { enabled: true, applies: true, drawn: true } }, 0, 1), 'Gene read for 40,000 of 455,000 cells. Faded: not read · gray: 0');
-  assert.equal(buildColorScaleNote({ geneSample: { cells: 40_000, of: 455_000 }, colorbar: { centered: true } }, -1, 1), 'Color scale centred at 0 · Gene read for 40,000 of 455,000 cells. Faded: not read');
+  assert.equal(buildColorScaleNote({ geneSample: { cells: 40_000, of: 455_000 }, colorbar: { centered: true } }, -1, 1), 'Color scale centered at 0 · Gene read for 40,000 of 455,000 cells. Faded: not read');
   assert.equal(buildColorScaleNote({ geneSample: null }, 0, 1), null);
   // Every cell read, gray for zero on: the figure says what gray is.
   assert.equal(buildColorScaleNote({ geneSample: null, zeroGray: { enabled: true, applies: true, drawn: true } }, 0, 1), 'Gray: 0');
@@ -807,7 +810,7 @@ test('when the gene index of every open cell is kept nowhere here, its cost name
   assert.notEqual((await reader.geneSampleCost('X', capped.index.fits + 1)).index.refusal, null, 'one more is not');
 });
 
-test('genes read for more cells reach every kept view: its values, its statistics, and its colours once focused', async () => {
+test('genes read for more cells reach every kept view: its values, its statistics, and its colors once focused', async () => {
   const { DataState } = await import('../assets/js/app/state/core/data-state.js');
   const { createInMemoryDimensionManager } = await import('../assets/js/data/dimension-manager.js');
   const state = new DataState(null, null);

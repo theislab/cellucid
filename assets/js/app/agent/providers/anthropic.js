@@ -16,6 +16,14 @@
  *   request's own `cache_control`). A model's reasoning (`thinking` blocks,
  *   with their signatures) comes back as `opaque` parts and is sent back
  *   unchanged, in its place, as Anthropic requires within a conversation.
+ * - **Progress notes.** The models that write a short note for the person
+ *   between tool calls (what they found, what they do next) return it as a
+ *   `thinking` block, empty unless the request asks for it
+ *   (`thinking.display: "updates"`, beta `thinking-display-updates-2026-08-18`):
+ *   asked of those models (`PROGRESS_MODELS`), each note's text streams as
+ *   `progress` events the chat shows before the call it introduces, and its
+ *   block goes back unchanged like any reasoning. Showing them costs nothing
+ *   more: the notes are written and billed the same under every display.
  * - **Tool results** are `tool_result` blocks with the MCP text and
  *   pictures (`image` blocks); a refusal is `is_error`.
  * - **Failures** map to the contract's kinds by status and Anthropic's
@@ -36,13 +44,47 @@ const WHO = 'Anthropic';
 /** The output limit sent when the key's model list did not say the model's own. */
 const FALLBACK_OUTPUT_TOKENS = 64_000;
 
-function headersFor(key) {
+function headersFor(key, betas = []) {
   return {
     'content-type': 'application/json',
     'x-api-key': key,
     'anthropic-version': ANTHROPIC_VERSION,
     'anthropic-dangerous-direct-browser-access': 'true',
+    ...(betas.length === 0 ? {} : { 'anthropic-beta': betas.join(',') }),
   };
+}
+
+/** The beta under which `thinking.display: "updates"` returns the progress notes' text. */
+export const PROGRESS_BETA = 'thinking-display-updates-2026-08-18';
+
+/**
+ * The models that write progress notes between tool calls and take
+ * `thinking.display: "updates"`, as Anthropic's Thinking page lists them
+ * ("Progress updates between tool calls", read 2026-11-11). The model list
+ * (`/v1/models`) does not say which models do, and the setting cannot be
+ * sent to every model: it comes with `thinking: {type: "adaptive"}`, which
+ * turns thinking on for a model that runs without it by default (Claude
+ * Opus 4.8, 4.7, 4.6, Sonnet 4.6), a cost the person did not choose. A model
+ * not listed is asked nothing and reads as before; one listed whose
+ * request is refused for the setting is asked again without it, and not
+ * asked again (`refusesProgress`).
+ */
+export const PROGRESS_MODELS = Object.freeze([
+  'claude-opus-5-5', 'claude-sonnet-5-5',
+  'claude-fable-5-2', 'claude-mythos-5-2', 'claude-fable-5-1', 'claude-mythos-5-1', 'claude-fable-5',
+]);
+
+/** The thinking setting that returns progress notes (sent with `PROGRESS_BETA`). */
+const PROGRESS_THINKING = Object.freeze({ type: 'adaptive', display: 'updates' });
+
+/**
+ * Whether Anthropic refused a request for its progress-notes setting (the
+ * beta or the display value unknown to this account or platform): a refused
+ * request whose sentence names the display or the beta. Anything else is
+ * the person's to see.
+ */
+function refusesProgress(error) {
+  return error instanceof ProviderError && error.kind === 'request' && /display|thinking-display-updates|anthropic-beta/i.test(error.message);
 }
 
 /** A refused request as a ProviderError of the contract's kind. */
@@ -205,8 +247,12 @@ function usageOf(usage) {
 /**
  * The events of one streamed `/v1/messages` answer, in the contract's terms.
  * @param {AsyncIterable<{event: string|null, data: any}>} events
+ * @param {{progress?: boolean}} [options] - `progress`: the request asked for
+ *   the progress notes (`thinking.display: "updates"`), so a `thinking` block's
+ *   text is a note for the person, streamed as `progress` events (a reasoning
+ *   block stays empty under that display)
  */
-export async function* anthropicEventsOf(events) {
+export async function* anthropicEventsOf(events, { progress = false } = {}) {
   const blocks = new Map();
   /** Anthropic's own usage fields: `message_start` gives them, `message_delta` updates some. */
   let raw = {};
@@ -237,6 +283,9 @@ export async function* anthropicEventsOf(events) {
           block.json += delta.partial_json;
         } else if (delta.type === 'thinking_delta') {
           block.thinking = (block.thinking ?? '') + delta.thinking;
+          if (progress && block.type === 'thinking' && typeof delta.thinking === 'string' && delta.thinking !== '') {
+            yield { type: 'progress', text: delta.thinking };
+          }
         } else if (delta.type === 'signature_delta') {
           block.signature = (block.signature ?? '') + delta.signature;
         }
@@ -280,6 +329,9 @@ export async function* anthropicEventsOf(events) {
  * @param {{fetch?: typeof fetch}} [options]
  */
 export function createAnthropicProvider({ fetch: fetchImpl = (...args) => globalThis.fetch(...args) } = {}) {
+  /** Models whose requests were refused for the progress-notes setting (`refusesProgress`): not asked again. */
+  const withoutProgress = new Set();
+
   return checkProvider({
     id: 'anthropic',
     label: 'Claude (Anthropic)',
@@ -313,23 +365,42 @@ export function createAnthropicProvider({ fetch: fetchImpl = (...args) => global
       return out;
     },
 
-    async *stream({ key, model, system, messages, tools, signal = null, outputTokens = null, effort = null }) {
+    // How long the cached prompt (instructions, tools, the conversation so far) is kept: the
+    // person's choice (Chat settings); an hour costs more to write and spares the rewrite after
+    // a pause longer than five minutes.
+    cacheLengths: Object.freeze(['5m', '1h']),
+
+    async *stream({ key, model, system, messages, tools, signal = null, outputTokens = null, effort = null, cacheLength = '5m' }) {
+      const cache = cacheLength === '1h' ? { type: 'ephemeral', ttl: '1h' } : { type: 'ephemeral' };
       const body = {
         model,
         max_tokens: outputTokens ?? FALLBACK_OUTPUT_TOKENS,
         stream: true,
         // The person's effort for the model; left out, the model's own default.
         ...(effort === null ? {} : { output_config: { effort } }),
-        cache_control: { type: 'ephemeral' },
-        system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+        cache_control: cache,
+        system: [{ type: 'text', text: system, cache_control: cache }],
         tools: anthropicToolsOf(tools),
         messages: anthropicMessagesOf(messages),
       };
-      const response = await anthropicFetch(fetchImpl, `${ANTHROPIC_API}/v1/messages`, {
-        method: 'POST', headers: headersFor(key), body: JSON.stringify(body), signal,
+      // The model's notes between tool calls, as text the chat shows (the module overview).
+      let progress = PROGRESS_MODELS.includes(model) && !withoutProgress.has(model);
+      const send = () => anthropicFetch(fetchImpl, `${ANTHROPIC_API}/v1/messages`, {
+        method: 'POST',
+        headers: headersFor(key, progress ? [PROGRESS_BETA] : []),
+        body: JSON.stringify(progress ? { ...body, thinking: PROGRESS_THINKING } : body),
+        signal,
       });
-      if (!response.ok) throw await anthropicErrorOf(response);
-      yield* anthropicEventsOf(readServerEvents(response, signal, WHO));
+      let response = await send();
+      if (!response.ok) {
+        const error = await anthropicErrorOf(response);
+        if (!(progress && refusesProgress(error))) throw error;
+        withoutProgress.add(model);
+        progress = false;
+        response = await send();
+        if (!response.ok) throw await anthropicErrorOf(response);
+      }
+      yield* anthropicEventsOf(readServerEvents(response, signal, WHO), { progress });
     },
   });
 }

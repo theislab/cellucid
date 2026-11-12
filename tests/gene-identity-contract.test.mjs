@@ -4,7 +4,7 @@
  * genes by a var column (a person chose `feature_name` in Data mapping), the
  * name the viewer shows goes beside it: a gene set pushed from a notebook
  * with `adata.var_names[...]` resolves to the shown genes, and a gene set and
- * the gene the viewer colours by go out by identifier with the shown names
+ * the gene the viewer colors by go out by identifier with the shown names
  * beside them. Named by the var index, the names are the identifiers and
  * nothing goes beside them.
  */
@@ -41,7 +41,7 @@ test('a request names a gene by its identifier or its name, identifiers first; t
   assert.equal(geneIdentities(data).idOf('a copy of a gene'), 'a copy of a gene');
 });
 
-test('gene sets and the gene the viewer colours by go out by identifier', async () => {
+test('gene sets and the gene the viewer colors by go out by identifier', async () => {
   const state = new DataState({}, null);
   state.pointCount = 4;
   state.highlightArray = new Uint8Array(4);
@@ -85,7 +85,7 @@ test('gene sets and the gene the viewer colours by go out by identifier', async 
   results.dispose();
 });
 
-test('named by the var index, genes go out by it alone: no symbols, no colour-by symbol', async () => {
+test('named by the var index, genes go out by it alone: no symbols, no color-by symbol', async () => {
   const state = new DataState({}, null);
   state.pointCount = 4;
   state.highlightArray = new Uint8Array(4);

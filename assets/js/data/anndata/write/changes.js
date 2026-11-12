@@ -35,7 +35,7 @@
 import { isGroup } from '../../../formats/store.js';
 import { attributeValue } from '../elements.js';
 import { frameRows } from '../views/modalities.js';
-import { CELLUCID_UNS_KEYS, CELLUCID_UNS_SCHEMA, isPortableDatasetId, requireCellucidFileMetadata } from '../../anndata-cellucid-metadata.js';
+import { CELLUCID_UNS_KEYS, CELLUCID_UNS_SCHEMA, isPortableDatasetId, proseText, requireCellucidFileMetadata, withProseTrimmed } from '../../anndata-cellucid-metadata.js';
 import { folderKey, requireDistinctElementKeys, requireElementKey } from './names.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { PRIORITY_ORIGINAL_COLUMN } from '../priority-layout.js';
@@ -157,8 +157,8 @@ export function requireUnsValue(value, label) {
 }
 
 /**
- * Every group of the source holds names distinct once Unicode-normalised
- * (NFC): two that are one become one entry to a ZIP reader that normalises
+ * Every group of the source holds names distinct once Unicode-normalized
+ * (NFC): two that are one become one entry to a ZIP reader that normalizes
  * (`formats/zip/names.js`) and one folder to a file system that does, so
  * the copy is refused before it starts, naming them.
  *
@@ -292,7 +292,8 @@ export function requireCopyChanges(changes, { root, nObs, modalities, sourceCell
     if (key === 'priority') throw new TypeError("uns['cellucid']['priority'] describes the file's rows: a copy keeps its source's.");
     if (value !== null) requireUnsValue(value, `uns['cellucid']['${key}']`);
   }
-  const cellucid = { ...(given ?? {}) };
+  // Descriptive text written trimmed, as prepare() writes it (withProseTrimmed).
+  const cellucid = withProseTrimmed(given ?? {});
   const source = sourceCellucid ?? {};
   const named = key => (Object.hasOwn(cellucid, key) ? cellucid[key] !== null : Object.hasOwn(source, key));
   // A copy names the dataset it copies: a reopened copy is the same dataset, its histories its own.
@@ -301,7 +302,7 @@ export function requireCopyChanges(changes, { root, nObs, modalities, sourceCell
     if (isPortableDatasetId(dataset.id)) cellucid.id = dataset.id;
     else notes.push(`uns['cellucid']['id'] was not written: the open dataset's id '${dataset.id}' is not one a file can name.`);
   }
-  if (!named('name') && typeof dataset?.name === 'string' && dataset.name.trim() === dataset.name && dataset.name !== '') cellucid.name = dataset.name;
+  if (!named('name') && typeof dataset?.name === 'string' && proseText(dataset.name) !== '') cellucid.name = proseText(dataset.name);
   const merged = { ...source };
   for (const [key, value] of Object.entries(cellucid)) {
     if (value === null) delete merged[key];

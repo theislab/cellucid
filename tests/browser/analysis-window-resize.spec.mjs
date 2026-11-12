@@ -53,10 +53,25 @@ async function openDataset(page) {
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
 }
 
-/** Copy one analysis row into a window and wait for its lift to settle. */
+/**
+ * Copy one analysis row into a window and wait for its lift to settle.
+ *
+ * A window opens beside the row it was copied from. Where that row is depends
+ * on the sidebar's scroll when it is clicked: the analysis code arrives after
+ * the first view, so the panels opened before it move, and a click scrolls a
+ * row out of view only to the nearest edge. A row at the foot of the screen
+ * opened its window there, and a drag down from its corner left the page,
+ * where a synthesized pointer sends neither moves nor the release: the drag
+ * never ended, the next press resized the window to its minimum and was not
+ * a click (CI run 42872892254, Firefox: 254 x 85, "Expected: 2, Received:
+ * 1"). The row is brought to the middle first, so every window opens with
+ * room around it.
+ */
 async function copyWindow(page, mode = 'simple') {
   const before = await page.locator(WINDOW).count();
-  await page.locator(`.analysis-mode[data-mode="${mode}"] .analysis-mode-copy-btn`).click();
+  const copy = page.locator(`.analysis-mode[data-mode="${mode}"] .analysis-mode-copy-btn`);
+  await copy.evaluate(button => button.scrollIntoView({ block: 'center' }));
+  await copy.click();
   await expect(page.locator(WINDOW)).toHaveCount(before + 1);
   const frame = page.locator(WINDOW).nth(before);
   await expectFloatingSettled(frame);
@@ -78,10 +93,21 @@ async function dragHandle(page, frame, edge, dx, dy, { steps = 8 } = {}) {
   const target = await handle(frame, edge).boundingBox();
   const x = target.x + target.width / 2;
   const y = target.y + target.height / 2;
+  // A synthesized pointer off the page sends no release: the drag would go
+  // on into the next press (`copyWindow`). Say so instead.
+  const { width, height } = page.viewportSize();
+  if (x + dx < 0 || x + dx >= width || y + dy < 0 || y + dy >= height) {
+    throw new Error(`A drag of the ${edge} handle to (${x + dx}, ${y + dy}) leaves the ${width} x ${height} page.`);
+  }
   await page.mouse.move(x, y);
   await page.mouse.down();
   await page.mouse.move(x + dx, y + dy, { steps });
   await page.mouse.up();
+}
+
+/** The top of the floating area: 8 px below the sidebar's toggle (`dockable-accordions.js` `floatingArea`). */
+async function belowToggle(page) {
+  return page.evaluate(() => Math.round(document.getElementById('sidebar-toggle').getBoundingClientRect().bottom) + 8);
 }
 
 test('eight handles resize by mouse; only the dragged edges move; no 500 px cap', async ({ page }) => {
@@ -110,7 +136,8 @@ test('eight handles resize by mouse; only the dragged edges move; no 500 px cap'
   // the page sends no moves, so the drag ends just inside it.
   await frame.locator('> details > summary').focus();
   for (let press = 0; press < 12; press++) await page.keyboard.press('Alt+Shift+ArrowUp');
-  expect((await box(frame)).top).toBe(8);
+  // The top of the area is below the sidebar's toggle (no window covers it, F65).
+  expect((await box(frame)).top).toBe(await belowToggle(page));
   const bottom = await handle(frame, 's').boundingBox();
   await dragHandle(page, frame, 's', 0, page.viewportSize().height - 2 - (bottom.y + bottom.height / 2));
   const tall = await box(frame);
@@ -215,9 +242,10 @@ test('an edge snaps to another window and shows a guide; maximize and restore', 
   const viewport = page.viewportSize();
   const full = await box(first);
   expect(full.left).toBe(Math.round(sidebar.x + sidebar.width + 8));
-  expect(full.top).toBe(8);
+  const top = await belowToggle(page);
+  expect(full.top).toBe(top);
   expect(full.left + full.width).toBe(viewport.width - 8);
-  expect(full.height).toBe(viewport.height - 16);
+  expect(full.height).toBe(viewport.height - 8 - top);
   await maximize.click();
   await expect.poll(() => box(first)).toEqual(snapped);
   // A double-click on the header does the same.

@@ -128,10 +128,12 @@ function exactTypedArrayEqual(left, right) {
 function composeViewLabel(field, filters) {
   const firstFilter = filters && filters.length ? filters[0] : null;
   const labelParts = [];
-  if (field && field.key) labelParts.push(field.key);
-  if (firstFilter && !/No filters active/i.test(firstFilter)) {
-    labelParts.push(firstFilter);
-  }
+  const filterText = firstFilter && !/No filters active/i.test(firstFilter) ? firstFilter : null;
+  // A filter of the colored field names it already ("cell_type: hiding B1 cells"): the field is
+  // not said twice (found 2026-11-10: "cell_type • cell_type: hiding …").
+  // A gene's filter names it with its units ("Ins1 · log1p(norm.): 1 – 2", `geneValueLabel`).
+  if (field && field.key && !(filterText !== null && (filterText.startsWith(`${field.key}:`) || filterText.startsWith(`${field.key} · `)))) labelParts.push(field.key);
+  if (filterText !== null) labelParts.push(filterText);
   const label = labelParts.join(' • ') || 'All cells';
   return {
     label,
@@ -176,7 +178,7 @@ export const viewContextCoreMethods = {
     if (!field) return null;
     const clone = { ...field };
     // Shared, because none is ever written in place (a change makes a new
-    // one): category colours and visibility (`category-state.js`), the
+    // one): category colors and visibility (`category-state.js`), the
     // category list and its originals (`renameCategory`, `_applyCategoryOverlay`)
     // and the centroid tables and their records (`_syncCentroidCategoryLabels`).
     // Codes and values are replaced, not written. What is written in place
@@ -370,7 +372,7 @@ export const viewContextCoreMethods = {
     const activeId = String(this.activeViewId);
     for (const [viewId, ctx] of this.viewContexts) {
       if (viewId === activeId) continue;
-      const rows = collectViewFilters(ctx, { geneSampled: (this.getGeneSample?.() ?? null) !== null });
+      const rows = collectViewFilters(ctx, { geneSampled: (this.getGeneSample?.() ?? null) !== null, geneValues: this.getShownExpressionTransform?.() ?? null });
       const filters = rows.length > 0
         ? rows.map((row) => row.text)
         : ['No filters active'];

@@ -4,8 +4,11 @@
  *
  * - A read, and a move of the history (undo, redo, a jump), answers with
  *   its result; a change answers with the step it made
- *   (`{step: {id, label}, result}`; `step: null` when nothing changed, so
- *   no step was kept). Both as JSON in one text item, between the data tags
+ *   (`{step: {id, label, turn}, result}`: `turn` for an agent's step). A change that made no step
+ *   (`step: null`) says why in a sentence after the data
+ *   (`UNRECORDED_NOTES`): nothing changed (it was so already: the agent
+ *   must not tell the person it did it), or the change is not recorded
+ *   (recording paused, a kind the person does not record, …). Both as JSON in one text item, between the data tags
  *   (`relay-protocol.js` `RESULT_DATA_TAGS`: `<cellucid-data>…</cellucid-data>`):
  *   every MCP client passes text to its model, the JSON keeps names, counts
  *   and tables exact, and the tags mark everything in it (names, labels,
@@ -49,17 +52,11 @@ import { pictureLeftOutNote, statisticsLeftOutNote, withoutSingleCellStatistics 
 import {
   RESULT_DATA_TAGS, RESULT_IMAGE_MAX_BYTES, RESULT_IMAGE_MAX_SIDE, RESULT_TEXT_CHARS, resultDataText,
 } from './relay-protocol.js';
+import { base64OfBytes, bytesOfBase64 } from '../../../utils/byte-text.js';
+import { pngSidesOf } from '../../ui/modules/figure-export/utils/png-metadata.js';
+import { lowerFirst } from '../../../utils/text-case.js';
 
-const BASE64_CHUNK = 0x8000;
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
-
-function base64Of(bytes) {
-  let text = '';
-  for (let offset = 0; offset < bytes.length; offset += BASE64_CHUNK) {
-    text += String.fromCharCode(...bytes.subarray(offset, offset + BASE64_CHUNK));
-  }
-  return btoa(text);
-}
 
 function cutNote(total, shown) {
   return `[Cellucid: this result is ${formatCountOf(total, 'character')}; `
@@ -128,14 +125,11 @@ function base64Bytes(text) {
 export function pngSides(base64) {
   let head;
   try {
-    head = atob(base64.slice(0, 32));
+    head = bytesOfBase64(base64.slice(0, 32));
   } catch {
     return null;
   }
-  if (head.length < 24 || head.slice(1, 4) !== 'PNG' || head.slice(12, 16) !== 'IHDR') return null;
-  const word = offset => ((head.charCodeAt(offset) << 24) | (head.charCodeAt(offset + 1) << 16)
-    | (head.charCodeAt(offset + 2) << 8) | head.charCodeAt(offset + 3)) >>> 0;
-  return { width: word(16), height: word(20) };
+  return pngSidesOf(head);
 }
 
 /** Why a chat would refuse this picture (its bytes or its size), or null. */
@@ -179,26 +173,61 @@ function liftPictures(json, schema, images) {
 }
 
 /**
+ * Why a change made no step, as the agent is told it after the result (the
+ * dispatcher's `unrecorded`): a change asked for what was so already must
+ * not be reported to the person as done (bug hunt F80: "Color by
+ * cell_type" on a dataset that opens colored by it). One note per reason of
+ * the closed set (`data/viewer-protocol.js` `VIEWER_ACTION_UNRECORDED`, what a
+ * notebook hears; a test keeps the two the same).
+ */
+export const UNRECORDED_NOTES = Object.freeze({
+  unchanged: '[Cellucid: this changed nothing: it was so already, so no step was recorded. Tell the person it was already so; do not say you changed it.]',
+  retracted: '[Cellucid: this put back what the step just before it changed, so that step is taken out and the history is as before it.]',
+  off: '[Cellucid: done, but the person\'s History settings do not record this kind of change, so no step was recorded and Undo turn does not take it back.]',
+  paused: '[Cellucid: done, but the history\'s recording is paused, so no step was recorded and Undo turn does not take it back.]',
+  elsewhere: '[Cellucid: done, but another tracker of the history was shown meanwhile, so no step was recorded.]',
+  'no-history': '[Cellucid: done, but the dataset\'s history has not started yet, so no step was recorded.]',
+});
+
+/**
+ * The step a change made, as its result names it: its id and label, and the
+ * turn it belongs to (an agent's step: the id a note on the turn, or Undo
+ * turn, names; nothing else tells an agent outside the chat bar its turn).
+ */
+function stepOf(step) {
+  if (step === null || step === undefined) return null;
+  const turn = step.by?.turn ?? null;
+  return turn === null ? { id: step.id, label: step.label } : { id: step.id, label: step.label, turn };
+}
+
+/**
  * The MCP result of an action that ran.
- * @param {{definition: object, outcome: unknown, step: object|null, summariesOnly?: boolean}} ran -
- *   `summariesOnly`: the dataset is set to names and summaries only (no picture, no single-cell
- *   statistic)
+ * @param {{definition: object, outcome: unknown, step: object|null, unrecorded?: string|null, summariesOnly?: boolean, told?: string[]}} ran -
+ *   `unrecorded`: why a change made no step (`UNRECORDED_NOTES`); `summariesOnly`: the dataset is set
+ *   to names and summaries only (no picture, no single-cell statistic); `told`: Cellucid's notes said
+ *   last (the person's settings, `agent-calls.js`), kept within the text's bound
  * @returns {Promise<{content: object[], isError: false}>}
  */
-export async function toolResultOf({ definition, outcome, step, summariesOnly = false }) {
+export async function toolResultOf({ definition, outcome, step, unrecorded = null, summariesOnly = false, told = [] }) {
   // Blob pictures are numbered by outcomeAsJson (1, 2, …); the result
   // schema's pictures follow them.
   const blobs = [];
   const json = outcomeAsJson(outcome, blobs);
   const images = [];
-  for (const blob of blobs) images.push({ data: base64Of(new Uint8Array(await blob.arrayBuffer())), mimeType: blob.type });
+  for (const blob of blobs) images.push({ data: base64OfBytes(new Uint8Array(await blob.arrayBuffer())), mimeType: blob.type });
   const lifted = liftPictures(json, definition.result ?? null, images);
   const { json: result, leftOut } = summariesOnly ? withoutSingleCellStatistics(definition.type, lifted) : { json: lifted, leftOut: [] };
   // A read, a history move and a dataset opened record no step: their result is the answer.
-  const body = isSteplessEffect(definition.effect)
+  const stepless = isSteplessEffect(definition.effect);
+  const body = stepless
     ? result
-    : { step: step === null || step === undefined ? null : { id: step.id, label: step.label }, result };
+    : { step: stepOf(step), result };
   const notes = leftOut.length === 0 ? [] : [statisticsLeftOutNote(leftOut)];
+  if (!stepless && (step === null || step === undefined) && unrecorded !== null) {
+    const note = UNRECORDED_NOTES[unrecorded];
+    if (note === undefined) throw new RangeError(`No step was recorded for a reason Cellucid does not know: ${unrecorded}`);
+    notes.push(note);
+  }
   const sent = [];
   for (const [index, image] of images.entries()) {
     const problem = summariesOnly ? null : imageProblem(image);
@@ -206,6 +235,7 @@ export async function toolResultOf({ definition, outcome, step, summariesOnly = 
     else if (problem === null) sent.push({ type: 'image', data: image.data, mimeType: image.mimeType });
     else notes.push(`[Cellucid: picture ${index + 1} is ${problem}, so it is left out. Ask for a smaller one.]`);
   }
+  notes.push(...told);
   return { content: [{ type: 'text', text: resultText(JSON.stringify(body), notes) }, ...sent], isError: false };
 }
 
@@ -245,9 +275,9 @@ export function plainText(text) {
   return splitMarked(String(text)).map((part, index) => (index % 2 === 1 ? plainSentence(part) : part.replaceAll('\\u003c', '<'))).join('');
 }
 
-/** A tool error with one sentence, its names marked as data where it was built (`refusalText`). */
-export function toolErrorOf(text) {
-  return { content: [{ type: 'text', text: limitText(refusalText(text)) }], isError: true };
+/** A tool error with one sentence, its names marked as data where it was built (`refusalText`), and Cellucid's notes `told` after it. */
+export function toolErrorOf(text, told = []) {
+  return { content: [{ type: 'text', text: limitText(`${refusalText(text)}${told.map(note => `\n${note}`).join('')}`) }], isError: true };
 }
 
 /**
@@ -261,7 +291,7 @@ export function errorSentenceOf(error, definition) {
   if (error instanceof ActionRefused) return marked ?? error.message;
   if (isCancellation(error)) return `Stopped before it finished: ${error.message}`;
   if (error instanceof TypeError || error instanceof RangeError) return marked ?? error.message;
-  const what = definition === null ? 'do that' : definition.title.charAt(0).toLowerCase() + definition.title.slice(1);
+  const what = definition === null ? 'do that' : lowerFirst(definition.title);
   const detail = error instanceof Error && error.message ? `: ${error.message}` : '';
   return `Cellucid could not ${what}${detail}`;
 }

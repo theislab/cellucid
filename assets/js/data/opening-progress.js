@@ -46,12 +46,15 @@ import { getTransferLog } from './transfer-log.js';
 import { formatBytes, formatDuration, formatRemaining } from '../utils/format-units.js';
 import { createDeadline } from '../utils/deadline.js';
 import { onWaitingOnPerson, whileWaitingOnPerson } from '../utils/person-wait.js';
+import { afterWelcome } from '../utils/startup-sequence.js';
 import { STARTUP_STEP_DEADLINE_MS, onStartupStepDeadline } from '../app/startup-phase.js';
 import { isCancellation, cancelled, onAbort } from '../utils/abort.js';
+import { lowerFirst } from '../utils/text-case.js';
+import { createListenerSet } from '../utils/listener-set.js';
 
 /**
  * Read kinds an opening reads before its first view: the file's structure,
- * an embedding, a field, the gene names, the neighbour graph.
+ * an embedding, a field, the gene names, the neighbor graph.
  */
 const OPENING_READ_KINDS = new Set(['open', 'transcode', 'embedding', 'field', 'names', 'graph']);
 
@@ -80,7 +83,7 @@ export function describeOpeningRead(activity) {
     case 'names':
       return 'Reading gene names';
     case 'graph':
-      return 'Reading the neighbour graph';
+      return 'Reading the neighbor graph';
     default:
       return `Reading ${activity.label}`;
   }
@@ -88,7 +91,7 @@ export function describeOpeningRead(activity) {
 
 /** Why an opening was cancelled, as the error each layer stops with. */
 export function openingCancelledError(title) {
-  return cancelled('user', `Opening ${textWithPublicLinks(title)} was cancelled.`);
+  return cancelled('user', `Opening ${textWithPublicLinks(title)} was canceled.`);
 }
 
 /**
@@ -175,6 +178,13 @@ class Opening {
     this.stalled = null;
     /** Whether the page waits on the person now (`utils/person-wait.js`): not silence. */
     this.personWaiting = false;
+    /** When the wait on the person began, while it lasts. */
+    this.personWaitStartedAt = 0;
+    /**
+     * The time since the first byte spent waiting on the person (an `.rda`'s
+     * "Open which one?", a sign-in): no transfer, so not in the rate.
+     */
+    this.personWaitMs = 0;
     /** Whether a startup step's deadline measures the wait now (`onStartupStepDeadline`). */
     this.stepMeasuring = false;
     /** Stop hearing of waits on the person and of startup step deadlines. */
@@ -211,6 +221,15 @@ function afterUnheld(ms, callback) {
  * requests, bytes, chunks and status. The same mark twice means nothing
  * moved in between.
  */
+/**
+ * How much of the wait on the person under way (begun at
+ * `personWaitStartedAt`, until `now`) came after the opening's first byte.
+ */
+function personWaitSinceFirstByte(opening, now) {
+  if (opening.firstByteAt === null) return 0;
+  return Math.max(0, now - Math.max(opening.personWaitStartedAt, opening.firstByteAt));
+}
+
 function progressMark(opening) {
   const reads = [...opening.reads.values()].map(read => [
     read.id, read.status, read.requests, read.bytesFetched, read.bytesPlanned,
@@ -226,11 +245,6 @@ function progressMark(opening) {
     opening.transferMark ?? '',
     reads.join(','),
   ].join('|');
-}
-
-/** `text` with its first letter in lower case, to follow "while". */
-function continuing(text) {
-  return text.length === 0 ? text : text[0].toLowerCase() + text.slice(1);
 }
 
 /**
@@ -286,8 +300,43 @@ export class OpeningProgress {
     /** @type {Opening|null} */
     this._current = null;
     this._nextId = 1;
-    this._listeners = new Set();
+    this._listeners = createListenerSet('the opening');
     this._unsubscribe = [];
+    /** Notification ids withdrawn when the next opening begins (`untilNextOpening`). */
+    this._earlierNotices = new Set();
+  }
+
+  /**
+   * Keep notification `id` only until the next opening begins: a notice
+   * about what was opened, or failed to open, last (an opening's failure, a
+   * file refused before it could open, the dataset's sample view not
+   * applied). The next opening replaces the dataset or the attempt it was
+   * about, so the notice would then describe something no longer on screen
+   * (R9U-13: "Sample view unavailable" of one sample stayed beside the next
+   * sample's own, and a refused file's card outlived two datasets).
+   * `takeEarlierNotices` hands them to the view that withdraws them.
+   *
+   * @param {string} id
+   * @returns {string} `id`
+   */
+  untilNextOpening(id) {
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new TypeError('A notice kept until the next opening needs its notification id.');
+    }
+    this._earlierNotices.add(id);
+    return id;
+  }
+
+  /**
+   * The notices kept until the next opening (`untilNextOpening`), handed
+   * over once, as the next opening begins.
+   *
+   * @returns {string[]}
+   */
+  takeEarlierNotices() {
+    const ids = [...this._earlierNotices];
+    this._earlierNotices.clear();
+    return ids;
   }
 
   /** Whether an opening is under way. */
@@ -369,8 +418,9 @@ export class OpeningProgress {
       // The file holds several objects (an `.rda` of several Seurat
       // objects): the opening waits for the person to pick one, shown with
       // its options; Cancel stops it as any opening. A wait on the person
-      // (`utils/person-wait.js`).
-      choose: ({ question, options }) => whileWaitingOnPerson(new Promise((resolve, reject) => {
+      // (`utils/person-wait.js`), asked once the welcome is closed: nothing
+      // is put on top of it (`utils/startup-sequence.js`).
+      choose: ({ question, options }) => whileWaitingOnPerson(afterWelcome().then(() => new Promise((resolve, reject) => {
         if (opening.state !== 'running') {
           reject(openingCancelledError(holder.title));
           return;
@@ -384,7 +434,7 @@ export class OpeningProgress {
           resolve(index);
         };
         this._publish();
-      })),
+      }))),
       get cancelled() {
         return opening.state === 'cancelled';
       },
@@ -486,7 +536,7 @@ export class OpeningProgress {
     if (opening === null || opening.state !== 'running') return false;
     const cancels = [...opening.cancels];
     opening.cancels.clear();
-    this._settle(opening, 'cancelled', `Opening ${opening.title} was cancelled.`);
+    this._settle(opening, 'cancelled', `Opening ${opening.title} was canceled.`);
     for (const cancel of cancels) {
       try {
         cancel();
@@ -511,8 +561,16 @@ export class OpeningProgress {
     const parts = [];
     let percent = null;
     let left = null;
-    const since = opening.firstByteAt === null ? 0 : now - opening.firstByteAt;
-    const rate = bytes > 0 && since >= 500 ? bytes / since : null;
+    // The rate is of the time the reads ran: a wait on the person (an `.rda`
+    // asking which object to open) moves no byte, and counted in, it made the
+    // rate shown beside the question fall for as long as the person thought
+    // (F76: "7.3 MB/s" in one capture, another figure in the next). While the
+    // person is asked, no rate is shown.
+    const since = opening.firstByteAt === null
+      ? 0
+      : now - opening.firstByteAt - opening.personWaitMs
+        - (opening.personWaiting ? personWaitSinceFirstByte(opening, now) : 0);
+    const rate = bytes > 0 && since >= 500 && !opening.personWaiting ? bytes / since : null;
     // How far the opening is, over everything it has planned to read: one
     // numerator and one denominator for all of its reads (each read's
     // planned bytes, once it has said them). A read joining the opening adds
@@ -552,7 +610,7 @@ export class OpeningProgress {
     const stalled = opening.state === 'running' && !waiting && opening.stalled !== null
       ? `Nothing has changed for ${formatDuration(Math.max(this._stallMs, now - opening.progressAt))}` +
         (opening.stalled.reads === null
-          ? ` while ${continuing(opening.stalled.step)}.`
+          ? ` while ${lowerFirst(opening.stalled.step)}.`
           : `; waiting for ${opening.stalled.reads}.`)
       : null;
     return Object.freeze({
@@ -589,8 +647,7 @@ export class OpeningProgress {
    * @returns {() => void}
    */
   subscribe(listener) {
-    this._listeners.add(listener);
-    return () => this._listeners.delete(listener);
+    return this._listeners.add(listener);
   }
 
   /** @private */
@@ -652,6 +709,10 @@ export class OpeningProgress {
     this._arm(opening);
     opening.stopWaitSources = [
       this._personWaits(waiting => {
+        if (waiting === opening.personWaiting) return;
+        const now = performance.now();
+        if (waiting) opening.personWaitStartedAt = now;
+        else opening.personWaitMs += personWaitSinceFirstByte(opening, now);
         opening.personWaiting = waiting;
         this._holdSilence(opening);
       }),
@@ -685,7 +746,7 @@ export class OpeningProgress {
     const reads = openReadsOf(opening);
     opening.stalled = { step, reads };
     this._console?.warn?.(
-      `[cellucid:opening] Opening ${opening.title} stalled while ${continuing(step)}: ` +
+      `[cellucid:opening] Opening ${opening.title} stalled while ${lowerFirst(step)}: ` +
       `nothing has changed for ${formatDuration(Math.max(this._stallMs, performance.now() - opening.progressAt))}` +
       (reads === null ? '.' : `, while reading ${reads}.`)
     );
@@ -757,13 +818,7 @@ export class OpeningProgress {
       }
     }
     const snapshot = this.snapshot();
-    for (const listener of this._listeners) {
-      try {
-        listener(snapshot);
-      } catch (error) {
-        console.error('[cellucid:opening] An opening display failed:', error);
-      }
-    }
+    this._listeners.notify(snapshot);
   }
 }
 
@@ -833,7 +888,8 @@ export function beginOpening(options) {
  * `outcome(error)`: why it was stopped, not the error stopping it caused.
  * `quiet`: work on an opening already shown (a progressive opening growing
  * in place, `app/open-cells-resize.js`, which says its own progress), not
- * shown on the opening progress; only `signal` stops it.
+ * shown on the opening progress; only `signal` stops it. The layer's own
+ * `signal` aborts when it is stopped, for reads `stop` does not end.
  *
  * @param {{title: string, step?: string, signal?: AbortSignal|null, stop: () => void, quiet?: boolean}} options
  */
@@ -841,15 +897,21 @@ export function stoppableOpening({ title, step, signal = null, stop, quiet = fal
   if (typeof stop !== 'function') throw new TypeError('A stoppable opening needs stop().');
   const handle = quiet ? QUIET_OPENING : beginOpening({ title, ...(step === undefined ? {} : { step }) });
   let reason = null;
+  // Aborts when the layer is stopped, for the reads `stop` does not end itself (an adapter's on
+  // a reader that stays open: `AnnDataFileSource.reopenCells`).
+  const halted = new AbortController();
   const halt = why => {
     if (reason !== null) return;
     reason = why;
+    halted.abort(why);
     stop();
   };
   const removeCancel = handle.onCancel(() => halt(openingCancelledError(title)));
   const removeAbort = onAbort(signal, () => halt(signal.reason ?? openingCancelledError(title)));
   return {
     handle,
+    /** Aborts when it is stopped (Cancel or `signal`), with why. */
+    signal: halted.signal,
     /** Whether it was stopped. */
     get stopped() {
       return reason !== null;

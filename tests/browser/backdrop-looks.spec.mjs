@@ -3,7 +3,7 @@
  * and dark; `rendering/backdrops/`) in the places a user reaches them.
  *
  * - Every look draws in a 3-D and a 2-D pane with finite state and no WebGL
- *   error, on a page coloured exactly like the canvas, and the scene goes
+ *   error, on a page colored exactly like the canvas, and the scene goes
  *   quiet once its bake has landed: no frame is drawn while nothing changes.
  * - In a two-pane grid each pane draws the look, and the panes go quiet.
  * - Below the Atelier floor the look still draws (the backlit paper).
@@ -97,7 +97,7 @@ async function showLook(page, look) {
 
 /**
  * Count the look passes drawn, and record any non-finite uniform handed to a
- * look program or a WebGL error. Look programs are recognised by their source.
+ * look program or a WebGL error. Look programs are recognized by their source.
  */
 async function installLookProbe(page) {
   await page.evaluate(() => {
@@ -166,7 +166,7 @@ async function lookFrame(page) {
 
 /**
  * The spread of the canvas corner (where the fixture draws no cell): a look
- * paints structure and grain there, a plain clear colour paints none.
+ * paints structure and grain there, a plain clear color paints none.
  */
 async function cornerSpread(page) {
   const image = decodePng(await page.locator('#glcanvas').screenshot());
@@ -213,7 +213,7 @@ for (const look of BACKDROP_LOOK_IDS) {
       expect(await cornerSpread(page), `${look} ${dimension}-D: the corner shows the look`)
         .toBeGreaterThan(0);
     }
-    // The page behind the canvas is exactly the colour the canvas clears to.
+    // The page behind the canvas is exactly the color the canvas clears to.
     const [r, g, b] = BACKDROP_LOOKS[look].surface;
     await expect.poll(() => page.evaluate(
       () => getComputedStyle(document.body).backgroundColor,
@@ -375,8 +375,8 @@ async function exportFigure(page, format) {
   return Buffer.concat(chunks);
 }
 
-/** Distinct colours on a 7-pixel lattice over the middle of a PNG's plot area. */
-function plotAreaColours({ width, height, channels, pixels }) {
+/** Distinct colors on a 7-pixel lattice over the middle of a PNG's plot area. */
+function plotAreaColors({ width, height, channels, pixels }) {
   const values = new Set();
   for (let y = Math.floor(height * 0.2); y < Math.floor(height * 0.8); y += 7) {
     for (let x = Math.floor(width * 0.2); x < Math.floor(width * 0.7); x += 7) {
@@ -393,7 +393,7 @@ function plotAreaColours({ width, height, channels, pixels }) {
  * point pass are not. Measured over this fixture's figure: 0.16 (WebKit) and
  * 0.12 (Chromium). The PNG Linux WebKit wrote while the composed figure
  * reached the encoder as an ImageBitmap held no point and measured 0, while
- * its blurred grid passed a count of more than five colours (it had 28).
+ * its blurred grid passed a count of more than five colors (it had 28).
  */
 function plotAreaShadedShare({ width, height, channels, pixels }) {
   let samples = 0;
@@ -408,8 +408,8 @@ function plotAreaShadedShare({ width, height, channels, pixels }) {
   return shaded / samples;
 }
 
-/** Distinct colours of the look raster an SVG export embeds. */
-function svgLookColours(svg) {
+/** Distinct colors of the look raster an SVG export embeds. */
+function svgLookColors(svg) {
   const match = svg.match(
     /<image class="cellucid-backdrop-look" [^>]*href="data:image\/png;base64,([A-Za-z0-9+/=]+)"/,
   );
@@ -453,12 +453,12 @@ test('figure export redraws the look under the points', async ({ page }, testInf
     // Under the points: the image comes before the first point.
     expect(svg.indexOf('cellucid-backdrop-look')).toBeLessThan(svg.indexOf('<circle'));
     // The look raster on its own, as the SVG carries it: it has structure.
-    expect.soft(svgLookColours(svg).size, `${look}: the look raster has structure`).toBeGreaterThan(20);
+    expect.soft(svgLookColors(svg).size, `${look}: the look raster has structure`).toBeGreaterThan(20);
     const pngBytes = await exportFigure(page, 'png');
     await keep(`${look}.png`, pngBytes, 'image/png');
     // The plot area is not the plain surface: the look has structure there.
     expect(
-      plotAreaColours(decodePng(pngBytes)).size,
+      plotAreaColors(decodePng(pngBytes)).size,
       `${look}: the PNG plot area shows the look`,
     ).toBeGreaterThan(20);
   }

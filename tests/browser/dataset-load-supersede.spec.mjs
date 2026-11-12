@@ -73,7 +73,7 @@ test('a file chosen while the startup dataset loads replaces it', async ({
   await releaseAndDrain(page, held);
   await expectSettledOn(page, H5AD);
   await expectNeverPublished(page, START.name);
-  await expectAnnouncedOnce(page, /User data ready: 120 cells/);
+  await expectAnnouncedOnce(page, /Opened .+: 120 cells/);
   await expectNoFailureAnnounced(page);
   expect(productErrors).toEqual([]);
 });
@@ -191,7 +191,7 @@ test('a one-dataset server connected while the startup dataset loads replaces it
   await releaseAndDrain(page, held);
   await expectSettledOn(page, remote);
   await expectNeverPublished(page, START.name);
-  await expectAnnouncedOnce(page, /Connected - dataset ".*" loaded/);
+  await expectAnnouncedOnce(page, new RegExp(`Opened ${TRAJECTORY.name}`));
   await expectNoFailureAnnounced(page);
   expect(productErrors).toEqual([]);
 });
@@ -279,7 +279,7 @@ test('a sample chosen while a file is still being read replaces it', async ({
   await expectNeverPublished(page, H5AD.name);
   const { notifications } = await readRecord(page);
   expect(
-    notifications.filter(entry => /User data ready/.test(entry.text)),
+    notifications.filter(entry => /Opened .+: \d[\d.,K]* cells/.test(entry.text)),
   ).toEqual([]);
   await expectNoFailureAnnounced(page);
   expect(productErrors).toEqual([]);
@@ -432,7 +432,7 @@ test('a server that answers after a newer choice keeps its dataset in the catalo
   ).toHaveCount(0);
   await expectAnnouncedOnce(
     page,
-    /Connected - ".*" was not opened because another dataset was chosen meanwhile/,
+    /Connected; ".*" was not opened because another dataset was chosen meanwhile/,
   );
   await expectSettledOn(page, TRAJECTORY);
   // A server's one dataset is not a choice of the sample list: opening the
@@ -480,7 +480,7 @@ test('a server that answers after a session was applied leaves that dataset and 
 
   await expectAnnouncedOnce(
     page,
-    /Connected - ".*" was not opened because another dataset was chosen meanwhile/,
+    /Connected; ".*" was not opened because another dataset was chosen meanwhile/,
   );
   // A server's one dataset is not a choice of the sample list: opening the
   // address again shows it.

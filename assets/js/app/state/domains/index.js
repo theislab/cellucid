@@ -18,6 +18,7 @@ import { DOMAIN_IDS } from '../../actions/domains.js';
 import { getStateDomains } from '../../actions/index.js';
 import { createCellsDomain } from './cells.js';
 import { createMappingDomain } from './mapping.js';
+import { createExpressionDomain } from './expression.js';
 import { createFieldOverlaysDomain } from './field-overlays.js';
 import { createGeneSetsDomain } from './gene-sets.js';
 import { createViewsDomain } from './views.js';
@@ -31,11 +32,14 @@ import { createCameraPathDomain } from './camera-path.js';
 import { createSettingsDomain } from './settings.js';
 import { createAnalysisDomain } from './analysis.js';
 import { createLayoutDomain } from './layout.js';
+import { RECORDS } from './records.js';
+import { readRecordShape, writeRecordShape } from './record-keys.js';
 
 /** Each domain's owner factory, by domain id. */
 export const OWNERS = Object.freeze({
   cells: createCellsDomain,
   mapping: createMappingDomain,
+  expression: createExpressionDomain,
   'field-overlays': createFieldOverlaysDomain,
   'gene-sets': createGeneSetsDomain,
   views: createViewsDomain,
@@ -50,6 +54,32 @@ export const OWNERS = Object.freeze({
   analysis: createAnalysisDomain,
   layout: createLayoutDomain,
 });
+
+/**
+ * The owner of a domain whose records `records.js` declares: every value it
+ * restores or describes is read against them first (a record of before
+ * filled in, a dropped key left out, a truly wrong one refused, naming where:
+ * `record-keys.js`), and every value it captures is written as before (an
+ * added key at its default left out, so a value that does not use it hashes
+ * as it did). The history keeps values as they were saved, so a value is
+ * read where it is used, never rewritten in place.
+ *
+ * @param {object} owner
+ * @param {object} shape
+ * @param {string} id
+ */
+export function readingRecords(owner, shape, id) {
+  const read = (value, what) => readRecordShape(value, shape, `The ${id} ${what}`);
+  const write = value => (value instanceof Promise ? value.then(done => writeRecordShape(done, shape)) : writeRecordShape(value, shape));
+  return Object.freeze({
+    ...owner,
+    capture: (...args) => write(owner.capture(...args)),
+    restore: (value, ...rest) => owner.restore(read(value, 'to restore'), ...rest),
+    ...(typeof owner.describe === 'function'
+      ? { describe: (a, b, ...rest) => owner.describe(read(a, 'compared'), read(b, 'compared'), ...rest) }
+      : {}),
+  });
+}
 
 /**
  * Provide every state domain's owner.
@@ -79,7 +109,8 @@ export function installStateDomains({ domains = getStateDomains(), ...context })
   const withdraw = DOMAIN_IDS.map(id => {
     const create = OWNERS[id];
     if (create === undefined) throw new Error(`The state domain "${id}" has no owner module.`);
-    return domains.provide(id, create(context));
+    const owner = create(context);
+    return domains.provide(id, RECORDS[id] === undefined ? owner : readingRecords(owner, RECORDS[id], id));
   });
   return () => {
     for (const remove of withdraw) remove();

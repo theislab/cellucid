@@ -135,7 +135,7 @@ in vec2 v_ndc;
 uniform mat4 u_invMvpMatrix;   // pane NDC -> model space
 uniform vec3 u_eye;            // camera position, model space
 uniform float u_pixelRatio;    // device pixels per CSS pixel
-uniform vec3 u_surfaceColor;   // clear colour; the backdrop at every pane edge
+uniform vec3 u_surfaceColor;   // clear color; the backdrop at every pane edge
 uniform vec3 u_glowColor;      // backdrop at the centre of the presented area
 uniform float u_glowCenterX;   // NDC x of that centre; the area spans [2c - 1, 1]
 uniform vec3 u_inkColor;
@@ -230,7 +230,7 @@ void main() {
 
   // A soft rise in lightness over the ellipse inscribed in the presented
   // area; outside it, and so along every pane edge, the backdrop is exactly
-  // the surface colour.
+  // the surface color.
   float glow = studioFalloff(length(vec2(
     (v_ndc.x - u_glowCenterX) / max(1.0 - u_glowCenterX, 1e-3),
     v_ndc.y
@@ -244,7 +244,7 @@ void main() {
   color = mix(color, u_inkColor, clamp(marks, 0.0, 1.0) * u_opacity);
 
   // Interleaved-gradient dither of under half a code value: it breaks 8-bit
-  // banding in the glow and leaves an exact surface colour unchanged.
+  // banding in the glow and leaves an exact surface color unchanged.
   float noise = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
   color += (noise - 0.5) * (0.98 / 255.0);
 

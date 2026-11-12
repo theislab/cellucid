@@ -47,7 +47,7 @@ import {
   withRetries,
 } from '../../formats/io/byte-source.js';
 import { ResponseClock } from '../../formats/io/link.js';
-import { realmHosts } from '../../formats/io/hosts.js';
+import { realmHosts, retryAfterMilliseconds } from '../../formats/io/hosts.js';
 import { OPERATION_OUTCOME_HEADER } from './worker-contract.js';
 import { formatDuration } from '../../utils/format-units.js';
 
@@ -218,6 +218,8 @@ export async function requestWorker(transport, url, init, {
       signal,
       clock,
       onWait,
+      // The Worker answers for GitHub: a repeat is said as GitHub's.
+      service: 'GitHub',
       random: spreadOf(`${init?.method ?? 'GET'} ${url}`),
       // A mutation is repeated only on an answer stating it was not applied
       // (thrown above as a transient status); a request it sent and lost may
@@ -247,13 +249,8 @@ export async function requestWorker(transport, url, init, {
  * milliseconds, or null: what a person is told to wait.
  */
 export function namedWaitMsOf(transport, url, response) {
-  const retryAfter = response.headers.get('Retry-After');
-  if (retryAfter !== null) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
-    const date = Date.parse(retryAfter);
-    if (Number.isFinite(date)) return Math.max(0, date - Date.now());
-  }
+  const retryAfter = retryAfterMilliseconds(response.headers.get('Retry-After'));
+  if (retryAfter !== null) return retryAfter;
   const held = transport.hosts.heldForMs?.(url) ?? 0;
   return held > 0 ? held : null;
 }

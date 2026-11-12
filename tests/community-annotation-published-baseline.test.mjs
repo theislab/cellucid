@@ -1,7 +1,8 @@
-// What the person has published, what is not published yet, and a vote
-// published alone (B1 and should-fix 4 of the community annotation UI audit,
-// 2026-11-05): an agent's vote writes the file as published plus that vote,
-// never the person's drafts; a vote that changes nothing writes nothing.
+// What the person has published, what is not published yet, and an agent's
+// votes and suggestions published alone (B1 and should-fix 4 of the community
+// annotation UI audit, 2026-11-05): they write the file as published plus
+// them, never the person's drafts; votes that change nothing write nothing.
+// One call is one composed file, so one commit (bug hunt F145).
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -14,8 +15,7 @@ import {
   publishedBaseline,
   sameJson,
   setPublishedBaseline,
-  withOneSuggestion,
-  withOneVote,
+  withChanges,
 } from '../assets/js/app/ui/modules/community-annotation/published-baseline.js';
 import { assertUserDocument, composeUserFile } from '../assets/js/app/community-annotations/wire-contract.js';
 
@@ -45,24 +45,58 @@ function view(extra = {}) {
 
 test('a vote alone is the published view plus that vote, nothing else', () => {
   const published = view();
-  const up = withOneVote(published, { githubUserId: 42, login: 'tester', suggestionId: 'ghid_7_other', direction: 'up', now: NOW });
+  const who = { githubUserId: 42, login: 'tester', now: NOW };
+  const up = withChanges(published, { ...who, votes: [{ suggestionId: 'ghid_7_other', direction: 'up' }] });
   assert.deepEqual(up.votes, { 'ghid_42_own': 'up', 'ghid_7_other': 'up' });
   assert.equal(up.updatedAt, NOW);
   assert.deepEqual(up.suggestions, published.suggestions, 'the suggestions stay as published');
   assert.equal(up.displayName, 'Tess', 'the profile stays as published');
   assertUserDocument(up, { path: '$ vote', filename: 'ghid_42.json' });
 
-  const withdrawn = withOneVote(published, { githubUserId: 42, login: 'tester', suggestionId: 'ghid_7_other', direction: null, now: NOW });
+  const withdrawn = withChanges(published, { ...who, votes: [{ suggestionId: 'ghid_7_other', direction: null }] });
   assert.deepEqual(withdrawn.votes, { 'ghid_42_own': 'up' });
 
   // Already so: the view comes back unchanged, updatedAt included, so the
   // composed file equals the published one and nothing is written.
-  const same = withOneVote(published, { githubUserId: 42, login: 'tester', suggestionId: 'ghid_42_own', direction: 'up', now: NOW });
+  const same = withChanges(published, { ...who, votes: [{ suggestionId: 'ghid_42_own', direction: 'up' }] });
   assert.equal(same, published);
+  assert.equal(withChanges(published, { ...who }), published, 'no changes: unchanged');
+});
+
+test('many votes and suggestions are one composed file: the published view plus all of them, nothing else (F145)', () => {
+  const published = view();
+  const gamma = { id: 'ghid_42_g', label: 'Gamma cell', proposedBy: 'ghid_42', proposedAt: NOW, ontologyId: 'CL:0000173', evidence: 'Sst+', editedAt: null, markers: null };
+  const delta = { id: 'ghid_42_d', label: 'Delta cell ✓ δ-Zelle', proposedBy: 'ghid_42', proposedAt: NOW, ontologyId: null, evidence: null, editedAt: null, markers: null };
+  const next = withChanges(published, {
+    githubUserId: 42, login: 'tester', now: NOW,
+    votes: [
+      { suggestionId: 'ghid_7_other', direction: 'up' },
+      { suggestionId: 'ghid_42_own', direction: null },
+      { suggestionId: 'ghid_9_third', direction: 'down' },
+      // Already so: changes nothing, the rest still applies.
+      { suggestionId: 'ghid_9_fourth', direction: null },
+    ],
+    suggestions: [{ bucket: 'cell_type:gamma', suggestion: gamma }, { bucket: 'cell_type:delta', suggestion: delta }],
+  });
+  assert.deepEqual(next.votes, { 'ghid_7_other': 'up', 'ghid_9_third': 'down', 'ghid_42_g': 'up', 'ghid_42_d': 'up' });
+  assert.deepEqual(next.suggestions['cell_type:gamma'], [gamma]);
+  assert.deepEqual(next.suggestions['cell_type:delta'], [delta]);
+  assert.deepEqual(next.suggestions['cell_type:alpha'], published.suggestions['cell_type:alpha']);
+  assert.equal(next.updatedAt, NOW);
+  assert.equal(next.displayName, 'Tess', 'the profile stays as published');
+  assertUserDocument(next, { path: '$ publication', filename: 'ghid_42.json' });
+  // The input is never changed (the published view stays what GitHub holds).
+  assert.deepEqual(published, view());
+  // Composed again on the result (a retry after a conflict Pull): the same file, so no second write.
+  assert.equal(withChanges(next, {
+    githubUserId: 42, login: 'tester', now: '2027-01-01T00:00:00.000Z',
+    votes: [{ suggestionId: 'ghid_7_other', direction: 'up' }, { suggestionId: 'ghid_42_own', direction: null }, { suggestionId: 'ghid_9_third', direction: 'down' }],
+    suggestions: [{ bucket: 'cell_type:gamma', suggestion: gamma }, { bucket: 'cell_type:delta', suggestion: delta }],
+  }), next);
 });
 
 test('a first vote of a person with no file makes a file of that vote and their login only', () => {
-  const first = withOneVote(null, { githubUserId: 42, login: 'tester', suggestionId: 'ghid_7_other', direction: 'down', now: NOW });
+  const first = withChanges(null, { githubUserId: 42, login: 'tester', now: NOW, votes: [{ suggestionId: 'ghid_7_other', direction: 'down' }] });
   assert.deepEqual(first, {
     version: 1, username: 'ghid_42', githubUserId: 42, login: 'tester', updatedAt: NOW, suggestions: {}, votes: { 'ghid_7_other': 'down' },
   });
@@ -129,12 +163,12 @@ test('the published view counts only while its SHA is the one the session knows'
 test('a suggestion alone is the published view plus that suggestion and its upvote', () => {
   const published = view();
   const added = { id: 'ghid_42_new', label: 'Gamma cell', proposedBy: 'ghid_42', proposedAt: NOW, ontologyId: null, evidence: null, editedAt: null, markers: null };
-  const next = withOneSuggestion(published, { githubUserId: 42, login: 'tester', bucket: 'cell_type:gamma', suggestion: added, now: NOW });
+  const next = withChanges(published, { githubUserId: 42, login: 'tester', suggestions: [{ bucket: 'cell_type:gamma', suggestion: added }], now: NOW });
   assert.deepEqual(next.suggestions['cell_type:gamma'], [added]);
   assert.deepEqual(next.suggestions['cell_type:alpha'], published.suggestions['cell_type:alpha']);
   assert.deepEqual(next.votes, { ...published.votes, 'ghid_42_new': 'up' });
   assertUserDocument(next, { path: '$ suggestion', filename: 'ghid_42.json' });
-  assert.equal(withOneSuggestion(next, { githubUserId: 42, login: 'tester', bucket: 'cell_type:gamma', suggestion: added, now: '2027-01-01T00:00:00.000Z' }), next, 'already there: unchanged');
-  const first = withOneSuggestion(null, { githubUserId: 42, login: 'tester', bucket: 'cell_type:gamma', suggestion: added, now: NOW });
+  assert.equal(withChanges(next, { githubUserId: 42, login: 'tester', suggestions: [{ bucket: 'cell_type:gamma', suggestion: added }], now: '2027-01-01T00:00:00.000Z' }), next, 'already there: unchanged');
+  const first = withChanges(null, { githubUserId: 42, login: 'tester', suggestions: [{ bucket: 'cell_type:gamma', suggestion: added }], now: NOW });
   assert.deepEqual(Object.keys(first.suggestions), ['cell_type:gamma']);
 });

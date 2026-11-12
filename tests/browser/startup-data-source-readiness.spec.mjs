@@ -227,7 +227,7 @@ test('a terminal startup failure leaves exactly one dialog on screen', async ({
         ? null
         : document.activeElement.id,
       dialogCount: document.querySelectorAll(
-        '[role="dialog"]:not(.hidden):not([hidden]), [role="alert"]',
+        'dialog[open], [role="dialog"]:not(.hidden):not([hidden]), [role="alert"]',
       ).length,
     };
   });

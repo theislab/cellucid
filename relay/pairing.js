@@ -17,7 +17,7 @@
  *   `asking`): its time running out answers the agent with that, and the
  *   tab keeps the question open (`detach`).
  * - **connections** (OAuth grants), in storage: per agent connected through
- *   this browser, its client, name, when it was made and last used, until
+ *   this browser, its client (the client id's digest), name, when it was made and last used, until
  *   when it lasts, and its refresh-token generation (a refresh token works
  *   once; a used one presented again closes the connection, the theft
  *   signal of OAuth 2.1). Forget deletes them all and closes every tab.
@@ -27,8 +27,9 @@
  */
 
 import { RELAY_BUNDLE } from './generated/bundle.js';
+import { isConnectCode } from './approval.js';
 import { displayText } from './clients.js';
-import { randomBase64Url } from './encoding.js';
+import { randomBase64Url, sha256Base64Url } from './encoding.js';
 
 /** How long a tool call may wait for the tab: under the 240 s Claude allows a tool call, with time for the answer to travel. */
 export const TAB_CALL_WAIT_MS = 225_000;
@@ -38,6 +39,16 @@ export const TAB_CALL_WAIT_MS = 225_000;
  * that has not after this is asleep (a frozen background tab) or gone.
  */
 export const TAB_LIST_WAIT_MS = 5_000;
+/**
+ * How long a call or a status waits for this browser's tab to come back when
+ * its last tab closed a moment ago: a reloaded page reaches the relay again
+ * in 1.5–2.8 s (measured on the Pancreas sample, local relay, 2026-11-11: the
+ * page dials before its dataset opens) and reports its dataset soon after,
+ * so a call that arrives during a reload runs in the reloaded tab instead of
+ * being told no tab is there. A tab that closed for good is said so after
+ * this wait, well within the time a client shows a call as running.
+ */
+export const TAB_RECONNECT_WAIT_MS = 20_000;
 /** How long a connection lasts unused: each refresh renews it. */
 export const CONNECTION_SECONDS = 30 * 24 * 60 * 60;
 /** How often "last used" is written (it is shown to the person in minutes, not seconds). */
@@ -87,6 +98,10 @@ export class RelayPairing {
     this.env = env;
     /** @type {Map<string, {tab: string, grant: string|null, rpcId: unknown, socket: WebSocket, settle: (answer: object) => void}>} */
     this.pending = new Map();
+    /** When the last open tab of this browser closed (0: none closed while this object was awake). */
+    this.lastTabGoneAt = 0;
+    /** Calls and statuses waiting for a tab to come back: each is woken by a tab's connection or state. */
+    this.tabWaiters = new Set();
     // The platform answers the tab's keep-alive without waking this object.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PROTOCOL.ping, PROTOCOL.pong));
   }
@@ -132,6 +147,31 @@ export class RelayPairing {
 
   tabs() {
     return this.ctx.getWebSockets(TAB_TAG).filter(socket => socket.readyState === OPEN);
+  }
+
+  /**
+   * The tab calls go to, once there is one to go to: while the last tab of
+   * this browser closed less than `TAB_RECONNECT_WAIT_MS` ago (a reload), wait
+   * until a tab is back and has said which dataset it shows, or the wait is
+   * over; otherwise the tab there is now (`target`), or null.
+   */
+  async targetSoon() {
+    const deadline = this.lastTabGoneAt + TAB_RECONNECT_WAIT_MS;
+    for (;;) {
+      const socket = this.target();
+      const ready = socket !== null && socket.deserializeAttachment().dataset !== null;
+      const left = deadline - Date.now();
+      if (ready || left <= 0) return socket;
+      await new Promise(resolve => {
+        const wake = () => { clearTimeout(timer); this.tabWaiters.delete(wake); resolve(); };
+        const timer = setTimeout(wake, left);
+        this.tabWaiters.add(wake);
+      });
+    }
+  }
+
+  wakeTabWaiters() {
+    for (const wake of [...this.tabWaiters]) wake();
   }
 
   /** The tab calls go to: focused last, else connected last. */
@@ -212,11 +252,16 @@ export class RelayPairing {
     else await this.ctx.storage.setAlarm(next);
   }
 
-  async createGrant({ clientId, agent, clientName, clientHost, scope }) {
+  async createGrant({ clientId, agent, clientName, clientHost, known, scope }) {
     const id = randomBase64Url(16);
     const now = Date.now();
+    // The client id is kept as its digest: a registered one is up to
+    // CLIENT_ID_MAX_CHARS of the registrant's choosing, and a connection is
+    // kept for CONNECTION_SECONDS, so the id itself would let anyone who
+    // approves their own connections in a loop store kilobytes per connection
+    // for a month. Checking a refresh needs only equality.
     await this.ctx.storage.put(`grant:${id}`, {
-      clientId, agent, clientName, clientHost, scope,
+      clientDigest: await sha256Base64Url(clientId), agent, clientName, clientHost, known: known === true, scope,
       generation: 0, createdAt: now, lastUsedAt: now, expiresAt: now + CONNECTION_SECONDS * 1000,
     });
     await this.scheduleExpiry();
@@ -227,10 +272,13 @@ export class RelayPairing {
   async rotateGrant({ grant, generation, clientId }) {
     const record = await this.grant(grant);
     if (record === null) return { error: 'This connection was removed in Cellucid or has expired; connect again.' };
-    if (clientId !== null && clientId !== record.clientId) return { error: 'This refresh token was issued to another client.' };
+    if (clientId !== null && await sha256Base64Url(clientId) !== record.clientDigest) {
+      return { error: 'This refresh token was issued to another client.' };
+    }
     if (generation !== record.generation) {
       await this.ctx.storage.delete(`grant:${grant}`);
       await this.scheduleExpiry();
+      this.endCalls([grant]);
       this.broadcast({ type: 'event', name: 'connections-changed' });
       return { error: 'This refresh token was used already, so the connection was closed for safety; connect again.' };
     }
@@ -260,6 +308,8 @@ export class RelayPairing {
         agent: record.agent,
         client: record.clientName,
         host: record.clientHost,
+        // Whether Claude's or ChatGPT's host vouches for it: else its own name is only what it calls itself.
+        known: record.known === true,
         createdAt: record.createdAt,
         lastUsedAt: record.lastUsedAt,
         expiresAt: record.expiresAt,
@@ -273,6 +323,7 @@ export class RelayPairing {
     const expired = [...grants.entries()].filter(([, record]) => now >= record.expiresAt).map(([key]) => key);
     if (expired.length > 0) {
       await this.ctx.storage.delete(expired);
+      this.endCalls(expired.map(key => key.slice('grant:'.length)));
       this.broadcast({ type: 'event', name: 'connections-changed' });
     }
     await this.scheduleExpiry();
@@ -282,7 +333,7 @@ export class RelayPairing {
 
   async list({ grant }) {
     if (await this.grant(grant) === null) return { outcome: 'revoked' };
-    const socket = this.target();
+    const socket = await this.targetSoon();
     if (socket === null) return { outcome: 'no-tab' };
     // The connection asking: its tools say what the person's settings let it do.
     const answer = await this.ask(socket, { type: 'list', id: randomBase64Url(12), grant }, TAB_LIST_WAIT_MS);
@@ -293,17 +344,20 @@ export class RelayPairing {
     const record = await this.grant(grant);
     if (record === null) return { outcome: 'revoked' };
     await this.touch(grant, record);
-    const socket = this.target();
+    const socket = await this.targetSoon();
     if (socket === null) return { outcome: 'no-tab' };
+    // `agent` is the name the person sees (the vouching host for an app that is not Claude's or
+    // ChatGPT's); the app's own name goes with `known`, so the tab quotes an unvouched one.
     return this.ask(socket, {
-      type: 'call', id: callId, tool, args, agent: record.agent, grant, client: record.clientName ?? null, host: record.clientHost ?? null,
+      type: 'call', id: callId, tool, args, agent: record.agent, grant,
+      client: record.clientName ?? null, host: record.clientHost ?? null, known: record.known === true,
     }, TAB_CALL_WAIT_MS, { grant, rpcId });
   }
 
   async status({ grant }) {
     const record = await this.grant(grant);
     if (record === null) return { outcome: 'revoked' };
-    const target = this.target();
+    const target = await this.targetSoon();
     return {
       outcome: 'status',
       agent: record.agent,
@@ -312,6 +366,21 @@ export class RelayPairing {
         return { focused, visible, dataset, version, connectedAt, receivesCalls: socket === target };
       }),
     };
+  }
+
+  /**
+   * Connections ended (removed in Cellucid, closed after a refresh token was
+   * used twice, expired, or every one of this browser forgotten): their
+   * calls in flight are stopped in the tab and answered as such at once, so
+   * nothing a removed agent asked for goes on running, records a step as
+   * that agent, or sends it what the call read. `grants` null: every one.
+   */
+  endCalls(grants) {
+    for (const [id, entry] of [...this.pending]) {
+      if (entry.grant === null || (grants !== null && !grants.includes(entry.grant))) continue;
+      try { entry.socket.send(JSON.stringify({ type: 'cancel', id })); } catch { /* closing */ }
+      entry.settle({ outcome: 'removed' });
+    }
   }
 
   /** The caller stopped waiting: by the call's id, or (an MCP cancellation) by the request id of its connection. */
@@ -367,6 +436,7 @@ export class RelayPairing {
           dataset: displayText(data.dataset),
           version: typeof data.version === 'string' ? displayText(data.version) : null,
         });
+        this.wakeTabWaiters();
         return;
       }
       case 'result': {
@@ -398,15 +468,14 @@ export class RelayPairing {
         entry.settle(valid ? { outcome: 'tools', tools: data.tools } : { outcome: 'bad-result' });
         return;
       }
-      case 'claim':
       case 'decide': {
-        if (typeof data.code !== 'string') {
+        // A code is claimed over HTTP, with the browser's approver cookie
+        // (`oauth.js` `handleClaim`); only the pairing that claimed it decides.
+        if (!isConnectCode(data.code)) {
           this.reply(socket, data.ref, null, { code: 'not-a-code', message: 'That is not a connect code.' });
           return;
         }
-        const answer = data.type === 'claim'
-          ? await this.approval(data.code, '/claim', { pairingId: attachment.pairingId })
-          : await this.approval(data.code, '/decide', { pairingId: attachment.pairingId, allow: data.allow === true });
+        const answer = await this.approval(data.code, '/decide', { pairingId: attachment.pairingId, allow: data.allow === true });
         if (answer.ok) this.reply(socket, data.ref, answer.body);
         else this.reply(socket, data.ref, null, { code: answer.body.code, message: answer.body.message });
         return;
@@ -417,13 +486,17 @@ export class RelayPairing {
       case 'disconnect': {
         const removed = typeof data.grant === 'string' && (await this.ctx.storage.delete(`grant:${data.grant}`));
         await this.scheduleExpiry();
-        if (removed) this.broadcast({ type: 'event', name: 'connections-changed' });
+        if (removed) {
+          this.endCalls([data.grant]);
+          this.broadcast({ type: 'event', name: 'connections-changed' });
+        }
         this.reply(socket, data.ref, { removed: Boolean(removed) });
         return;
       }
       case 'forget': {
         await this.ctx.storage.deleteAll();
         await this.ctx.storage.deleteAlarm();
+        this.endCalls(null);
         this.reply(socket, data.ref, { forgotten: true });
         for (const tab of this.tabs()) {
           try { tab.close(PROTOCOL.close.forgotten, 'forgotten'); } catch { /* closing */ }
@@ -439,6 +512,8 @@ export class RelayPairing {
     for (const entry of [...this.pending.values()]) {
       if (entry.tab === tab) entry.settle({ outcome: 'tab-closed' });
     }
+    // The last tab gone: a reload brings it back within seconds (`targetSoon`).
+    if (this.tabs().every(other => other === socket)) this.lastTabGoneAt = Date.now();
   }
 
   async webSocketClose(socket, code, reason) {

@@ -21,6 +21,7 @@ import { WasmCodecError, wasmCodecs } from '../../io/wasm-codecs.js';
 import { decoderFor } from '../../io/decoder-choice.js';
 import { zstdDecompress as zstdInJavaScript } from './javascript/zstd.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { lowerFirst } from '../../../utils/text-case.js';
 
 const FRAME_MAGIC = 0xfd2fb528;
 const SKIPPABLE_MASK = 0xfffffff0;
@@ -39,7 +40,7 @@ function startsWithFrame(input) {
 }
 
 function lowered(message) {
-  return message.charAt(0).toLowerCase() + message.slice(1).replace(/\.$/, '');
+  return lowerFirst(message).replace(/\.$/, '');
 }
 
 /**

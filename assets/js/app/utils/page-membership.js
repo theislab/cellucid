@@ -11,12 +11,7 @@
  * @module utils/page-membership
  */
 
-/**
- * The most pages one intersection field may combine. A cell's intersection is
- * the set of pages holding it, stored as one bit per page in a 32-bit mask,
- * and a session records each intersection's label under that mask.
- */
-export const MAX_INTERSECTION_PAGES = 32;
+import { formatCountOf } from '../../utils/format-units.js';
 
 /**
  * Visit every enabled cell index of one page, validating it.
@@ -49,72 +44,134 @@ function requirePages(pages, pointCount) {
 }
 
 /**
- * Each cell's page set as a bit mask: bit `p` is set when page `p` holds the
- * cell. The narrowest unsigned width that carries one bit per page is used.
+ * The key of a combination of pages: their positions among the field's
+ * pages, ascending, joined by "+" (`"0+1"`, `"3+17+41"`). A session records
+ * each intersection's label under it. It names any number of pages: an
+ * intersection field combines as many pages as the person gives (bug hunt
+ * F269: a 32-bit mask per cell once refused a 33rd page).
+ *
+ * @param {ArrayLike<number>} positions - Ascending page positions
+ * @returns {string}
+ */
+export function intersectionKey(positions) {
+  return Array.from(positions).join('+');
+}
+
+const INTERSECTION_KEY = /^(?:0|[1-9][0-9]*)(?:\+(?:0|[1-9][0-9]*))+$/;
+
+/**
+ * The page positions an intersection key names, checked: two or more
+ * positions, ascending without repeats, each one of `pageCount` pages.
+ *
+ * @param {string} key
+ * @param {number} pageCount
+ * @returns {number[]}
+ */
+export function parseIntersectionKey(key, pageCount) {
+  if (typeof key !== 'string' || !INTERSECTION_KEY.test(key)) {
+    throw new TypeError(
+      `Intersection key "${key}" must name two or more page positions joined by "+" (as "0+2")`
+    );
+  }
+  const positions = key.split('+').map(Number);
+  for (let index = 0; index < positions.length; index++) {
+    const position = positions[index];
+    if (!Number.isSafeInteger(position) || position >= pageCount) {
+      throw new RangeError(`Intersection key "${key}" names a page beyond the ${formatCountOf(pageCount, 'page')} given`);
+    }
+    if (index > 0 && position <= positions[index - 1]) {
+      throw new RangeError(`Intersection key "${key}" must list its pages ascending, each once`);
+    }
+  }
+  return positions;
+}
+
+/**
+ * Order combinations of pages by how many pages they combine, then by their
+ * page positions (the first differing position first).
+ *
+ * @param {ArrayLike<number>} left - Ascending page positions
+ * @param {ArrayLike<number>} right
+ */
+export function compareIntersections(left, right) {
+  if (left.length !== right.length) return left.length - right.length;
+  for (let index = 0; index < left.length; index++) {
+    if (left[index] !== right[index]) return left[index] - right[index];
+  }
+  return 0;
+}
+
+/**
+ * Each cell's set of pages, for any number of pages. Every set a cell can
+ * have is interned once, as the pages are visited in order: a cell's set
+ * grows by its next page, so the same set is always reached by the same
+ * steps (set, page) -> set, and one id per set suffices. A cell listed twice
+ * on one page counts once.
  *
  * @param {Array<{groups: ArrayLike<ArrayLike<number>>, describeGroup: (groupIndex: number) => string}>} pages
  * @param {number} pointCount
  * @returns {{
- *   masks: Uint8Array|Uint16Array|Uint32Array,
+ *   combinationOf: Int32Array,
+ *   combinations: number[][],
  *   pageCounts: number[],
- *   intersectionCounts: Map<number, number>,
+ *   intersections: Array<{key: string, pages: number[], count: number}>,
  *   overlapCount: number,
  *   coveredCount: number
- * }} `pageCounts[p]` counts cells held by page `p` alone; `intersectionCounts`
- *   counts the cells of every mask with two or more pages.
+ * }} `combinationOf[cell]` indexes `combinations` (0: no page, the empty
+ *   set); `combinations[id]` lists the set's page positions ascending;
+ *   `pageCounts[p]` counts cells held by page `p` alone; `intersections`
+ *   lists every set of two or more pages that holds cells, with its key and
+ *   count, in `compareIntersections` order.
  */
 export function intersectionMembership(pages, pointCount) {
   requirePages(pages, pointCount);
-  if (pages.length > MAX_INTERSECTION_PAGES) {
-    throw new RangeError(
-      `Each intersection supports at most ${MAX_INTERSECTION_PAGES} pages`
-    );
-  }
-  const MaskArray = pages.length <= 8
-    ? Uint8Array
-    : pages.length <= 16 ? Uint16Array : Uint32Array;
-  const masks = new MaskArray(pointCount);
+  const pageCount = pages.length;
+  const combinationOf = new Int32Array(pointCount);
+  const combinations = [[]];
+  // The last page of each set, to count a cell listed twice on a page once.
+  const lastPage = [-1];
+  const next = new Map();
   pages.forEach(({ groups, describeGroup }, pageIndex) => {
-    // `>>> 0` keeps bit 31 a positive mask.
-    const bit = (1 << pageIndex) >>> 0;
     forEachPageCell(groups, pointCount, describeGroup, cell => {
-      masks[cell] = (masks[cell] | bit) >>> 0;
+      const from = combinationOf[cell];
+      if (lastPage[from] === pageIndex) return;
+      const step = from * pageCount + pageIndex;
+      let to = next.get(step);
+      if (to === undefined) {
+        to = combinations.length;
+        combinations.push([...combinations[from], pageIndex]);
+        lastPage.push(pageIndex);
+        next.set(step, to);
+      }
+      combinationOf[cell] = to;
     });
   });
 
-  const pageCounts = new Array(pages.length).fill(0);
-  const intersectionCounts = new Map();
+  const counts = new Float64Array(combinations.length);
+  for (let cell = 0; cell < pointCount; cell++) counts[combinationOf[cell]]++;
+  const pageCounts = new Array(pageCount).fill(0);
+  const intersections = [];
   let overlapCount = 0;
-  let coveredCount = 0;
-  for (let cell = 0; cell < pointCount; cell++) {
-    const mask = masks[cell];
-    if (mask === 0) continue;
-    coveredCount++;
-    if ((mask & (mask - 1)) === 0) {
-      pageCounts[31 - Math.clz32(mask)]++;
+  for (let id = 1; id < combinations.length; id++) {
+    const count = counts[id];
+    if (count === 0) continue;
+    const combination = combinations[id];
+    if (combination.length === 1) {
+      pageCounts[combination[0]] += count;
     } else {
-      overlapCount++;
-      intersectionCounts.set(mask, (intersectionCounts.get(mask) ?? 0) + 1);
+      overlapCount += count;
+      intersections.push({ key: intersectionKey(combination), pages: combination, count });
     }
   }
-  return { masks, pageCounts, intersectionCounts, overlapCount, coveredCount };
-}
-
-/** Number of pages in a mask. */
-function maskPageCount(mask) {
-  let remaining = mask >>> 0;
-  let count = 0;
-  while (remaining !== 0) {
-    remaining = (remaining & (remaining - 1)) >>> 0;
-    count++;
-  }
-  return count;
-}
-
-/** Order intersection masks by how many pages they combine, then by value. */
-export function compareIntersectionMasks(left, right) {
-  const cardinality = maskPageCount(left) - maskPageCount(right);
-  return cardinality === 0 ? left - right : cardinality;
+  intersections.sort((left, right) => compareIntersections(left.pages, right.pages));
+  return {
+    combinationOf,
+    combinations,
+    pageCounts,
+    intersections,
+    overlapCount,
+    coveredCount: pointCount - counts[0]
+  };
 }
 
 /**

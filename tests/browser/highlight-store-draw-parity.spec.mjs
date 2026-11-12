@@ -4,7 +4,7 @@
  *
  * A highlight of many cells is drawn from the point store the view already
  * holds on the GPU (`rendering/highlight-renderer.js`, `rebuildBuffer`): its
- * positions, with a colour word for every slot written on the GPU from the
+ * positions, with a color word for every slot written on the GPU from the
  * highlight and visibility bytes, the cells not admitted rejected by the
  * vertex shader. At a reduced level of detail the records are the level's
  * members in the store's own order (the level is the store's first slots),

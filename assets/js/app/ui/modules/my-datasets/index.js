@@ -41,7 +41,7 @@ import {
 import { listLocalFiles, localHandlesAvailable, onLocalFilesChange } from '../../../library/local-file-handles.js';
 import { listSavedStates, onSavedStatesChange } from '../../../history/autosave.js';
 import { LIBRARY_FILE_EXTENSION, exportLibrary, importLibrary } from '../../../library/library-file.js';
-import { downloadBlob } from '../../../utils/download.js';
+import { downloadBlob, fileTimestamp } from '../../../utils/download.js';
 import { getSavedHistories, subscribeCurrentHistory } from '../../../history/current.js';
 import { keptStoragePlace, listKeptStores, onKeptStoresChange } from '../../../../data/anndata/transcode/space.js';
 import { setNextCellSubsetRequest, withdrawNextCellSubsetRequest } from '../../../../data/cell-subset-policy.js';
@@ -76,7 +76,7 @@ export async function openWithLastCells(entry, opensAnother, open) {
   }
 }
 
-/** The page's My datasets' import of a library file, while it is initialised. */
+/** The page's My datasets' import of a library file, while it is initialized. */
 let pageImport = null;
 
 /**
@@ -109,7 +109,7 @@ export const KEPT_UNTIL_WINDOW_CLOSES = 'Kept only until this window closes.';
  *   onDatasetChange: (listener: () => void) => (() => void),
  *   openDatasetSource: (record: Object) => Promise<boolean>,
  *   reopenLocalFile: (datasetId: string) => Promise<boolean>,
- *   openSavedState: (id: string) => Promise<boolean>,
+ *   openSavedState: (id: string) => Promise<{opened: boolean, problem: string|null, code: string|null}>,
  *   library?: ReturnType<typeof myDatasets>,
  *   view?: Window,
  *   now?: () => number,
@@ -197,8 +197,7 @@ export function initMyDatasets(dom, {
     onForget: (entry, options) => forget(entry, options),
     onExport: async ({ datasets, savedStates }) => {
       const written = await exportLibrary({ datasets, savedStates, library });
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      downloadBlob(written.blob, `cellucid-library-${timestamp}${LIBRARY_FILE_EXTENSION}`);
+      downloadBlob(written.blob, `cellucid-library-${fileTimestamp()}${LIBRARY_FILE_EXTENSION}`);
       return written;
     },
     onImport: file => importLibrary(file, { library }),

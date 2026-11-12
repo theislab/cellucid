@@ -81,7 +81,13 @@
  *   told to the other realms of this site and to whoever watches it (the
  *   page keeps it per origin across visits: `data/host-link-memory.js`),
  *   and an opening starts from what was kept (`seedPace`), so a visit never
- *   sends the burst that blocked an earlier one.
+ *   sends the burst that blocked an earlier one. A host on this machine
+ *   (`utils/loopback.js`) learns no pace: it blocks no network, and its
+ *   silence is a server restarting or down. Nor do requests lost on this
+ *   side of the link (`lostOnThisSide`: this computer offline, or a request
+ *   failing in less than half the host's quickest answer, which a refusal,
+ *   being an answer, never does): a connection that drops for a moment is
+ *   no block, and a pace learned from it would slow the host for a day.
  *
  * - **Whether it answers at all** (`answeredBefore`): a request that gets
  *   no answer a page may read (no connection, or an answer without CORS
@@ -120,6 +126,8 @@
 
 import { onAbort, abortReason } from '../../utils/abort.js';
 import { MIN_STALL_TIMEOUT_MS } from './link.js';
+import { isLoopbackUrl } from '../../utils/loopback.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
 /** Half the shortest stall timeout (RFC 6298's floor, `link.js`): the most a delivery is told to other realms late. */
 const DELIVERY_TOLD_EVERY_MS = MIN_STALL_TIMEOUT_MS / 2;
@@ -157,7 +165,7 @@ export class HostNotAnswering extends Error {
   }
 }
 
-/** The name of the channel the realms of this site tell each other what they learnt of hosts on. */
+/** The name of the channel the realms of this site tell each other what they learned of hosts on. */
 export const HOSTS_CHANNEL = 'cellucid-hosts';
 
 /** An address requests are counted by: the URL without its fragment (its query names what is asked: Drive's file and its details). */
@@ -266,10 +274,12 @@ export function budgetOf(headers, epochNow = Date.now()) {
  * clock.
  *
  * @param {{now?: () => number, after?: (ms: number, callback: () => void) => () => void,
- *   epoch?: () => number, channel?: {postMessage: Function, onmessage: Function|null}|null}} [options]
+ *   epoch?: () => number, channel?: {postMessage: Function, onmessage: Function|null}|null,
+ *   online?: () => boolean}} [options]
  *   `now`, the monotonic clock in milliseconds every time here is kept on,
  *   and `after`, its timers; `epoch`, the wall clock a reset in epoch
- *   seconds is read against; `channel`, what tells the other realms
+ *   seconds is read against; `channel`, what tells the other realms;
+ *   `online`, whether this computer says it is online (`navigator.onLine`)
  */
 export function createHostBook({
   now = () => performance.now(),
@@ -279,6 +289,7 @@ export function createHostBook({
   },
   epoch = () => Date.now(),
   channel = null,
+  online = () => globalThis.navigator?.onLine !== false,
 } = {}) {
   /** @type {Map<string, Object>} */
   const hosts = new Map();
@@ -289,8 +300,8 @@ export function createHostBook({
   /** @type {Map<string, number>} */
   const lostAt = new Map();
   let answeredAt = -Infinity;
-  /** Who hears a host's pace learnt here or told by another realm (`watchPace`). */
-  const paceWatchers = new Set();
+  /** Who hears a host's pace learned here or told by another realm (`watchPace`). */
+  const paceWatchers = createListenerSet('a host\'s pace');
 
   function hostOf(origin) {
     let host = hosts.get(origin);
@@ -326,6 +337,10 @@ export function createHostBook({
         answeredAt: [],
         paceMs: 0,
         lastSentAt: -Infinity,
+        // The quickest answer it gave (from its request sent to the answer):
+        // no answer of it comes sooner, so a request lost sooner than half of
+        // it never reached it (`lostOnThisSide`).
+        fastestAnswerMs: Infinity,
       };
       hosts.set(origin, host);
     }
@@ -450,18 +465,48 @@ export function createHostBook({
    * further round and kept under its 60 s maximum -- and what waits for it
    * fails unsent (`HostNotAnswering`).
    */
-  function lose(host, address) {
+  function lose(host, address, onThisSide = false) {
     const loss = lossesOf(host, address);
+    // Whether a round of this streak was lost on this side of the link
+    // (`lostOnThisSide`): the streak then says nothing of the host.
+    loss.thisSide = loss.streak === 0 ? onThisSide : loss.thisSide || onThisSide;
+    // Whether every round of this streak was lost while this computer said
+    // it was offline: then its quiet ends when it is online again (`admit`).
+    const offline = !online();
+    loss.offline = loss.streak === 0 ? offline : loss.offline && offline;
     loss.round++;
     loss.streak++;
     if (loss.streak < 2) return;
     loss.quietUntil = now() + Math.min(MAX_QUIET_MS, MIN_STALL_TIMEOUT_MS * 2 ** (loss.streak - 2));
     // A host that answered this site and now refuses it blocks this network:
-    // it is sent no faster than half the rate that met the block.
-    if (loss.streak === 2 && host.deliveries > 0) learnPace(host);
+    // it is sent no faster than half the rate that met the block. Not when
+    // the requests were lost on this side (this computer offline, its link
+    // down for a moment): no pace mends that, and a pace learned from it
+    // would slow every read of the host for the rest of the visit and, kept,
+    // the next day's (round 9, R9P-5: a flapping link read Suo at 70 KB/s
+    // over a fast one, "theislab.github.io limits how many requests it
+    // answers").
+    if (loss.streak === 2 && host.deliveries > 0 && !loss.thisSide) learnPace(host);
     const refused = host.queue.filter(waiter => waiter.address === address);
     host.queue = host.queue.filter(waiter => waiter.address !== address);
     for (const waiter of refused) waiter.refused();
+  }
+
+  /**
+   * Whether a request to `host` that got no answer was lost on this side of
+   * the link, not refused by the host: this computer says it is offline, or
+   * it failed in less than half the quickest answer the host ever gave -- a
+   * host's refusal (Zenodo's "unusual traffic" page, read as no answer for
+   * its missing CORS headers) is an answer, and comes no sooner than its
+   * answers do. A loss that took longer (a stall, a timeout) may be either,
+   * and counts as the host's.
+   *
+   * @param {Object} host
+   * @param {number|null} elapsedMs - From the request's sending to its loss
+   */
+  function lostOnThisSide(host, elapsedMs) {
+    if (!online()) return true;
+    return elapsedMs !== null && Number.isFinite(host.fastestAnswerMs) && elapsedMs < host.fastestAnswerMs / 2;
   }
 
   /** One more request to `host` is on its way now. */
@@ -482,6 +527,9 @@ export function createHostBook({
    * Only a host that answered most of them is taken to refuse their rate.
    */
   function learnPace(host) {
+    // A host on this machine blocks no network: its silence is a server restarting or down, which
+    // no pace mends (and a pace kept from it would slow every later visit).
+    if (isLoopbackUrl(host.origin)) return;
     const at = now();
     const recent = host.sentAt.filter(time => time >= at - PACE_WINDOW_MS).length;
     // A host that answered most of the window's requests before refusing
@@ -496,18 +544,12 @@ export function createHostBook({
     setPace(host, paceMs, true);
   }
 
-  /** `host`'s pace is `paceMs` (never lowered here); `tellOthers`: learnt in this realm. */
+  /** `host`'s pace is `paceMs` (never lowered here); `tellOthers`: learned in this realm. */
   function setPace(host, paceMs, tellOthers) {
     if (!(paceMs > host.paceMs) || !Number.isFinite(paceMs)) return;
     host.paceMs = paceMs;
     if (tellOthers) tell({ pace: { origin: host.origin, paceMs } });
-    for (const watcher of paceWatchers) {
-      try {
-        watcher(host.origin, paceMs);
-      } catch {
-        // A watcher's failure is its own.
-      }
-    }
+    paceWatchers.notify(host.origin, paceMs);
     pump(host);
   }
 
@@ -576,6 +618,7 @@ export function createHostBook({
       if (origin === null) return;
       const host = hostOf(origin);
       host.deliveries++;
+      host.deliveredUrl = String(url);
       const at = now();
       if (at - host.toldAt >= DELIVERY_TOLD_EVERY_MS) {
         host.toldAt = at;
@@ -591,6 +634,16 @@ export function createHostBook({
     answeredBefore(url) {
       const origin = originOf(url);
       return origin !== null && (hosts.get(origin)?.deliveries ?? 0) > 0;
+    },
+
+    /**
+     * The address of the host of `url` that last delivered to this realm, or
+     * null: asked again, it tells a host that still serves this site (and
+     * lets it read some of its files, not `url`) from one refusing it.
+     */
+    deliveredAddress(url) {
+      const origin = originOf(url);
+      return origin === null ? null : hosts.get(origin)?.deliveredUrl ?? null;
     },
 
     /**
@@ -610,6 +663,11 @@ export function createHostBook({
       return recent.length >= 2 && answeredAt < Math.min(...recent);
     },
 
+    /** Whether this computer says it is online (`navigator.onLine`; the book's `online`). */
+    online() {
+      return online();
+    },
+
     /** How many deliveries of the host of `url` this realm knows of: a watch compares two counts. */
     deliveries(url) {
       const origin = originOf(url);
@@ -625,7 +683,7 @@ export function createHostBook({
      * waitMs, lost})` with the answer (null: none came), `limiting` when it
      * refused the request for the host's limit, `waitMs` the wait it named
      * for the whole host, `lost` when no answer a page may read came (not
-     * a request cancelled or ended as stalled). `onWait(info)` hears when the request waits
+     * a request canceled or ended as stalled). `onWait(info)` hears when the request waits
      * (`{host, untilMs}`, `untilMs` from now, null: until an answer) and
      * `onWait(null)` when it no longer does.
      *
@@ -657,16 +715,19 @@ export function createHostBook({
       // in (`lossesOf`).
       const address = addressOf(typeof burst === 'string' ? burst : url);
       let round = null;
+      // When this request was sent (null until then).
+      let sentMs = null;
       // Whether this request is the one probe asked of an address that stopped answering.
       let probe = false;
       const answered = (response, { limiting = false, waitMs = null, lost = false } = {}) => {
         host.inFlight = Math.max(0, host.inFlight - 1);
+        const elapsedMs = sentMs === null ? null : now() - sentMs;
         if (probe) {
           const loss = host.losses.get(address);
           if (loss !== undefined) loss.probing = false;
         }
         if (response === null && lost) {
-          if (burst && round === (host.losses.get(address)?.round ?? 0)) lose(host, address);
+          if (burst && round === (host.losses.get(address)?.round ?? 0)) lose(host, address, lostOnThisSide(host, elapsedMs));
           // Only a host that answered this site before is a witness: a new
           // host's silence may be CORS or a mistyped name, not the connection.
           if (host.deliveries > 0) lostAt.set(siteOf(origin), now());
@@ -674,6 +735,7 @@ export function createHostBook({
           answeredAt = now();
           lostAt.delete(siteOf(origin));
           host.losses.delete(address);
+          if (elapsedMs !== null) host.fastestAnswerMs = Math.min(host.fastestAnswerMs, elapsedMs);
           const at = now();
           host.answeredAt.push(at);
           let old = 0;
@@ -698,6 +760,13 @@ export function createHostBook({
       // reads waiting it out (`byte-source.js` `refusesForNow`) never send
       // one each when they wake.
       const loss = burst ? host.losses.get(address) : undefined;
+      // Requests lost while this computer was offline say nothing of the
+      // host: once it is online again, the address is asked at once, not
+      // after the rest of a quiet meant for a host.
+      if (loss !== undefined && loss.offline && online() && loss.quietUntil > now()) {
+        loss.quietUntil = -Infinity;
+        loss.probing = false;
+      }
       if (loss !== undefined && (now() < (loss.quietUntil ?? -Infinity) || (loss.streak >= 2 && loss.probing === true))) {
         return waits ? Promise.reject(new HostNotAnswering(new URL(origin).host)) : null;
       }
@@ -708,6 +777,7 @@ export function createHostBook({
       const free = nextFree(host);
       if (host.queue.length === 0 && free <= now()) {
         sent(host);
+        sentMs = now();
         round = host.losses.get(address)?.round ?? 0;
         return answered;
       }
@@ -719,6 +789,7 @@ export function createHostBook({
             stopWaiting();
             if (told) onWait?.(null);
             sent(host);
+            sentMs = now();
             round = host.losses.get(address)?.round ?? 0;
             resolve(answered);
           },
@@ -750,7 +821,7 @@ export function createHostBook({
      * What one more request to the host of `url` costs in time, as its
      * request budget prices it: 0 while the host has stated no budget (or
      * no window). Otherwise the budget's interval, its window over its limit
-     * (Zenodo: 60 s / 133, 0.45 s; the window learnt from the longest reset
+     * (Zenodo: 60 s / 133, 0.45 s; the window learned from the longest reset
      * stated whole), in the share of this window already spent: a request
      * is nearly free while most of the window remains, so early reads stay
      * exact, and costs the whole interval once nothing remains for what is
@@ -764,7 +835,7 @@ export function createHostBook({
       const origin = originOf(url);
       const host = origin === null ? undefined : hosts.get(origin);
       if (host === undefined) return 0;
-      // A pace learnt from a block binds every request (`learnPace`).
+      // A pace learned from a block binds every request (`learnPace`).
       if (!(host.limit > 0) || !(host.windowMs > 0)) return host.paceMs;
       const interval = host.windowMs / host.limit;
       const left = host.remaining === null ? host.limit : host.remaining - host.inFlight - host.queue.length;
@@ -789,10 +860,9 @@ export function createHostBook({
       setPace(hostOf(origin), paceMs, false);
     },
 
-    /** Hear every host's pace as it is learnt or told (`(origin, paceMs) => void`); returns what stops it. */
+    /** Hear every host's pace as it is learned or told (`(origin, paceMs) => void`); returns what stops it. */
     watchPace(listener) {
-      paceWatchers.add(listener);
-      return () => paceWatchers.delete(listener);
+      return paceWatchers.add(listener);
     },
     /**
      * How long the host of `url` is held now (milliseconds; 0 when it may be

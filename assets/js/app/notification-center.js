@@ -19,11 +19,10 @@ import { NotificationType, CategoryIcons } from './notification-center/constants
 import { downloadTrackingMethods } from './notification-center/download-tracking.js';
 import { benchmarkNotificationMethods } from './notification-center/benchmark-notifications.js';
 import { escapeHtml } from './utils/dom-utils.js';
-import {
-  registerModalDocumentAuxiliary
-} from './ui/components/modal-background-owner.js';
+import { failureDetails, pointToDetails, sayFailure } from '../utils/errors.js';
+import { keepAboveModals } from './ui/components/app-dialog.js';
 import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
-import { formatBytes, formatDuration, countNoun } from '../utils/format-units.js';
+import { formatBytes, formatDuration, formatPercent, countNoun } from '../utils/format-units.js';
 
 /**
  * The one rule for work in progress: a loading or progress card appears only
@@ -152,7 +151,8 @@ function assertNotificationOptions(options, { partial = false } = {}) {
   ) {
     requireFiniteRange(options.progress, 'Notification progress', 0, 100);
   }
-  if (Object.hasOwn(options, 'speed')) {
+  // A speed of null takes the shown speed away (a load that stopped reading bytes, `phaseDownload`).
+  if (Object.hasOwn(options, 'speed') && options.speed !== null) {
     requireFiniteRange(
       options.speed,
       'Notification speed',
@@ -237,6 +237,20 @@ function assertNotificationOptions(options, { partial = false } = {}) {
 }
 
 /**
+ * Options whose message says a broken invariant's sentence, given Details:
+ * the sentence says its words are there (`utils/errors.js` `pointToDetails`).
+ * A card without Details says the sentence alone.
+ *
+ * @param {object} options
+ * @returns {object}
+ */
+function withDetailsPointer(options) {
+  if (typeof options.message !== 'string' || typeof options.details !== 'string' || options.details === '') return options;
+  const message = pointToDetails(options.message);
+  return message === options.message ? options : { ...options, message };
+}
+
+/**
  * A notification's details: the technical text behind its message (the raw
  * error of a failure), folded so the message stays one short sentence.
  *
@@ -248,6 +262,21 @@ function notificationDetailsHtml(details) {
     + `<div class="notification-details-text">${escapeHtml(details)}</div></details>`;
 }
 
+/**
+ * What `show()` accepts for a notification it makes (not one it updates):
+ * its options, and no `announce`, which names a completion
+ * (`complete(id, message, { announce })`). A publisher's test doubles check
+ * with it, so a notice the real center refuses is refused there too.
+ *
+ * @param {object} options
+ */
+export function assertNewNotificationOptions(options) {
+  assertNotificationOptions(options, { partial: true });
+  if (Object.hasOwn(options, 'announce')) {
+    throw new TypeError('Notification announce names a completion: complete(id, message, { announce }).');
+  }
+}
+
 function assertMethodOptions(options, methodName, reservedKeys) {
   assertNotificationOptions(options, { partial: true });
   for (const key of reservedKeys) {
@@ -257,13 +286,6 @@ function assertMethodOptions(options, methodName, reservedKeys) {
       );
     }
   }
-}
-
-function describeThrownError(error) {
-  if (error instanceof Error && error.message.length > 0) {
-    return error.message;
-  }
-  return 'the handler threw a non-Error value';
 }
 
 /**
@@ -281,19 +303,25 @@ class NotificationCenter {
   constructor() {
     this.container = null;
     this.notifications = new Map();
+    // Notifications dismissed (a person's ×, or their owner): a later update
+    // or completion of one by the work that made it changes nothing, as the
+    // person closed it; an id never made is still an error. (Found
+    // 2026-11-10: a field read completed its progress notice after it was
+    // dismissed, and the read failed: the dataset opened uncolored.)
+    this._dismissed = new Set();
     this.notificationId = 0;
     // Cards on screen at once: five, and two on a phone, where each covers
     // the foot of the plot (`init`). A card retired early to make room is kept
     // in `overflowMessages` and listed behind the "earlier messages" control,
     // so no message is lost to the cap.
     this.maxNotifications = 5;
-    /** @type {Array<{ type: string, title: string|null, message: string|null }>} */
+    /** @type {Array<{ id: string, type: string, title: string|null, message: string|null, action: {label: string, run: () => void}|null, secondaryAction: {label: string, run: () => void}|null }>} */
     this.overflowMessages = [];
     this._overflowElement = null;
     this._overflowParts = null;
     this._overflowExpanded = false;
     this.initialized = false;
-    this._releaseModalAuxiliary = null;
+    this._releaseAboveModals = null;
     // The places of cards that have left, kept while the pointer is over the
     // stack (`_retire`), and whether it is (`_followPointer`).
     /** @type {Set<HTMLElement>} */
@@ -353,13 +381,14 @@ class NotificationCenter {
       phone.addEventListener?.('change', fit);
     }
     try {
-      this._releaseModalAuxiliary =
-        registerModalDocumentAuxiliary(this.container);
+      // Over an open dialog the cards live inside it; outside it they would
+      // be inert (`app-dialog.js`).
+      this._releaseAboveModals = keepAboveModals(this.container);
       this.initialized = true;
     } catch (error) {
       this.container.remove();
       this.container = null;
-      this._releaseModalAuxiliary = null;
+      this._releaseAboveModals = null;
       throw error;
     }
 
@@ -543,7 +572,7 @@ class NotificationCenter {
       if (speed !== null) {
         html += `<div class="notification-speed">${formatBytes(speed)}/s</div>`;
       } else if (progress !== null && !isIndeterminate) {
-        html += `<div class="notification-progress-text">${Math.round(progress)}%</div>`;
+        html += `<div class="notification-progress-text">${formatPercent(progress)}</div>`;
       }
     }
 
@@ -643,9 +672,9 @@ class NotificationCenter {
     } catch (error) {
       cancelButton.disabled = false;
       cancelButton.removeAttribute('aria-disabled');
-      this.error(`Cancel failed: ${describeThrownError(error)}`, {
+      this.error(`Cancel failed: ${sayFailure(error)}`, {
         category: 'default',
-        title: 'Cancellation Error'
+        ...failureDetails(error),
       });
       return false;
     }
@@ -658,6 +687,7 @@ class NotificationCenter {
    */
   show(options) {
     assertNotificationOptions(options, { partial: true });
+    options = withDetailsPointer(options);
     if (!this.initialized) this.init();
 
     const id = options.id ?? this._generateId();
@@ -668,14 +698,11 @@ class NotificationCenter {
       this._updateNotification(id, options);
       return id;
     }
-    if (Object.hasOwn(options, 'announce')) {
-      throw new TypeError('Notification announce names a completion: complete(id, message, { announce }).');
-    }
+    assertNewNotificationOptions(options);
 
-    // Active loading/progress work owns its visible lifecycle. Make room by
-    // retiring the oldest non-active item first; if every published item is
-    // active, temporarily exceed the visual cap rather than orphan async IDs.
-    this._evictNonActiveUntil(this.maxNotifications - 1);
+    // Room is made when a card comes on screen (`_reveal`), not when it is
+    // published: work in progress is held back (NOTICE_AFTER_MS) and most of
+    // it ends unseen, so it must not retire a card the person is reading.
 
     // Create new notification
     const el = this._createNotificationElement(id, options);
@@ -722,12 +749,23 @@ class NotificationCenter {
     return id;
   }
 
-  /** Put a held-back card on screen, with its enter animation. @private */
+  /**
+   * Put a card on screen, with its enter animation, first making room for it
+   * under the cap (`maxNotifications` cards on screen): the oldest settled
+   * card on screen retires to the earlier messages; if every card on screen
+   * is work in progress, the cap is exceeded for now rather than orphan the
+   * work's id. Only cards on screen count: a held-back card of work in
+   * progress (NOTICE_AFTER_MS) took the place of the card a person was
+   * reading, a best-guess notice with its Show, for a field read that ended
+   * in 45 ms unseen (F71, `data-mapping.spec.mjs` "on a phone", WebKit).
+   * @private
+   */
   _reveal(notification) {
     if (notification.revealTimer !== null) {
       clearTimeout(notification.revealTimer);
       notification.revealTimer = null;
     }
+    this._evictNonActiveUntil(this.maxNotifications - 1, notification);
     const el = notification.element;
     el.hidden = false;
     requestAnimationFrame(() => {
@@ -785,8 +823,10 @@ class NotificationCenter {
   _updateNotification(id, options) {
     requireNonEmptyString(id, 'Notification id');
     assertNotificationOptions(options, { partial: true });
+    options = withDetailsPointer(options);
     const notif = this.notifications.get(id);
     if (!notif) {
+      if (this._dismissed.has(id)) return null;
       throw new RangeError(`Notification "${id}" does not exist.`);
     }
     if (Object.hasOwn(options, 'id') && options.id !== id) {
@@ -890,7 +930,7 @@ class NotificationCenter {
     }
 
     // A title published with active work names that work in progress
-    // ("Downloading", "Processing", "Generating Data"). Once the work settles
+    // ("Downloading", "Processing", "Generating data"). Once the work settles
     // the title is no longer true, so a terminal transition that names no title
     // of its own retires it instead of leaving a finished download announced as
     // still downloading.
@@ -938,7 +978,7 @@ class NotificationCenter {
       const progressText = element.querySelector('.notification-progress-text');
       if (progressText) {
         if (options.progress !== null) {
-          progressText.textContent = Math.round(options.progress) + '%';
+          progressText.textContent = formatPercent(options.progress);
         } else {
           // Hide percentage text when progress is unknown
           progressText.textContent = '';
@@ -946,8 +986,10 @@ class NotificationCenter {
       }
     }
 
-    // Update speed
-    if (options.speed !== undefined) {
+    // Update speed (null: none shown, the work is not reading bytes now)
+    if (options.speed === null) {
+      element.querySelector('.notification-speed')?.remove();
+    } else if (options.speed !== undefined) {
       let speedEl = element.querySelector('.notification-speed');
       if (!speedEl) {
         speedEl = document.createElement('div');
@@ -1021,26 +1063,43 @@ class NotificationCenter {
     }
   }
 
-  _evictNonActiveUntil(maximumSize) {
+  /**
+   * Retire the oldest settled cards on screen, other than `except` (the card
+   * coming on screen), until at most `maximumSize` others are on screen. A
+   * held-back card is not on screen and takes no place.
+   */
+  _evictNonActiveUntil(maximumSize, except = null) {
     if (!Number.isSafeInteger(maximumSize) || maximumSize < 0) {
       throw new RangeError(
         'Notification capacity target must be a non-negative safe integer.'
       );
     }
-    while (this.notifications.size > maximumSize) {
+    const onScreen = () => [...this.notifications.values()]
+      .filter(notification => notification !== except && !notification.element.hidden);
+    for (let shown = onScreen(); shown.length > maximumSize; shown = onScreen()) {
       let candidateId = null;
       for (const [id, notification] of this.notifications) {
-        if (!ACTIVE_NOTIFICATION_TYPES.has(notification.options.type)) {
+        if (
+          notification !== except &&
+          !notification.element.hidden &&
+          !ACTIVE_NOTIFICATION_TYPES.has(notification.options.type)
+        ) {
           candidateId = id;
           break;
         }
       }
       if (candidateId === null) return;
       const { options } = this.notifications.get(candidateId);
+      // What the card offered goes with it (its Show, its Retry): no follow-up
+      // is lost to the cap. Its owner dismissing it later withdraws it
+      // (`dismiss`), as it would the card.
       this.overflowMessages.push({
+        id: candidateId,
         type: options.type,
         title: typeof options.title === 'string' ? options.title : null,
         message: typeof options.message === 'string' ? options.message : null,
+        action: options.action ?? null,
+        secondaryAction: options.secondaryAction ?? null,
       });
       this.dismiss(candidateId);
       // The control sits under the stack, so it appearing or its open list
@@ -1132,11 +1191,50 @@ class NotificationCenter {
         message.textContent = record.message;
         item.append(message);
       }
+      const followUps = this._overflowFollowUps(record);
+      if (followUps !== null) item.append(followUps);
       fragment.append(item);
     }
     if (fresh) list.prepend(fragment);
     else list.replaceChildren(fragment);
     this._overflowListed = count;
+  }
+
+  /**
+   * The buttons of a retired card's follow-ups in its row of the earlier
+   * messages, or null when it offered none (or they were taken or
+   * withdrawn). Taking one settles it, as on the card.
+   */
+  _overflowFollowUps(record) {
+    record.followUps = null;
+    if (record.action === null) return null;
+    const actions = document.createElement('div');
+    actions.className = 'notification-actions';
+    for (const [follow, className] of [
+      [record.action, 'notification-action'],
+      [record.secondaryAction, 'notification-secondary-action'],
+    ]) {
+      if (follow === null) continue;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `btn btn-compact ${className}`;
+      button.textContent = follow.label;
+      button.addEventListener('click', () => {
+        this._withdrawOverflowFollowUps(record);
+        follow.run();
+      });
+      actions.append(button);
+    }
+    record.followUps = actions;
+    return actions;
+  }
+
+  /** A retired card's follow-ups go: taken, or its owner dismissed it. */
+  _withdrawOverflowFollowUps(record) {
+    record.action = null;
+    record.secondaryAction = null;
+    record.followUps?.remove();
+    record.followUps = null;
   }
 
   /**
@@ -1178,10 +1276,18 @@ class NotificationCenter {
   dismiss(id) {
     requireNonEmptyString(id, 'Notification id');
     const notif = this.notifications.get(id);
-    if (!notif) return false;
+    if (!notif) {
+      // A card retired to the earlier messages: its owner's dismissal
+      // withdraws what it offered (a Show for a dataset no longer open).
+      for (const record of this.overflowMessages) {
+        if (record.id === id && record.action !== null) this._withdrawOverflowFollowUps(record);
+      }
+      return false;
+    }
 
     const { element } = notif;
     this.notifications.delete(id);
+    this._dismissed.add(id);
     if (notif.dismissTimer !== null) {
       clearTimeout(notif.dismissTimer);
       notif.dismissTimer = null;
@@ -1382,11 +1488,14 @@ class NotificationCenter {
   }
 
   /**
-   * Fail a calculation
+   * Fail a calculation: one sentence, the failure's own words under Details.
+   * @param {string} id
+   * @param {string} errorMessage
+   * @param {{details?: string}} [options]
    */
-  failCalculation(id, errorMessage) {
+  failCalculation(id, errorMessage, options = {}) {
     requireNonEmptyString(errorMessage, 'Calculation error message');
-    this.fail(id, errorMessage);
+    this.fail(id, errorMessage, options);
   }
 
   // =========================================================================
@@ -1411,70 +1520,6 @@ class NotificationCenter {
    */
   getCategories() {
     return { ...CategoryIcons };
-  }
-
-  /**
-   * Batch notification: show multiple related notifications efficiently
-   * Useful when loading multiple files or performing parallel operations
-   * @param {Array<Object>} items - Array of {name, operation} objects
-   * @param {Function} operation - Async operation to perform for each item
-   * @param {Object} options - Shared options
-   * @returns {Promise<Array>} Results from all operations
-   */
-  async batch(items, operation, options = {}) {
-    if (!Array.isArray(items)) {
-      throw new TypeError('Notification batch items must be an array.');
-    }
-    if (typeof operation !== 'function') {
-      throw new TypeError('Notification batch operation must be a function.');
-    }
-    requireKeys(options, [], ['category', 'parallel'], 'Notification batch options');
-    const { category = 'data', parallel = true } = options;
-    requireNonEmptyString(category, 'Notification batch category');
-    if (!Object.hasOwn(CategoryIcons, category)) {
-      throw new TypeError(
-        `Unknown notification category "${category}". Register it before use.`
-      );
-    }
-    if (typeof parallel !== 'boolean') {
-      throw new TypeError('Notification batch parallel must be a boolean.');
-    }
-    for (const [index, item] of items.entries()) {
-      if (!isPlainRecord(item)) {
-        throw new TypeError(`Notification batch item ${index} must be a plain object.`);
-      }
-      requireNonEmptyString(item.name, `Notification batch item ${index} name`);
-    }
-    const results = [];
-
-    if (parallel) {
-      const promises = items.map(async (item) => {
-        const id = this.loading(`Processing ${item.name}...`, { category });
-        try {
-          const result = await operation(item);
-          this.complete(id, `${item.name} complete`);
-          return result;
-        } catch (error) {
-          this.fail(id, `${item.name}: ${describeThrownError(error)}`);
-          throw error;
-        }
-      });
-      return Promise.all(promises);
-    }
-
-    for (const item of items) {
-      const id = this.loading(`Processing ${item.name}...`, { category });
-      try {
-        const result = await operation(item);
-        this.complete(id, `${item.name} complete`);
-        results.push(result);
-      } catch (error) {
-        this.fail(id, `${item.name}: ${describeThrownError(error)}`);
-        throw error;
-      }
-    }
-
-    return results;
   }
 }
 

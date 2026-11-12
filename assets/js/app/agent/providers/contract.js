@@ -15,20 +15,25 @@
  * | `keyLabel`, `keyPlaceholder`, `keyUrl` | the key field's label and hint, where a key is made |
  * | `defaultModel` | the model chosen until the person picks one (used when the key's list holds it) |
  * | `models({key, signal})` | the models this key may use, newest first: `[{id, label, contextTokens, outputTokens, images, efforts}]` (`efforts`: the effort or reasoning levels the person may choose, lowest first; `null` for what the provider does not say) |
- * | `stream({key, model, system, messages, tools, signal, outputTokens, effort})` | one model call, as an async iterable of events (below); `effort` null leaves the model's own |
+ * | `stream({key, model, system, messages, tools, signal, outputTokens, effort, cacheLength})` | one model call, as an async iterable of events (below); `effort` null leaves the model's own; `cacheLength` one of the provider's `cacheLengths` (a provider without them ignores it) |
  *
  * **Messages** are provider-neutral (`chat/conversation.js` makes them):
  * `{role: 'user', text}`, `{role: 'assistant', parts}` with parts
- * `{type: 'text', text}`, `{type: 'tool-call', id, name, args}` and
+ * `{type: 'text', text}`, `{type: 'tool-call', id, name, args}`,
  * `{type: 'opaque', provider, value}` (what one provider asks to have sent
  * back unchanged, such as a model's reasoning; another provider leaves it
- * out), and `{role: 'tool', results: [{id, name, content, isError}]}` whose
+ * out), `{type: 'progress', text}` (a note shown to the person, which no
+ * provider sends: its own `opaque` part carries it to the model that wrote
+ * it), and `{role: 'tool', results: [{id, name, content, isError}]}` whose
  * content is MCP content (`{type: 'text', text}`, `{type: 'image', data,
  * mimeType}`). Tools are MCP tools (`bridge/mcp-tools.js`): each provider
  * converts them to its own format, so there is one tool list.
  *
  * **Events** of `stream`: `{type: 'text', text}` (a piece of the reply),
  * `{type: 'thinking'}` (the model is reasoning; nothing to show),
+ * `{type: 'progress', text}` (a piece of a note the model writes for the
+ * person between its tool calls, shown before the call it introduces; it is
+ * not sent back as words: the provider's `opaque` value carries it),
  * `{type: 'tool-call', id, name, args}` (complete), `{type: 'opaque', value}`,
  * `{type: 'usage', input, output, cacheRead, cacheWrite}` (the tokens of the
  * call so far, `input` counting the whole prompt, cached parts included; a
@@ -52,6 +57,7 @@
  */
 
 import { isCancellation, throwIfAborted } from '../../../utils/abort.js';
+import { retryAfterMilliseconds } from '../../../formats/io/hosts.js';
 
 export const PROVIDER_ERROR_KINDS = Object.freeze([
   'auth', 'permission', 'quota', 'rate', 'busy', 'network', 'unreadable', 'model', 'too-long', 'request',
@@ -61,6 +67,15 @@ export const PROVIDER_ERROR_KINDS = Object.freeze([
 const RETRYABLE = new Set(['rate', 'busy', 'network']);
 
 export const STOP_REASONS = Object.freeze(['end', 'tool-use', 'max-tokens', 'refusal']);
+
+/**
+ * Each reasoning effort a provider takes (`ANTHROPIC_EFFORTS`, `OPENAI_EFFORTS`)
+ * in the words the chat's Effort menu and status line show: an API's value is
+ * not a label ("xhigh" read "Xhigh").
+ */
+export const EFFORT_LABELS = Object.freeze({
+  none: 'None', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Maximum',
+});
 
 /** A model call that failed, with what kind of failure it is and one sentence for the person. */
 export class ProviderError extends Error {
@@ -114,17 +129,13 @@ export function checkProvider(provider) {
 
 /**
  * How long a response asks to be waited for before the next request
- * (`retry-after`: seconds or an HTTP date), or null.
+ * (`retry-after`: seconds or an HTTP date, read by `formats/io/hosts.js`
+ * `retryAfterMilliseconds`, the one reader of it), or null.
  * @param {{get: (name: string) => string|null}} headers
  * @param {() => number} [now]
  */
 export function retryAfterOf(headers, now = () => Date.now()) {
-  const value = headers?.get?.('retry-after');
-  if (value === null || value === undefined || value === '') return null;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
-  const at = Date.parse(value);
-  return Number.isFinite(at) ? Math.max(0, at - now()) : null;
+  return retryAfterMilliseconds(headers?.get?.('retry-after') ?? null, now());
 }
 
 /**

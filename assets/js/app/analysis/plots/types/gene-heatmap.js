@@ -17,6 +17,7 @@ import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { setOwnDataProperty } from '../../../../utils/exact-record.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
+import { geneValueLabel } from '../../../../data/expression-transform.js';
 
 function truncateLabel(label, maxLen) {
   if (typeof label !== 'string') {
@@ -343,7 +344,9 @@ const geneHeatmapDefinition = {
           color: theme.textMuted
         },
         title: {
-          text: transform === 'zscore' ? 'z-score' : (transform === 'log1p' ? 'log(1 + x)' : 'Expression'),
+          // What the colors are, with the units of the means the run read
+          // (`data.values`, the result's values record: "z-score · log1p(norm.)").
+          text: escapeHtml(geneValueLabel(transform === 'zscore' ? 'z-score' : (transform === 'log1p' ? 'log(1 + x)' : 'Expression'), data.values ?? null)),
           side: 'top',
           font: {
             family: theme.fontFamily,

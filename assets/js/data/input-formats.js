@@ -60,7 +60,7 @@ import { PLACES, placePath } from '../app/ui/place-names.js';
  *   (`standsAlone`)
  * @property {string} writeAgain - What to do with a file the browser cannot
  *   read, in the words of the tools that write the format
- * @property {string} [refusal] - Present on a format Cellucid recognises but
+ * @property {string} [refusal] - Present on a format Cellucid recognizes but
  *   never opens: the whole message, with the route that converts it. The web
  *   app, `cellucid serve` (Python) and `cellucid_serve()` (R) refuse such a
  *   file with exactly these words, so the three never disagree on it.
@@ -236,8 +236,9 @@ export const INPUT_FORMATS = Object.freeze([
  * Each is named by its endings and says, in one sentence (`said`), what it
  * is and where it goes. The web app takes a library file dropped or chosen
  * in Open… › File… to My datasets' Import (`app/library/library-file.js`)
- * and refuses a session file with its sentence; Python (`cellucid serve`)
- * and R say the same sentence when given one.
+ * and loads a session file dropped or chosen there as Load… › Open a
+ * session file… does, its dataset opened with it (bug hunt L25-8); Python
+ * (`cellucid serve`) and R say the sentence when given one to serve.
  *
  * @typedef {Object} CellucidFile
  * @property {'library'|'session'} id
@@ -260,8 +261,8 @@ export const CELLUCID_FILES = Object.freeze([
     label: 'Cellucid session file',
     names: Object.freeze(['.cellucid-session']),
     said: 'This is a Cellucid session file: the history of one dataset, not a dataset. '
-      + `Open its dataset, then load it with ${placePath(PLACES.state, PLACES.sessionFile)} › Load… › Open a session file…; `
-      + 'in Python read it with cellucid.read_session(), in R with cellucid_read_session().',
+      + `Open it in the web app: drop it on the page, or choose it with ${placePath(PLACES.state, PLACES.sessionFile)} › Load… › Open a session file…; its dataset opens with it. `
+      + 'In Python read it with cellucid.read_session(), in R with cellucid_read_session().',
   }),
 ]);
 
@@ -355,6 +356,23 @@ export function folderFormatOfName(name) {
   const trimmed = String(name).replace(/\/+$/, '');
   const match = matchName(trimmed, ['folder']);
   return match === null ? null : Object.freeze({ format: match.format.id, layout: 'folder' });
+}
+
+/**
+ * The store folder a path inside one names (`a/atlas.zarr/obs/.zattrs`,
+ * `a/atlas.zarr/.zmetadata` → `a/atlas.zarr`): the path up to its first
+ * segment that names a store folder (`folderFormatOfName`), when more
+ * follows it; else null. A link copied from a host's file browser while
+ * looking inside a store is the store.
+ *
+ * @param {string} path - Slash-separated, decoded or not
+ * @returns {string|null}
+ */
+export function storeFolderOfPath(path) {
+  const segments = String(path).split('/');
+  const at = segments.findIndex(segment => segment !== '' && folderFormatOfName(segment) !== null);
+  if (at < 0 || segments.slice(at + 1).every(segment => segment === '')) return null;
+  return segments.slice(0, at + 1).join('/');
 }
 
 /**
@@ -465,9 +483,27 @@ export function namesOfLayout(layout) {
 const LAYOUT_NOUNS = Object.freeze({ file: 'file', folder: 'folder', zip: 'archive' });
 
 /**
+ * A format's endings in one layout, as a message names them: every ending
+ * that stands alone (`standsAlone`: `.rds`, never the compressed copy's
+ * `.rds.gz`), shortest first, joined by `/` (`.rda/.rdata`), leaving out one
+ * another ends with (`.zip` of `.zarr.zip`); the first ending when none
+ * stands alone. cellucid-python `_anndata_files.openable_files_text` and
+ * cellucid-r `.openable_files_text()` apply the same rule.
+ *
+ * @param {ReadonlyArray<string>} names
+ * @returns {string}
+ */
+function phraseEndings(names) {
+  const alone = names.filter(standsAlone);
+  if (alone.length === 0) return names[0];
+  const kept = alone.filter(ending => !alone.some(other => other !== ending && other.endsWith(ending)));
+  return kept.sort((a, b) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0)).join('/');
+}
+
+/**
  * What can be opened, as a message names it: one phrase per format and
- * layout, by its usual name ending (`.h5ad file`, `.zarr folder`,
- * `.zarr.zip archive`), or by its label for a folder known by its files
+ * layout, by its usual name endings (`.h5ad file`, `.rda/.rdata file`,
+ * `.zarr folder`, `.zarr.zip archive`), or by its label for a folder known by its files
  * (`Cell Ranger outs/ folder`). A format known only by its content (MuData
  * Zarr, in a Zarr store's names) adds none, and a format with a `refusal`
  * (h5Seurat) none either.
@@ -478,11 +514,11 @@ export function openableNamePhrases() {
   const phrases = [];
   for (const layout of ['file', 'folder', 'zip']) {
     for (const format of INPUT_FORMATS) {
-      // Recognised only to be refused (h5Seurat): not something that opens.
+      // Recognized only to be refused (h5Seurat): not something that opens.
       if (format.refusal !== undefined) continue;
       const names = format.names[layout];
       if (names === undefined) continue;
-      if (names.length > 0) phrases.push(`${names.find(standsAlone) ?? names[0]} ${LAYOUT_NOUNS[layout]}`);
+      if (names.length > 0) phrases.push(`${phraseEndings(names)} ${LAYOUT_NOUNS[layout]}`);
       // A folder known by the files it holds, not by its name.
       else if (layout === 'folder' && (FOLDER_MARKERS[format.id] !== undefined || FOLDER_MARKER_PATTERNS[format.id] !== undefined)) phrases.push(format.label);
     }
@@ -534,7 +570,7 @@ function standsAlone(ending) {
  * last part is an ending of its own is offered by that part (`.zip` covers
  * `.zarr.zip`); one whose last part is not (`.rds.gz`) is offered whole,
  * never as its last part: a bare `.gz` would offer every gzip file. A
- * browser whose file dialog matches only last extensions may grey such a
+ * browser whose file dialog matches only last extensions may gray such a
  * file out; dropping it, or its link, opens it all the same, and a picked
  * file is checked by its whole name (`fileFormatOfName`).
  *

@@ -85,6 +85,57 @@ test('a host that refuses after answering this site before is refusing this netw
   assert.equal(error.details.hostFault.kind, 'refusing');
 });
 
+test('a sign-in asked for (401) is the link\'s permissions, even from a host that answered this site before', async t => {
+  // Round 9 sources lane (R9S-2): a lab server serving one public and one
+  // private folder was said to refuse "this network for now, which it gives
+  // everyone" for the private file. No host blocks a network with a 401.
+  let signIn = false;
+  serve(t, (url, init) => {
+    if (signIn) return new Response('<html>Sign in</html>', { status: 401, headers: { 'Content-Type': 'text/html' } });
+    const headers = { 'Content-Range': 'bytes 0-99/100', 'Content-Length': '100' };
+    if (init.method === 'HEAD') return new Response(null, { status: 206, headers });
+    return new Response(new Uint8Array(100), { status: 206, headers });
+  });
+  await describe('https://mixed.example/public/first.h5ad');
+  signIn = true;
+  const error = await refusalOf('https://mixed.example/private/second.h5ad');
+  assert.equal(error.code, 'PERMISSION_DENIED');
+  assert.equal(
+    error.message,
+    'mixed.example refused second.h5ad (HTTP 401, not signed in): it is private or deleted, or the link has expired. ' +
+      'This is the link\'s permissions, not a fault of mixed.example or Cellucid. Ask its owner for a public link.'
+  );
+  assert.equal(error.details.hostFault.kind, 'refused');
+});
+
+test('a host that lets this site read one file and not another says so; one that stopped answering every file is refusing (R9S-3)', async t => {
+  // A lab server whose public folder sends CORS headers and whose other
+  // folder does not was said to refuse "this network for now, which it gives
+  // everyone" for the second file, since the host had answered before.
+  let blocked = false;
+  const asked = serve(t, (url, init) => {
+    if (init.mode === 'no-cors') return new Response(null, { status: 200 });
+    if (blocked || url.includes('/plain/')) throw new TypeError('Failed to fetch');
+    const headers = { 'Content-Range': 'bytes 0-99/100', 'Content-Length': '100' };
+    if (init.method === 'HEAD') return new Response(null, { status: 206, headers });
+    return new Response(new Uint8Array(100), { status: 206, headers });
+  });
+  await describe('https://folders.example/shared/first.h5ad');
+  const cors = await refusalOf('https://folders.example/plain/second.h5ad');
+  assert.equal(cors.code, 'PERMISSION_DENIED');
+  assert.equal(
+    cors.message,
+    'folders.example does not let other websites read second.h5ad, though it lets them read other files of its, so ' +
+      'this site cannot read it. Download it and open it from your computer (Open… › File…).'
+  );
+  // The file that answered before was asked again, once, to tell.
+  assert.equal(asked.filter(request => request.url === 'https://folders.example/shared/first.h5ad' && request.method === 'HEAD').length >= 2, true);
+  // Nothing of the host readable any more: refusing this network for now.
+  blocked = true;
+  const refusing = await refusalOf('https://folders.example/plain/third.h5ad');
+  assert.equal(refusing.details.hostFault.kind, 'refusing');
+});
+
 test('a host that answers but lets no other website read it is told from one that cannot be reached', async t => {
   const asked = serve(t, (url, init) => {
     // An opaque answer: the host is there (Node has no opaque response; any answer will do).
@@ -145,4 +196,45 @@ test('a host that answered before and gives no answer while this computer is off
   assert.equal(error.message, 'This computer is offline, so second.zarr.zip cannot be read from catalog.example: the ' +
     'connection on this side, not catalog.example or Cellucid. Connect, then try again.');
   assert.equal(error.details.hostFault.kind, 'offline');
+});
+
+test('a store folder whose first read gets no readable answer is said as a file is, also across the reader worker (R9S-5)', async t => {
+  // A Zarr folder on a host without CORS headers said "The linked data could
+  // not be opened. Try again; if it keeps failing, check the address" with
+  // the byte layer's sentence under Details; a file on the same host said
+  // "does not let other websites read its files". The store's error crossed
+  // the reader worker as a plain Error named ByteSourceError, which
+  // `isUnanswered` did not know.
+  const { ByteSourceError, BYTE_SOURCE_FAILURES, isUnanswered } = await import('../assets/js/formats/io/byte-source.js');
+  const { toWire, fromWire } = await import('../assets/js/utils/error-wire.js');
+  const { unreadableAtHost } = await import('../assets/js/data/sources/remote-file.js');
+  const { folderFormatOfName } = await import('../assets/js/data/input-formats.js');
+  const url = 'https://nocors-store.example/data/atlas.zarr/.zmetadata';
+  const original = new ByteSourceError(BYTE_SOURCE_FAILURES.NETWORK, `${url}: no answer this page may read`, { url, host: 'nocors-store.example', phase: 'answer' });
+  const rebuilt = fromWire(toWire(original));
+  assert.equal(rebuilt instanceof ByteSourceError, false);
+  assert.equal(isUnanswered(rebuilt), true, 'known on the page side of the worker');
+  serve(t, (asked, init) => {
+    if (init.mode === 'no-cors') return new Response(null, { status: 200 });
+    throw new TypeError('Failed to fetch');
+  });
+  const error = await unreadableAtHost({ url, name: 'atlas.zarr', format: folderFormatOfName('atlas.zarr'), error: rebuilt });
+  assert.equal(error.code, 'PERMISSION_DENIED');
+  // A folder is downloaded and opened as one.
+  assert.equal(error.message, 'nocors-store.example does not let other websites read its files, so this site cannot read atlas.zarr. ' +
+    'Download the folder and open it from your computer (Open… › Folder…).');
+});
+
+test('a host that stops sending, or never answers, within the read\'s patience is said to stall, not to refuse CORS (R9S-11)', async () => {
+  const { ByteSourceError, BYTE_SOURCE_FAILURES } = await import('../assets/js/formats/io/byte-source.js');
+  const { unreadableAtHost } = await import('../assets/js/data/sources/remote-file.js');
+  const url = 'https://slow.example/atlas.h5ad';
+  const body = await unreadableAtHost({ url, name: 'atlas.h5ad', format: null,
+    error: new ByteSourceError(BYTE_SOURCE_FAILURES.STALLED, `${url}: no more bytes for 3.0 s.`, { url, phase: 'body', silentMs: 3000 }) });
+  assert.equal(body.code, 'NETWORK_ERROR');
+  assert.equal(body.message, 'slow.example started sending atlas.h5ad and stopped (no more bytes for 3.0 s), also when asked again: ' +
+    'the host, or the connection to it, is failing or very slow. Try again later.');
+  const answer = await unreadableAtHost({ url, name: 'atlas.h5ad', format: null,
+    error: new ByteSourceError(BYTE_SOURCE_FAILURES.STALLED, `${url}: no answer for 30 s.`, { url, phase: 'answer', silentMs: 30000 }) });
+  assert.match(answer.message, /^slow\.example gave no answer for atlas\.h5ad for 30\.0 s, also when asked again: /);
 });

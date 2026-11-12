@@ -33,9 +33,10 @@ import {
   openStarted,
 } from './helpers/dataset-loading.mjs';
 import { SAMPLE_ORIGIN, appUrl } from './helpers/origins.mjs';
+import { tabKey } from './helpers/dialog-keys.mjs';
 import { answerPickers, pickWithFileItem } from './helpers/local-file-pickers.mjs';
 import { openCollapsedPanels, openPhoneSheet } from './helpers/panels.mjs';
-import { dismissWelcome } from './helpers/welcome.mjs';
+import { continueOffer as offerCard, dismissWelcome } from './helpers/welcome.mjs';
 
 const H5AD_NAME = 'current-ui-smoke.h5ad';
 const LINKS = Object.freeze({
@@ -109,7 +110,7 @@ function savedStatesOf(page, datasetId) {
   }, datasetId);
 }
 
-/** Colour by a categorical field not shown now and wait until the step is kept in this browser. */
+/** Color by a categorical field not shown now and wait until the step is kept in this browser. */
 async function takeAStep(page, datasetId) {
   // Its options name fields by index; '-1' is None.
   const field = await page.evaluate(() => {
@@ -124,10 +125,6 @@ async function takeAStep(page, datasetId) {
   await page.evaluate(() => window._cellucidHistories.current().reconcile());
   await expect.poll(async () => (await savedStatesOf(page, datasetId)).reduce((sum, state) => sum + state.steps, 0)).toBeGreaterThan(0);
   return key;
-}
-
-function offerCard(page) {
-  return page.locator('#notification-center .notification').filter({ hasText: 'Continue where you left off?' });
 }
 
 test('datasets opened are listed most recent first; the menu offers five of seven; each opens again with one click; All… lists every one', async ({ page, browserName }) => {
@@ -408,7 +405,7 @@ test('a window that gives the site no IndexedDB keeps the list for this page; on
 
 test('keyboard alone: the menu opens, moves and chooses; All… opens, its rows open their facts; Escape gives the focus back', async ({ page, browserName }) => {
   // WebKit's Tab skips buttons unless Option is held (Safari's own setting).
-  const tab = browserName === 'webkit' ? 'Alt+Tab' : 'Tab';
+  const tab = tabKey(browserName);
   const errors = await openStarted(page);
   await openCollapsedPanels(page);
   await chooseSample(page, TRAJECTORY);
@@ -499,8 +496,8 @@ for (const theme of ['light', 'dark']) {
     const actions = await first.locator('.library-row-actions').boundingBox();
     expect(actions.y).toBeGreaterThanOrEqual(toggle.y + toggle.height - 1);
     expect(actions.x + actions.width).toBeLessThanOrEqual(box.x + box.width);
-    // The theme's own colours, from its tokens.
-    const colours = await page.evaluate(() => {
+    // The theme's own colors, from its tokens.
+    const colors = await page.evaluate(() => {
       const probe = document.createElement('div');
       document.body.append(probe);
       const resolve = token => {
@@ -518,9 +515,9 @@ for (const theme of ['light', 'dark']) {
       probe.remove();
       return out;
     });
-    expect(colours.text).toBe(colours.textToken);
-    expect(colours.surface).toBe(colours.surfaceToken);
-    expect(colours.text).not.toBe(colours.surface);
+    expect(colors.text).toBe(colors.textToken);
+    expect(colors.surface).toBe(colors.surfaceToken);
+    expect(colors.text).not.toBe(colors.surface);
     expect(errors).toEqual([]);
   });
 }

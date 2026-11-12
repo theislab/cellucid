@@ -11,9 +11,14 @@
  * the panel's Tour button and Stop do (`history.tour.start`,
  * `history.tour.stop`, provided by `index.js`).
  * Under reduced motion nothing flies: each step is shown at once and held.
+ * Anyone else changing what is shown while it plays (the person's step, an
+ * agent's move, another tracker or a load, an edit that removed steps) ends
+ * the tour where they are, without returning: its next jump would move away
+ * from what they just did (bug hunt LB-3). A note, a bookmark or a rename
+ * changes nothing shown and the tour plays on.
  *
  * The bar sits over the top of the viewer, like the camera path's transport
- * bar, and is a labelled region whose caption is announced.
+ * bar, and is a labeled region whose caption is announced.
  *
  * @module ui/modules/state/tour
  */
@@ -21,7 +26,8 @@
 import { tourPlan } from './model.js';
 import { STATE_ICONS, reportHistoryFailure } from './shared.js';
 import { pathTo } from './history-source.js';
-import { prefersReducedMotion } from '../cinematic-camera/playback-controller.js';
+import { prefersReducedMotion } from '../../../../utils/reduced-motion.js';
+import { isPageKey } from '../../../../utils/key-ownership.js';
 import { createCameraPathPlan, interpolatePlannedCameraState } from '../cinematic-camera/interpolation-engine.js';
 import { runBeforeNextFrame } from '../../../../rendering/frame-phases.js';
 import { onAbort } from '../../../../utils/abort.js';
@@ -50,8 +56,11 @@ function flightPlan(from, to, seconds) {
  * @param {(stepId: string) => object|null} [options.recordedCamera] - the focused view's camera as a
  *   step kept it, while camera moves are not recorded (a jump then leaves the camera; the tour, asked
  *   for, still shows each step's view, History v2 §3.15.5); null while they are recorded
+ * @param {(listener: (event: {kind: string, head?: string}) => void) => (() => void)} [options.subscribe] - the
+ *   history's events (`history.subscribe`): one that leaves another step or tracker shown than the
+ *   tour's own jump, or an edit that removed steps, ends it
  */
-export function createTour({ ownerDocument, view, jump, camera, onChange = () => {}, recordedCamera = () => null }) {
+export function createTour({ ownerDocument, view, jump, camera, onChange = () => {}, recordedCamera = () => null, subscribe = () => () => {} }) {
   let session = null;
   /** The play running now (what `stop` waits for), or null. */
   let running = null;
@@ -164,7 +173,9 @@ export function createTour({ ownerDocument, view, jump, camera, onChange = () =>
     if (session !== null) return running;
     const run = playTour(options);
     running = run;
-    void run.finally(() => { if (running === run) running = null; });
+    // Cleared however it ends (its own failures are reported inside; `run` stays the caller's to await).
+    const clear = () => { if (running === run) running = null; };
+    run.then(clear, clear);
     return run;
   }
 
@@ -178,6 +189,9 @@ export function createTour({ ownerDocument, view, jump, camera, onChange = () =>
     session = {
       tracker: tracker.id, returnTo: tracker.headId, plan, index: 0, paused: false, skip: false,
       controller, ui, target: null,
+      // The step the tour shows (or is showing: its own jump), and whether someone else changed
+      // what is shown meanwhile (the tour then ends where they are).
+      at: tracker.headId, jumpingTo: null, interrupted: false,
       // Where the camera was: put back at the end when the tour moved it outside the history.
       cameraAtStart: camera === null ? null : camera.getCameraState(),
     };
@@ -192,9 +206,33 @@ export function createTour({ ownerDocument, view, jump, camera, onChange = () =>
       else if (action === 'previous') seek(-1);
     }, { signal: controller.signal });
     ownerDocument.addEventListener('keydown', event => {
-      if (event.key === 'Escape' && !event.defaultPrevented) { event.preventDefault(); stop(); }
+      if (event.key === 'Escape' && isPageKey(event)) { event.preventDefault(); stop(); }
     }, { signal: controller.signal });
     ui.pause.focus({ preventScroll: true });
+    const own = session;
+    const unsubscribe = subscribe(event => {
+      if (session !== own || controller.signal.aborted) return;
+      const shown = view();
+      // While its own jump is under way the step shown is still the one it showed, or already the
+      // one it goes to: an event meanwhile that moves nothing (a chat kept with the history as an
+      // agent's turn ends, a note) left it playing only once the head had moved.
+      const ownStep = shown !== null && (shown.headId === own.at || (own.jumpingTo !== null && shown.headId === own.jumpingTo));
+      const elsewhere = shown === null || shown.id !== own.tracker || !ownStep;
+      const removed = event.kind === 'edited' && (event.removed?.length ?? 0) > 0;
+      if (!elsewhere && !removed) return;
+      own.interrupted = true;
+      controller.abort();
+    });
+    onAbort(controller.signal, unsubscribe);
+    const show = async stepId => {
+      own.jumpingTo = stepId;
+      try {
+        await jump(stepId);
+        own.at = stepId;
+      } finally {
+        own.jumpingTo = null;
+      }
+    };
     const branch = tracker.branch(tracker.activeBranch);
     onStart({
       tracker: { id: tracker.id, name: tracker.name },
@@ -219,7 +257,7 @@ export function createTour({ ownerDocument, view, jump, camera, onChange = () =>
         ui.previous.disabled = session.index === 0;
         ui.next.disabled = session.index === plan.length - 1;
         const from = item.fly && camera !== null ? camera.getCameraState() : null;
-        await jump(item.stepId);
+        await show(item.stepId);
         if (controller.signal.aborted) break;
         if (from !== null) {
           // Camera moves not recorded: the jump left the camera; the step's own is flown to.
@@ -279,12 +317,17 @@ export function createTour({ ownerDocument, view, jump, camera, onChange = () =>
 
   async function end() {
     if (session === null) return;
-    const { tracker, returnTo, ui, controller, cameraAtStart } = session;
+    const { tracker, returnTo, ui, controller, cameraAtStart, interrupted } = session;
     session = null;
     controller.abort();
     ui.bar.remove();
     ownerDocument.body.classList.remove('history-touring');
     try {
+      // Someone else changed the history while it played: they moved on, and it ends where they are.
+      if (interrupted) {
+        onChange(false);
+        return;
+      }
       // Back where the person was, unless they acted meanwhile (a new step is theirs to keep).
       const shown = view();
       if (shown !== null && shown.id === tracker && shown.step(returnTo) !== undefined && shown.headId !== returnTo

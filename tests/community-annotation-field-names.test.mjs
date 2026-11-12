@@ -13,7 +13,7 @@ import {
 test('a renamed field and category are keyed on the dataset\'s names', () => {
   const plain = { key: 'cluster', categories: ['alpha', 'beta'] };
   assert.equal(annotationFieldKey(plain), 'cluster');
-  assert.equal(annotationCategories(plain), plain.categories);
+  assert.deepEqual(annotationCategories(plain), plain.categories);
   assert.equal(hasLocalNames(plain), false);
 
   const renamed = { key: 'Cell type', _originalKey: 'cell_type', categories: ['Alpha renamed', 'beta'], _originalCategories: ['alpha', 'beta'] };

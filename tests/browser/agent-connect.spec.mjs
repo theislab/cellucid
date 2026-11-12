@@ -9,8 +9,10 @@
  *   the code; Allow answers the relay, the panel says who is connected.
  * - Manage… lists the connection, Remove ends it; Forget this browser asks
  *   in place, ends them all and deletes the pairing.
- * - A code typed from another device: a wrong one is said under the box; a
- *   typed code warns; Deny, and closing the dialog, deny.
+ * - A code typed in this browser: a wrong one is said under the box; a
+ *   typed code warns; one started in another browser is refused with the
+ *   relay's sentence; Deny, and closing the dialog, deny. Every claim is the
+ *   credentialed request (`/oauth/claim`) with this browser's tab secret.
  * - The status line follows the link: offline, retrying, back.
  * - A tool call through the relay runs as the agent: a dataset opened by
  *   name, a refusal naming what exists, a picture as image content with the
@@ -26,7 +28,8 @@ import { resultJson } from './helpers/agent-chat.mjs';
 import { plainText } from '../../assets/js/app/agent/bridge/mcp-content.js';
 
 const UNKNOWN_APP = Object.freeze({
-  agent: 'Notes helper', name: 'Notes helper', host: null, redirectHost: '127.0.0.1', loopback: true, known: false, registration: 'registered',
+  // As the relay names an app no host vouches for (F122): as an app on this computer, its own name only quoted.
+  agent: 'An app on this computer', name: 'Notes helper', host: null, redirectHost: '127.0.0.1', loopback: true, known: false, registration: 'registered',
 });
 
 const status = page => page.locator('#agent-connect-status');
@@ -43,12 +46,17 @@ test('the approval link: its code leaves the address, Allow connects, Manage… 
   await expect(page.locator('#agent-approval-who')).toHaveText(/^Claude \(claude\.ai\) asks to work in Cellucid in this browser/);
   await expect(page.locator('#agent-approval-where')).toHaveText('The answer goes to claude.ai.');
   await expect(page.locator('#agent-approval-code')).toHaveText('ABCD-EFGH');
-  await expect(page.locator('#agent-approval-warnings')).toBeHidden();
+  await expect(page.locator('#agent-approval-warnings li')).toHaveText([
+    'Allow only if you asked Claude to connect just now, never for a link someone sent you.',
+  ]);
   // Deny comes first in the focus order.
   await expect(page.locator('#agent-approval-deny')).toBeFocused();
-  expect((await received(relay, 'claim')).code).toBe('ABCDEFGH');
-  // Claiming paired the browser: its tab secret is kept.
+  const claim = await received(relay, 'claim');
+  expect(claim.code).toBe('ABCDEFGH');
+  // Claiming paired the browser: its tab secret is kept, and named the pairing in the claim.
   expect(await page.evaluate(key => localStorage.getItem(key), SECRET_KEY)).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  expect(claim.secret).toBe(await page.evaluate(key => localStorage.getItem(key), SECRET_KEY));
+  expect(claim.origin).toBe(new URL(page.url()).origin);
 
   await page.locator('#agent-approval-allow').click();
   expect(await received(relay, 'decide')).toMatchObject({ code: 'ABCDEFGH', allow: true });
@@ -100,7 +108,7 @@ test('a typed code: a wrong one is said, a typed one warns, Deny and closing the
 
   await page.locator('#agent-connect-code').fill('XYZ');
   await page.locator('#agent-connect-code').press('Enter');
-  await expect(page.locator('#agent-connect-code-status')).toHaveText('Codes look like ABCD-EFGH');
+  await expect(page.locator('#agent-connect-code-status')).toHaveText('Codes look like ABCD-EFGH.');
   await expect(page.locator('#agent-connect-code-status')).toHaveAttribute('title', 'A connect code has eight letters and digits, like ABCD-EFGH.');
   await expect(page.locator('#agent-connect-code-status')).toHaveAttribute('data-tone', 'warning');
 
@@ -109,7 +117,8 @@ test('a typed code: a wrong one is said, a typed one warns, Deny and closing the
   await page.locator('#agent-connect-code-btn').click();
   await expect(dialog(page)).toBeVisible();
   expect((await received(relay, 'claim')).code).toBe('ABCDEFG0');
-  await expect(page.locator('#agent-approval-title')).toHaveText('Connect Notes helper?');
+  await expect(page.locator('#agent-approval-title')).toHaveText('Connect an app on this computer?');
+  await expect(page.locator('#agent-approval-who')).toHaveText(/^An app on this computer, which calls itself “Notes helper”, asks to work/);
   await expect(page.locator('#agent-approval-where')).toHaveText('The answer goes to an app on this computer (127.0.0.1).');
   await expect(page.locator('#agent-approval-warnings li')).toHaveText([
     'Allow only if you started connecting Cellucid from this app yourself, just now.',
@@ -118,7 +127,7 @@ test('a typed code: a wrong one is said, a typed one warns, Deny and closing the
   await page.locator('#agent-approval-deny').click();
   expect(await received(relay, 'decide')).toMatchObject({ code: 'ABCDEFG0', allow: false });
   await expect(dialog(page)).toBeHidden();
-  await expect(page.locator('#notification-center')).toContainText('Notes helper was not connected.');
+  await expect(page.locator('#notification-center')).toContainText('An app on this computer was not connected.');
   await expect(status(page)).toHaveText('Ready · no agent yet');
 
   // A code the relay does not know: one short line, the relay's sentence in a notification.
@@ -126,6 +135,13 @@ test('a typed code: a wrong one is said, a typed one warns, Deny and closing the
   await page.locator('#agent-connect-code').press('Enter');
   await expect(page.locator('#agent-connect-code-status')).toHaveText('Code not accepted');
   await expect(page.locator('#notification-center')).toContainText('was not accepted: This connect code is unknown or has expired. Start connecting again from Claude or ChatGPT.');
+  await expect(dialog(page)).toBeHidden();
+
+  // A code started in another browser (a link or code someone sent): refused by the relay, said the same way.
+  await page.locator('#agent-connect-code').fill('YYYY-YYYY');
+  await page.locator('#agent-connect-code').press('Enter');
+  await expect(page.locator('#agent-connect-code-status')).toHaveText('Code not accepted');
+  await expect(page.locator('#notification-center')).toContainText('This connect code was started in another browser, so it cannot connect this one.');
   await expect(dialog(page)).toBeHidden();
 
   // Closing the question (Escape) denies it too.
@@ -196,14 +212,23 @@ test('a tool call through the relay runs as the agent: a dataset opened by name,
   expect(picture.result.content[1].mimeType).toBe('image/png');
   const body = resultJson(picture.result.content[0].text);
   expect(body.png).toMatchObject({ image: 1, mimeType: 'image/png' });
-  expect(body.plot).toEqual({ width: 320, height: 240 });
+  // The size asked for is the box the plot fits in (F78, as in a figure export): one side fills it,
+  // the other fits inside, and the plot keeps the view's shape as framed on screen (F150).
+  expect(body.plot.width).toBeLessThanOrEqual(320);
+  expect(body.plot.height).toBeLessThanOrEqual(240);
+  expect(body.plot.width === 320 || body.plot.height === 240).toBe(true);
+  const pane = await page.locator('#glcanvas').boundingBox();
+  expect(body.plot.width / body.plot.height).toBeCloseTo(pane.width / pane.height, 2);
   expect(picture.result._meta['cellucid/view']).toMatchObject({ dataset: TRAJECTORY.name });
-  // The agent's opening is no step of either history; its colouring is, labelled as Claude's, and the
+  // The agent's opening is no step of either history; its coloring is, labeled as Claude's, and the
   // history reads, undoes and shows steps through the same tools.
-  const field = resultJson((await callTool(page, relay, 'fields_list', { kind: 'categorical' })).result.content[0].text).fields[0];
-  const coloured = await callTool(page, relay, 'color_by', { field: { source: 'obs', key: field.key } });
-  const stepId = resultJson(coloured.result.content[0].text).step.id;
-  expect(coloured.result._meta).toBeUndefined();
+  // A field the cells are not colored by: the dataset opens colored by its first coloring
+  // (`app/first-coloring.js`), and coloring by that again would be no step.
+  const shownField = await page.evaluate(() => window._cellucidState.getActiveField()?.key ?? null);
+  const field = resultJson((await callTool(page, relay, 'fields_list', { kind: 'categorical' })).result.content[0].text).fields.find(each => each.key !== shownField);
+  const colored = await callTool(page, relay, 'color_by', { field: { source: 'obs', key: field.key } });
+  const stepId = resultJson(colored.result.content[0].text).step.id;
+  expect(colored.result._meta).toBeUndefined();
   const history = resultJson((await callTool(page, relay, 'history_get', {})).result.content[0].text);
   expect(history.steps.map(step => step.type)).not.toContain('dataset.open');
   const step = history.steps.find(each => each.id === stepId);

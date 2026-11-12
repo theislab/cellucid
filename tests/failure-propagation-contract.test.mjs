@@ -91,8 +91,10 @@ test('analysis modal teardown aggregates independent cleanup failures', () => {
       },
     ],
     classList: {
+      add() {},
       remove() {},
     },
+    _appDialog: null,
     parentNode: null,
   };
 
@@ -171,8 +173,8 @@ test('form-based modal exports fail when no exact modal plot exists', async () =
       /SVG export requires an open analysis modal plot/,
     );
     assert.throws(
-      () => ui._exportModalCSV(),
-      /_exportModalCSV\(\) must be implemented by subclass/,
+      () => ui.tableFile(),
+      /tableFile\(\) must be implemented by subclass/,
     );
   } finally {
     if (previousHTMLElement === undefined) delete globalThis.HTMLElement;

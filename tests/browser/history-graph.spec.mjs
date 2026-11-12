@@ -12,7 +12,7 @@
  *
  * The history is History v2's records, acted on by the history actions
  * (`helpers/history-v2-fake.mjs` provides them on the page's dispatcher, so
- * every operation is the panel's dispatch of a catalogue action).
+ * every operation is the panel's dispatch of a catalog action).
  */
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
@@ -61,7 +61,7 @@ test('rows match the tree: the path, the stub where Main parts, the undone tail;
   await openWith(page, FORKED);
   expect(await rowFacts(page)).toEqual([
     ['step', 'Opened', '●', '1'],
-    ['step', 'Coloured by cell_type', '●', '1'],
+    ['step', 'Colored by cell_type', '●', '1'],
     ['step', 'Hid alpha of cell_type', '●', '1'],
     ['fork', 'Main', '⑂', '1'],
     ['step', 'Kept a view', '◉', '1'],
@@ -72,11 +72,11 @@ test('rows match the tree: the path, the stub where Main parts, the undone tail;
   await row(page, 'Main').locator('.hg-toggle').click();
   await expect.poll(() => rowFacts(page)).toEqual([
     ['step', 'Opened', '●', '1'],
-    ['step', 'Coloured by cell_type', '●', '1'],
+    ['step', 'Colored by cell_type', '●', '1'],
     ['step', 'Hid alpha of cell_type', '●', '1'],
     ['fork', 'Main', '⑂', '1'],
     ['step', 'Hid gamma of cell_type', '●', '2'],
-    ['step', 'Coloured by score', '●', '2'],
+    ['step', 'Colored by score', '●', '2'],
     ['step', 'Kept a view', '◉', '1'],
     ['step', 'Renamed 0 to T cells', '○', '1'],
   ]);
@@ -86,7 +86,7 @@ test('rows match the tree: the path, the stub where Main parts, the undone tail;
 test('owner rule: a click selects without moving the history; a double-click shows; › opens the details', async ({ page }) => {
   const errors = observeProductErrors(page);
   await openWith(page, FORKED);
-  const target = row(page, 'Coloured by cell_type');
+  const target = row(page, 'Colored by cell_type');
   await target.click();
   await expect(target).toHaveAttribute('aria-selected', 'true');
   await expect(target).toBeFocused();
@@ -106,13 +106,13 @@ test('keys: arrows move, Enter shows, Space opens details, → opens a stub, Shi
   await openWith(page, FORKED);
   await row(page, 'Opened').click();
   await page.keyboard.press('ArrowDown');
-  await expect(row(page, 'Coloured by cell_type')).toBeFocused();
+  await expect(row(page, 'Colored by cell_type')).toBeFocused();
   await page.keyboard.press('Enter');
   await expect.poll(() => head(page)).toBe('s1');
   await page.keyboard.press('Space');
-  await expect(row(page, 'Coloured by cell_type').locator('.hg-details')).toBeVisible();
+  await expect(row(page, 'Colored by cell_type').locator('.hg-details')).toBeVisible();
   await page.keyboard.press('Space');
-  await expect(row(page, 'Coloured by cell_type').locator('.hg-details')).toHaveCount(0);
+  await expect(row(page, 'Colored by cell_type').locator('.hg-details')).toHaveCount(0);
   await page.keyboard.press('ArrowDown');
   await page.keyboard.press('ArrowDown');
   await expect(row(page, 'Main')).toBeFocused();
@@ -121,13 +121,13 @@ test('keys: arrows move, Enter shows, Space opens details, → opens a stub, Shi
   await page.keyboard.press('ArrowRight');
   await expect(row(page, 'Hid gamma of cell_type')).toBeFocused();
   await page.keyboard.press('Shift+ArrowDown');
-  await expect(row(page, 'Coloured by score')).toHaveAttribute('aria-selected', 'true');
+  await expect(row(page, 'Colored by score')).toHaveAttribute('aria-selected', 'true');
   await expect(row(page, 'Hid gamma of cell_type')).toHaveAttribute('aria-selected', 'true');
   await page.keyboard.press('ControlOrMeta+g');
-  const ask = page.locator('.confirm-dialog-overlay');
+  const ask = page.locator('dialog.confirm-dialog');
   await expect(ask).toBeVisible();
   await expect(page.locator('.confirm-dialog-title')).toHaveText('Group 2 steps');
-  await page.locator('.confirm-dialog-overlay .confirm-dialog-textarea').fill('QC');
+  await page.locator('dialog.confirm-dialog .confirm-dialog-textarea').fill('QC');
   await ask.getByRole('button', { name: 'Group', exact: true }).click();
   await expect(row(page, 'QC')).toHaveAttribute('data-kind', 'group');
   expect(errors).toEqual([]);
@@ -164,6 +164,29 @@ for (const [width, height] of [[1440, 1000], [390, 844]]) {
     expect(box.height, 'a wrapped row grows').toBeGreaterThan(30);
   });
 }
+
+test('a width the labels wrap at again: every drawn row is measured again, none overlaps the next, the last is not cut off', async ({ page }) => {
+  await openWith(page, 'long');
+  const layoutAt = width => page.locator('#history-graph').evaluate(async (graph, cssWidth) => {
+    graph.style.width = cssWidth;
+    // The tree draws again a frame after its size changed (`ResizeObserver`).
+    for (let frame = 0; frame < 4; frame += 1) await new Promise(resolve => requestAnimationFrame(resolve));
+    const boxes = [...graph.querySelectorAll('.hg-row')]
+      .map(row => ({ label: row.querySelector('.hg-label').textContent, ...row.getBoundingClientRect().toJSON() }))
+      .sort((a, b) => a.top - b.top);
+    const sizer = graph.querySelector('.hg-sizer').getBoundingClientRect();
+    return { boxes, sizerBottom: sizer.bottom };
+  }, width);
+  for (const width of ['150px', '']) {
+    const { boxes, sizerBottom } = await layoutAt(width);
+    expect(boxes.length).toBeGreaterThan(1);
+    for (let index = 1; index < boxes.length; index += 1) {
+      expect(boxes[index].top, `${boxes[index].label} starts below ${boxes[index - 1].label} at width ${width || 'auto'}`)
+        .toBeGreaterThanOrEqual(boxes[index - 1].bottom - 0.5);
+    }
+    expect(boxes.at(-1).bottom, `the last row fits the tree at width ${width || 'auto'}`).toBeLessThanOrEqual(sizerBottom + 0.5);
+  }
+});
 
 test('2 000 steps: the drawn rows stay bounded, End reaches the last row, and a new step draws once', async ({ page }) => {
   const errors = observeProductErrors(page);
@@ -212,7 +235,7 @@ test('a long history that scrolls: the Details button of a row takes its click o
   });
   const shown = row(page, label);
   const button = shown.locator('.hg-details-btn');
-  // Nothing covers the button at its centre: the row ends clear of the strip.
+  // Nothing covers the button at its center: the row ends clear of the strip.
   expect(await button.evaluate(element => {
     const box = element.getBoundingClientRect();
     return element.contains(document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2));
@@ -227,15 +250,15 @@ test('a long history that scrolls: the Details button of a row takes its click o
 
 test('merge 3 steps into one from a selection, then restore them from Recently deleted', async ({ page }) => {
   const errors = observeProductErrors(page);
-  await openWith(page, 'recolours');
-  // Colour tweaks present the analysis: they fold into one row, and the row stands for its steps.
+  await openWith(page, 'recolors');
+  // Color tweaks present the analysis: they fold into one row, and the row stands for its steps.
   const run = page.locator('#history-graph .hg-row[data-kind="run"]');
-  await expect(run.locator('.hg-label')).toHaveText('Colors ×3');
+  await expect(run.locator('.hg-label')).toHaveText('Recolored 1 · Recolored 2 · 1 more step');
   await run.click();
   await run.click({ button: 'right' });
   await page.getByRole('menuitem', { name: 'Merge 3 steps into one…' }).click();
   await expect(page.locator('.confirm-dialog-title')).toHaveText('Merge 3 steps into one?');
-  await page.locator('.confirm-dialog-overlay').getByRole('button', { name: 'Merge into one step' }).click();
+  await page.locator('dialog.confirm-dialog').getByRole('button', { name: 'Merge into one step' }).click();
   await expect(run).toHaveCount(0);
   await expect(page.locator('#history-graph .hg-row', { hasText: 'Merged 3 steps' })).toHaveCount(1);
   await page.locator('#history-menu-btn').click();
@@ -243,7 +266,7 @@ test('merge 3 steps into one from a selection, then restore them from Recently d
   await expect(page.locator('#history-deleted-list li')).toHaveCount(1);
   await page.locator('#history-deleted-list').getByRole('button', { name: /^Restore/ }).click();
   await page.locator('#history-deleted-dialog .app-dialog-close').click();
-  await expect(run.locator('.hg-label')).toHaveText('Colors ×3');
+  await expect(run.locator('.hg-label')).toHaveText('Recolored 1 · Recolored 2 · 1 more step');
   expect(errors).toEqual([]);
 });
 
@@ -259,7 +282,7 @@ test('paused: the switch, the marker, and Keep / Discard / Cancel before going b
   await expect(page.locator('#history-status')).toContainText('since ');
   await expect(page.locator('#history-recording')).toHaveAttribute('title', /changes still apply/);
   await page.locator('#history-undo-btn').click();
-  const ask = page.locator('.confirm-dialog-overlay');
+  const ask = page.locator('dialog.confirm-dialog');
   await expect(page.locator('.confirm-dialog-title')).toHaveText('Keep your changes first?');
   await ask.getByRole('button', { name: 'Cancel' }).click();
   await expect.poll(() => head(page)).toBe('s2');
@@ -285,7 +308,7 @@ test('delete a branch: the confirmation names its steps, where you will be, and 
   await expect(page.locator('.confirm-dialog-message')).toHaveText(
     'Its 2 steps, from “Kept a view” to “Renamed 0 to T cells”, go to Recently deleted, where you can restore them.');
   await expect(page.locator('.confirm-dialog-list li')).toHaveText(['You are on this branch: you will see step 2 (“Hid alpha of cell_type”).']);
-  await page.locator('.confirm-dialog-overlay').getByRole('button', { name: 'Delete branch' }).click();
+  await page.locator('dialog.confirm-dialog').getByRole('button', { name: 'Delete branch' }).click();
   await expect.poll(() => head(page)).toBe('s2');
   await expect(row(page, 'Kept a view')).toHaveCount(0);
   expect(errors).toEqual([]);
@@ -293,7 +316,7 @@ test('delete a branch: the confirmation names its steps, where you will be, and 
 
 /** Whether the open popup menu sits by its anchor box and is narrower than the page. */
 async function menuBy(page, anchor) {
-  const menu = page.locator('.history-popup-menu');
+  const menu = page.locator('.popup-menu');
   await expect(menu).toBeVisible();
   const box = await menu.boundingBox();
   const width = page.viewportSize().width;
@@ -311,7 +334,7 @@ for (const [width, height] of [[1440, 1000], [390, 844]]) {
     await page.setViewportSize({ width, height });
     await openWith(page, 'forkedAtTip');
     // The row menu from the keyboard (Shift+F10), anchored at the row.
-    const target = row(page, 'Coloured by cell_type');
+    const target = row(page, 'Colored by cell_type');
     await target.click();
     await page.keyboard.press('Shift+F10');
     await menuBy(page, await target.boundingBox());
@@ -344,9 +367,36 @@ for (const [width, height] of [[1440, 1000], [390, 844]]) {
         const room = line.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
         return { label: el.querySelector('.hg-label').textContent, width: el.querySelector('.hg-label').getBoundingClientRect().width, room };
       }));
-    expect(facts.map(each => each.label)).toEqual(['Hid the doublets after the quality check', 'Coloured by the leiden clusters at resolution one']);
+    expect(facts.map(each => each.label)).toEqual(['Hid the doublets after the quality check', 'Colored by the leiden clusters at resolution one']);
     for (const each of facts) expect(each.width, each.label).toBeGreaterThanOrEqual(Math.min(96, each.room) - 1);
   });
+
+  for (const scene of ['walk', 'forkedAtTip']) {
+    test(`every row's buttons keep one line, the row's first, at its end, at ${width} px (${scene})`, async ({ page }) => {
+      // A turn's ↗ and details went onto a second line under a long label
+      // (live pass 3, 2026-11-11): nested actions keep one line, aligned.
+      await page.setViewportSize({ width, height });
+      await openWith(page, scene);
+      const facts = await rows(page).evaluateAll(list => list.map(el => {
+        const line = el.querySelector('.hg-line').getBoundingClientRect();
+        const buttons = [...el.querySelectorAll('.hg-tools > button')].map(button => button.getBoundingClientRect());
+        return {
+          kind: el.dataset.kind,
+          label: el.querySelector('.hg-label').textContent,
+          tops: [...new Set(buttons.map(box => Math.round(box.top)))],
+          firstLine: buttons.every(box => box.bottom <= line.top + parseFloat(getComputedStyle(el).minHeight) + 1),
+          end: buttons.length === 0 ? null : Math.round(line.right - Math.max(...buttons.map(box => box.right))),
+        };
+      }));
+      expect(facts.some(each => each.kind !== 'step'), 'the scene has rows other than steps').toBe(true);
+      const ends = new Set(facts.filter(each => each.end !== null).map(each => each.end));
+      for (const each of facts) {
+        expect(each.tops.length, `${each.kind} "${each.label}": one line of buttons`).toBeLessThanOrEqual(1);
+        expect(each.firstLine, `${each.kind} "${each.label}": the buttons are on the row's first line`).toBe(true);
+      }
+      expect(ends.size, 'every row ends its buttons at the same place').toBe(1);
+    });
+  }
 }
 
 test('the branch picker closes when a branch is chosen and on a press outside it, and keeps focus while it redraws', async ({ page }) => {
@@ -365,7 +415,7 @@ test('the branch picker closes when a branch is chosen and on a press outside it
   // A redraw (a new step) keeps the focus on the branch it was on.
   const pick = page.locator('#history-branches .history-branch[data-branch="b1"] .history-branch-pick');
   await pick.focus();
-  await page.evaluate(() => globalThis.__fakeHistory.append('Coloured again'));
+  await page.evaluate(() => globalThis.__fakeHistory.append('Colored again'));
   await expect(page.locator('#history-branches .history-branch[data-branch="b1"] .history-branch-pick')).toBeFocused();
   await page.locator('#history-status').click();
   await expect(picker).toBeHidden();
@@ -385,7 +435,7 @@ test('§6 test 8: delete a branch with its sub-branch, the records exact after i
   await expect(page.locator('.confirm-dialog-option')).toHaveText('Also delete the branch that starts from it (1 step)');
   await option.check();
   await expect(page.locator('.confirm-dialog-list li')).toHaveText(['The branch that starts from it goes too.']);
-  await page.locator('.confirm-dialog-overlay').getByRole('button', { name: 'Delete branch' }).click();
+  await page.locator('dialog.confirm-dialog').getByRole('button', { name: 'Delete branch' }).click();
   // Exactly Main is left: its steps, its tip shown, nothing of either branch.
   await expect.poll(() => page.evaluate(() => globalThis.__fakeHistory.records.branches.map(each => each.id))).toEqual(['b0']);
   const after = await page.evaluate(() => structuredClone(globalThis.__fakeHistory.records));
@@ -418,8 +468,8 @@ test('§6 test 9: a note and a bookmark, found by search and by the filters', as
   await target.locator('.hg-details-btn').click();
   await target.click({ button: 'right' });
   await page.getByRole('menuitem', { name: 'Bookmark…' }).click();
-  await page.locator('.confirm-dialog-overlay .confirm-dialog-textarea').fill('Before QC');
-  await page.locator('.confirm-dialog-overlay').getByRole('button', { name: 'Save' }).click();
+  await page.locator('dialog.confirm-dialog .confirm-dialog-textarea').fill('Before QC');
+  await page.locator('dialog.confirm-dialog').getByRole('button', { name: 'Save' }).click();
   await expect(target).toHaveAttribute('aria-label', /bookmarked “Before QC”, has a note/);
   // Search finds the note's words, and the bookmark's name.
   await page.locator('#history-search-btn').click();
@@ -443,8 +493,8 @@ test('Add to group: a step after a group joins it from the row menu, and its toa
   // A group of one step, then the step after it (same branch) joins it.
   await row(page, 'Kept a view').click();
   await page.keyboard.press('ControlOrMeta+g');
-  await page.locator('.confirm-dialog-overlay .confirm-dialog-textarea').fill('QC');
-  await page.locator('.confirm-dialog-overlay').getByRole('button', { name: 'Group', exact: true }).click();
+  await page.locator('dialog.confirm-dialog .confirm-dialog-textarea').fill('QC');
+  await page.locator('dialog.confirm-dialog').getByRole('button', { name: 'Group', exact: true }).click();
   await expect(row(page, 'QC')).toHaveAttribute('aria-label', /^Group “QC”, 1 step/);
   await row(page, 'Renamed 0 to T cells').click({ button: 'right' });
   await expect(page.getByRole('menuitem', { name: 'Add to group “QC”' })).toHaveAttribute('title', 'The group grows to this step, taking in 1 step');
@@ -455,7 +505,7 @@ test('Add to group: a step after a group joins it from the row menu, and its toa
   await toast.getByRole('button', { name: 'Undo' }).click();
   await expect(row(page, 'QC')).toHaveAttribute('aria-label', /^Group “QC”, 1 step/);
   // A step on another branch than the group's is not offered.
-  await row(page, 'Coloured by cell_type').click({ button: 'right' });
+  await row(page, 'Colored by cell_type').click({ button: 'right' });
   await expect(page.getByRole('menuitem', { name: /^Add to group/ })).toHaveCount(0);
   await page.keyboard.press('Escape');
   expect(errors).toEqual([]);
@@ -471,11 +521,11 @@ test('§6 test 12: the keys and chrome: Discard with “Don’t ask again”, se
   await page.locator('#history-undo-btn').click();
   await expect(page.locator('.confirm-dialog-title')).toHaveText('Keep your changes first?');
   await page.locator('.confirm-dialog-option input').check();
-  await page.locator('.confirm-dialog-overlay').getByRole('button', { name: 'Discard and go' }).click();
+  await page.locator('dialog.confirm-dialog').getByRole('button', { name: 'Discard and go' }).click();
   await expect.poll(() => head(page)).toBe('s5');
   await page.locator('#history-redo-btn').click();
   await expect.poll(() => head(page)).toBe('s6');
-  await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(0);
+  await expect(page.locator('dialog.confirm-dialog')).toHaveCount(0);
   expect(await page.evaluate(() => globalThis.__fakeHistory.pausedChoices)).toEqual(['discard', 'discard']);
   await expect(page.locator('#history-announce')).toHaveText('Redid “Renamed 0 to T cells”');
   await page.locator('#history-recording').click();
@@ -515,7 +565,7 @@ test('§6 test 12: the keys and chrome: Discard with “Don’t ask again”, se
   await row(page, 'Kept a view').focus();
   await page.keyboard.press('Delete');
   await expect(page.locator('.confirm-dialog-title')).toHaveText('Delete step 5 (“Kept a view”)?');
-  await page.locator('.confirm-dialog-overlay').getByRole('button', { name: 'Cancel' }).click();
+  await page.locator('dialog.confirm-dialog').getByRole('button', { name: 'Cancel' }).click();
   await expect(row(page, 'Kept a view')).toHaveCount(1);
 
   // The map's graph follows the row rule: a click selects, a double-click shows.
@@ -538,7 +588,7 @@ test.describe('on a touch screen', () => {
   test('§6 test 12: a double tap shows the step once; a single tap only selects', async ({ page }) => {
     const errors = observeProductErrors(page);
     await openWith(page, 'forkedAtTip');
-    const target = row(page, 'Coloured by cell_type');
+    const target = row(page, 'Colored by cell_type');
     await target.locator('.hg-label').tap();
     await expect(target).toHaveAttribute('aria-selected', 'true');
     expect(await head(page)).toBe('s6');

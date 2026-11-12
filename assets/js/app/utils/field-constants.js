@@ -36,6 +36,13 @@ export const OverlapStrategy = Object.freeze({
 });
 
 /**
+ * The one spelling of the category of cells without a label: a deleted
+ * category's cells (`category.delete`), the cells on no page of Create
+ * categorical (`field.create-from-pages`, the builder).
+ */
+export const UNASSIGNED_LABEL = 'Unassigned';
+
+/**
  * Generate a stable composite identifier for a field.
  * Used for registries that must survive display renames.
  * @param {string} source - 'obs' | 'var'

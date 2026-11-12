@@ -7,7 +7,7 @@ the activity line, and the notice of what agents send with the dataset's switch.
 | Module | What it is |
 | --- | --- |
 | `index.js` | `initAgentPresence({root, dialog, actions, permissions})`: installs the dispatcher's confirmer (`setConfirmer`), follows the dispatcher's events, draws the cards, the lines and the permission settings dialog |
-| `permissions.js` | pure: the kinds, the modes, the decision for one question (`decide`), what a connection's tool list says (`permissionFor`), what an agent is told (`permissionsForAgent`), the store (`cellucid:agent-permissions`, this browser) |
+| `permissions.js` | pure: the kinds, the modes, the decision for one question (`decide`), what holds for one connection, told to its agent (`permissionFor`), what an agent is told (`permissionsForAgent`), the store (`cellucid:agent-permissions`, this browser) |
 | `activity.js` | pure: the agent turns (acting, done with steps, stopped, undone), fed the dispatcher's events |
 
 **Permissions.** The dispatcher passes every change of an agent to the confirmer (reads never):
@@ -58,11 +58,10 @@ turn steps aside when the person (or a notebook) takes a step. A surface that sh
 
 **API:** `attach({agent, turn, connection, stop, shownElsewhere})` returns the detach;
 `refresh()`; `confirm` (the confirmer itself); `permissions` (the store); `permissionFor({kind,
-connection})` (what a connection's tool list says; given to the Connect panel's relay client);
+connection})` (what holds for a connection, told to its agent after its results; given to the Connect
+panel's relay client and the local agent calls);
 `bindPermissionsLine({summary, change})` (the one-line settings in the chat settings and the
-Agents panel); `openPermissions(opener)`; `forgetGrants()`; `onPermissionsChanged(listener)`
-(the settings or a grant changed: what a connection's tool list says may differ; the viewer host
-tells `cellucid mcp`); `questionFor(signal)` (the card's question about the agent call whose
+Agents panel); `openPermissions(opener)`; `forgetGrants()`; `questionFor(signal)` (the card's question about the agent call whose
 signal this is, in one sentence); `answer(signal, allowed)` (the person answered that question
 in the agent's own app, an MCP elicitation: Allow once or Deny, as if clicked).
 

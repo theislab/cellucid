@@ -12,7 +12,7 @@
  * recovery; it is made from the demo catalog at the transport.
  *
  * The other synthetic failures are the ones a file cannot express -- an HTTP
- * status, an offline network, a slow link and a cancelled request -- and
+ * status, an offline network, a slow link and a canceled request -- and
  * those are injected at the transport while the loader under test stays real.
  */
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -370,6 +370,11 @@ for (const [label, fail] of Object.entries(OPENING_FAILURES)) {
       });
       await dismissWelcome(page);
       await expectRenders(page, MIXED_DEFAULT);
+      // The samples are listed once the first view has settled
+      // (`holdListingUntil`): the file is read, and the dataset named, before
+      // it is broken.
+      await expect(page.locator(`#dataset-select option[value="${optionValue(GOOD_DATASET.id)}"]`))
+        .toContainText(GOOD_DATASET.name);
       // The catalog has been listed: every read of the file from here on
       // opens it.
       await page.route(`${GOOD_CATALOG}${GOOD_DATASET.id}.zarr.zip`, fail);
@@ -420,6 +425,11 @@ for (const [label, fail] of Object.entries(OPENING_FAILURES)) {
     });
     await dismissWelcome(page);
     await expectRenders(page, MIXED_DEFAULT);
+    // The samples are listed once the first view has settled
+    // (`holdListingUntil`): the file is read, and the dataset named, before
+    // it is broken.
+    await expect(page.locator(`#dataset-select option[value="${optionValue(GOOD_DATASET.id)}"]`))
+      .toContainText(GOOD_DATASET.name);
     await page.route(`${GOOD_CATALOG}${GOOD_DATASET.id}.zarr.zip`, fail);
 
     await page.locator('#dataset-select').selectOption(optionValue(GOOD_DATASET.id));
@@ -494,7 +504,7 @@ for (const [label, names] of Object.entries(STARTUP_FILE_FAILURES)) {
 }
 
 /* ------------------------------------------------------------------ *
- * Transport failures: offline, slow, cancelled
+ * Transport failures: offline, slow, canceled
  * ------------------------------------------------------------------ */
 
 test('a sample that cannot be listed leaves the open dataset shown and the list recoverable', async ({
@@ -553,6 +563,10 @@ test('an offline dataset switch is reported and the session survives', async ({
   });
   await dismissWelcome(page);
   await expectRenders(page, GOOD_DATASET);
+  // The samples' listing reads their files once the first view has settled
+  // (`holdListingUntil`): over before the link goes, so the dataset is named.
+  await expect(page.locator(`#dataset-select option[value="${optionValue(MIXED_DEFAULT.id)}"]`))
+    .toContainText(MIXED_DEFAULT.name);
 
   await goOffline(context);
   await page.locator('#dataset-select').selectOption(
@@ -601,11 +615,15 @@ test('a load cancelled by switching datasets leaves the winner rendered', async 
   });
   await dismissWelcome(page);
   await expectRenders(page, GOOD_DATASET);
+  // The samples' listing reads their files once the first view has settled
+  // (`holdListingUntil`): over before the 3D file is held, so the reads held
+  // below are the opening's, not the listing's.
+  await expect(page.locator(`#dataset-select option[value="${optionValue(MIXED_DEFAULT.id)}"]`))
+    .toContainText(MIXED_DEFAULT.name);
 
   // Slow every read of the 3D dataset's file, start it, then choose the 1D
   // dataset while its first read is in flight. The last request must win and
-  // the first must not resurface. (The catalog was listed at startup: these
-  // reads open it.)
+  // the first must not resurface.
   const supersededUrl = `${GOOD_CATALOG}synthetic-development-3d.zarr.zip`;
   const superseded = { settled: 0, started: 0 };
   const settled = new Set();

@@ -10,13 +10,20 @@
  *
  * Opening a dataset replaces the open one, as choosing it in Session › Open
  * data does: the open dataset's history stays kept in this browser (State ›
- * Saved states, My datasets › Continue) and the new one starts its own. So
+ * Saved states, My datasets › Continue) while Autosave keeps it, steps it
+ * does not keep being asked about first (`ctx.confirmReplacing`, kind
+ * `replaces-unkept`: `app/unkept-work-guard.js`), and the new one starts its own. So
  * it is not a step of either history and touches no domain; the agent's turn
  * on the dataset it leaves ends there. A download of a whole file (a host
  * that serves no parts of it) is asked about first when an agent opens it
  * (`confirm: 'large-download'`, asked by the implementation once the link
  * says how big it is: `confirmAt: 'handler'`); a copy this browser kept is
- * not downloaded again and not asked about.
+ * not downloaded again and not asked about. Before that, a link, an
+ * accession or a server the person has not seen in this tab (typed or pasted
+ * in the address bar or the chat, open now, or one of My datasets) is asked
+ * about before anything is requested (`opensLinks`, the kind `unseen-link`:
+ * an agent misled by text it read could otherwise make the tab send what it
+ * read to any host, F121).
  *
  * The implementation is the Open data controls'
  * (`app/ui/modules/dataset-open-action.js`), through the paths the person's
@@ -28,6 +35,7 @@
 import { defineAction } from '../catalog.js';
 import { PLAIN_QUOTE } from '../targets/names.js';
 import { PLACES, placePath } from '../../ui/place-names.js';
+import { CELLS_TO_OPEN, cellsToOpenArguments, cellsToOpenWords, namesCellsToOpen } from './params.js';
 
 /** Where a name is looked for. */
 export const DATASET_NAME_KINDS = Object.freeze(['any', 'sample', 'my-datasets', 'link']);
@@ -105,7 +113,7 @@ export const datasetActions = Object.freeze([
   defineAction({
     type: 'dataset.open',
     title: 'Open a dataset',
-    summary: 'Open a dataset by the name the person gives: a built-in sample, one of their datasets (My datasets), a link, or an accession the link box takes. It replaces the open dataset; that one\'s history stays kept in this browser and the new one starts its own. A whole-file download is asked about first.',
+    summary: `Open a dataset by the name the person gives: a built-in sample, one of their datasets (${PLACES.myDatasets.name}), a link, or an accession the link box takes. It replaces the open dataset; that one's history stays kept in this browser while Autosave keeps it (steps it does not keep are asked about first) and the new one starts its own. A link, accession or server the person has not typed, pasted or opened in this tab is asked of them first (before anything is requested), and so is a whole-file download. A count or fraction opens that subsample of its cells at once, read once (as cells_open takes it); without, it opens with the cells the person chose for openings (${placePath(PLACES.session, PLACES.subsampling)}), or the cells one of ${PLACES.myDatasets.name} was last open with.`,
     group: 'Datasets',
     params: {
       type: 'object', additionalProperties: false, required: ['name'],
@@ -118,12 +126,14 @@ export const datasetActions = Object.freeze([
           type: 'string', enum: DATASET_NAME_KINDS, default: 'any',
           description: 'Where to look for the name: any (samples, then My datasets, then as a link), sample, my-datasets or link.',
         },
+        ...CELLS_TO_OPEN,
       },
     },
     reads: [],
     effect: 'dataset',
     confirm: 'large-download',
     confirmAt: 'handler',
+    opensLinks: true,
     result: {
       type: 'object', additionalProperties: false,
       required: ['name', 'kind', 'cells', 'total_cells', 'genes', 'saved_states', 'already_open'],
@@ -137,10 +147,12 @@ export const datasetActions = Object.freeze([
         already_open: { type: 'boolean', description: 'It was open already, so nothing was opened again and its history goes on.' },
       },
     },
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Opened ${quote.bare(params.name)}`,
-    code: params => (params.kind === 'any' || params.kind === undefined
-      ? `open_dataset(${JSON.stringify(params.name)})`
-      : `open_dataset(${JSON.stringify(params.name)}, kind=${JSON.stringify(params.kind)})`),
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Opened ${quote.bare(params.name)}${namesCellsToOpen(params) ? ` with ${cellsToOpenWords(params)}` : ''}`,
+    code: params => `open_dataset(${[
+      JSON.stringify(params.name),
+      ...(params.kind === 'any' || params.kind === undefined ? [] : [`kind=${JSON.stringify(params.kind)}`]),
+      ...cellsToOpenArguments(params),
+    ].join(', ')})`,
   }),
   defineAction({
     type: 'my-datasets.forget',

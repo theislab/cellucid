@@ -173,7 +173,7 @@ test.describe('where a converted object is kept, with storage and without it', (
     await expect(page.locator('#dataset-origin')).toHaveText('R data (.rda, .RData) · this computer');
     await page.locator('#dataset-details .disclosure-header').click();
     await expect(kept).toHaveText(inStorage
-      ? "In this browser's storage (the origin-private file system) until it is cleared (Session › Stored, Clear) or the browser needs the room"
+      ? "In this browser's storage (the origin-private file system) until it is removed (Session › Stored › Manage…) or the browser needs the room"
       : 'In memory until this tab closes: this browser gives this page no storage (as in a private window)');
     await expect(page.locator('#dataset-details-list dt:text-is("Read in parts") + dd')).toHaveText(/cellucid_prepare\(\) in R, cellucid\.prepare\(\) in Python/);
     await expect(notRead).toHaveText([

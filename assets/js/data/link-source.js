@@ -44,6 +44,7 @@ import {
 import { BYTE_SOURCE_FAILURES, isUnanswered } from '../formats/io/byte-source.js';
 import { realmHosts } from '../formats/io/hosts.js';
 import { formatLocator, getProviderRegistry, publicLocatorOf } from './sources/registry.js';
+import { releaseSourceAccessesOf } from './sources/access.js';
 import {
   AnnDataCatalog,
   CATALOG_FILENAME,
@@ -56,7 +57,8 @@ import { createAnnDataFileSource } from './anndata-file-source.js';
 import { getTransferLog } from './transfer-log.js';
 import { prewarmAnnDataReaderWorker } from './anndata-reader-client.js';
 import { beginOpening, openingCancelledError } from './opening-progress.js';
-import { openableNamesText } from './input-formats.js';
+import { folderFormatOfName, openableNamesText } from './input-formats.js';
+import { unreadableAtHost } from './sources/remote-file.js';
 import { formatCountOf } from '../utils/format-units.js';
 import { isCancellation, cancel, cancelled } from '../utils/abort.js';
 
@@ -276,12 +278,22 @@ export class LinkDataSource {
    * about itself.
    * @private
    */
-  async _loadCatalog(baseUrl, title, signal, { askOnce = false } = {}) {
+  async _loadCatalog(baseUrl, title, signal, { askOnce = false, provider = null } = {}) {
     let validated;
     try {
       validated = await fetchAnnDataCatalog(baseUrl, this.type, signal, { askOnce });
     } catch (error) {
-      if (error?.code !== DataSourceErrorCode.NOT_FOUND) throw error;
+      if (error?.code !== DataSourceErrorCode.NOT_FOUND) {
+        // No answer this page may read: said as a file's would be.
+        throw await unreadableAtLinkError(provider, {
+          url: `${baseUrl}${CATALOG_FILENAME}`,
+          name: CATALOG_FILENAME,
+          format: null,
+          // A catalog opens from its host only: what it lists can open from a download.
+          nextStep: 'Ask its owner to let other websites read it (CORS headers), or download a dataset it lists and ' +
+            'open it from your computer (Open… › File…).',
+        }, error, signal);
+      }
       // The commonest mistake: a link to a page, a file listing or the wrong
       // folder. Say what a folder link has to hold.
       throw explainedFailure(
@@ -311,14 +323,23 @@ export class LinkDataSource {
    * Read what one opening holds, completely.
    * @private
    */
-  async _load(opening, signal, progress) {
+  async _load(opening, signal, progress, provider) {
     if (opening.catalog) {
       progress.step('Reading the dataset list');
-      const { catalog, datasets } = await this._loadCatalog(opening.catalog.baseUrl, opening.title, signal);
+      const { catalog, datasets } = await this._loadCatalog(opening.catalog.baseUrl, opening.title, signal, { provider });
       return { catalog, annData: null, datasets };
     }
     if (opening.store) {
-      const annData = await openZarrFolder(opening.store, signal);
+      let annData;
+      try {
+        annData = await openZarrFolder(opening.store, signal);
+      } catch (error) {
+        throw await unreadableAtLinkError(provider, {
+          url: opening.store.url,
+          name: opening.store.name,
+          format: folderFormatOfName(opening.store.name),
+        }, error, signal);
+      }
       return { catalog: null, annData, datasets: [annData.metadata] };
     }
     if (opening.files) {
@@ -376,12 +397,16 @@ export class LinkDataSource {
     let opened = null;
     let reading = shown;
     let adopted = false;
+    // What the provider opened, whose files' accesses (`sources/access.js`)
+    // go with an opening that fails before its reader took it.
+    let providerOpening = null;
     try {
       const { provider, locator: asked, publicLocator: askedPublic, opening } = await this._openProvider(
         input,
         owner.controller.signal,
         progress
       );
+      providerOpening = opening;
       this._assertOperation(owner, 'Opening a link');
       opened = provider;
       reading = opening.title;
@@ -423,7 +448,7 @@ export class LinkDataSource {
               label: opening.title,
               why: 'reading on demand: each dataset when it is chosen',
             });
-      loaded = await this._load(opening, owner.controller.signal, progress);
+      loaded = await this._load(opening, owner.controller.signal, progress, provider);
       this._assertOperation(owner, 'Opening a link');
       // Named after what was opened: the dataset, or how many a catalog holds
       // (where it is read from is the entry's own line).
@@ -485,9 +510,12 @@ export class LinkDataSource {
       ) {
         throw error;
       }
-      // Only a request that got no answer is a network failure; anything
-      // else (a reader refusing what it read) keeps its own message.
-      const unanswered = error instanceof TypeError && /fetch|network/i.test(error.message);
+      // Only a request that got no answer is a network failure, as the one
+      // transport labels it (`fetchOnce`: no connection, an answer without
+      // CORS headers, a stall); anything else (a reader refusing what it
+      // read, a programming error whose message names "network") keeps its
+      // own message.
+      const unanswered = isUnanswered(error);
       throw new DataSourceError(
         `Failed to open ${shown}: ${error?.message ?? error}`,
         unanswered ? DataSourceErrorCode.NETWORK_ERROR : undefined,
@@ -497,6 +525,9 @@ export class LinkDataSource {
     } finally {
       loaded?.annData?.source.clear();
       loaded?.catalog?.close();
+      if (!adopted && providerOpening !== null) {
+        releaseSourceAccessesOf({ file: providerOpening.file?.resource ?? null, files: providerOpening.files?.files ?? null });
+      }
       this._finishOperation(owner, { failed: !adopted });
     }
   }
@@ -691,7 +722,7 @@ export class LinkDataSource {
   }
 
   /**
-   * Title, link and licence of what is open, for the UI and figure
+   * Title, link and license of what is open, for the UI and figure
    * provenance.
    * @returns {Object|null}
    */
@@ -746,7 +777,7 @@ export class LinkDataSource {
         baseUrl,
         this._opening?.title ?? baseUrl,
         owner.controller.signal,
-        { askOnce: true }
+        { askOnce: true, provider: this._registry.get(this._opening?.provider ?? '') }
       );
       this._assertOperation(owner, 'Link refresh');
       if (
@@ -793,6 +824,24 @@ export function createLinkDataSource() {
 }
 
 /**
+ * What a link opens without a probe of its own (a Zarr store folder, a
+ * dataset catalog) whose first read got no answer a page may read, said as a
+ * file's probe says it: on a bare web address, whether its host does not let
+ * other websites read it, cannot be reached or refuses this network for now
+ * (`unreadableAtHost`); on a provider's host, which lets other websites read
+ * it, `unansweredProviderError`. Any other failure as it is. The byte
+ * layer's failure may come wrapped (`fetchJson`'s `details.cause`).
+ */
+async function unreadableAtLinkError(provider, { url, name, format, nextStep }, error, signal) {
+  if (isCancellation(error)) return error;
+  const unanswered = isUnanswered(error) ? error : isUnanswered(error?.details?.cause) ? error.details.cause : null;
+  if (unanswered === null) return error;
+  if (provider !== null && provider.id !== 'url') return unansweredProviderError(provider, unanswered, text => text);
+  const at = URL.canParse(unanswered.details?.url ?? '') ? unanswered.details.url : url;
+  return unreadableAtHost({ url: at, name, format, error: unanswered, signal, nextStep });
+}
+
+/**
  * A provider's request that got no answer a page may read, written for the
  * person: the provider's host lets other websites read it (that is why it is
  * a provider), so it is not CORS. Asked again once already (`withRetries`):
@@ -803,9 +852,9 @@ function unansweredProviderError(provider, error, shown) {
   // request's label, `api-request.js`).
   let host = typeof error.details?.host === 'string' ? error.details.host : null;
   if (host === null && URL.canParse(error.details?.url ?? '')) host = new URL(error.details.url).host;
-  if (globalThis.navigator?.onLine === false || (host !== null && realmHosts.connectionDown(`https://${host}/`))) {
+  if (!realmHosts.online() || (host !== null && realmHosts.connectionDown(`https://${host}/`))) {
     return hostFaultFailure({
-      kind: globalThis.navigator?.onLine === false ? 'offline' : 'connection',
+      kind: !realmHosts.online() ? 'offline' : 'connection',
       host: host ?? provider.label,
       what: 'it',
       service: provider.label,

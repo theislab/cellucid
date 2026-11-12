@@ -47,9 +47,11 @@ body.dock-resizing * {
   user-select: none !important;
 }
 
-/* Canvas (scene) */
+/* Canvas (scene). The agents' side panel takes its width from the plot's
+   right (app/agent/dock.js publishes --agent-panel-inline-size; 0 when the
+   chat is closed or a bar), so the viewer lays its views out beside it. */
 #glcanvas {
-  width: 100%;
+  width: calc(100% - var(--agent-panel-inline-size, 0px));
   height: 100%;
   display: block;
   cursor: grab;
@@ -63,7 +65,7 @@ body.dock-resizing * {
    iOS a press held on them otherwise starts a text selection, which with no
    text under the finger grows to the whole page, or opens the callout menu,
    instead of reaching the viewer's own gestures (Cell info's press-and-hold,
-   Select mode, the camera). Safari honours only the -webkit- user-select. */
+   Select mode, the camera). Safari honors only the -webkit- user-select. */
 #glcanvas,
 .select-bar,
 .split-view-badges,

@@ -107,3 +107,22 @@ test('a window keeps a header clear of the touches it takes past its frame', () 
     TypeError
   );
 });
+
+test('no window is placed, moved, resized, maximised or snapped over the sidebar\'s toggle (viewportTop)', async () => {
+  const { clampFloatingPosition, resizeFloatingRect, maximizedFloatingRect, floatingSnapTargets, FLOATING_MARGIN } =
+    await import('../assets/js/app/dockable-accordions/geometry.js');
+  // A phone (390 × 844) with the panel open: its close button is 44 px tall at the top.
+  const area = { viewportWidth: 390, viewportHeight: 844, viewportTop: 44 };
+  assert.equal(clampFloatingPosition({ left: 12, top: 0, width: 364, height: 828, ...area }).y, 44 + FLOATING_MARGIN,
+    'a window as tall as the screen starts below the toggle (it covered the close button)');
+  const { rect } = resizeFloatingRect({
+    start: { left: 12, top: 200, width: 300, height: 300 }, edge: 'n', dx: 0, dy: -400, minWidth: 100, minHeight: 100, ...area,
+  });
+  assert.equal(rect.top, 44 + FLOATING_MARGIN);
+  const max = maximizedFloatingRect({ sidebarRight: 0, minWidth: 100, ...area });
+  assert.deepEqual([max.top, max.top + max.height], [44 + FLOATING_MARGIN, 844 - FLOATING_MARGIN]);
+  const snap = floatingSnapTargets({ ...area, sidebarRight: 0, sidebarWidth: 0, others: [], contentHeight: 0, distance: 8 });
+  assert.equal(snap.ys[0], 44 + FLOATING_MARGIN);
+  // With no toggle shown, the area starts at the top as before.
+  assert.equal(clampFloatingPosition({ left: 12, top: 0, width: 100, height: 100, viewportWidth: 390, viewportHeight: 844 }).y, FLOATING_MARGIN);
+});

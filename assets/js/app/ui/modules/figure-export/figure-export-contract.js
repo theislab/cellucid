@@ -12,7 +12,8 @@ import { assertReferenceGridAppearance } from './utils/viewer-background.js';
 import { SHADER_QUALITIES } from '../../../../rendering/shader-quality.js';
 import { isBackdropLook } from '../../../../rendering/backdrops/backdrop-looks.js';
 import { requireExactKeys, requirePlainRecord } from '../../../../utils/exact-record.js';
-import { abortReason, onAbort } from '../../../../utils/abort.js';
+import { abortReason, onAbort, requireSignal } from '../../../../utils/abort.js';
+import { isHexColor } from '../../../../utils/hex-color.js';
 
 const FORMATS = new Set(['png', 'svg']);
 const STRATEGIES = new Set(['full-vector', 'optimized-vector', 'hybrid']);
@@ -59,6 +60,7 @@ const JOB_KEYS = Object.freeze(['dpi', 'format']);
 const PAYLOAD_KEYS = Object.freeze([
   'dpi',
   'format',
+  'gridColumns',
   'height',
   'meta',
   'options',
@@ -77,6 +79,7 @@ const VIEW_KEYS = Object.freeze([
   'data',
   'id',
   'label',
+  'name',
   'renderState',
   'scientificState',
 ]);
@@ -89,10 +92,13 @@ const VIEW_DATA_KEYS = Object.freeze([
   'pointCount',
   'positions',
   'transparency',
+  'vectorField',
 ]);
+const VECTOR_FIELD_KEYS = Object.freeze(['colormapId', 'label', 'maxMagnitude', 'unitsPerRender', 'vectors']);
 const CENTROID_FLAG_KEYS = Object.freeze(['labels', 'points']);
 const SELECTION_KEYS = Object.freeze([
   'highlightArray',
+  'pageName',
   'totalCount',
   'visibleCount',
 ]);
@@ -116,6 +122,8 @@ const META_VIEW_KEYS = Object.freeze([
   'filters',
   'id',
   'label',
+  'name',
+  'vectorField',
 ]);
 const NORM_TRANSFORM_KEYS = Object.freeze(['center', 'scale']);
 const RENDER_STATE_KEYS = Object.freeze([
@@ -136,6 +144,7 @@ const RENDER_STATE_KEYS = Object.freeze([
   'mvpMatrix',
   'near',
   'pointSize',
+  'pointSizeMax',
   'projectionMatrix',
   'shaderQuality',
   'sizeAttenuation',
@@ -173,7 +182,7 @@ function assertBackdropLook(look, context) {
     throw new TypeError(`${context}.id must name a background look.`);
   }
   if (!Array.isArray(look.tints) || look.tints.length !== 3) {
-    throw new TypeError(`${context}.tints must be three colours.`);
+    throw new TypeError(`${context}.tints must be three colors.`);
   }
   look.tints.forEach((tint, index) => {
     if (!Array.isArray(tint) || tint.length !== 3) {
@@ -197,7 +206,7 @@ function assertBackdropLook(look, context) {
     throw new TypeError(`${context}.shadow.packed must be the size² × 2 half-float map.`);
   }
   if (!Array.isArray(look.shadow.window) || look.shadow.window.length !== 3) {
-    throw new TypeError(`${context}.shadow.window must be [centre u, centre v, half size].`);
+    throw new TypeError(`${context}.shadow.window must be [center u, center v, half size].`);
   }
   look.shadow.window.forEach((value, k) => assertFiniteNumber(value, `${context}.shadow.window[${k}]`));
 }
@@ -217,54 +226,13 @@ function assertBoolean(value, context) {
   }
 }
 
-function readFigureExportAbortState(signal, context) {
-  const AbortSignalCtor = globalThis.AbortSignal;
-  const abortedGetter = typeof AbortSignalCtor === 'function'
-    ? Object.getOwnPropertyDescriptor(
-        AbortSignalCtor.prototype,
-        'aborted'
-      )?.get
-    : null;
-  if (
-    signal === null ||
-    typeof signal !== 'object' ||
-    typeof abortedGetter !== 'function' ||
-    typeof signal.addEventListener !== 'function' ||
-    typeof signal.removeEventListener !== 'function'
-  ) {
-    throw new TypeError(`${context} must be an AbortSignal.`);
-  }
-  try {
-    return abortedGetter.call(signal);
-  } catch {
-    throw new TypeError(`${context} must be an AbortSignal.`);
-  }
-}
-
-/**
- * Validate the live cancellation owner without accepting lookalike objects.
- * Borrowing the current realm's Web-IDL getter performs the AbortSignal brand
- * check while remaining safe for signals created by another same-origin realm.
- *
- * @param {unknown} signal
- * @param {string} [context]
- * @returns {AbortSignal}
- */
-function assertFigureExportSignal(
-  signal,
-  context = 'Figure export signal'
-) {
-  readFigureExportAbortState(signal, context);
-  return signal;
-}
-
 /**
  * @param {AbortSignal|null} signal
  * @returns {boolean}
  */
 export function isFigureExportSignalAborted(signal) {
   if (signal === null) return false;
-  return readFigureExportAbortState(signal, 'Figure export signal');
+  return requireSignal(signal, 'Figure export signal').aborted;
 }
 
 /**
@@ -276,7 +244,7 @@ export function isFigureExportSignalAborted(signal) {
  */
 export function throwIfFigureExportAborted(signal) {
   if (signal === null) return;
-  if (!readFigureExportAbortState(signal, 'Figure export signal')) return;
+  if (!requireSignal(signal, 'Figure export signal').aborted) return;
   throw abortReason(signal);
 }
 
@@ -292,7 +260,7 @@ export function throwIfFigureExportAborted(signal) {
  */
 export function awaitFigureExportAbortable(signal, operation) {
   if (signal === null) return Promise.resolve(operation);
-  assertFigureExportSignal(signal);
+  requireSignal(signal, 'Figure export signal');
   throwIfFigureExportAborted(signal);
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -349,9 +317,18 @@ function assertFormat(value, context) {
   }
 }
 
+/**
+ * A figure's size: `width` × `height` figure pixels, the box a picture fits,
+ * or `height: null`, a width the figure fills at its own height (the
+ * panel's physical width, `utils/figure-size.js`).
+ */
+function assertFigureSize(value, context) {
+  assertInteger(value.width, `${context}.width`, 10);
+  if (value.height !== null) assertInteger(value.height, `${context}.height`, 10);
+}
+
 function assertBaseRequestValues(request, context) {
-  assertInteger(request.width, `${context}.width`, 10);
-  assertInteger(request.height, `${context}.height`, 10);
+  assertFigureSize(request, context);
   assertBoolean(request.exportAllViews, `${context}.exportAllViews`);
   assertString(request.title, `${context}.title`);
   assertBoolean(request.includeAxes, `${context}.includeAxes`);
@@ -366,7 +343,7 @@ function assertBaseRequestValues(request, context) {
   }
   if (
     typeof request.backgroundColor !== 'string' ||
-    !/^#[0-9a-fA-F]{6}$/.test(request.backgroundColor)
+    !isHexColor(request.backgroundColor)
   ) {
     throw new TypeError(`${context}.backgroundColor must be an exact #RRGGBB color.`);
   }
@@ -379,7 +356,8 @@ function assertBaseRequestValues(request, context) {
     'titleFontSizePx',
     'centroidLabelFontSizePx',
   ]) {
-    assertInteger(request[key], `${context}.${key}`, 1);
+    // In figure pixels: a size set in points is a fraction of one (7 pt is 9 1/3 px).
+    assertFiniteNumber(request[key], `${context}.${key}`, Number.MIN_VALUE);
   }
   assertCropRect01(request.crop);
   // Null means "this figure carries no reference grid" — either the viewer is
@@ -403,7 +381,7 @@ function assertBaseRequestValues(request, context) {
 
 function assertBaseRequest(request, expectedKeys, context) {
   requireExactKeys(request, expectedKeys, context);
-  assertFigureExportSignal(request.signal, `${context}.signal`);
+  requireSignal(request.signal, `${context}.signal`);
   return assertBaseRequestValues(request, context);
 }
 
@@ -530,7 +508,7 @@ function assertOwnedLegendValue(value, context, seen = new Set()) {
       `${context} must contain only acyclic, owned legend data.`
     );
   }
-  // A categorical's colours and visibility: bytes (`utils/category-state.js`).
+  // A categorical's colors and visibility: bytes (`utils/category-state.js`).
   if (value instanceof Uint8Array) return;
   seen.add(value);
   if (Array.isArray(value)) {
@@ -619,6 +597,10 @@ function assertRenderState(renderState, context) {
   renderState.cameraPosition.forEach((value, index) => {
     assertFiniteNumber(value, `${context}.cameraPosition[${index}]`);
   });
+  // The sprite cap the pane draws with (rendering/point-sprite.js).
+  if (!(renderState.pointSizeMax > 0) || !Number.isFinite(renderState.pointSizeMax)) {
+    throw new RangeError(`${context}.pointSizeMax must be a finite positive number.`);
+  }
   for (const key of [
     'pointSize',
     'sizeAttenuation',
@@ -638,7 +620,7 @@ function assertRenderState(renderState, context) {
   // Multisampling is a property of the view the user is looking at, published by
   // `viewer.getAntialiasing()` at the moment of the export — it is a live
   // setting that also follows the dataset's size. It travels with the render
-  // state because a raster that does not honour it is a different picture of
+  // state because a raster that does not honor it is a different picture of
   // the same data — see `utils/webgl-point-rasterizer.js`.
   if (typeof renderState.antialias !== 'boolean') {
     throw new TypeError(`${context}.antialias must be an exact boolean.`);
@@ -720,6 +702,23 @@ function assertViewData(data, dimensionLevel, context) {
       `${context}.centroidLabelTexts must match the published centroid count when labels are enabled.`
     );
   }
+  // The vector field the view shows, drawn as arrows on a grid
+  // (`components/vector-field-figure.js`), or null.
+  if (data.vectorField !== null) {
+    const field = data.vectorField;
+    requireExactKeys(field, VECTOR_FIELD_KEYS, `${context}.vectorField`);
+    if (typeof field.label !== 'string' || field.label.length === 0 || typeof field.colormapId !== 'string' || field.colormapId.length === 0) {
+      throw new TypeError(`${context}.vectorField must name its field and color scheme.`);
+    }
+    if (!(field.vectors instanceof Float32Array) || field.vectors.length !== data.pointCount * dimensionLevel) {
+      throw new TypeError(`${context}.vectorField.vectors must hold one vector per point.`);
+    }
+    for (const key of ['maxMagnitude', 'unitsPerRender']) {
+      if (!Number.isFinite(field[key]) || field[key] < 0 || (key === 'unitsPerRender' && field[key] === 0)) {
+        throw new RangeError(`${context}.vectorField.${key} must be a finite ${key === 'unitsPerRender' ? 'positive' : 'non-negative'} number.`);
+      }
+    }
+  }
 }
 
 function assertSelectionSnapshot(selection, pointCount, context) {
@@ -737,7 +736,18 @@ function assertSelectionSnapshot(selection, pointCount, context) {
         `${context}.highlightArray must be null when no cells are highlighted.`
       );
     }
+    if (selection.pageName !== null) {
+      throw new TypeError(
+        `${context}.pageName must be null when no cells are highlighted.`
+      );
+    }
     return;
+  }
+  // The highlight page whose cells are drawn: the figure's legend names it.
+  if (typeof selection.pageName !== 'string') {
+    throw new TypeError(
+      `${context}.pageName must be the highlight page's name when cells are highlighted.`
+    );
   }
   assertUint8Array(
     selection.highlightArray,
@@ -871,7 +881,7 @@ function assertMetaProvenance(meta, views) {
     const context = `Figure export payload.meta.views[${index}]`;
     requireExactKeys(record, META_VIEW_KEYS, context);
     const view = views[index];
-    if (record.id !== view.id || record.label !== view.label) {
+    if (record.id !== view.id || record.label !== view.label || record.name !== view.name) {
       throw new Error(
         `${context} must describe the exported view "${view.id}".`
       );
@@ -882,8 +892,11 @@ function assertMetaProvenance(meta, views) {
       record.fieldKind !== scientificState.fieldKind
     ) {
       throw new Error(
-        `${context} must name the field its view was coloured by.`
+        `${context} must name the field its view was colored by.`
       );
+    }
+    if (record.vectorField !== (view.data.vectorField === null ? null : view.data.vectorField.label)) {
+      throw new Error(`${context} must name the vector field its view draws.`);
     }
     if (
       !Array.isArray(record.filters) ||
@@ -908,8 +921,9 @@ function assertPayloadOptions(options, context) {
 export function assertFigureExportPayload(payload) {
   requireExactKeys(payload, PAYLOAD_KEYS, 'Figure export payload');
   assertFormat(payload.format, 'Figure export payload.format');
-  assertInteger(payload.width, 'Figure export payload.width', 10);
-  assertInteger(payload.height, 'Figure export payload.height', 10);
+  assertFigureSize(payload, 'Figure export payload');
+  // The on-screen arrangement's columns a grid figure keeps (`computeGridDims`).
+  assertInteger(payload.gridColumns, 'Figure export payload.gridColumns', 1);
   if (payload.format === 'png') {
     assertInteger(payload.dpi, 'Figure export payload.dpi', 72);
   } else if (payload.dpi !== null) {
@@ -938,6 +952,8 @@ export function assertFigureExportPayload(payload) {
     requireExactKeys(view, VIEW_KEYS, context);
     assertFigureExportViewId(view.id, `${context}.id`);
     assertString(view.label, `${context}.label`, { allowEmpty: false });
+    // The name the view was given (`view.rename`), its panel's title, or null.
+    if (view.name !== null) assertString(view.name, `${context}.name`, { allowEmpty: false });
     if (viewIds.has(view.id)) {
       throw new Error(`Figure export payload contains duplicate view "${view.id}".`);
     }

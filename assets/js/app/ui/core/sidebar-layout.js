@@ -10,7 +10,7 @@
  * application.
  *
  * The sidebar publishes the part of the plot it covers; the viewer lays its
- * views out in the rest (the presented area), and the selection bar centres
+ * views out in the rest (the presented area), and the selection bar centers
  * itself in that same presented layout.
  *
  * @module ui/core/sidebar-layout

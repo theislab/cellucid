@@ -18,6 +18,8 @@
  * @module shared/debug-utils
  */
 
+import { webStorage } from '../../../utils/web-storage.js';
+
 // =============================================================================
 // CONFIGURATION
 // =============================================================================
@@ -34,8 +36,14 @@
 function isDebugEnabled() {
   if (typeof window === 'undefined') return false;
 
-  const storage = requireDebugStorage();
-  const storedValue = storage.getItem('debug');
+  // A browser that keeps nothing for this site has no stored switch.
+  const storage = webStorage('localStorage');
+  let storedValue = null;
+  try {
+    storedValue = storage?.getItem('debug') ?? null;
+  } catch {
+    storedValue = null;
+  }
   if (storedValue === 'true' || storedValue === '1') {
     return true;
   }
@@ -59,14 +67,6 @@ function isDebugEnabled() {
   }
 
   return false;
-}
-
-function requireDebugStorage() {
-  const storage = globalThis.localStorage;
-  if (!storage || typeof storage.getItem !== 'function') {
-    throw new TypeError('Debug mode requires localStorage getItem()');
-  }
-  return storage;
 }
 
 // Cache the debug state

@@ -16,6 +16,7 @@
  * @module analysis/options/render-options-form
  */
 
+import { setControlAvailability } from '../../ui/core/control-availability.js';
 import {
   createDisclosure,
   createField,
@@ -25,6 +26,7 @@ import {
   createSegmented,
   createSelect,
   createSwitch,
+  buttonClassName,
   readDecimalInput,
   writeDecimalInput
 } from '../../ui/components/controls.js';
@@ -144,7 +146,7 @@ export function renderOptionsForm({
             return option;
           }));
           select.value = record[key];
-          select.disabled = choices.length === 0;
+          setControlAvailability(select, choices.length === 0 ? `no choice of ${entry.label} fits this result` : null);
         };
         select.addEventListener('change', () => commit(key, select.value), { signal: abort.signal });
         const block = createField({ label: entry.label, control: select, tip: entry.tip, className: 'field-select' });
@@ -345,7 +347,7 @@ export function renderOptionsForm({
     moreCount = addCount(more.header);
     resetButton = document.createElement('button');
     resetButton.type = 'button';
-    resetButton.className = 'analysis-link-btn analysis-options-reset';
+    resetButton.className = buttonClassName('quiet', 'analysis-options-reset');
     resetButton.textContent = 'Reset to defaults';
     resetButton.addEventListener('click', () => {
       const defaults = schema.defaults(currentContext);

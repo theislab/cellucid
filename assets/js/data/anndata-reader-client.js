@@ -55,6 +55,8 @@ import { PieceReceiver } from '../utils/large-arrays.js';
 import { copyTypedArray } from './sparse-column-index.js';
 import { columnFormOf, noteColumnForm } from './column-forms.js';
 import { fromWire } from '../utils/error-wire.js';
+import { onNextMacrotask } from '../utils/yield-macrotask.js';
+import { createListenerSet } from '../utils/listener-set.js';
 
 /** Error details as a record that crosses to the worker. */
 function plainDetails(details) {
@@ -222,25 +224,6 @@ export function hasSpareAnnDataReaderWorker() {
 }
 
 /**
- * Run `callback` on a later task: after the current task and every promise
- * continuation it queued, so the gene reads a burst of callers asks for are
- * sent together.
- */
-const nextTask = (() => {
-  if (typeof setImmediate === 'function') return callback => setImmediate(callback);
-  if (typeof MessageChannel === 'function') {
-    const channel = new MessageChannel();
-    const queue = [];
-    channel.port1.onmessage = () => queue.shift()();
-    return callback => {
-      queue.push(callback);
-      channel.port2.postMessage(0);
-    };
-  }
-  return callback => setTimeout(callback, 0);
-})();
-
-/**
  * Replace how reader workers are created (tests run the same handler
  * in-process); `null` restores the module worker.
  *
@@ -269,10 +252,8 @@ const notedColumn = ({ column, form }) => noteColumnForm(column, form);
  * `{client, event: 'genes-arrived', sample, cellSubset}` once the open
  * cells were read again on the store it made, or with `error` when it
  * failed.
- *
- * @type {Set<(message: Object) => void>}
  */
-const matrixShareListeners = new Set();
+const matrixShareListeners = createListenerSet('a matrix read after its map');
 
 /**
  * Hear every reader's matrix read after its map (`matrixShareListeners`).
@@ -281,11 +262,10 @@ const matrixShareListeners = new Set();
  * @returns {() => void} Stops hearing
  */
 export function onMatrixShare(listener) {
-  matrixShareListeners.add(listener);
-  return () => matrixShareListeners.delete(listener);
+  return matrixShareListeners.add(listener);
 }
 
-// A pace a host was found to bear, learnt here or by a reader worker (told
+// A pace a host was found to bear, learned here or by a reader worker (told
 // over the hosts channel), is kept for later visits (`host-link-memory.js`).
 realmHosts.watchPace((origin, paceMs) => rememberHostPace(origin, paceMs));
 
@@ -434,7 +414,7 @@ export class AnnDataReaderClient {
       };
       window.addEventListener('pagehide', this._onPageHide);
     }
-    // A page hidden (another tab, a minimised window, a phone's app switch)
+    // A page hidden (another tab, a minimized window, a phone's app switch)
     // may be discarded without another event: the worker has what it
     // fetched held by the disk now (`formats/io/kept-parts.js`).
     if (this._onHidden === null && typeof document !== 'undefined' &&
@@ -480,7 +460,7 @@ export class AnnDataReaderClient {
         if (this._snapshot?.cellSubset != null && message.cellSubset != null) this._snapshot.cellSubset.genes = message.cellSubset.genes ?? null;
       }
       const { event, ...rest } = message;
-      for (const listener of matrixShareListeners) listener({ client: this, event, ...rest, ...(message.error === undefined ? {} : { error: rebuildReaderError(message.error) }) });
+      matrixShareListeners.notify({ client: this, event, ...rest, ...(message.error === undefined ? {} : { error: rebuildReaderError(message.error) }) });
       return;
     }
     if (message?.event === 'whole-read') {
@@ -889,7 +869,7 @@ export class AnnDataReaderClient {
   }
 
   /**
-   * How much of the neighbour graph `obsp[key]` the open subsample keeps,
+   * How much of the neighbor graph `obsp[key]` the open subsample keeps,
    * once it was read (`AnnDataReader.subsampleGraphShare`): `{kept, of}`,
    * or null.
    *
@@ -1290,7 +1270,7 @@ export class AnnDataReaderClient {
       const read = { form, element, gene: index, owner, key, signal, onPartial, rows: rows === null ? null : [rows[0], rows[1]], resolve, reject, settled: false, batch: null, stopWaiting: null };
       read.stopWaiting = onAbort(signal, () => this._cancelGeneRead(read));
       this._geneReads.push(read);
-      if (this._geneReads.length === 1) nextTask(() => this._sendGeneReads());
+      if (this._geneReads.length === 1) onNextMacrotask(() => this._sendGeneReads());
     });
   }
 
@@ -1420,17 +1400,18 @@ export class AnnDataReaderClient {
   /**
    * What a copy of the whole dataset is planned against
    * (`anndata/write/copy-target.js`): the stored obs columns, the values of
-   * those `names` lists over every cell by original position, and
-   * `uns['cellucid']`; its reads of the job `owner`.
+   * those `names` lists over every cell by original position, the root `uns`
+   * keys, the colors of the columns `colors` lists (`uns['<column>_colors']`)
+   * and `uns['cellucid']`; its reads of the job `owner`.
    *
    * @param {string[]} names
-   * @param {{signal?: AbortSignal|null, owner?: string|null, varModality?: string|null}} [options]
+   * @param {{signal?: AbortSignal|null, owner?: string|null, varModality?: string|null, colors?: string[]}} [options]
    * @returns {Promise<{nObs: number, obsColumns: string[], modalityColumns: string[], varColumns: string[],
-   *   columns: Record<string, Object>, cellucid: Object|null}>}
+   *   columns: Record<string, Object>, unsKeys: string[], colors: Record<string, string[]|null>, cellucid: Object|null}>}
    */
-  readCopyTarget(names, { signal = null, owner = null, varModality = null } = {}) {
+  readCopyTarget(names, { signal = null, owner = null, varModality = null, colors = [] } = {}) {
     this._requireOpen();
-    return this._callWith({ signal }, 'readCopyTarget', [...names], owner, varModality);
+    return this._callWith({ signal }, 'readCopyTarget', [...names], owner, varModality, [...colors]);
   }
 
   /**
@@ -1684,20 +1665,24 @@ export class AnnDataReaderClient {
    * `AnnDataReader._readPresentCategorical`), every one found before kept.
    *
    * @param {string} key
-   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null, categories?: ReadonlyArray<string|boolean>|null}} [options]
+   * A column of 64-bit integers holding identifiers past 2^53 arrives as
+   * text (`asText`, `readExactIntegers`); `integers` is how a column already
+   * shown reads again (`'text'`, `'numbers'`, `'decide'`).
+   *
+   * @param {{signal?: AbortSignal|null, rows?: [number, number]|null, categories?: ReadonlyArray<string|boolean>|null, integers?: 'decide'|'text'|'numbers'}} [options]
    */
-  async getObsField(key, { signal = null, rows = null, categories = null } = {}) {
+  async getObsField(key, { signal = null, rows = null, categories = null, integers = 'decide' } = {}) {
     this._requireOpen();
     const codedUnder = categories === null ? null : [...categories];
     if (rows !== null) {
-      const field = await this._callWith({ signal }, 'getObsField', key, [rows[0], rows[1]], codedUnder);
+      const field = await this._callWith({ signal }, 'getObsField', key, [rows[0], rows[1]], codedUnder, integers);
       return field.dtype === 'categorical'
         ? { ...field, categories: Object.freeze(field.categories) }
         : field;
     }
     const cached = this._obsFields.get(key);
     if (cached !== undefined) return cached;
-    const field = await this._callWith({ signal }, 'getObsField', key, null, codedUnder);
+    const field = await this._callWith({ signal }, 'getObsField', key, null, codedUnder, integers);
     const known = this._obsFields.get(key);
     if (known !== undefined) return known;
     if (field.dtype === 'categorical') {
@@ -1713,6 +1698,7 @@ export class AnnDataReaderClient {
         dtype: 'categorical',
         ...(field.discovered === true ? { discovered: true } : {}),
         ...(field.present === undefined ? {} : { present: field.present }),
+        ...(field.asText === undefined ? {} : { asText: field.asText }),
         codes,
         categories,
         ordered,
@@ -1775,13 +1761,15 @@ export class AnnDataReaderClient {
    * @param {{signal?: AbortSignal|null}} [options]
    * @returns {Promise<Object|null>}
    */
-  getConnectivityEdges(key, { signal = null } = {}) {
+  getConnectivityEdges(key, { signal = null, readKey = null } = {}) {
     this._requireOpen();
-    return this._callWith({ signal }, 'getConnectivityEdges', key);
+    // The read is told under `readKey` (`read-activity-log.js` `adopt`): the
+    // notice of whoever waits for the graph shows it, once (R9F-9).
+    return this._callWith({ signal }, 'getConnectivityEdges', key, readKey === null ? null : [readKey]);
   }
 
   /**
-   * Some open cells' neighbours in `obsp[key]`, read from the file by row
+   * Some open cells' neighbors in `obsp[key]`, read from the file by row
    * in the reader worker (`AnnDataReader.getConnectivityRows`); null when
    * the file has no such matrix.
    *

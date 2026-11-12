@@ -11,11 +11,11 @@
  * needs `uint32` only past 65,535 categories.
  *
  * This module is the single derivation point: the AnnData adapter picks the
- * width a field's codes are narrowed to, and every reader of codes (colouring,
+ * width a field's codes are narrowed to, and every reader of codes (coloring,
  * filters, analysis, sessions) resolves the missing marker from the array's
  * own width here. A reader that disagreed by one would not fail loudly — it
  * would read the missing marker as a real category, or a real category as
- * missing, and colour cells by a label they do not have.
+ * missing, and color cells by a label they do not have.
  *
  * @module data/categorical-storage-contract
  */

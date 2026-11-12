@@ -225,7 +225,7 @@ const densityplotDefinition = {
   buildLayout(pageData, options, layoutEngine) {
     const layout = PlotFactory.createLayout({ pageData, options });
     // Dataset-supplied field name reaching a markup-parsing axis title.
-    const variableName = escapeHtml(BasePlot.getVariableName(pageData));
+    const variableName = escapeHtml(BasePlot.getValueLabel(pageData));
 
     layout.xaxis = { title: variableName, automargin: true, type: options.logX ? 'log' : 'linear' };
     layout.yaxis = { title: 'Density', zeroline: true, rangemode: 'tozero', type: options.logY ? 'log' : 'linear' };
@@ -240,7 +240,7 @@ const densityplotDefinition = {
           meanVal = values.length === 0 ? NaN : mean(values);
         }
         if (Number.isNaN(meanVal)) return;
-        const color = BasePlot.getPageColor(layoutEngine, pd.pageId, i);
+        const color = BasePlot.colorOfPage(pd, layoutEngine, i);
         layout.shapes.push({
           type: 'line',
           x0: meanVal, x1: meanVal, y0: 0, y1: 1,

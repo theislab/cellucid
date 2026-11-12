@@ -10,7 +10,7 @@
  * - The first pass is taken only when the measured cost says it pays.
  * - A form analysis draws the first pass, says which cells it used, refines
  *   in place, keeps the first pass (saying so) when the refinement is
- *   cancelled, and skips a first pass the sample cannot carry.
+ *   canceled, and skips a first pass the sample cannot carry.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -124,17 +124,55 @@ test('the cost model fits its last two passes and survives broken storage', () =
   assert.deepEqual(fragile.cost('DE'), { fixedMs: 0, perCellMs: 0.1 });
 });
 
-test('a run is judged by the work it does: its genes scale what earlier runs measured (F-16)', () => {
-  const model = new AnalysisCostModel({ storage: null });
-  // 2,000 genes over 1,000 and 101,000 cells.
-  model.record('DE · link', 1_000, 300, 2_000);
-  model.record('DE · link', 101_000, 2_300, 2_000);
-  const small = model.cost('DE · link', 2_000);
-  const large = model.cost('DE · link', 30_000);
-  assert.ok(Math.abs(large.fixedMs / small.fixedMs - 15) < 1e-9);
-  assert.ok(Math.abs(large.perCellMs / small.perCellMs - 15) < 1e-9);
-  // Another source is another kind: nothing measured for it yet.
-  assert.equal(model.cost('DE · local-user', 30_000), null);
+test('a cost is known only for the genes it was measured with: a 6-gene run says nothing of a 3,691-gene one (L25-1)', () => {
+  const stored = new Map();
+  const storage = { getItem: key => stored.get(key) ?? null, setItem: (key, value) => stored.set(key, value) };
+  const model = new AnalysisCostModel({ storage });
+  // The live-agents fixture: 6 genes, 120 cells, 546 ms (a run's start and its first reads, nearly all of it).
+  model.record('Differential expression · local-demo', 120, 546, 6);
+  assert.deepEqual(model.cost('Differential expression · local-demo', 6), { fixedMs: 0, perCellMs: 546 / 120 });
+  // Kanemaru next (3,691 genes): nothing measured for that work; it was "about 102 h" scaled per gene.
+  assert.equal(model.cost('Differential expression · local-demo', 3_691), null);
+  assert.equal(model.measuredCells('Differential expression · local-demo', 3_691), null);
+  // Its own runs fit its own line; the fixture's pass is kept for the fixture.
+  model.record('Differential expression · local-demo', 363, 2_390, 3_691);
+  model.record('Differential expression · local-demo', 131_636, 1_009, 3_691);
+  const kanemaru = model.cost('Differential expression · local-demo', 3_691);
+  assert.equal(kanemaru.perCellMs, 0);
+  assert.equal(kanemaru.fixedMs, 2_390);
+  assert.equal(model.passCount('Differential expression · local-demo', 3_691), 2);
+  assert.equal(model.measuredCells('Differential expression · local-demo', 3_691), 131_636);
+  assert.deepEqual(model.cost('Differential expression · local-demo', 6), { fixedMs: 0, perCellMs: 546 / 120 });
+  // Kept across visits, each work's passes apart; another source is another kind.
+  const again = new AnalysisCostModel({ storage });
+  assert.deepEqual(again.cost('Differential expression · local-demo', 3_691), kanemaru);
+  assert.deepEqual(again.cost('Differential expression · local-demo', 6), { fixedMs: 0, perCellMs: 546 / 120 });
+  assert.equal(model.cost('Differential expression · local-user', 3_691), null);
+});
+
+test('a run is estimated from runs over its genes, never grown from one smaller run (L25-1)', () => {
+  const n = 131_636;
+  const ui = createHarness('Estimate L25-1', n, async () => ({ data: { cells: n } }));
+  ui.dataLayer.state.varData = { fields: Array.from({ length: 3_691 }, (_, i) => ({ key: `g${i}` })) };
+  ui._getRunUnits = () => 3_691;
+  ui._options = {};
+  const kind = 'Estimate L25-1';
+  // Nothing measured: no estimate (the agent's permission card says no time).
+  assert.equal(ui.estimateRun(), null);
+  // Another work's pass (6 genes): still nothing for this one.
+  getAnalysisCostModel().record(kind, 120, 546, 6);
+  assert.equal(ui.estimateRun(), null);
+  // One pass over these genes on fewer cells: how it grows with the cells is unknown.
+  getAnalysisCostModel().record(kind, 1_000, 900, 3_691);
+  assert.equal(ui.estimateRun(), null);
+  // A second pass, on every open cell: the line through both, here that run's own time.
+  getAnalysisCostModel().record(kind, n, 1_009, 3_691);
+  assert.equal(Math.round(ui.estimateRun().ms), 1_009);
+  assert.match(ui.estimateRun().what, /on 131,636 open cells/);
+  // One pass alone on as many cells as are open (or more) says its time.
+  ui.title = 'Estimate L25-1 single';
+  getAnalysisCostModel().record('Estimate L25-1 single', n, 1_200, 3_691);
+  assert.equal(Math.round(ui.estimateRun().ms), 1_200);
 });
 
 for (const [label, priority] of [['ranked', DEFAULT_CELL_PRIORITY], ['open order', OPEN_ORDER_PRIORITY]]) {
@@ -287,7 +325,7 @@ test('a form analysis draws its first pass, says so, and refines in place to eve
   assert.equal(ui.getLastResult().data.cells, n);
   assert.equal(ui.used[0], describeCellsUsed({ m, n }, n, 'refining'));
   assert.equal(ui.used.at(-1), describeCellsUsed(null, n));
-  assert.match(ui.used[0], /uniform sample of 50\.0% of the open cells \(about 500,000 of 1,000,000\) · refining/);
+  assert.match(ui.used[0], /uniform sample of 50% of the open cells \(about 500,000 of 1,000,000\) · refining/);
   assert.equal(ui._cellsUsedLine.root.dataset.cellsUsed, 'all');
 });
 
@@ -341,9 +379,9 @@ test('the cells-used sentence: every cell, a gene sample, and a first pass on ei
   assert.equal(describeCellsUsed(null, n, null, genes), null, 'the gene sample\'s own line says it');
   const first = { m: 10_000, n };
   assert.equal(describeCellsUsed(first, n, 'refining'),
-    'First pass: each group\'s cells in a uniform sample of 1.0% of the open cells (about 10,000 of 1,000,000) · refining on every cell…');
+    'First pass: each group\'s cells in a uniform sample of 1% of the open cells (about 10,000 of 1,000,000) · refining on every cell…');
   assert.equal(describeCellsUsed(first, n, 'refining', genes),
-    'First pass: each group\'s cells in a uniform sample of 1.0% of the open cells (about 10,000 of 1,000,000) · refining on the cells genes are read for…');
+    'First pass: each group\'s cells in a uniform sample of 1% of the open cells (about 10,000 of 1,000,000) · refining on the cells genes are read for…');
   assert.equal(describeCellsUsed(first, n, 'stopped', genes),
-    'First pass: each group\'s cells in a uniform sample of 1.0% of the open cells (about 10,000 of 1,000,000). Stopped before the cells genes are read for; run again for all of them.');
+    'First pass: each group\'s cells in a uniform sample of 1% of the open cells (about 10,000 of 1,000,000). Stopped before the cells genes are read for; run again for all of them.');
 });

@@ -4,11 +4,11 @@
  * A control is reachable when, after scrolling only its own scroll container
  * (`scrollIntoView`):
  *
- * - its centre lies inside the viewport, so no fixed bar, selection bar or
+ * - its center lies inside the viewport, so no fixed bar, selection bar or
  *   panel pushes it off screen;
  * - no ancestor clips it: an `overflow` box that cannot scroll it into view
  *   would trap it;
- * - `elementFromPoint` at its centre is the control itself (or a part of it,
+ * - `elementFromPoint` at its center is the control itself (or a part of it,
  *   or the label that operates it), so nothing covers it — another control's
  *   touch hit area included;
  * - it is in the Tab order, unless it is one item of a roving-tabindex group
@@ -145,8 +145,8 @@ async function auditScope(page, scope) {
         continue;
       }
       // An ancestor's overflow clips only what it contains: a fixed-position
-      // element (a notification card, kept inside an open modal's document
-      // so it is not inert there: `modal-background-owner.js`) escapes every
+      // element (a notification card, kept inside an open dialog so it is
+      // not inert there: `keepAboveModals` in `app-dialog.js`) escapes every
       // ancestor up to the one that is its containing block (a transform, a
       // filter, a backdrop filter, perspective or paint containment).
       const containsFixed = style => style.transform !== 'none' || style.perspective !== 'none'
@@ -458,9 +458,9 @@ for (const layout of LAYOUTS) {
         });
       });
       await expect(page.locator('.confirm-dialog')).toBeVisible();
-      await expectReachable(page, '.confirm-dialog-overlay', `${layout.name} confirm`, 3);
+      await expectReachable(page, 'dialog.confirm-dialog', `${layout.name} confirm`, 3);
       await page.keyboard.press('Escape');
-      await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(0);
+      await expect(page.locator('dialog.confirm-dialog')).toHaveCount(0);
 
       await page.evaluate(async () => {
         const { confirmExportFidelityWarnings } = await import(
@@ -503,7 +503,7 @@ for (const layout of LAYOUTS) {
       });
       await expect(page.locator('.notification-progress')).toBeVisible();
       // Cards let a touch through to what lies under them, so the walk also
-      // checks that no card is drawn over a control's centre.
+      // checks that no card is drawn over a control's center.
       const covered = await page.evaluate(async () => {
         const frame = () => new Promise(resolve => requestAnimationFrame(() => resolve()));
         const cards = [...document.querySelectorAll('#notification-center .notification')];
@@ -589,7 +589,7 @@ for (const layout of LAYOUTS) {
       const next = dialog.locator('.community-annotation-wizard-next');
       for (let step = 1; step <= 4; step += 1) {
         await expectReachable(
-          page, '.community-annotation-modal-overlay', `${layout.name} GitHub sync step ${step}`, 2,
+          page, '.community-annotation-dialog:not(.community-annotation-details-dialog)', `${layout.name} GitHub sync step ${step}`, 2,
         );
         if (!(await next.isVisible()) || (await next.isDisabled())) break;
         await next.click();

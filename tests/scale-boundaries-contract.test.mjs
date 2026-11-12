@@ -154,9 +154,9 @@ test('an obs-column CSV of every cell reads its names, builds and writes its row
   assert.equal(expected.at(-1), csv.blob.size, 'exact once every row is written');
   assert.equal(csv.blob.type, 'text/csv');
   const lines = (await csv.blob.text()).trimEnd().split('\n');
-  assert.equal(lines.length, n + 2);
-  assert.equal(lines[3], 'c1,true');
-  assert.equal(lines[n + 1], `c${n - 1},true`);
+  assert.equal(lines.length, n + 3);
+  assert.equal(lines[4], 'c1,true');
+  assert.equal(lines[n + 2], `c${n - 1},true`);
   assert.ok(own.largestRead <= 65536, `a read of ${own.largestRead} rows`);
   assert.ok(progress.length >= 4 && progress.at(-1) === n);
   // A file in priority order, listed by original position.
@@ -164,8 +164,9 @@ test('an obs-column CSV of every cell reads its names, builds and writes its row
   const ranked = namesAdapter(row => `c${identity.originalAt(row)}`);
   const field = await fieldCsv({ state: exportState(identity, codes), adapter: ranked, fieldIndex: 0 });
   const rows = (await field.blob.text()).trimEnd().split('\n');
-  assert.equal(rows.length, n + 2);
-  for (const k of [0, 1, 12345, n - 1]) assert.equal(rows[k + 2].split(',')[0], `c${k}`);
+  assert.equal(rows.length, n + 3);
+  assert.equal(rows[2], 'categories,"[""a"",""b""]"');
+  for (const k of [0, 1, 12345, n - 1]) assert.equal(rows[k + 3].split(',')[0], `c${k}`);
   // Each batch's cells lie throughout the file: read batch by batch, every
   // batch would read every name chunk again. The names are read once, as
   // the range of every open cell, in the stored order.
@@ -389,7 +390,7 @@ test('a cell table is read once from its start; a column of numbers that becomes
 
 test('the edges of a k-nearest-neighbour graph cost what their arrays say, and past the device are refused before any is made', async () => {
   const { connectivityEdgeBytes } = await import('../assets/js/data/connectivity-edges.js');
-  // 50M cells, 14 stored neighbours each (k = 15): 350M edges.
+  // 50M cells, 14 stored neighbors each (k = 15): 350M edges.
   const plan = connectivityEdgeBytes({ nCells: 50_000_000, nnz: 700_000_000, float32: true });
   assert.equal(plan.edges, 350_000_000);
   // Held: the forward adjacency, a partner and a strength an edge (8 B) and

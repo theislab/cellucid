@@ -1,7 +1,7 @@
 /**
  * @fileoverview Cells to open (Session accordion, Open data): how much of a
  * dataset is read, as a share of its cells, and how the cells are chosen
- * (`data/subsample.js`). One slider and its exact count; below 100 % the
+ * (`data/subsample.js`). One slider and its exact count; below 100% the
  * method, its seed and what the method needs (a field to stratify by, an
  * embedding) appear, with Apply.
  *
@@ -33,22 +33,29 @@ import {
   DEFAULT_GRID_SIZE,
   FEWEST_OPEN_CELLS,
   FEWEST_OPEN_CELLS_REASON,
+  countFromFraction,
   countFromShare,
   describeSubsampleChoice,
   describeSubsampleMethod,
 } from '../../../data/subsample.js';
 import { captureCarried, describeCarried, restoreCarried, takeInNewCells } from '../../cell-subset-carry.js';
-import { formatBytes, formatCount, formatCountOf, parseDecimalText } from '../../../utils/format-units.js';
+import { formatBytes, formatCount, formatCountOf, formatShare, parseDecimalText } from '../../../utils/format-units.js';
 import { geneReadPlanFacts, geneSampleFacts } from '../../../data/gene-read-plan.js';
 import { cellShareReadShare } from '../../../data/anndata/subsample-plan.js';
 import { renderFactList } from '../components/controls.js';
 import { readDataSourceUrlParameters } from '../../url-state.js';
-import { SUBSAMPLE_URL_PARAMETERS, subsampleLink } from '../../subsample-url.js';
+import { SUBSAMPLE_URL_PARAMETERS, linkedSubsampleSpec, subsampleLink } from '../../subsample-url.js';
+import { identityField } from '../../utils/field-roles.js';
 import { onAbort, throwIfAborted } from '../../../utils/abort.js';
 import { getActions } from '../../actions/index.js';
 import { shownMsPerCell } from '../../../data/opening-cost.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
+import { cellsToOpenRequestOf } from '../../actions/targets/cells-to-open.js';
 import { dispatchFromControl } from '../../actions/control-dispatch.js';
+import { markReported } from '../../../utils/errors.js';
+import { PLACES, placePath } from '../place-names.js';
+import { copyText } from '../../utils/clipboard.js';
+import { upperFirst, lowerFirst } from '../../../utils/text-case.js';
 
 const DOM_KEYS = Object.freeze([
   'root', 'slider', 'percent', 'count', 'settings', 'method', 'seed',
@@ -58,7 +65,7 @@ const DOM_KEYS = Object.freeze([
 
 /**
  * The cells a share of `nObs` stands for (`countFromShare`); none for a
- * share of 0 %.
+ * share of 0%.
  *
  * @param {number} percent
  * @param {number} nObs
@@ -81,7 +88,7 @@ export function shareCount(percent, nObs) {
  */
 export function describeShare(percent, nObs, k = shareCount(percent, nObs)) {
   if (!(nObs > 0)) return '';
-  // "All" only when every cell is: a share that rounds to 100 % of more
+  // "All" only when every cell is: a share that rounds to 100% of more
   // cells than it opens says how many.
   if (k >= nObs) return `All ${formatCountOf(nObs, 'cell')}`;
   const share = `${formatCount(k)} of ${formatCountOf(nObs, 'cell')}`;
@@ -109,7 +116,6 @@ export function shareShown(k, nObs) {
 }
 
 /** A sentence's first letter in upper case. */
-const sentence = text => `${text[0].toUpperCase()}${text.slice(1)}`;
 
 /**
  * The one short line under the settings: how the open cells were chosen, or
@@ -135,17 +141,17 @@ export function openCellsStatus(subset, growth = null) {
   }
   const how = describeSubsampleMethod(subset.spec);
   if (subset.autoFit != null) return { text: `Fitted to this device: ${how}.`, tone: 'muted', growing: false };
-  return { text: `${sentence(how)}.`, tone: 'muted', growing: false };
+  return { text: `${upperFirst(how)}.`, tone: 'muted', growing: false };
 }
 
 /**
  * What a share asked for (not yet applied) reads of the file, when that is
  * far more than its share of the cells: the cells of a scattered method lie
- * in nearly every stored chunk, so a 1 % uniform share of a 10M-cell `.h5ad`
+ * in nearly every stored chunk, so a 1% uniform share of a 10M-cell `.h5ad`
  * reads as much as every cell (`cellShareReadShare`, from the layout the
  * open cells came with: `readLayout`). Which method is scattered depends on
  * the file's order: on a file in its own order, every method but `blocks`
- * (runs of neighbouring cells); on a priority-ordered file (Cellucid's),
+ * (runs of neighboring cells); on a priority-ordered file (Cellucid's),
  * every method but uniform under the file's own seed (its first rows),
  * `blocks` included, whose runs of original positions lie throughout it.
  * Said before Apply, in one line, with what the cheap method reads instead
@@ -167,15 +173,15 @@ export function scatteredShareCost(subset, { method, seed, fraction }) {
   const read = cellShareReadShare(subset.readLayout ?? null, fraction, cheapAsked ? 'blocks' : 'uniform');
   const cheap = cellShareReadShare(subset.readLayout ?? null, fraction, 'blocks');
   if (read === null || cheap === null || read < 0.5 || read < 3 * cheap) return null;
-  const percent = share => `${share >= 0.995 ? 100 : Math.max(1, Math.round(100 * share))} %`;
-  const cells = `${(100 * fraction).toPrecision(2)} %`;
+  const percent = share => formatShare(share, 1);
+  const cells = formatShare(fraction, 1);
   const alternative = priorityFile ? 'file' : 'blocks';
   const instead = priorityFile ? "this file's own order reads" : 'blocks read';
   return {
     text: `Reads about ${percent(read)} of the file for ${cells} of its cells; ${instead} about ${percent(cheap)}.`,
     title: priorityFile
       ? `These cells lie throughout the file, so nearly every stored chunk holds one and is read whole: about as much as every cell takes. Uniform with this file's own seed (${subset.prioritySeed}) reads only its first cells, about their share.`
-      : 'These cells lie throughout the file, so nearly every stored chunk holds one and is read whole: about as much as every cell takes. Blocks keep runs of neighbouring cells and read about their share.',
+      : 'These cells lie throughout the file, so nearly every stored chunk holds one and is read whole: about as much as every cell takes. Blocks keep runs of neighboring cells and read about their share.',
     read,
     cheap,
     alternative,
@@ -255,7 +261,7 @@ export function openCellsFacts(subset, { growth = null, digest = null, represent
     rows.push({
       label: 'Fitted to',
       value: `this device: needs ${formatBytes(fit.neededBytes)}, has ${formatBytes(fit.budgetBytes)}`,
-      title: `${sentence(what)} ${formatBytes(fit.neededBytes)} in memory, and this device has ${formatBytes(fit.budgetBytes)} for it.`,
+      title: `${upperFirst(what)} ${formatBytes(fit.neededBytes)} in memory, and this device has ${formatBytes(fit.budgetBytes)} for it.`,
     });
   }
   // A priority-ordered file reads only its share for a uniform subsample
@@ -273,8 +279,8 @@ export function openCellsFacts(subset, { growth = null, digest = null, represent
   if (typeof share === 'number' && share > 1.5 * (k / subset.nObs)) {
     rows.push({
       label: 'Matrix read',
-      value: `${Math.round(100 * share)} % for ${(100 * k / subset.nObs).toPrecision(2)} % of the cells`,
-      title: `Reading genes fetches ${Math.round(100 * share)} % of the matrix for these ${(100 * k / subset.nObs).toPrecision(2)} % of the cells (blocks fetch about their share).`,
+      value: `${formatShare(share, 1)} for ${formatShare(k, subset.nObs)} of the cells`,
+      title: `Reading genes fetches ${formatShare(share, 1)} of the matrix for these ${formatShare(k, subset.nObs)} of the cells (blocks fetch about their share).`,
     });
   }
   // The cells a gene is read for, and why (sized by what the first gene reads: the cause, from the layout).
@@ -304,7 +310,8 @@ export function geneCostFacts(plan) {
 
 /**
  * @param {{dom: Object, state: Object, getCellSubset: () => (Object|null),
- *   reopen: (cellSubset: Object) => Promise<{shown: boolean, inPlace: boolean}>, notify?: (text: string) => void,
+ *   reopen: (cellSubset: Object, how?: {signal?: AbortSignal|null}) => Promise<{shown: boolean, inPlace: boolean, failure?: string}>,
+ *   notify?: (text: string) => void,
  *   representation?: (key: string) => Promise<Object|null>,
  *   geneCost?: () => Promise<import('../components/controls.js').FactRow[]|null>}} options
  *   `representation`: how the open subsample represents a categorical field
@@ -313,7 +320,8 @@ export function geneCostFacts(plan) {
  *   when Details is first opened (working it out may read the matrix's row
  *   pointers, which the first gene reads anyway)
  * @returns {{refresh: () => void, showGrowth: (progress: {cells: number, target: number}|null) => void, showOpenCells: () => void,
- *   reopenKeeping: (cellSubset: Object) => Promise<{restoring: Promise<void>}>, destroy: () => void}}
+ *   reopenKeeping: (cellSubset: Object, how?: {heavy?: Function|null, signal?: AbortSignal|null}) => Promise<{shown: boolean, failure: string|null, restoring: Promise<void>}>,
+ *   destroy: () => void}}
  */
 export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify = () => {}, representation = async () => null, geneCost = async () => null, viewCarry = null }) {
   for (const key of DOM_KEYS) {
@@ -328,8 +336,15 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
     const subset = getCellSubset();
     const msPerCell = shownMsPerCell();
     if (subset === null || msPerCell === null) return null;
-    const cells = params.mode === 'all' || params.count === undefined || params.count >= subset.nObs ? subset.nObs : params.count;
-    return { ms: msPerCell * cells, bytes: null, what: `Opens ${formatCountOf(cells, 'cell')} again` };
+    const asked = params.fraction === undefined ? params.count : countFromFraction(params.fraction, subset.nObs);
+    const cells = params.mode === 'all' || asked === undefined || asked >= subset.nObs ? subset.nObs : asked;
+    const opening = { ms: msPerCell * cells, bytes: null, what: `Opens ${formatCountOf(cells, 'cell')} again` };
+    // Normalized values sum the cells' totals of the cells read again (priced as a new reading).
+    return Promise.resolve(state.shownCellTotalsCost?.({ reread: cells })).catch(() => null).then(totals => (totals == null ? opening : {
+      ms: opening.ms + (totals.ms ?? 0),
+      bytes: totals.bytes,
+      what: `${opening.what}; ${lowerFirst(totals.what)}`,
+    }));
   });
   const lifecycle = new AbortController();
   onAbort(lifecycle.signal, unprovide);
@@ -376,10 +391,28 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
     const fields = (state.obsData?.fields ?? []).filter(field => field?.kind === 'category' && field._isUserDefined !== true);
     const chosenField = subset?.spec?.field ?? dom.field.value;
     dom.field.replaceChildren(...fields.map(field => new Option(field.key, field.key, false, field.key === chosenField)));
-    const layouts = state.getMappingCandidates?.()?.obsm ?? null;
-    const embeddings = Array.isArray(layouts) ? layouts.filter(item => item.usable).map(item => item.key) : [];
+    const embeddings = spatialEmbeddings();
     const chosenEmbedding = subset?.spec?.embedding ?? dom.embedding.value;
-    dom.embedding.replaceChildren(...embeddings.map(key => new Option(key, key, false, key === chosenEmbedding)));
+    dom.embedding.replaceChildren(...embeddings.map(key => new Option(state.representationNameOf({ layoutKey: key, label: key, provenance: null }), key, false, key === chosenEmbedding)));
+  }
+
+  /**
+   * The embeddings a spatial subsample can thin, by the data mapping's own
+   * rule: the obsm arrays its embeddings show in 2D or 3D (Session › Data
+   * mapping › Embeddings), the 2D default first. A vector field, a table, a
+   * sparse array or an array the mapping does not show is no embedding here
+   * either; the reader thins columns 0 and 1.
+   */
+  function spatialEmbeddings() {
+    const keys = [];
+    const representations = state.getEnabledRepresentations?.() ?? [];
+    for (const dimension of [2, 3]) {
+      for (const representation of representations) {
+        const key = representation.ref?.key ?? null;
+        if (representation.dimension === dimension && key !== null && !keys.includes(key)) keys.push(key);
+      }
+    }
+    return keys;
   }
 
   /**
@@ -401,7 +434,7 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
   /**
    * The cells the control asks for now: the open subsample's exact count
    * while the share has not been edited, else the count the share stands
-   * for (`shareCount`); every cell for 100 %.
+   * for (`shareCount`); every cell for 100%.
    */
   function chosenCount(nObs) {
     if (exactK !== null) return exactK;
@@ -496,20 +529,26 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
     dom.openAll.hidden = !(subset?.kept != null && subset.autoFit !== null);
     dom.copyLink.hidden = !(subset?.kept != null && datasetParameters().size > 0);
     // The buttons show only when one of them has something to do: every
-    // cell open and 100 % chosen leaves the control at its slider.
+    // cell open and 100% chosen leaves the control at its slider.
     dom.actions.hidden = !busy && dom.apply.disabled && dom.openAll.hidden && dom.copyLink.hidden && dom.useBlocks.hidden;
   }
 
   /**
    * The field a subsample is judged by: its stratifying field, else the
-   * categorical obs field shown now, else the first categorical one.
+   * categorical obs field shown now, else the field of the cells' identity
+   * (`utils/field-roles.js` `identityField`: a cell type name first).
    */
   function judgedField(subset) {
     if (subset?.spec?.field) return subset.spec.field;
     const fields = state.obsData?.fields ?? [];
     const shown = state.activeFieldSource === 'obs' ? fields[state.activeFieldIndex] : null;
     const usable = field => field?.kind === 'category' && field._isUserDefined !== true;
-    return (usable(shown) ? shown : fields.find(usable))?.key ?? null;
+    if (usable(shown)) return shown.key;
+    const candidates = fields.filter(usable).map(field => ({
+      key: field.key,
+      categoryCount: Array.isArray(field.categories) ? field.categories.length : (field.categoryCount ?? null),
+    }));
+    return identityField(candidates) || null;
   }
 
   /** The parameters that name the open dataset in a link (none for a local file). */
@@ -522,14 +561,11 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
   /** Copy a link that opens this dataset with exactly the subsample open now. */
   async function copyLink() {
     const subset = getCellSubset();
-    if (subset?.kept == null) return;
-    const link = subsampleLink(window.location.href, datasetParameters(), subset.spec);
-    try {
-      await navigator.clipboard.writeText(link);
-      notify(`Copied a link that opens these ${formatCountOf(subset.kept.length, 'cell')} (cells ${state.cellIdentity.digest}).`);
-    } catch {
-      notify(`Link to these cells: ${link}`);
-    }
+    const spec = linkedSubsampleSpec(subset);
+    if (spec === null) return;
+    const link = subsampleLink(window.location.href, datasetParameters(), spec);
+    const copied = await copyText(link, { what: 'the link', success: null, failure: `The link: ${link}` });
+    if (copied) notify(`Copied a link that opens these ${formatCountOf(subset.kept.length, 'cell')} (cells ${state.cellIdentity.digest}).`);
   }
 
   /** Ask once per opening what a gene costs now, for Details. */
@@ -595,38 +631,46 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
    * keeping what the person made and where they were: highlights and labels
    * by original cell position (`cell-subset-carry.js`), and every other
    * state domain but the cells themselves (`viewCarry`: the views and their
-   * cameras, colours and filters, the settings, the analyses, through each
+   * cameras, colors and filters, the settings, the analyses, through each
    * domain's owner). The cells newly open then join what is derived from the file (a
    * label made from a column, a category or range group), as growing in
    * place gives the cells added (`takeInNewCells`).
    *
-   * Resolves once the new cells are open, with `restoring`: what was shown
-   * coming back on them (a view coloured by a gene reads that gene again
+   * Resolves once the new cells are open (`shown`: false when the reading
+   * was canceled or failed, the cells open before still open; `failure`:
+   * why it failed, as the person was told), with `restoring`: what was shown
+   * coming back on them (a view colored by a gene reads that gene again
    * for the new cells: on a large atlas tens of seconds). The control is
    * the person's again as soon as the cells are open, so a share chosen by
    * mistake can be changed at once; a later Apply supersedes the restoring
    * (its reads end with the cells they were for), whose notes are then not
-   * said.
+   * said. `heavy`: an action's `ctx.heavy`, asked before the Expression
+   * values put back sum the new cells' totals (normalized values).
+   * `signal`: what stops the action or the move that asked (its Stop): the
+   * reading is canceled as its Cancel cancels it, and the cells open
+   * before stay (`reopen`).
    */
-  async function reopenKeeping(cellSubset) {
+  async function reopenKeeping(cellSubset, { heavy = null, signal = null } = {}) {
     const carried = captureCarried(state);
     const view = viewCarry === null ? null : await viewCarry.capture();
-    const { shown, inPlace } = await reopen(cellSubset);
+    const { shown, inPlace, failure = null } = await reopen(cellSubset, { signal });
     // Cells grown or cut in place kept everything shown
-    // (`app/open-cells-resize.js`); a new reading gets it back.
-    if (shown !== true || inPlace === true) return { restoring: Promise.resolve() };
-    // Labels first: a view may be coloured by one.
+    // (`app/open-cells-resize.js`); a new reading gets it back. Not shown:
+    // the reading was canceled or failed (said where it failed), and the
+    // cells open before are still open.
+    if (shown !== true || inPlace === true) return { shown: shown === true, failure, restoring: Promise.resolve() };
+    // Labels first: a view may be colored by one.
     const restored = restoreCarried(state, carried);
     const reading = ++reopenings;
     const restoring = (async () => {
-      const lost = view === null ? [] : await viewCarry.restore(view);
+      const lost = view === null ? [] : await viewCarry.restore(view, { heavy });
       await takeInNewCells(state, carried, restored);
       if (reading !== reopenings) return;
       const said = describeCarried(restored);
       if (said !== '') notify(said);
       for (const reason of lost) notify(`Not kept after reading the cells again — ${reason}`);
     })();
-    return { restoring };
+    return { shown: true, restoring };
   }
 
   /** The parameters of `cells.open` the control's choice stands for. */
@@ -660,49 +704,49 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
 
   /**
    * The action `cells.open`: read the open dataset again with every cell or
-   * with exactly `count` cells chosen by `method` (the file's own when
-   * null), keeping what was made (`reopenKeeping`). Resolves once what was
+   * with exactly `count` cells (or a `fraction` of them) chosen by `method`
+   * (the file's own when null), keeping what was made (`reopenKeeping`). Resolves once what was
    * shown is back, or, when a newer `cells.open` replaces it meanwhile, once
    * the cells are open: the control is the person's again as soon as they
    * are (a share chosen by mistake is changed at once), and the newer
    * reading supersedes the restoring, whose notes are then not said.
    */
-  async function openCellsAction(params, { signal }) {
+  async function openCellsAction(params, { signal, heavy = null }) {
     const subset = getCellSubset();
     if (subset === null) {
       throw new ActionRefused('The dataset shown cannot be read again with other cells.', { code: 'unavailable' });
     }
     if (busy) throw new ActionRefused('The cells are being read again; wait until that ends.', { code: 'busy' });
     const nObs = subset.nObs;
-    let exact;
-    if (params.mode === 'all' || params.count >= nObs) {
-      exact = { mode: 'all' };
-    } else {
-      if (params.count === undefined) throw new ActionRefused('A subsample names how many cells to open (count).', { code: 'bad-params' });
-      if (params.count < FEWEST_OPEN_CELLS) {
-        throw new ActionRefused(`Open at least ${formatCountOf(FEWEST_OPEN_CELLS, 'cell')}: ${FEWEST_OPEN_CELLS_REASON}.`, { code: 'bad-params' });
+    if (params.mode !== 'all' && params.method === 'spatial') {
+      // The embedding is one the data mapping shows (the menu's rule), its 2D default when none is named.
+      const allowed = spatialEmbeddings();
+      if (allowed.length === 0) {
+        throw new ActionRefused(`A spatial subsample thins an embedding shown in 2D or 3D, and ${placePath(PLACES.dataMapping)} shows none.`, { code: 'refused' });
       }
-      const method = params.method;
-      if (method === 'stratified' && params.field === undefined) {
-        throw new ActionRefused('A stratified subsample names the categorical column it is stratified by (field).', { code: 'bad-params' });
+      if (params.embedding !== undefined && !allowed.includes(params.embedding)) {
+        throw new ActionRefused(
+          `A spatial subsample thins an embedding ${placePath(PLACES.dataMapping)} shows in 2D or 3D (${allowed.map(key => `'${key}'`).join(', ')}); '${params.embedding}' is not one.`,
+          { code: 'refused' },
+        );
       }
-      const request = {
-        mode: 'subsample',
-        ...(method === null ? {} : { method }),
-        ...(params.seed === null ? {} : { seed: params.seed }),
-        ...(method === 'stratified' ? { field: params.field, allocation: params.allocation } : {}),
-        ...(method === 'spatial' ? { ...(params.embedding === undefined ? {} : { embedding: params.embedding }), gridSize: DEFAULT_GRID_SIZE } : {}),
-      };
-      // The open dataset is read with exactly this many cells.
-      exact = { ...request, k: params.count, strict: true };
+      if (params.embedding === undefined) params = { ...params, embedding: allowed[0] };
     }
+    // The open dataset is read with exactly these cells (`cells-to-open.js`, as `dataset.open` opens them).
+    const exact = params.mode === 'all' ? { mode: 'all' } : cellsToOpenRequestOf(params, nObs);
     throwIfAborted(signal);
     busy = true;
     render();
     try {
-      const { restoring } = await reopenKeeping(exact);
+      // Stopped while the cells are read, the reading is canceled (the cells open before stay).
+      const { shown, failure = null, restoring } = await reopenKeeping(exact, { heavy, signal });
       busy = false;
       refresh();
+      // Stopped, or failed (said where it failed: Apply's line, a notice):
+      // the cells open before are still open, and no step says otherwise.
+      throwIfAborted(signal);
+      // The agent or notebook gets the reason the person read.
+      if (!shown) throw markReported(new Error(failure ?? 'The cells could not be read again; the cells open before are still open.'));
       let removeStop = () => {};
       const replaced = new Promise(resolve => { removeStop = onAbort(signal, resolve); });
       try {
@@ -710,6 +754,9 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
       } finally {
         removeStop();
       }
+      // Grown in place, normalized values: the totals of the cells added,
+      // read now rather than by a later read (`prepareCellTotals`).
+      if (!signal.aborted) await state.prepareCellTotals?.({ signal, heavy });
     } finally {
       if (busy) {
         busy = false;
@@ -771,6 +818,12 @@ export function initSubsampleControl({ dom, state, getCellSubset, reopen, notify
     };
     state.on('gene-sample:changed', onGeneSample);
     onAbort(lifecycle.signal, () => state.off?.('gene-sample:changed', onGeneSample));
+    // The data mapping changed what it shows: the spatial menu follows it.
+    const onRepresentations = () => {
+      if (!lifecycle.signal.aborted) fillChoices(getCellSubset());
+    };
+    state.on('representations:changed', onRepresentations);
+    onAbort(lifecycle.signal, () => state.off?.('representations:changed', onRepresentations));
   }
   refresh();
   return {

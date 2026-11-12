@@ -24,7 +24,8 @@ import { markProvenCellRows } from '../rendering/unplaced-positions.js';
 import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
 import { formatCountOf } from '../utils/format-units.js';
 import { cellsSteady, trackCellWork } from './open-cells-work.js';
-import { cancelled } from '../utils/abort.js';
+import { cancelled, throwIfAborted } from '../utils/abort.js';
+import { InternalError } from '../utils/errors.js';
 
 function requireNonEmptyString(value, label) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -262,14 +263,14 @@ export class VectorFieldManager {
     // (`open-cells-work.js`).
     const steady = cellsSteady();
     if (steady !== null) await steady;
-    if (this._lifetime.signal.aborted) throw this._lifetime.signal.reason;
+    throwIfAborted(this._lifetime.signal);
     const entry = this._fields.get(id);
     if (entry === undefined) {
-      throw new Error(`VectorFieldManager.loadField: unknown field "${id}".`);
+      throw new InternalError(`VectorFieldManager.loadField: unknown field "${id}".`);
     }
     const dim = this._bindings.get(id).get(key);
     if (dim === undefined) {
-      throw new Error(
+      throw new InternalError(
         `VectorFieldManager.loadField: field "${id}" declares no data for layout "${key}".`
       );
     }
@@ -330,30 +331,30 @@ export class VectorFieldManager {
       positions.length === 0 ||
       positions.length % dimension !== 0
     ) {
-      throw new Error(
+      throw new InternalError(
         `VectorFieldManager.loadField: getPositions() must return a non-empty Float32Array with ${formatCountOf(dimension, 'component')} per cell.`
       );
     }
     const cellCount = positions.length / dimension;
     const { vectors, maxMagnitude, unplacedCount, unplacedNames } = payload ?? {};
     if (!(vectors instanceof Float32Array)) {
-      throw new Error(
+      throw new InternalError(
         'VectorFieldManager.loadField: an AnnData vector payload must be a Float32Array.'
       );
     }
     const expectedLength = cellCount * dimension;
     if (vectors.length !== expectedLength) {
-      throw new Error(
+      throw new InternalError(
         `VectorFieldManager.loadField: vectors length ${vectors.length} does not equal expected length ${expectedLength}.`
       );
     }
     if (!Number.isFinite(maxMagnitude) || maxMagnitude < 0) {
-      throw new Error(
+      throw new InternalError(
         `VectorFieldManager.loadField: field "${id}" must carry a finite non-negative largest magnitude.`
       );
     }
     if (!Number.isSafeInteger(unplacedCount) || unplacedCount < 0 || !Array.isArray(unplacedNames)) {
-      throw new Error(
+      throw new InternalError(
         `VectorFieldManager.loadField: field "${id}" must state the cells it has no vector for.`
       );
     }

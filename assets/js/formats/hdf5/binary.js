@@ -18,6 +18,7 @@
  */
 
 import { formatError } from './errors.js';
+import { formatCountOf } from '../../utils/format-units.js';
 
 const TWO_32 = 2 ** 32;
 
@@ -108,7 +109,7 @@ export class Cursor {
 
   need(count) {
     if (count < 0 || this.position + count > this.bytes.length) {
-      throw this.error(`needs ${count} more bytes but only ${Math.max(0, this.remaining)} remain`);
+      throw this.error(`needs ${formatCountOf(count, 'more byte', 'more bytes')} but only ${Math.max(0, this.remaining)} remain`);
     }
   }
 

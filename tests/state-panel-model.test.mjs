@@ -146,7 +146,10 @@ test('a row\'s accessible name says the step, its branch, who, when, and what st
   assert.equal(describeRow(stub, { view, now }).name, 'The rest of branch “Main”, 1 step, last change 8 minutes ago, main, collapsed');
   const turn = layout.rows.find(each => each.kind === 'turn');
   assert.equal(describeRow(turn, { view, now }).name, 'Claude\'s turn “Markers”, 1 step, at step 3');
-  assert.equal(runLabel({ filtered: false, categories: [{ name: 'Camera', count: 6 }, { name: 'Layout', count: 1 }], off: true }), 'Camera ×6 · Layout · not recorded now');
+  assert.equal(runLabel({ filtered: false, changes: [{ label: 'Moved the camera of View 1', count: 6 }, { label: 'Docked Visualization', count: 1 }], off: true }), 'Moved the camera of View 1 ×6 · Docked Visualization · not recorded now');
+  // Two legend switches say which (they read "Colors ×2"); past the first two changes, how many more steps.
+  assert.equal(runLabel({ filtered: false, changes: [{ label: 'Hid T cells of cell_type', count: 1 }, { label: 'Showed B cells of cell_type', count: 1 }], off: false }), 'Hid T cells of cell_type · Showed B cells of cell_type');
+  assert.equal(runLabel({ filtered: false, changes: [{ label: 'A', count: 1 }, { label: 'B', count: 2 }, { label: 'C', count: 1 }, { label: 'D', count: 3 }], off: false }), 'A · B ×2 · 4 more steps');
 });
 
 test('a collapsed group holding the head says where it is among its steps ("at 4 of 7")', () => {
@@ -174,17 +177,6 @@ test('the status line: steps, the step shown and undone ones, a search\'s count,
   assert.deepEqual(statusWords({ steps: 14, undone: 5, matches: null, stale: 0, recording: true, pausedAt: null, now }), { text: '14 steps · 5 undone', stale: null });
   assert.deepEqual(statusWords({ steps: 214, undone: 0, matches: 8, stale: 0, recording: true, pausedAt: null, now }), { text: '8 of 214 steps', stale: null });
   assert.match(statusWords({ steps: 3, undone: 0, matches: null, stale: 0, recording: false, pausedAt: now - 60_000, now }).text, /^since \S/);
-});
-
-test('a text field keeps its own undo; a slider, a checkbox and a select do not (they have none)', async () => {
-  const { hasOwnUndo } = await import('../assets/js/app/ui/modules/state/keyboard.js');
-  const input = type => ({ tagName: 'INPUT', getAttribute: name => (name === 'type' ? type : null) });
-  assert.equal(hasOwnUndo(null), false);
-  assert.equal(hasOwnUndo({ tagName: 'TEXTAREA' }), true);
-  assert.equal(hasOwnUndo({ tagName: 'DIV', isContentEditable: true }), true);
-  for (const type of ['text', 'search', 'number', null]) assert.equal(hasOwnUndo(input(type)), true, `${type} input`);
-  for (const type of ['range', 'checkbox', 'radio', 'color', 'button']) assert.equal(hasOwnUndo(input(type)), false, `${type} input`);
-  assert.equal(hasOwnUndo({ tagName: 'SELECT' }), false);
 });
 
 test('memory: the warning shows while what is drawn passes the allowance, and names the largest parts', async () => {

@@ -65,7 +65,7 @@
   --control-glyph-md: var(--text-xl);
   --control-glyph-lg: var(--text-2xl);
 
-  /* Checkbox, colour swatch. */
+  /* Checkbox, color swatch. */
   --control-check-size: var(--space-3-5);
 
   /* Switch. */

@@ -4,7 +4,7 @@
  * (`contract.js`), Anthropic's Messages API and OpenAI's Responses API
  * (requests, streamed events, failures by kind, models listed, the
  * person's effort, a refused key told apart from no connection), OpenAI's
- * strict tool schemas made from the whole catalogue, the scripted model of
+ * strict tool schemas made from the whole catalog, the scripted model of
  * the browser specs and where the page offers it.
  */
 import assert from 'node:assert/strict';
@@ -14,7 +14,7 @@ import {
   ProviderError, checkProvider, isRetryable, readServerEvents, retryAfterOf,
 } from '../assets/js/app/agent/providers/contract.js';
 import {
-  ANTHROPIC_EFFORTS, ANTHROPIC_VERSION, anthropicEventsOf, anthropicMessagesOf, createAnthropicProvider, effortsOf,
+  ANTHROPIC_EFFORTS, ANTHROPIC_VERSION, PROGRESS_BETA, PROGRESS_MODELS, anthropicEventsOf, anthropicMessagesOf, createAnthropicProvider, effortsOf,
 } from '../assets/js/app/agent/providers/anthropic.js';
 import {
   OPENAI_EFFORTS, argsFromStrict, createOpenAIProvider, openaiEventsOf, openaiInputOf, openaiToolsOf, strictSchemaOf,
@@ -64,7 +64,7 @@ async function collect(iterable) {
 }
 
 const MESSAGES = Object.freeze([
-  { role: 'user', text: 'Colour by cell type' },
+  { role: 'user', text: 'Color by cell type' },
   {
     role: 'assistant',
     parts: [
@@ -131,10 +131,20 @@ test('Anthropic: the request sends the key to Anthropic only, with the browser h
   assert.equal(request.body.stream, true);
   assert.deepEqual(request.body.cache_control, { type: 'ephemeral' });
   assert.deepEqual(request.body.system, [{ type: 'text', text: 'Be brief.', cache_control: { type: 'ephemeral' } }]);
+  // The person's choice of an hour (Chat settings › Prompt cache) marks both breakpoints.
+  assert.deepEqual(provider.cacheLengths, ['5m', '1h']);
+  const hour = recordingFetch([sse([
+    { event: 'message_start', data: { type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 1 } } } },
+    { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } } },
+    { event: 'message_stop', data: { type: 'message_stop' } },
+  ])]);
+  await collect(createAnthropicProvider({ fetch: hour.fetch }).stream({ key: 'sk-ant-x', model: 'claude-x', system: 'Be brief.', messages: MESSAGES, tools: TOOLS, cacheLength: '1h' }));
+  assert.deepEqual(hour.requests[0].body.cache_control, { type: 'ephemeral', ttl: '1h' });
+  assert.deepEqual(hour.requests[0].body.system[0].cache_control, { type: 'ephemeral', ttl: '1h' });
   assert.equal(request.body.tools.length, TOOLS.length);
   assert.deepEqual(Object.keys(request.body.tools[0]), ['name', 'description', 'input_schema']);
   assert.deepEqual(request.body.messages, [
-    { role: 'user', content: [{ type: 'text', text: 'Colour by cell type' }] },
+    { role: 'user', content: [{ type: 'text', text: 'Color by cell type' }] },
     { role: 'assistant', content: [
       { type: 'thinking', thinking: '', signature: 'sig-1' },
       { type: 'text', text: 'Looking.' },
@@ -205,6 +215,96 @@ test('Anthropic: streamed text, reasoning kept whole with its signature, a tool 
   })())), error => error.kind === 'unreadable' && error.message === 'Anthropic sent a tool call Cellucid could not read.');
   const torn = new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('data: {"type":\n\n')); controller.close(); } }));
   await assert.rejects(collect(readServerEvents(torn, null, 'Anthropic')), error => error.kind === 'unreadable' && error.message === 'Anthropic sent an answer Cellucid could not read.');
+});
+
+test('Anthropic: a model that writes notes between its calls is asked for them as text (display "updates", its beta); any other model is asked nothing', async () => {
+  const ended = () => sse([
+    { data: { type: 'message_start', message: { usage: { input_tokens: 1, output_tokens: 1 } } } },
+    { data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } } },
+  ]);
+  // The documented models (Anthropic's Thinking page, "Progress updates between tool calls"), never one that runs without thinking by default.
+  assert.deepEqual([...PROGRESS_MODELS].sort(), [
+    'claude-fable-5', 'claude-fable-5-1', 'claude-fable-5-2', 'claude-mythos-5-1', 'claude-mythos-5-2', 'claude-opus-5-5', 'claude-sonnet-5-5',
+  ]);
+  assert.equal(PROGRESS_BETA, 'thinking-display-updates-2026-08-18');
+  for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5']) {
+    const { fetch, requests } = recordingFetch([ended]);
+    await collect(createAnthropicProvider({ fetch }).stream({ key: 'k', model, system: 's', messages: MESSAGES, tools: TOOLS, effort: 'high' }));
+    assert.deepEqual(requests[0].body.thinking, { type: 'adaptive', display: 'updates' }, model);
+    assert.equal(requests[0].headers['anthropic-beta'], PROGRESS_BETA, model);
+    // Nothing else of the request changes: the effort chosen, the cached prefix.
+    assert.deepEqual(requests[0].body.output_config, { effort: 'high' });
+    assert.deepEqual(requests[0].body.cache_control, { type: 'ephemeral' });
+  }
+  for (const model of ['claude-haiku-5-5', 'claude-opus-4-8', 'claude-sonnet-5', 'claude-x']) {
+    const { fetch, requests } = recordingFetch([ended]);
+    await collect(createAnthropicProvider({ fetch }).stream({ key: 'k', model, system: 's', messages: MESSAGES, tools: TOOLS }));
+    assert.equal(requests[0].body.thinking, undefined, model);
+    assert.equal(requests[0].headers['anthropic-beta'], undefined, model);
+  }
+});
+
+test('Anthropic: a request refused for the notes setting is sent again without it, and that model is not asked again; another refusal is the person\'s', async () => {
+  const ended = () => sse([
+    { data: { type: 'message_start', message: { usage: { input_tokens: 1, output_tokens: 1 } } } },
+    { data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } } },
+  ]);
+  const refusedDisplay = () => json({ type: 'error', error: { type: 'invalid_request_error', message: 'thinking.display: Input should be \'summarized\' or \'omitted\'' } }, { status: 400 });
+  const { fetch, requests } = recordingFetch([refusedDisplay, ended, ended]);
+  const provider = createAnthropicProvider({ fetch });
+  await collect(provider.stream({ key: 'k', model: 'claude-opus-5-5', system: 's', messages: MESSAGES, tools: [] }));
+  await collect(provider.stream({ key: 'k', model: 'claude-opus-5-5', system: 's', messages: MESSAGES, tools: [] }));
+  assert.deepEqual(requests.map(request => [request.body.thinking ?? null, request.headers['anthropic-beta'] ?? null]), [
+    [{ type: 'adaptive', display: 'updates' }, PROGRESS_BETA], [null, null], [null, null],
+  ]);
+  // A refusal of something else is not a reason to stop asking for the notes.
+  const other = recordingFetch([json({ type: 'error', error: { type: 'invalid_request_error', message: 'tools.0: bad' } }, { status: 400 }), ended]);
+  const kept = createAnthropicProvider({ fetch: other.fetch });
+  await assert.rejects(collect(kept.stream({ key: 'k', model: 'claude-opus-5-5', system: 's', messages: MESSAGES, tools: [] })), error => error.kind === 'request');
+  await collect(kept.stream({ key: 'k', model: 'claude-opus-5-5', system: 's', messages: MESSAGES, tools: [] }));
+  assert.deepEqual(other.requests.map(request => request.body.thinking ?? null), [{ type: 'adaptive', display: 'updates' }, { type: 'adaptive', display: 'updates' }]);
+});
+
+test('Anthropic: asked for, a note\'s text streams as progress before the call it introduces, its block kept whole; a reasoning block stays silent; not asked, no progress', async () => {
+  const stream = async function* () {
+    yield { data: { type: 'message_start', message: { usage: { input_tokens: 3, output_tokens: 0 } } } };
+    // Reasoning: empty under display "updates".
+    yield { data: { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } } };
+    yield { data: { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '' } } };
+    yield { data: { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'r' } } };
+    yield { data: { type: 'content_block_stop', index: 0 } };
+    // A progress note, then the call it introduces.
+    yield { data: { type: 'content_block_start', index: 1, content_block: { type: 'thinking', thinking: '' } } };
+    yield { data: { type: 'content_block_delta', index: 1, delta: { type: 'thinking_delta', thinking: 'The clusters are read; ' } } };
+    yield { data: { type: 'content_block_delta', index: 1, delta: { type: 'thinking_delta', thinking: 'coloring by cell_type next.' } } };
+    yield { data: { type: 'content_block_delta', index: 1, delta: { type: 'signature_delta', signature: 'p' } } };
+    yield { data: { type: 'content_block_stop', index: 1 } };
+    yield { data: { type: 'content_block_start', index: 2, content_block: { type: 'tool_use', id: 'toolu_1', name: 'color_by', input: {} } } };
+    yield { data: { type: 'content_block_stop', index: 2 } };
+    yield { data: { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 9 } } };
+  };
+  const asked = await collect(anthropicEventsOf(stream(), { progress: true }));
+  assert.deepEqual(asked.filter(event => event.type !== 'usage'), [
+    { type: 'thinking' },
+    { type: 'opaque', value: { type: 'thinking', thinking: '', signature: 'r' } },
+    { type: 'thinking' },
+    { type: 'progress', text: 'The clusters are read; ' },
+    { type: 'progress', text: 'coloring by cell_type next.' },
+    { type: 'opaque', value: { type: 'thinking', thinking: 'The clusters are read; coloring by cell_type next.', signature: 'p' } },
+    { type: 'tool-call', id: 'toolu_1', name: 'color_by', args: {} },
+    { type: 'stop', reason: 'tool-use' },
+  ]);
+  const notAsked = await collect(anthropicEventsOf(stream()));
+  assert.equal(notAsked.some(event => event.type === 'progress'), false);
+  // The block goes back to Anthropic unchanged, its note in it; the note itself is never sent as words.
+  assert.deepEqual(anthropicMessagesOf([{ role: 'assistant', parts: [
+    { type: 'progress', text: 'coloring next.' },
+    { type: 'opaque', provider: 'anthropic', value: { type: 'thinking', thinking: 'coloring next.', signature: 'p' } },
+    { type: 'tool-call', id: 'toolu_1', name: 'color_by', args: {} },
+  ] }]), [{ role: 'assistant', content: [
+    { type: 'thinking', thinking: 'coloring next.', signature: 'p' },
+    { type: 'tool_use', id: 'toolu_1', name: 'color_by', input: {} },
+  ] }]);
 });
 
 test('Anthropic: each refusal of a request is one sentence of its kind', async () => {
@@ -330,7 +430,7 @@ test('OpenAI: the request keeps nothing at OpenAI, asks for encrypted reasoning,
   assert.deepEqual(request.body.include, ['reasoning.encrypted_content']);
   assert.equal(request.body.tools.length, TOOLS.length);
   assert.deepEqual(request.body.input, [
-    { role: 'user', content: [{ type: 'input_text', text: 'Colour by cell type' }] },
+    { role: 'user', content: [{ type: 'input_text', text: 'Color by cell type' }] },
     { type: 'reasoning', id: 'rs_1', encrypted_content: 'enc' },
     { role: 'assistant', content: 'Looking.' },
     { type: 'function_call', call_id: 'call-1', name: 'color_by', arguments: '{"field":{"source":"obs","key":"cell_type"}}' },
@@ -361,14 +461,14 @@ test('OpenAI: streamed text, encrypted reasoning, a strict call\'s arguments as 
     yield { data: { type: 'response.created', response: {} } };
     yield { data: { type: 'response.output_item.added', item: { type: 'reasoning', id: 'rs_9' } } };
     yield { data: { type: 'response.output_item.done', item: { type: 'reasoning', id: 'rs_9', encrypted_content: 'e9', summary: [] } } };
-    yield { data: { type: 'response.output_text.delta', delta: 'Colouring' } };
+    yield { data: { type: 'response.output_text.delta', delta: 'Coloring' } };
     yield { data: { type: 'response.output_item.done', item: { type: 'function_call', call_id: 'call_9', name: 'color_by', arguments: '{"field":{"source":"obs","key":"cell_type"}}' } } };
     yield { data: { type: 'response.completed', response: { output: [{ type: 'function_call' }], usage: { input_tokens: 9, output_tokens: 3 } } } };
   })(), schemas));
   assert.deepEqual(events, [
     { type: 'thinking' },
     { type: 'opaque', value: { type: 'reasoning', id: 'rs_9', encrypted_content: 'e9', summary: [] } },
-    { type: 'text', text: 'Colouring' },
+    { type: 'text', text: 'Coloring' },
     { type: 'tool-call', id: 'call_9', name: 'color_by', args: { field: { source: 'obs', key: 'cell_type' } } },
     { type: 'usage', input: 9, output: 3, cacheRead: 0, cacheWrite: 0 },
     { type: 'stop', reason: 'tool-use' },

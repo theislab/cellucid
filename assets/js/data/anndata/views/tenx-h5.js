@@ -41,7 +41,8 @@
 
 import { isArrayNode, isGroup } from '../../../formats/store.js';
 import { defaultModality } from '../../data-mapping.js';
-import { attributeValue } from '../elements.js';
+import { AnnDataFormatError, attributeValue } from '../elements.js';
+import { countNoun } from '../../../utils/format-units.js';
 import { LayoutRefusal, noEmbeddingRefusal, tenxEmbeddingHint } from './refusal.js';
 import { modalityList } from './modalities.js';
 import { columnWindowMatrix, encodingAttrs, joinPath, rowWindowArray, viewArray, viewGroup } from './view-nodes.js';
@@ -58,10 +59,26 @@ function textAttribute(node, key) {
   return typeof first === 'string' ? first : null;
 }
 
-/** Whether `group` holds a 10x matrix's arrays (of either layout). */
+/**
+ * Whether `group` is a 10x matrix group (of either layout), by what names
+ * its axes: its barcodes and its features (`features` in Cell Ranger 3,
+ * `genes` before). Its matrix arrays are not part of recognizing it: a
+ * matrix group missing one breaks the format and is refused as a 10x file
+ * (`requireMatrixArrays`), not read as another format.
+ */
 function isMatrixGroup(group, namesKey) {
-  return isGroup(group) && MATRIX_ARRAYS.every(key => isArrayNode(group.get(key))) &&
-    (namesKey === null || isArrayNode(group.get(namesKey)) || isGroup(group.get(namesKey)));
+  return isGroup(group) && isArrayNode(group.get('barcodes')) &&
+    (isArrayNode(group.get(namesKey)) || isGroup(group.get(namesKey)));
+}
+
+/** Refuse a matrix group missing one of its matrix's arrays, naming each. */
+function requireMatrixArrays(group) {
+  const missing = MATRIX_ARRAYS.filter(key => !isArrayNode(group.get(key)));
+  if (missing.length === 0) return;
+  const listed = missing.length === 1 ? missing[0] : `${missing.slice(0, -1).join(', ')} and ${missing.at(-1)}`;
+  throw new AnnDataFormatError(
+    `its matrix group ${group.path} has no ${listed} ${countNoun(missing.length, 'array')} (a 10x matrix stores ${MATRIX_ARRAYS.join(', ')})`
+  );
 }
 
 /** The genome groups of a Cell Ranger 2 file. */
@@ -202,6 +219,7 @@ export async function tenxView(root, { name, analysis = null, signal = null, fro
   /** @type {Array<{name: string, matrixGroup: Object, nCells: number, arrays: Object, nFeatures: number, windows: Array}>} */
   let sources;
   if (isMatrixGroup(matrix, 'features')) {
+    requireMatrixArrays(matrix);
     const features = matrix.get('features');
     const nFeatures = features.get('id')?.shape[0] ?? features.get('name').shape[0];
     const windows = await featureTypeWindows(features, nFeatures, name, { signal });
@@ -210,6 +228,7 @@ export async function tenxView(root, { name, analysis = null, signal = null, fro
     const genomes = genomeGroups(root);
     sources = genomes.map(genome => {
       const group = root.get(genome);
+      requireMatrixArrays(group);
       const nFeatures = group.get('genes').shape[0];
       const index = isArrayNode(group.get('gene_names')) ? group.get('gene_names') : group.get('genes');
       return {

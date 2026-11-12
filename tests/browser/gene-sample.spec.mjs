@@ -4,7 +4,7 @@
  * and a gene is read for a stated sample of them (`subsample-plan.js`,
  * `genes`): the others are NaN (not read, drawn gray beneath, never 0), the
  * gene's legend says so in one line that links to Session › Subsampling:
- * Genes read for, whose slider at 100 % (its cost said first) reads the
+ * Genes read for, whose slider at 100% (its cost said first) reads the
  * rest, after which the gene has a value on every cell and the lines go. The planner's arithmetic, the
  * reader's segments and the analyses' cells are held by
  * `tests/gene-sample-contract.test.mjs`; this is the app, in each engine.
@@ -111,7 +111,7 @@ test('a CSR atlas over a slow link opens every cell, reads a gene for a stated s
   await expect(page.locator('#gene-read-block')).toBeVisible();
   await expect(page.locator('#gene-read-status')).toHaveText(/^[\d.]+K? of 2\.4K cells$/);
   await expect(page.locator('#subsample-notice')).toBeHidden();
-  await expect(page.locator('#reading-summary')).toHaveText(/^100 % cells · genes [\d.]+ %$/);
+  await expect(page.locator('#reading-summary')).toHaveText(/^100% cells · genes [\d.]+%$/);
 
   // A gene: values on the sample's cells, NaN (not read) on the others.
   await chooseGene(page, 'g5');
@@ -134,7 +134,7 @@ test('a CSR atlas over a slow link opens every cell, reads a gene for a stated s
     return { unreadValues, readNaN };
   });
   expect(read).toEqual({ unreadValues: 0, readNaN: 0 });
-  // The legend: one line naming the sample, a link to Genes read for; the states drawn beside their colours.
+  // The legend: one line naming the sample, a link to Genes read for; the states drawn beside their colors.
   const link = page.locator('#legend .legend-gene-read .gene-read-link');
   await expect(link).toHaveText(/^Gene read for [\d.]+K? of 2\.4K cells$/);
   await expect(link).toHaveAttribute('title', new RegExp(`^Gene read for ${filled.cells.toLocaleString('en-US')} of 2,400 cells\\. `));
@@ -150,7 +150,7 @@ test('a CSR atlas over a slow link opens every cell, reads a gene for a stated s
   await expect(page.locator('#reading-toggle')).toHaveAttribute('aria-expanded', 'true');
   await expect(page.locator('#gene-read-slider')).toBeFocused();
 
-  // 100 %, the top of the slider: its cost said before it is read.
+  // 100%, the top of the slider: its cost said before it is read.
   await page.keyboard.press('End');
   await expect(page.locator('#gene-read-percent')).toHaveValue('100');
   await expect(page.locator('#gene-read-status')).toHaveText(/^2\.4K of 2\.4K cells · \d[\d.,]* (KB|MB)(, ~\d.*)?$/);
@@ -165,7 +165,7 @@ test('a CSR atlas over a slow link opens every cell, reads a gene for a stated s
   }), { timeout: 60_000 }).toBe(0);
   await expect(page.locator('#legend .legend-gene-read')).toBeHidden();
   await expect(page.locator('#gene-read-block')).toBeHidden();
-  await expect(page.locator('#reading-summary')).toHaveText('100 % cells');
+  await expect(page.locator('#reading-summary')).toHaveText('100% cells');
   // A later gene is read for every cell.
   await chooseGene(page, 'g9');
   expect(await page.evaluate(() => {

@@ -18,7 +18,7 @@
  *   the bucket of its row (`RowPointers.indexOf`). A lookup a row by a
  *   binary search over millions of ranges took 11 s of a 5M-cell induced
  *   subgraph. The pointers are read in one pass over the rows ascending
- *   (`CellRows.ascending`), ranges a few pointers apart one: a 50 % uniform
+ *   (`CellRows.ascending`), ranges a few pointers apart one: a 50% uniform
  *   share's ranges are a few, not one a row.
  */
 import assert from 'node:assert/strict';

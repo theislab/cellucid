@@ -26,6 +26,7 @@ import { BOOL_DTYPE, numericDtype, stringDtype, valueArrayClass } from '../store
 import { ZarrFormatError, ZarrUnsupportedError } from './errors.js';
 import { decodeUtf8 } from './codecs/vlen.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { bytesOfBase64 } from '../../utils/byte-text.js';
 
 /**
  * @typedef {Object} StoredType
@@ -459,10 +460,7 @@ function base64Bytes(text, what) {
   if (typeof text !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(text) || text.length % 4 === 1) {
     throw new ZarrFormatError(`${what}: the fill_value ${JSON.stringify(text)} is not Base64.`);
   }
-  const binary = atob(text);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
+  return bytesOfBase64(text);
 }
 
 function floatFromBits(text, size, what) {

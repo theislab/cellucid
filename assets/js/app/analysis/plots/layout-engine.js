@@ -8,6 +8,7 @@
 import { PAGE_COLORS } from '../core/plugin-contract.js';
 import { getPlotTheme } from '../shared/plot-theme.js';
 import { escapeHtml } from '../../utils/dom-utils.js';
+import { InternalError } from '../../../utils/errors.js';
 
 /**
  * Layout mode definitions
@@ -170,7 +171,7 @@ export class LayoutEngine {
     }
     for (const [pageId, color] of customColors) {
       if (!options.pageIds.includes(pageId)) {
-        throw new Error(
+        throw new InternalError(
           `LayoutEngine custom color references unknown page "${pageId}"`
         );
       }
@@ -209,7 +210,7 @@ export class LayoutEngine {
       pageId = pageIdOrIndex;
       index = this._pageColorMap.get(pageIdOrIndex);
       if (index === undefined) {
-        throw new Error(`LayoutEngine received unknown page "${pageIdOrIndex}"`);
+        throw new InternalError(`LayoutEngine received unknown page "${pageIdOrIndex}"`);
       }
     } else {
       if (
@@ -247,7 +248,7 @@ export class LayoutEngine {
     }
 
     if (!Number.isSafeInteger(index) || index < 0 || index >= this.pageCount) {
-      throw new Error(
+      throw new InternalError(
         `LayoutEngine received unknown page "${String(pageIdOrIndex)}"`
       );
     }

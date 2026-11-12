@@ -12,8 +12,9 @@
  * so each plan is made against what the one before it wrote. Then the
  * cases the golden does not hold: a subsample's unknown cells, a name a
  * file cannot hold, a dataset's own column never replaced, a gene set's var
- * column replaced in place, kept when it is the dataset's own, and absent
- * when the mapping reads no var.
+ * column replaced in place, kept when it is the dataset's own, absent
+ * when the mapping reads no var, and the step's expression values recorded
+ * in the provenance (never applied).
  */
 
 import assert from 'node:assert/strict';
@@ -23,7 +24,7 @@ import test from 'node:test';
 import { HISTORY_GOLDEN_EXPECTED_PATH, goldenSession } from '../scripts/generate-history-golden.mjs';
 import { valuesAt } from '../assets/js/app/history/tree.js';
 import {
-  GENE_SET_PREFIX, HISTORY_APPLIED_KEY, chooseStep, geneSetColumns, highlightColumn, historyApplied, planAnnDataCopy, unwritableName,
+  COLORS_NOTE, GENE_SET_PREFIX, HISTORY_APPLIED_KEY, PRESENTATION_NOTE, chooseStep, geneSetColumns, highlightColumn, historyApplied, planAnnDataCopy, unwritableName,
 } from '../assets/js/app/history/exports/anndata-copy.js';
 import { requireElementKey } from '../assets/js/data/anndata/write/names.js';
 
@@ -40,6 +41,8 @@ function goldenTarget({ known = null } = {}) {
     order: [...columns.keys()],
     columns,
     cellucid: null,
+    // Root uns keys other than cellucid (a column's colors, `<column>_colors`), as stored.
+    uns: new Map(),
     var: new Map(),
     known,
     genes: { names: [...dataset.var_names], modality: null, columns: [] },
@@ -53,6 +56,12 @@ function copyTarget(state) {
     obsColumns: [...state.order],
     modalityColumns: new Set(),
     column: async name => state.columns.get(name) ?? null,
+    unsKeys: [...state.uns.keys()],
+    // As `copy-target.js` reads them: text colors, null for none or another form.
+    colors: async name => {
+      const held = state.uns.get(`${name}_colors`);
+      return Array.isArray(held) && held.every(color => typeof color === 'string') ? [...held] : null;
+    },
     cellucid: state.cellucid,
     known: state.known,
     copiedValues: async () => { throw new Error('The golden holds no continuous copy.'); },
@@ -84,6 +93,10 @@ function applyChanges(state, changes) {
   state.order = order;
   state.columns = columns;
   for (const change of changes.var) state.var.set(change.name, change.column);
+  for (const [key, value] of Object.entries(changes.uns ?? {})) {
+    if (value === null) state.uns.delete(key);
+    else state.uns.set(key, value);
+  }
   if (changes.cellucid !== undefined) state.cellucid = { ...(state.cellucid ?? {}), ...changes.cellucid };
 }
 
@@ -193,6 +206,266 @@ test('a column the dataset holds of its own is never replaced, and an unwritable
   assert.equal(unwritableName(made.plan, requireElementKey), null);
   const slash = { rows: [{ kind: 'gene-set', name: 'CD4+/CD8+ T', status: 'write' }] };
   assert.match(unwritableName(slash, requireElementKey), /^The gene set "CD4\+\/CD8\+ T" cannot be saved in a file under that name/);
+});
+
+test('the provenance records the step\'s expression values, never applied; null for a session without them; another shape refused', async () => {
+  const { session, valueOf } = await golden();
+  const choice = chooseStep(session.trackers, { activeTracker: session.activeTracker });
+  const plan = (expression, state = goldenTarget()) => planAnnDataCopy({
+    choice, valueOf: domain => (domain === 'expression' ? expression : valueOf(choice, domain)),
+    target: copyTarget(state), sessionSha256: expected.sha256, version: '0.9.7',
+  });
+  // The golden head holds the opening's values (as stored), as the expected provenance says.
+  assert.deepEqual(valueOf(choice, 'expression'), { normalize: false, log1p: false });
+  assert.deepEqual(expected.apply.provenance.expression, { normalize: false, log1p: false });
+  const state = goldenTarget();
+  const shown = await plan({ normalize: true, log1p: true }, state);
+  assert.deepEqual(shown.provenance.expression, { normalize: true, log1p: true });
+  // Recorded, never applied: no change touches the expression matrix (obs and
+  // var columns, and the colors of the categorical field written, only).
+  assert.deepEqual(Object.keys(shown.changes).sort(), ['cellucid', 'obs', 'uns', 'var']);
+  assert.deepEqual(shown.changes.uns, { 'cell_type (merged)_colors': ['#ff9900', '#0077c8'] });
+  applyChanges(state, shown.changes);
+  assert.deepEqual(historyApplied(state.cellucid).map(record => record.expression), [{ normalize: true, log1p: true }]);
+  assert.deepEqual((await plan({ normalize: true, log1p: false })).provenance.expression, { normalize: true, log1p: false });
+  assert.equal((await plan(undefined)).provenance.expression, null);
+  await assert.rejects(plan({ normalize: true }), /The expression values at step s13 is exactly \{normalize: boolean, log1p: boolean\}/);
+  await assert.rejects(plan({ normalize: true, log1p: 1 }), /The expression values at step s13 is exactly/);
+});
+
+test('a column\'s colors go with it as the packages write them: a field\'s palette, none for another column, carried by a rename and a merge', async () => {
+  // F139: the rule of cellucid-python's write_columns and cellucid-r's .colors_state, case for case.
+  const { session, valueOf } = await golden();
+  const choice = chooseStep(session.trackers, { activeTracker: session.activeTracker });
+  const n = expected.dataset.n_obs;
+  const field = (id, key, categories, palette) => ({
+    id, source: 'obs', kind: 'category', key, deleted: false, purged: false, createdAt: 0, sourceField: null,
+    operation: { type: 'annotation' }, categories, codes: { cells: null, values: Uint8Array.from({ length: n }, (_, i) => (i % 2 === 0 ? 0 : 255)) },
+    sourcePages: [], overlapStrategy: 'first', overlapLabel: null, intersectionLabels: null, uncoveredLabel: null, palette,
+  });
+  const plan = (state, overlays, highlights = { active: null, pages: [] }, options = {}) => planAnnDataCopy({
+    choice, valueOf: domain => (domain === 'field-overlays' ? overlays : domain === 'highlights' ? highlights : valueOf(choice, domain)),
+    target: copyTarget(state), sessionSha256: expected.sha256, version: '0.9.7', ...options,
+  });
+  const overlays = ({ renamedFields = [], renamedCategories = [], userFields = [] }) => ({ renamedFields, renamedCategories, deletedFields: [], userFields });
+  const state = goldenTarget();
+  state.order.push('label');
+  state.columns.set('label', { kind: 'strings', values: Array.from({ length: n }, (_, i) => `x${i % 2}`) });
+  state.uns.set('plain_colors', ['#000000', '#111111']);
+  state.uns.set('cellucid_highlight__QC__Gate_colors', ['#000000']);
+  state.uns.set('cell_type_colors', ['#aa0000', '#00aa00', '#0000aa']);
+  state.uns.set('leiden_colors', ['#111111', '#222222', '#333333', '#444444', '#555555', '#666666']);
+  state.uns.set('cluster_colors', ['#999999']);
+  state.uns.set('label_colors', ['#444444', '#555555']);
+  const made = await plan(state, overlays({
+    renamedFields: [{ source: 'obs', key: 'leiden', name: 'cluster' }],
+    // B cell merges into T cell, in B cell's place: the category keeps B cell's color.
+    renamedCategories: [{ source: 'obs', field: 'cell_type', category: 'B cell', name: 'T cell' }, { source: 'obs', field: 'label', category: 'x1', name: 'y' }],
+    userFields: [field('user_cat_1', 'annotation', ['a', 'unused'], ['#dc2626', '#2563eb']), field('user_cat_2', 'plain', ['x'], null)],
+  }), { active: 'page_1', pages: [{ id: 'page_1', name: 'QC', color: '#e41a1c', groups: [{ id: 'highlight_1', type: 'lasso', label: 'Gate', enabled: true, cells: Uint32Array.of(0, 1) }] }] });
+  assert.deepEqual(made.changes.uns, {
+    'cell_type_colors': ['#aa0000', '#0000aa'],
+    // A text column relabeled: Scanpy colors it by its sorted labels, which the rename reorders.
+    'label_colors': null,
+    'leiden_colors': null,
+    'cluster_colors': ['#111111', '#222222', '#333333', '#444444', '#555555', '#666666'],
+    // Every category, used or not; a field without a palette: Cellucid's own
+    // colors (F239); a column of no categories (a highlight) takes none.
+    'annotation_colors': ['#dc2626', '#2563eb'],
+    'plain_colors': ['#ff9900'],
+    'cellucid_highlight__QC__Gate_colors': null,
+  });
+  applyChanges(state, made.changes);
+  assert.deepEqual(state.columns.get('cell_type').categories, ['T cell', 'NK cell']);
+  // Applied again: unchanged, colors as they are.
+  state.uns.set('annotation_colors', ['#dc2626', '#000000']);
+  const again = await plan(state, overlays({ userFields: [field('user_cat_1', 'annotation', ['a', 'unused'], ['#dc2626', '#2563eb'])] }));
+  assert.equal(again.provenance, null);
+  assert.equal(again.changes.uns, undefined);
+  // Replaced (overwrite): the new palette replaces the colors.
+  const other = field('user_cat_1', 'annotation', ['a', 'unused'], ['#111111', '#222222']);
+  other.codes = { cells: null, values: new Uint8Array(n) };
+  const replaced = await plan(state, overlays({ userFields: [other] }), undefined, { overwrite: true });
+  assert.equal(replaced.plan.rows.find(row => row.name === 'annotation').status, 'replace');
+  assert.deepEqual(replaced.changes.uns, { annotation_colors: ['#111111', '#222222'] });
+
+  // A merge drops colors that did not cover the categories; a rename alone leaves them.
+  const short = goldenTarget();
+  short.uns.set('cell_type_colors', ['#aa0000', '#00aa00']);
+  short.uns.set('leiden_colors', ['#111111']);
+  const merged = await plan(short, overlays({ renamedCategories: [
+    { source: 'obs', field: 'cell_type', category: 'NK cell', name: 'T cell' }, { source: 'obs', field: 'leiden', category: '0', name: 'zero' },
+  ] }));
+  assert.deepEqual(merged.changes.uns, { cell_type_colors: null });
+});
+
+test('a field\'s colors are the ones the view in focus shows, as the packages write them', async () => {
+  // L26-8: the colors a person or an agent gave a field's categories reach
+  // uns['<key>_colors']: in the view in focus at the step, each category
+  // recolored there, the rest in the colors it opens with -- its palette,
+  // else Cellucid's own colors by position. Another view's colors stay how
+  // the data was shown; a dataset column recolored in the view in focus
+  // takes its colors too (RCC-1).
+  const { session, valueOf } = await golden();
+  // A step whose colors differ from the tracker's opening (a color map), so the plan has a colors row.
+  const choice = chooseStep(session.trackers, { activeTracker: session.activeTracker, step: 's14' });
+  const n = expected.dataset.n_obs;
+  const field = (id, key, categories, palette) => ({
+    id, source: 'obs', kind: 'category', key, deleted: false, purged: false, createdAt: 0, sourceField: null,
+    operation: { type: 'group' }, categories, codes: { cells: null, values: Uint8Array.from({ length: n }, (_, i) => i % categories.length) },
+    sourcePages: [], overlapStrategy: 'first', overlapLabel: null, intersectionLabels: null, uncoveredLabel: null, palette,
+  });
+  const recolor = (id, ...pairs) => ({ field: { source: 'obs', user: id }, colors: pairs.map(([category, color]) => ({ category, color })) });
+  const overlays = { renamedFields: [], renamedCategories: [], deletedFields: [], userFields: [
+    field('user_cat_1', 'stage', ['early', 'mid', 'late'], null), field('user_cat_2', 'fate', ['a', 'b'], ['#dc2626', '#16a34a']),
+  ] };
+  const live = [recolor('user_cat_1', ['early', '#111111'])];
+  const kept = [
+    { field: { source: 'obs', key: 'cell_type' }, colors: [{ category: 'B cell', color: '#000000' }] },
+    recolor('user_cat_1', ['late', '#008080'], ['early', '#808080'], ['absent', '#ffffff']),
+    recolor('user_cat_2', ['b', '#ffd700']),
+  ];
+  const plan = (focus, colors = { views: [live, kept] }, state = goldenTarget()) => planAnnDataCopy({
+    choice,
+    valueOf: domain => (domain === 'field-overlays' ? overlays : domain === 'colors' ? colors
+      : domain === 'views' ? { ...valueOf(choice, 'views'), focus } : valueOf(choice, domain)),
+    target: copyTarget(state), sessionSha256: expected.sha256, version: '0.9.7',
+  });
+  const kept1 = await plan(1);
+  assert.deepEqual(kept1.changes.uns, {
+    // The dataset column recolored in the view in focus (RCC-1).
+    cell_type_colors: ['#000000', '#0077c8', '#ad50e0'],
+    stage_colors: ['#808080', '#0077c8', '#008080'], fate_colors: ['#dc2626', '#ffd700'],
+  });
+  const [columnRow, row] = kept1.plan.rows.filter(entry => entry.domain === 'colors');
+  assert.deepEqual([columnRow.kind, columnRow.name, columnRow.status], ['column-colors', 'cell_type', 'write']);
+  assert.deepEqual([row.status, row.note], ['not-applied', COLORS_NOTE]);
+  // Recolored in another view only: not written.
+  assert.deepEqual((await plan(0)).changes.uns, { stage_colors: ['#111111', '#0077c8', '#ad50e0'], fate_colors: ['#dc2626', '#16a34a'] });
+  // Applied again: the dataset column holds those colors (unchanged), the presentation row still says they went.
+  const state = goldenTarget();
+  applyChanges(state, kept1.changes);
+  const again = await plan(1, undefined, state);
+  assert.deepEqual(again.plan.rows.filter(entry => entry.domain === 'colors').map(entry => [entry.kind, entry.status, entry.note]), [
+    ['column-colors', 'unchanged', null], ['presentation', 'not-applied', COLORS_NOTE]]);
+  // Nothing recolored: the colors the fields open with.
+  const none = await plan(0, { views: [[]] });
+  assert.deepEqual(none.changes.uns, { stage_colors: ['#ff9900', '#0077c8', '#ad50e0'], fate_colors: ['#dc2626', '#16a34a'] });
+  assert.equal(none.plan.rows.find(entry => entry.domain === 'colors').note, PRESENTATION_NOTE);
+  await assert.rejects(plan(1, { views: [[]] }), /colors value holds 1 view, and the view in focus is view 1/);
+  await assert.rejects(plan(0, { views: [[recolor('user_cat_1', ['early', '#FFFFFF'])]] }), /not one #rrggbb color/);
+});
+
+/**
+ * cellucid-python's `_small()` as a copy target: `cell_type` (B, T, NK),
+ * `leiden` ("0", "1", "2"), `label` (text) and `count` (numbers), six cells.
+ */
+function smallTarget() {
+  const columns = new Map([
+    ['cell_type', { kind: 'categorical', categories: ['B', 'T', 'NK'], codes: Int8Array.of(0, 1, 1, 2, 0, 1), ordered: false }],
+    ['leiden', { kind: 'categorical', categories: ['0', '1', '2'], codes: Int8Array.of(0, 1, 2, 0, 1, 2), ordered: false }],
+    ['label', { kind: 'strings', values: ['x0', 'x1', 'x0', 'x1', 'x0', 'x1'] }],
+    ['count', { kind: 'numbers', values: Float64Array.of(0, 1, 2, 3, 4, 5) }],
+  ]);
+  return {
+    nObs: 6, order: [...columns.keys()], columns, cellucid: null, uns: new Map(), var: new Map(), known: null,
+    genes: { names: ['G1', 'G2'], modality: null, columns: [] },
+  };
+}
+
+/** Plan a step of the golden that holds a colors value against `state`, with the domains given (the data domains empty otherwise). */
+async function smallPlan(state, given, targetOverrides = {}) {
+  const { session, valueOf } = await golden();
+  const choice = chooseStep(session.trackers, { activeTracker: session.activeTracker, step: 's14' });
+  const empty = {
+    'field-overlays': { renamedFields: [], renamedCategories: [], deletedFields: [], userFields: [] },
+    highlights: { active: null, pages: [] },
+    'gene-sets': { sets: [] },
+  };
+  return planAnnDataCopy({
+    choice,
+    valueOf: domain => (Object.hasOwn(given, domain) ? given[domain] : Object.hasOwn(empty, domain) ? empty[domain] : valueOf(choice, domain)),
+    target: { ...copyTarget(state), ...targetOverrides }, sessionSha256: expected.sha256, version: '0.9.7',
+  });
+}
+
+const datasetRecolor = (key, ...pairs) => ({ field: { source: 'obs', key }, colors: pairs.map(([category, color]) => ({ category, color })) });
+
+test('a recolored dataset column is written with the colors it is shown in, as the packages write it', async () => {
+  // RCC-1, cellucid-python's test of the same name, input for input: the
+  // categories recolored, the rest in the colors the column opens with --
+  // Scanpy's colors for it, as drawn (#rgb widened, alpha dropped), else
+  // Cellucid's own by position. Applied again: unchanged.
+  const colors = { views: [[
+    datasetRecolor('cell_type', ['T', '#123456']),
+    datasetRecolor('leiden', ['1', '#00ff00']),
+    datasetRecolor('label', ['x0', '#ffffff']),
+    datasetRecolor('count', ['absent', '#ffffff']),
+  ]] };
+  const state = smallTarget();
+  state.uns.set('cell_type_colors', ['#AA0000', '#0a0', '#0000aaff']);
+  state.uns.set('leiden_colors', ['#111111']); // fewer than its 3 categories: the viewer opens it in Cellucid's colors
+  const made = await smallPlan(state, { colors });
+  assert.deepEqual(made.plan.rows.filter(row => row.domain === 'colors').map(row => [row.kind, row.name, row.status, row.note]), [
+    ['column-colors', 'cell_type', 'write', null],
+    ['column-colors', 'leiden', 'write', null],
+    ['column-colors', 'label', 'not-applied', 'The obs column "label" is not categorical; Scanpy keeps colors for a categorical column only.'],
+    ['column-colors', 'count', 'not-applied', 'The obs column "count" is not categorical; Scanpy keeps colors for a categorical column only.'],
+    ['presentation', 'Colors', 'not-applied', COLORS_NOTE],
+  ]);
+  assert.deepEqual(made.changes.uns, {
+    cell_type_colors: ['#aa0000', '#123456', '#0000aa'],
+    leiden_colors: ['#ff9900', '#00ff00', '#ad50e0'],
+  });
+  assert.notEqual(made.provenance, null);
+  assert.deepEqual(made.provenance.skipped.filter(entry => entry.kind === 'column-colors').map(entry => entry.name), ['label', 'count']);
+  applyChanges(state, made.changes);
+  const again = await smallPlan(state, { colors });
+  assert.equal(again.provenance, null);
+  assert.equal(again.changes.uns, undefined);
+  assert.deepEqual(again.plan.rows.filter(row => row.kind === 'column-colors').map(row => row.status), ['unchanged', 'unchanged', 'not-applied', 'not-applied']);
+  // A column the dataset lacks, or a MuData modality's, says why.
+  const lacking = await smallPlan(smallTarget(), { colors: { views: [[datasetRecolor('ghost', ['a', '#ffffff'])]] } });
+  assert.deepEqual(lacking.plan.rows.find(row => row.kind === 'column-colors').note, 'The object has no obs column "ghost".');
+  const modality = await smallPlan(smallTarget(), { colors: { views: [[datasetRecolor('rna:leiden', ['0', '#ffffff'])]] } },
+    { modalityColumns: new Set(['rna:leiden']) });
+  assert.equal(modality.plan.rows.find(row => row.kind === 'column-colors').note, '"rna:leiden" is a column of a MuData modality; colors apply to the global obs.');
+});
+
+test('a recolored dataset column renamed in the session takes its colors by its new labels, as the packages write it', async () => {
+  // The colors value names a dataset column by the key the dataset gives it
+  // and its categories by the labels shown at the step: the column renamed
+  // and a category relabeled by the same apply are written under the new
+  // names, the colors in the column's order; a label the column lacks is
+  // said, the others written.
+  const state = smallTarget();
+  state.uns.set('cell_type_colors', ['#aa0000', '#00aa00', '#0000aa']);
+  const made = await smallPlan(state, {
+    'field-overlays': {
+      renamedFields: [{ source: 'obs', key: 'cell_type', name: 'kind' }],
+      renamedCategories: [{ source: 'obs', field: 'cell_type', category: 'B', name: 'Bcell' }],
+      deletedFields: [], userFields: [],
+    },
+    colors: { views: [[datasetRecolor('cell_type', ['Bcell', '#101010'], ['ghost', '#202020'])]] },
+  });
+  applyChanges(state, made.changes);
+  assert.deepEqual(state.columns.get('kind').categories, ['Bcell', 'T', 'NK']);
+  assert.deepEqual(state.uns.get('kind_colors'), ['#101010', '#00aa00', '#0000aa']);
+  assert.equal(state.uns.has('cell_type_colors'), false);
+  const [row] = made.plan.rows.filter(entry => entry.kind === 'column-colors');
+  assert.deepEqual([row.name, row.status, row.note], ['kind', 'write', 'Not written: the color of "ghost", which the obs column "kind" does not have.']);
+  // Only labels the column lacks: nothing to write.
+  const only = await smallPlan(smallTarget(), { colors: { views: [[datasetRecolor('leiden', ['9', '#202020'], ['8', '#303030'])]] } });
+  const [lone] = only.plan.rows.filter(entry => entry.kind === 'column-colors');
+  assert.deepEqual([lone.status, lone.note], ['not-applied', 'Not written: the colors of "9", "8", which the obs column "leiden" does not have.']);
+  // A merge by the same apply: the category takes its first source's opening color.
+  const merged = smallTarget();
+  merged.uns.set('cell_type_colors', ['#aa0000', '#00aa00', '#0000aa']);
+  const merging = await smallPlan(merged, {
+    'field-overlays': { renamedFields: [], renamedCategories: [{ source: 'obs', field: 'cell_type', category: 'B', name: 'NK' }], deletedFields: [], userFields: [] },
+    colors: { views: [[datasetRecolor('cell_type', ['T', '#123456'])]] },
+  });
+  assert.deepEqual(merging.changes.uns, { cell_type_colors: ['#aa0000', '#123456'] });
 });
 
 test('highlight columns follow the packages\' naming rule', () => {

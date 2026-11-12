@@ -110,8 +110,8 @@
     var(--colormap-stops, var(--color-border-light), var(--color-border-light)));
 }
 
-/* The row owns the ink, so the selected row's inverse colour reaches its
-   label. A colour of its own here kept the label primary-on-primary — dark on
+/* The row owns the ink, so the selected row's inverse color reaches its
+   label. A color of its own here kept the label primary-on-primary — dark on
    the dark highlight in light theme, light on light in dark theme. */
 .colormap-name {
   min-width: 72px;
@@ -193,6 +193,12 @@
   cursor: pointer;
 }
 
+/* The invisible input's focus ring is drawn by the swatch it edits (WCAG 2.4.7). */
+.legend-swatch:has(> .legend-color-input:focus-visible) {
+  outline: var(--border-width-2) solid var(--color-border-focus);
+  outline-offset: var(--space-0-5);
+}
+
 .legend-swatch:hover {
   border-color: color-mix(in srgb, var(--color-border-strong) 60%, transparent);
   box-shadow: var(--shadow-xs);
@@ -217,6 +223,12 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* A category with no name, shown as (empty) or (blank): quiet, as the hover card shows it. */
+.legend-label-main.is-unnamed {
+  color: var(--color-text-tertiary);
+  font-style: italic;
 }
 
 .legend-label-sub {
@@ -332,7 +344,7 @@ button.legend-count:hover {
   text-decoration: underline;
 }
 
-/* On touch the count is drawn at the touch size (32px), centred in its row. */
+/* On touch the count is drawn at the touch size (32px), centered in its row. */
 @media (pointer: coarse) {
   button.legend-count {
     display: inline-flex;
@@ -346,9 +358,9 @@ button.legend-count:hover {
   color: var(--color-text-link);
 }
 
-/* A dot of the colour a lower layer is drawn in (a gene's 0, a cell not read),
+/* A dot of the color a lower layer is drawn in (a gene's 0, a cell not read),
    made from the view's background by the viewer (rendering/read-cell-layer.js):
-   the legend names each state beside the colour it shows as on this theme. */
+   the legend names each state beside the color it shows as on this theme. */
 .legend-layer-swatch {
   display: inline-block;
   width: 0.75em;
@@ -480,7 +492,7 @@ button.legend-count:hover {
 /* A gene read for a sample of the open cells: the states drawn (one line,
    `legend-layer-note`) and how many cells it is read for, a link to where
    that is chosen (`gene-read-control.js`, `.gene-read-note`). Each one line,
-   spaced by the colour section's gap alone. */
+   spaced by the color section's gap alone. */
 .legend-section > .legend-layer-note {
   margin: 0;
   white-space: nowrap;

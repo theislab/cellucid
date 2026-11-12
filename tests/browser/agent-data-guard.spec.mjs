@@ -2,7 +2,7 @@
  * What agents are sent of the data, on a real page (`app/agent/data-scope.js`,
  * `app/agent/bridge/data-guard.js`), and the chat's extras around it:
  *
- * - every read of the catalogue, walked through the one tool call both ways
+ * - every read of the catalog, walked through the one tool call both ways
  *   in run, with the dataset set to names and summaries only: no picture and
  *   no array of the cells' own values leaves (the same walk with the switch
  *   off finds both, so the check sees what it looks for);
@@ -15,6 +15,7 @@
  */
 import { expect, test } from './helpers/test.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { tabKey } from './helpers/dialog-keys.mjs';
 import {
   CELL_TYPE, agentRequests, installScriptedModel, observeProductErrors, openAgentDataset, openChat, queueReplies, resultJson, say,
 } from './helpers/agent-chat.mjs';
@@ -31,7 +32,7 @@ async function setSummariesOnly(page, on) {
 }
 
 /**
- * Every read of the catalogue run as an agent's call, with real names where
+ * Every read of the catalog run as an agent's call, with real names where
  * it takes them; each result with whether it carried a picture and the
  * arrays of numbers that are the cells' own values (of a continuous field
  * and a gene, read for every open cell).
@@ -167,12 +168,12 @@ test.describe('agent data guard', () => {
     expect(free.byType.data.groups.every(group => group.min !== null && group.max !== null)).toBe(true);
 
     const guarded = await run(true, 'guarded');
-    // Naming cells and making a field of them are changes the person allowed; summarising values over them is not.
+    // Naming cells and making a field of them are changes the person allowed; summarizing values over them is not.
     expect([guarded.picked, guarded.made]).toEqual([false, false]);
     expect(guarded.summary.isError).toBe(true);
     expect(guarded.summary.text).toMatch(/whose groups an agent made by naming cells/);
     expect(guarded.summary.text.includes(String(guarded.own))).toBe(false);
-    // A field of the dataset's own categories is still summarised, without its extremes.
+    // A field of the dataset's own categories is still summarized, without its extremes.
     expect(guarded.byType.isError).toBe(false);
     expect(guarded.byType.data.groups.every(group => group.min === null && group.max === null && group.median === null && group.mean !== null)).toBe(true);
     expect(guarded.byType.text).toMatch(/\[Cellucid: median, min, max left out: each is one cell's own value/);
@@ -252,7 +253,7 @@ test.describe('agent data guard', () => {
     expect(errors).toEqual([]);
   });
 
-  test('the selection chip: a reference attached to each message, left out with × until the selection changes, reached from the keyboard', async ({ page, browserName }) => {
+  test('the selection chip: a reference attached once, never one the conversation knows (sent before, or its agent\'s own), left out with × until the selection changes, reached from the keyboard', async ({ page, browserName }) => {
     const errors = observeProductErrors(page);
     await openAgentDataset(page);
     await openChat(page);
@@ -262,22 +263,31 @@ test.describe('agent data guard', () => {
       const { getActions } = await import('/assets/js/app/actions/index.js');
       await getActions().dispatch('highlight.cells', { cells: list, label: 'Picked' });
     }, cells);
+    const lastSent = async () => (await agentRequests(page)).at(-1).messages.at(-1).text;
     await highlight([0, 1, 2, 3, 4]);
     await expect(chip).toBeVisible();
     await expect(chip.locator('.agent-chat-chip-text')).toHaveText('Selection: 5 cells');
     await queueReplies(page, [{ text: 'Five cells.' }]);
     await say(page, 'What are these?');
     await expect(page.locator('#agent-chat-log .agent-msg-agent').last()).toContainText('Five cells.');
-    const sent = (await agentRequests(page)).at(-1).messages.at(-1).text;
+    const sent = await lastSent();
     expect(sent).toMatch(/^What are these\?\n\n\[Cellucid: Permissions: [^\n]*\]\n\n\[Cellucid: The person attached their selection: a reference to the cells highlighted on a highlight page, not the cells\./);
     expect(sent).toContain('<cellucid-data>{"page":');
     expect(sent).toContain('"cells":5');
     await expect(page.locator('#agent-chat-log .agent-msg-user .agent-msg-attached').last()).toHaveText('Selection: 5 cells');
+    // Sent once: the conversation knows it, so the chip goes and the next message carries nothing.
+    await expect(chip).toBeHidden();
+    await queueReplies(page, [{ text: 'Still five.' }]);
+    await say(page, 'And their types?');
+    await expect(page.locator('#agent-chat-log .agent-msg-agent').last()).toContainText('Still five.');
+    expect(await lastSent()).toBe('And their types?');
 
-    // × from the keyboard (Shift+Tab from the field reaches it): left out of the next message.
+    // A new selection attaches again; × from the keyboard (Shift+Tab from the field reaches it) leaves it out.
+    await highlight([10, 11]);
+    await expect(chip.locator('.agent-chat-chip-text')).toHaveText('Selection: 7 cells');
     await page.locator('#agent-chat-input').focus();
     // WebKit on macOS moves to buttons with Option-Tab (Tab alone skips them, as Safari does by default).
-    await page.keyboard.press(browserName === 'webkit' ? 'Alt+Shift+Tab' : 'Shift+Tab');
+    await page.keyboard.press(tabKey(browserName, { shift: true }));
     await expect(chip.locator('.agent-chat-chip-remove')).toBeFocused();
     await page.keyboard.press('Enter');
     await expect(chip).toBeHidden();
@@ -285,10 +295,29 @@ test.describe('agent data guard', () => {
     await queueReplies(page, [{ text: 'Nothing attached.' }]);
     await say(page, 'And now?');
     await expect(page.locator('#agent-chat-log .agent-msg-agent').last()).toContainText('Nothing attached.');
-    expect((await agentRequests(page)).at(-1).messages.at(-1).text).toBe('And now?');
-    // A new selection attaches again; clearing the highlights clears the chip.
-    await highlight([10, 11]);
-    await expect(chip.locator('.agent-chat-chip-text')).toHaveText('Selection: 7 cells');
+    // Left out: no reference to the cells goes with the message. What the person did since the
+    // agent's last turn is still told (F270, `history-link.js` `historySinceSentence`): the
+    // highlight is a step of theirs, in effect now, whether or not they attach the selection.
+    expect(await lastSent()).toBe('And now?\n\n[Cellucid: Since your last turn the history changed: The person\'s step '
+      + '<cellucid-data>"Highlighted 2 cells as \\"Picked (2)\\" on page \\"Page 1\\""</cellucid-data> is now in effect. '
+      + 'Rely on the state as it is now, not on what your earlier replies said.]');
+
+    // What the agent highlights in its turn is its own: never attached back as the person's.
+    await queueReplies(page, [
+      { text: '', calls: [{ name: 'highlight_cells', args: { cells: [20, 21, 22], label: 'Agent picked' } }] },
+      { text: 'Highlighted three more.' },
+    ]);
+    await say(page, 'Highlight three more cells');
+    await expect(page.locator('#agent-chat-log .agent-msg-agent').last()).toContainText('Highlighted three more.');
+    await expect(chip).toBeHidden();
+    await queueReplies(page, [{ text: 'Ten in all.' }]);
+    await say(page, 'How many now?');
+    await expect(page.locator('#agent-chat-log .agent-msg-agent').last()).toContainText('Ten in all.');
+    expect(await lastSent()).toBe('How many now?');
+
+    // A new chat knows no selection; clearing the highlights clears the chip.
+    await page.locator('#agent-chat-new').click();
+    await expect(chip.locator('.agent-chat-chip-text')).toHaveText('Selection: 10 cells');
     await page.evaluate(async () => {
       const { getActions } = await import('/assets/js/app/actions/index.js');
       await getActions().dispatch('highlight.clear-all', {});
@@ -301,16 +330,16 @@ test.describe('agent data guard', () => {
     const errors = observeProductErrors(page);
     await openAgentDataset(page);
     await openChat(page);
-    await queueReplies(page, [{ text: 'Before I colour:', calls: [{ name: 'ask_person', args: { question: 'Colour by which field?', choices: ['cell_type', 'leiden', 'Neither'] } }] }]);
-    await say(page, 'Colour it');
-    await expect(page.locator('#agent-chat-log .agent-msg-agent').last()).toContainText('Before I colour:');
+    await queueReplies(page, [{ text: 'Before I color:', calls: [{ name: 'ask_person', args: { question: 'Color by which field?', choices: ['cell_type', 'leiden', 'Neither'] } }] }]);
+    await say(page, 'Color it');
+    await expect(page.locator('#agent-chat-log .agent-msg-agent').last()).toContainText('Before I color:');
     const choices = page.locator('#agent-chat-tray .agent-chat-choices');
     await expect(choices).toBeVisible();
-    await expect(choices).toHaveAttribute('aria-label', 'Colour by which field?');
+    await expect(choices).toHaveAttribute('aria-label', 'Color by which field?');
     await expect(choices.locator('button')).toHaveText(['cell_type', 'leiden', 'Neither']);
     await expect(page.locator('#agent-chat-tray [role="status"]')).toHaveText('Choices: cell_type, leiden, Neither. They are above the message field; you can also type an answer.');
     // The question in the conversation, with its choices as words; the turn ended without another model call.
-    await expect(page.locator('#agent-chat-log .agent-ask-question')).toHaveText('Colour by which field?');
+    await expect(page.locator('#agent-chat-log .agent-ask-question')).toHaveText('Color by which field?');
     await expect(page.locator('#agent-chat-log .agent-ask-choices')).toHaveText('cell_type · leiden · Neither');
     expect(await agentRequests(page)).toHaveLength(1);
 
@@ -319,7 +348,7 @@ test.describe('agent data guard', () => {
     await page.locator('#agent-chat-input').fill('half a thought');
     await page.locator('#agent-chat-input').focus();
     // WebKit on macOS moves to buttons with Option-Tab (Tab alone skips them, as Safari does by default).
-    await page.keyboard.press(browserName === 'webkit' ? 'Alt+Shift+Tab' : 'Shift+Tab');
+    await page.keyboard.press(tabKey(browserName, { shift: true }));
     await expect(choices.locator('button').last()).toBeFocused();
     await page.keyboard.press('Enter');
     await expect(page.locator('#agent-chat-log .agent-msg-agent').last()).toContainText('Then I leave it.');

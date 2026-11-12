@@ -187,7 +187,9 @@ export function deResultsToCSV(results) {
 }
 
 /**
- * Convert correlation results to CSV
+ * Convert correlation results to CSV: each axis's variable by type and key,
+ * and its label, what its values are as read (`x_label`, `y_label`: a gene's
+ * with its units when not as stored, "Ins1 · log1p(norm.)", `geneValueLabel`)
  *
  * @param {Object[]} results - Array of per-page correlation results
  * @param {Object} [metadata] - Optional metadata { method, variableX, variableY }
@@ -198,7 +200,7 @@ export function correlationResultsToCSV(results, metadata = {}) {
   const x = metadata.variableX || metadata.varX || null;
   const y = metadata.variableY || metadata.varY || null;
 
-  const header = 'page,method,x_type,x_key,y_type,y_key,r,r_squared,p_value,n';
+  const header = 'page,method,x_type,x_key,x_label,y_type,y_key,y_label,r,r_squared,p_value,n';
   const rows = [header];
 
   for (const r of results || []) {
@@ -219,8 +221,10 @@ export function correlationResultsToCSV(results, metadata = {}) {
       toCSVCell(method),
       toCSVCell(x?.type || ''),
       toCSVCell(x?.key || ''),
+      toCSVCell(r?.xLabel ?? ''),
       toCSVCell(y?.type || ''),
       toCSVCell(y?.key || ''),
+      toCSVCell(r?.yLabel ?? ''),
       toCSVCell(rVal),
       toCSVCell(rSquaredVal),
       toCSVCell(pVal),

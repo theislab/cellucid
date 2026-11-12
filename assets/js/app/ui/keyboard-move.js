@@ -23,7 +23,7 @@
  * floating, so its current state already names the only place it can go.
  *
  * Announcements go to a polite, visually hidden live region owned by this
- * module rather than to the notification centre. The notification centre is a
+ * module rather than to the notification center. The notification center is a
  * visible toast stack with a four-item cap that evicts older entries; narrating
  * every aim step through it would paper the screen over and push real
  * notifications out. Committed outcomes that already publish a toast keep
@@ -39,9 +39,23 @@ const INSTRUCTIONS_TEXT =
   'Press Enter or Space to pick this up, arrow keys to choose where it goes, '
   + 'Enter to drop it there, and Escape to cancel.';
 
-const AIM_FORWARD_KEYS = new Set(['ArrowDown', 'ArrowRight']);
-const AIM_BACKWARD_KEYS = new Set(['ArrowUp', 'ArrowLeft']);
-const ACTIVATION_KEYS = new Set(['Enter', ' ', 'Spacebar']);
+/**
+ * The grammar's keys (`KeyboardEvent.key`), by step: the handler below reads
+ * them and the Keyboard shortcuts panel lists them
+ * (`ui/onboarding/shortcut-table.js`). `Spacebar` is the Space key's name in
+ * older engines.
+ */
+export const MOVE_KEYS = Object.freeze({
+  activate: Object.freeze(['Enter', ' ', 'Spacebar']),
+  forward: Object.freeze(['ArrowDown', 'ArrowRight']),
+  backward: Object.freeze(['ArrowUp', 'ArrowLeft']),
+  first: Object.freeze(['Home']),
+  last: Object.freeze(['End']),
+  cancel: Object.freeze(['Escape']),
+});
+const AIM_FORWARD_KEYS = new Set(MOVE_KEYS.forward);
+const AIM_BACKWARD_KEYS = new Set(MOVE_KEYS.backward);
+const ACTIVATION_KEYS = new Set(MOVE_KEYS.activate);
 
 function requireOwnerDocument(value, label) {
   if (
@@ -214,7 +228,7 @@ export function createKeyboardMove(options) {
     if (cancelOptions.silent !== true) {
       announceKeyboardMove(
         ownerDocument,
-        `Move cancelled. ${source} stayed where it was.`
+        `Move canceled. ${source} stayed where it was.`
       );
     }
   }
@@ -262,7 +276,7 @@ export function createKeyboardMove(options) {
       commit();
       return true;
     }
-    if (event.key === 'Escape') {
+    if (MOVE_KEYS.cancel.includes(event.key)) {
       event.preventDefault();
       event.stopPropagation();
       cancel();
@@ -282,14 +296,14 @@ export function createKeyboardMove(options) {
       announceKeyboardMove(ownerDocument, describeAim());
       return true;
     }
-    if (event.key === 'Home') {
+    if (MOVE_KEYS.first.includes(event.key)) {
       event.preventDefault();
       event.stopPropagation();
       aimAt(0);
       announceKeyboardMove(ownerDocument, describeAim());
       return true;
     }
-    if (event.key === 'End') {
+    if (MOVE_KEYS.last.includes(event.key)) {
       event.preventDefault();
       event.stopPropagation();
       aimAt(targets.length - 1);

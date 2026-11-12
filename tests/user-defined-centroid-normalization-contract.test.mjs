@@ -262,7 +262,7 @@ test('a field created from highlight pages shows its labels at once', async () =
   const expected = expectedFromResident(manager, field, 'X_umap_2d');
   assert.equal(state.centroidCount, 3);
   assert.deepEqual(centroidPublications.at(-1), padded(expected).map(Math.fround));
-  // Building again (any later recolour) never moves them.
+  // Building again (any later recolor) never moves them.
   state.setActiveField(fieldIndex);
   assert.deepEqual(field.centroidsByLayout.get('X_umap_2d'), expected);
 });
@@ -393,6 +393,7 @@ const USER_CATEGORY_KEYS = Object.freeze([
   'operation',
   'overlapLabel',
   'overlapStrategy',
+  'palette',
   'purged',
   'source',
   'sourceField',

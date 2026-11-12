@@ -16,7 +16,7 @@ import {
   parseOrcidPersonName,
 } from './profile-identifiers.js';
 import { parseExactJson } from './wire-contract.js';
-import { throwIfAborted } from '../../utils/abort.js';
+import { throwIfAborted, requireSignalOrNull } from '../../utils/abort.js';
 import {
   fetchOnce,
   isTransientAnswer,
@@ -39,21 +39,6 @@ let orcidLink = null;
 function defaultOrcidTransport() {
   orcidLink ??= new ResponseClock();
   return { fetch: (url, init) => globalThis.fetch(url, init), hosts: realmHosts, clock: orcidLink };
-}
-
-function assertAbortSignalOrNull(signal) {
-  if (
-    signal !== null &&
-    (
-      typeof signal !== 'object' ||
-      typeof signal.aborted !== 'boolean' ||
-      typeof signal.addEventListener !== 'function' ||
-      typeof signal.removeEventListener !== 'function'
-    )
-  ) {
-    throw new TypeError('ORCID request signal must be an AbortSignal or exact null');
-  }
-  return signal;
 }
 
 function createResponseError(message, code, cause = undefined) {
@@ -97,7 +82,7 @@ export function decodeOrcidJson(bytes, label) {
 }
 
 async function fetchSuccessfulJson(url, { label, signal, transport = null }) {
-  const ownerSignal = assertAbortSignalOrNull(signal);
+  const ownerSignal = requireSignalOrNull(signal, 'ORCID request signal');
   throwIfAborted(ownerSignal);
   const { fetch: fetchImpl, hosts, clock } = transport ?? defaultOrcidTransport();
   const { response, bytes } = await withRetries(async () => {

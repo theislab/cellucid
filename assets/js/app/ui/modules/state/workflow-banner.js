@@ -13,6 +13,7 @@
  */
 
 import { formatCountOf } from '../../../../utils/format-units.js';
+import { ICONS, createIconButton } from '../../components/controls.js';
 
 /**
  * What the banner says of a tracker, or null when it says nothing.
@@ -73,12 +74,7 @@ export function createWorkflowBanner({ box, ops }) {
   report.className = 'btn btn-compact';
   report.textContent = 'Report…';
   report.addEventListener('click', () => ops.report(report));
-  const close = doc.createElement('button');
-  close.type = 'button';
-  close.className = 'icon-btn history-banner-close';
-  close.setAttribute('aria-label', 'Dismiss');
-  close.title = 'Dismiss';
-  close.textContent = '✕';
+  const close = createIconButton({ label: 'Dismiss', icon: ICONS.close, className: 'history-banner-close' });
   close.addEventListener('click', () => {
     if (trackerId !== null) dismissed.add(trackerId);
     box.hidden = true;

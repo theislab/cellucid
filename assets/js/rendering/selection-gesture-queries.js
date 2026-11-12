@@ -14,7 +14,7 @@
  *   of the tiles that triangle covers, with the very crossing expression the
  *   full even-odd test evaluates, so the result is the full test's result
  *   bit for bit, at any number of vertices.
- * - Proximity: the centre is fixed for the gesture, so every cell's squared
+ * - Proximity: the center is fixed for the gesture, so every cell's squared
  *   distance is bucketed once by a monotone function of it; a radius change
  *   re-tests only the buckets between the old and the new radius.
  * - k-NN: a breadth-first expansion over the reader worker's adjacency, with
@@ -235,7 +235,7 @@ export class LassoHitTest {
     const screenX = (clipX / clipW + 1) * 0.5 * this.vpWidth;
     const screenY = (1 - clipY / clipW) * 0.5 * this.vpHeight;
     // A point the pane does not present (under the sidebar, or projected past
-    // the pane edge into a neighbour's cell) is not on screen there. Written
+    // the pane edge into a neighbor's cell) is not on screen there. Written
     // as a negation so a cell without a position (NaN) is off screen too: no
     // crossing test can enclose it.
     if (!(
@@ -453,7 +453,7 @@ export class LassoHitTest {
 }
 
 /**
- * The drawn cells within a radius of a fixed centre: squared Euclidean
+ * The drawn cells within a radius of a fixed center: squared Euclidean
  * distance over the cell's components (absent ones read as 0) at most the
  * squared radius, and nothing for a radius of 0.
  */
@@ -476,7 +476,7 @@ export class ProximityHitTest {
       !Number.isFinite(center[1]) ||
       !Number.isFinite(center[2])
     ) {
-      throw new TypeError('Proximity hit test needs a centre of three finite numbers.');
+      throw new TypeError('Proximity hit test needs a center of three finite numbers.');
     }
     this.positions = positions;
     this.dimensionLevel = dimensionLevel;
@@ -676,16 +676,16 @@ function growUint32(buffer, needed) {
 const KNN_ROW_BATCH_CELLS = 1 << 16;
 
 /**
- * A breadth-first expansion from one seed cell over the neighbour graph,
+ * A breadth-first expansion from one seed cell over the neighbor graph,
  * through drawn cells only: degree d holds the cells at most d hops away.
  * The seed must be drawn, or the expansion is empty.
  *
- * The graph is a row source (`KnnRowSource`): a cell's neighbours are read
+ * The graph is a row source (`KnnRowSource`): a cell's neighbors are read
  * from the file by row (`getConnectivityRows`, the reader worker), a batch
  * of frontier cells at a time, the next batch asked for while one is
  * walked; while a view shows the graph, the source answers from the edges
  * the page holds when that is measured faster (`knnRowReader`,
- * `app/main.js`). No thread holds every cell's neighbour list for it.
+ * `app/main.js`). No thread holds every cell's neighbor list for it.
  *
  * Reached cells are kept in discovery order with the count reached by each
  * degree, so the cells at exactly degree d are one range of that list (the
@@ -714,7 +714,7 @@ export class KnnExpansion {
     this.seed = seed;
     this._visited = new CellSet(cellCount);
     // One bit a cell, set while the cell is drawn and not yet reached: the
-    // expansion's per-neighbour test is one load from a bitset small enough
+    // expansion's per-neighbor test is one load from a bitset small enough
     // to stay in the first-level cache (70 KB for 562k cells).
     this._open = new Uint32Array(Math.ceil(cellCount / 32));
     for (let cell = 0; cell < cellCount; cell++) {
@@ -781,7 +781,7 @@ export class KnnExpansion {
           !(rows?.offsets instanceof Uint32Array) || rows.offsets.length !== cells.length + 1 ||
           !(rows.neighbors instanceof Uint32Array) || rows.offsets[cells.length] !== rows.neighbors.length
         ) {
-          throw new TypeError('KNN rows must be Uint32 offsets (one a cell, plus one) over Uint32 neighbours.');
+          throw new TypeError('KNN rows must be Uint32 offsets (one a cell, plus one) over Uint32 neighbors.');
         }
         batch.rows = rows;
       }, error => {
@@ -931,7 +931,7 @@ export class KnnExpansion {
 
 /**
  * What the k-NN tool expands through: the graph's cell count, and its rows
- * read by cell (`readRows(cells, {signal})`: distinct cells' neighbours,
+ * read by cell (`readRows(cells, {signal})`: distinct cells' neighbors,
  * cell `cells[i]`'s at `neighbors[offsets[i] .. offsets[i + 1]]`; the
  * reader worker reads them from the file, `getConnectivityRows`).
  *

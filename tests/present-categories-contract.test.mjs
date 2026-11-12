@@ -4,11 +4,11 @@
  * has 1.2M of them, 35 MB) is coded by the categories its open cells hold
  * (`AnnDataReader._readPresentCategorical`):
  *
- * - its codes are read first, then only the labels (and `uns` colours) of
+ * - its codes are read first, then only the labels (and `uns` colors) of
  *   the stored categories they name: a share of the cells reads a share of
  *   the dictionary, never all of it;
  * - its categories are those, in stored order, each cell's label exactly the
- *   one its stored code names; colours are each category's with every
+ *   one its stored code names; colors are each category's with every
  *   category open (the file's at its stored position, else Cellucid's at
  *   that position);
  * - an opening grown in place keeps every category found and adds the ones
@@ -83,7 +83,7 @@ const expectedLabels = rows => rows.map(row => (row % 97 === 5 ? null : label(st
 /** Chunk keys of `path` among `fetched` (Zarr v2: `<path>/<chunk>`). */
 const chunksOf = (fetched, path) => new Set(fetched.filter(key => key.startsWith(`${path}/`) && !key.slice(path.length + 1).includes('/') && !key.endsWith('.zarray')));
 
-test('a share reads its codes, then the labels and colours of the categories they name alone', async () => {
+test('a share reads its codes, then the labels and colors of the categories they name alone', async () => {
   const { reader, fetched } = await open({ mode: 'subsample', method: 'uniform', fraction: 0.01, seed: 3 });
   const n = reader.nObs;
   assert.ok(n < CELLS && n > 10, `opened ${n} cells`);
@@ -134,12 +134,12 @@ test('a dictionary one request of the link reads is read whole: every category l
   assert.equal(field.categories.length, CELLS);
 });
 
-test('colours: the file\'s at each stored position, else Cellucid\'s at that position', () => {
+test('colors: the file\'s at each stored position, else Cellucid\'s at that position', () => {
   const stored = Uint32Array.of(3, 70, 2999);
   assert.deepEqual(presentCategoryPalette(null, stored), Array.from(stored, c => [...getCategoryColor(c)].slice(0, 3)));
   const file = presentCategoryPalette(['#ff0000', '#00ff00', '#0000ff'], stored);
   assert.deepEqual(file, [[1, 0, 0], [0, 1, 0], [0, 0, 1]]);
-  // One colour that is not hex: Cellucid's, for every category (never mixed).
+  // One color that is not hex: Cellucid's, for every category (never mixed).
   assert.deepEqual(presentCategoryPalette(['#ff0000', 'red', '#0000ff'], stored), presentCategoryPalette(null, stored));
 });
 
@@ -200,7 +200,7 @@ test('another reading of other cells is coded anew; a field read whole first sta
 
 const enc = (type, version) => ({ 'encoding-type': type, 'encoding-version': version });
 
-/** An `.h5ad` of `n` cells whose `barcode` categorical names category `(i * 11) % n` in cell `i`, with an embedding and colours. */
+/** An `.h5ad` of `n` cells whose `barcode` categorical names category `(i * 11) % n` in cell `i`, with an embedding and colors. */
 async function barcodeH5ad(n) {
   const codes = Int32Array.from({ length: n }, (_, i) => (i * 11) % n);
   const root = group(enc('anndata', '0.1.0'), [
@@ -255,7 +255,7 @@ function quiet(t) {
   });
 }
 
-test('through the reader worker and the adapter: the page gets the present categories, their stored count and colours, and grows them in place', async t => {
+test('through the reader worker and the adapter: the page gets the present categories, their stored count and colors, and grows them in place', async t => {
   quiet(t);
   // The reader worker's link to a local file carries 32 MiB a request: as
   // small as a dictionary of 3,000 categories needs, for this test.
@@ -290,7 +290,7 @@ test('through the reader worker and the adapter: the page gets the present categ
   assert.deepEqual([...added.categories], grownPresent.map(label));
   assert.deepEqual(added.palette, presentCategoryPalette(grownPresent.map(color), Uint32Array.from(grownPresent)));
   assert.deepEqual(Array.from(added.codes, code => added.categories[code]), grownOpen.slice(resized.from).map(row => label(codes[row])));
-  // The colour each category had is the colour it keeps.
+  // The color each category had is the color it keeps.
   for (const [i, category] of first.categories.entries()) {
     assert.deepEqual(added.palette[added.categories.indexOf(category)], first.palette[i], category);
   }

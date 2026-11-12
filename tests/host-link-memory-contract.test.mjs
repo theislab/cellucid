@@ -247,7 +247,7 @@ test('a host\'s kept pace loosens a step a visit after a day without refusals, s
   assert.equal(told.rememberedHostPace(origin, storage), 1000, 'snapped back to the learnt pace');
   assert.equal(JSON.parse(memory.get('cellucid:host-pace:v1'))[origin].blocks, 2);
   assert.equal(await seedAt(t0 + 30 * 24 * hour), 1000, 'a host that blocks again stays paced');
-  // A pace heard twice (learnt here, told by the worker) counts one block.
+  // A pace heard twice (learned here, told by the worker) counts one block.
   const other = 'https://o.test';
   const once = await visit();
   once.rememberHostPace(other, 500, storage, t0);
@@ -261,4 +261,18 @@ test('a host\'s kept pace loosens a step a visit after a day without refusals, s
   // The Stored dialog forgets every pace.
   (await visit()).forgetHostLinks(storage);
   assert.equal((await visit()).rememberedHostPace(origin, storage), 0);
+});
+
+test('one test says which addresses are this machine', async () => {
+  const { isLoopbackHostname, isLoopbackUrl } = await import('../assets/js/utils/loopback.js');
+  for (const host of ['localhost', 'cellucid.localhost', '127.0.0.1', '127.1.2.3', '[::1]', '::1', '0.0.0.0', 'LOCALHOST']) {
+    assert.equal(isLoopbackHostname(host), true, host);
+  }
+  for (const host of ['localhost.example.com', '128.0.0.1', '10.0.0.1', '192.168.1.2', 'example.org', '']) {
+    assert.equal(isLoopbackHostname(host), false, host);
+  }
+  assert.equal(isLoopbackUrl('http://127.0.0.1:54683'), true);
+  assert.equal(isLoopbackUrl('https://localhost:4180/x'), true);
+  assert.equal(isLoopbackUrl('file:///tmp/a.h5ad'), false);
+  assert.equal(isLoopbackUrl('not a url'), false);
 });

@@ -22,9 +22,10 @@ import {
   isValidOperation
 } from './operations.js';
 import { executeOperation } from './operation-handlers.js';
+import { transformedTask } from './task-values.js';
 import { debug } from '../shared/debug-utils.js';
-// A cancelled operation never starts.
-import { throwIfAborted } from '../../../utils/abort.js';
+// A canceled operation never starts.
+import { requireSignalOrNull, throwIfAborted } from '../../../utils/abort.js';
 import { requireClonedRecord, requireKeys } from '../../../utils/exact-record.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 
@@ -161,13 +162,7 @@ export class ComputeManager {
     if (Object.hasOwn(options, 'backend') && !BACKENDS.has(options.backend)) {
       throw new TypeError(`Unknown compute backend: ${options.backend}`);
     }
-    if (
-      Object.hasOwn(options, 'signal')
-      && options.signal !== null
-      && !(options.signal instanceof AbortSignal)
-    ) {
-      throw new TypeError('Compute signal must be an AbortSignal or null');
-    }
+    if (Object.hasOwn(options, 'signal')) requireSignalOrNull(options.signal, 'Compute signal');
     if (
       Object.hasOwn(options, 'transfer')
       && typeof options.transfer !== 'boolean'
@@ -289,7 +284,7 @@ export class ComputeManager {
    * @param {(threadIndex: number) => Object} payloadFor - A payload per thread
    *   (each is transferred, so each must own its buffers)
    * `retainAs` / `releases` name state a worker keeps for later tasks, which
-   * a worker replaced after a cancelled task gets again (`WorkerPool.broadcast`);
+   * a worker replaced after a canceled task gets again (`WorkerPool.broadcast`);
    * `heldBytes`, what each worker holds for that state (counted in the
    * `analysis` share while it is kept).
    *
@@ -367,7 +362,9 @@ export class ComputeManager {
   }
 
   async _executeCPU(operation, payload) {
-    return executeOperation(operation, payload);
+    // As a worker's `runTask`: a task naming its run's values has its genes
+    // put in them before its kernel (`task-values.js`).
+    return executeOperation(operation, transformedTask(payload));
   }
 
   getStatus() {

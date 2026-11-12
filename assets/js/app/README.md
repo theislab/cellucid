@@ -13,10 +13,10 @@ The layers, glossary and "where to change X" index are in `assets/js/ARCHITECTUR
 ```
 app/
 ├── main.js                  # Entry point: bootstrap, dataset load and publication (≈5,700 lines;
-│                            #   split by stage 5e of the reorganisation plan)
+│                            #   split by stage 5e of the reorganization plan)
 ├── state/                   # DataState and its managers
 │   ├── core/                # data-state.js (DataState + mixin wiring), base-manager.js, constants.js
-│   ├── managers/            # Mixins: colours, filters, highlights, views, mappings, open cells,
+│   ├── managers/            # Mixins: colors, filters, highlights, views, mappings, open cells,
 │   │   │                    #   outliers, latent space, var axis, per-cell array ownership
 │   │   └── field/           # Field methods by concern: loading, residency, summary, overlays,
 │   │                        #   categories (category-growth, pending-categories, category-ops),
@@ -26,15 +26,16 @@ app/
 │   │                        #   history, sessions and agents read; the state fingerprint (README.md)
 │   └── index.js             # Public state exports
 ├── ui/                      # UI wiring
-│   ├── core/                # ui-coordinator.js (initUI), dom-cache, early classic-script bootstraps
+│   ├── core/                # ui-coordinator.js (initUI), dom-cache, early classic-script bootstraps, control-availability.js (a control turned off says why), control-readout.js (what a slider's value reads as)
 │   ├── modules/             # Sidebar features (dataset connections, subsample control, Genes read for, legend,
 │   │                        #   kept-stores dialog, my-datasets/ (My datasets and All…), highlight,
 │   │                        #   figure-export/, benchmark/, state/ (the State panel: Share… and Load…,
 │   │                        #   the branch graph, branches, trackers, tour, exports), …)
-│   ├── components/          # Reusable controls
-│   ├── onboarding/          # Welcome modal and keyboard shortcuts
+│   ├── components/          # Reusable controls; app-dialog.js, the one modal dialog
+│   ├── onboarding/          # Welcome dialog; the one shortcut table and the page's key listener
 │   ├── place-names.js       # Names of places in the UI used in sentences
-│   └── utils.js             # One re-export of escapeHtml (removal listed in the reorganisation plan)
+│   ├── no-dataset.js        # What every part says while no dataset is open (one wording)
+│   └── utils.js             # One re-export of escapeHtml (removal listed in the reorganization plan)
 ├── session/                 # .cellucid-session files (format 4, the history): session-serializer.js (save, load,
 │                            #   starting views), history-file.js (the format), published-default.js (starting
 │                            #   views), codecs/, bundle/, session-context.js (dataset fingerprint),
@@ -42,7 +43,7 @@ app/
 │                            #   (README.md)
 ├── state-serializer/        # The control inventory: every stable sidebar control, its value, the domain
 │                            #   that holds it (ui-controls.js, README.md)
-├── actions/                 # The action catalogue, the state domains' list and the dispatcher: every change
+├── actions/                 # The action catalog, the state domains' list and the dispatcher: every change
 │                            #   and read (README.md); definitions/ one pure module per area, targets/ names
 │                            #   to the open dataset's objects
 ├── history/                 # The action history: trackers, value pool, undo/jumps/branches, the dataset's
@@ -69,7 +70,7 @@ app/
 ├── notification-center/ + notification-center.js  # Notifications
 ├── registries/              # Field registries (rename, delete, user-defined)
 └── utils/                   # App-layer helpers (dom, events, cell sets, field registry, sha256,
-                             #   opaque ids, page colours, state validator, gene lookup
+                             #   opaque ids, page colors, state validator, gene lookup
                              #   (gene-lookup.js: which gene a name chooses, or why none), …)
 ```
 
@@ -99,7 +100,7 @@ Its methods are manager modules mixed into `DataState` at load time
 
 **Performance-critical paths (benchmark before changing):**
 `computeGlobalVisibility()` (O(n × filters)), `updateColorsContinuous()` /
-`updateColorsCategorical()` (O(n) colour buffer updates).
+`updateColorsCategorical()` (O(n) color buffer updates).
 
 ## UI layer (`app/ui/`)
 

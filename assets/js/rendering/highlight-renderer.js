@@ -20,13 +20,17 @@ import {
 } from './gl-utils.js';
 import { glStateOf } from './gl-state-shadow.js';
 import {
+  HIGHLIGHT_COLOR,
   HIGHLIGHT_STYLES_BY_QUALITY,
   HP_VS_HIGHLIGHT,
   HP_FS_HIGHLIGHT,
   highlightGlowAt,
+  highlightRingColorFor,
   writePointShaderFrame,
 } from './shaders/high-perf-shaders.js';
 import { writeFogUniforms } from './shaders/fog-shaders.js';
+import { gpuPointSizeMax } from './point-sprite.js';
+import { prefersReducedMotion } from '../utils/reduced-motion.js';
 import { GpuPermuter } from './high-perf/gpu-permute.js';
 import { forEachSegmentRange } from './high-perf/point-store-segments.js';
 import { requireLodMembership } from './high-perf/renderer-contracts.js';
@@ -51,7 +55,7 @@ import {
 } from './select-mode.js';
 import { formatCountOf } from '../utils/format-units.js';
 import { isCancellation } from '../utils/abort.js';
-import { failureText } from '../utils/errors.js';
+import { InternalError, failureDetails, joinFailure, sayFailure } from '../utils/errors.js';
 
 /**
  * The kind of field one pane is colored by, as the annotation tool reads it.
@@ -280,7 +284,7 @@ function requireFiniteHighlightNumber(value, label, positive = false) {
 /**
  * Clip an overlay drawing to the part of the canvas its pane presents, as
  * the WebGL scissor clips the pane's points: an indicator never spills under
- * the sidebar or into a neighbouring grid cell.
+ * the sidebar or into a neighboring grid cell.
  */
 function clipToPresentedPane(ctx, viewport) {
   ctx.beginPath();
@@ -302,6 +306,7 @@ function requireHighlightViewport(viewport, label) {
   requireFiniteHighlightNumber(viewport.vpWidth, `${label} width`, true);
   requireFiniteHighlightNumber(viewport.vpHeight, `${label} height`, true);
   requireFiniteHighlightNumber(viewport.vpAspect, `${label} aspect`, true);
+  requireFiniteHighlightNumber(viewport.fov, `${label} field of view`, true);
   requireFiniteHighlightNumber(viewport.vpOffsetX, `${label} X offset`);
   requireFiniteHighlightNumber(viewport.vpOffsetY, `${label} Y offset`);
   requireFiniteHighlightNumber(viewport.vpLocalX, `${label} local X`);
@@ -410,7 +415,7 @@ function createHighlightStaging() {
 }
 
 /**
- * A highlight record's colour word (RGB white, alpha the cell's intensity)
+ * A highlight record's color word (RGB white, alpha the cell's intensity)
  * for each intensity byte, built from its bytes so either byte order holds.
  */
 const HIGHLIGHT_COLOR_WORDS = (() => {
@@ -427,7 +432,7 @@ const HIGHLIGHT_COLOR_WORDS = (() => {
 /**
  * Pack the admitted highlighted cells of candidates `[from, candidateCount)`
  * into the staging block, a record a cell (XYZ, the axes the embedding does
- * not have written as the zero they are, then the colour word), until the
+ * not have written as the zero they are, then the color word), until the
  * block is full or the candidates end. Candidate `j` is cell
  * `candidateIndices[j]`, or cell `j` when `candidateIndices` is null (a
  * level's first cells). The admission test is `rebuildBuffer`'s: a level's
@@ -504,8 +509,8 @@ function countHighlightRecords(
 }
 
 /**
- * Bytes a highlight costs drawn from its own records (XYZ and a colour word)
- * and drawn from the point store (a colour word a slot of the store).
+ * Bytes a highlight costs drawn from its own records (XYZ and a color word)
+ * and drawn from the point store (a color word a slot of the store).
  */
 const HIGHLIGHT_RECORD_BYTES = 16;
 const HIGHLIGHT_SLOT_BYTES = 4;
@@ -550,6 +555,8 @@ export class HighlightRenderer {
 
     // Shader program and locations
     this.program = createProgram(gl, HP_VS_HIGHLIGHT, HP_FS_HIGHLIGHT);
+    // The GPU's largest point, read once with the program (null: not said).
+    this._gpuPointSizeMax = gpuPointSizeMax(gl);
     this.attribLocations = {
       position: gl.getAttribLocation(this.program, 'a_position'),
       color: gl.getAttribLocation(this.program, 'a_color'),
@@ -560,8 +567,11 @@ export class HighlightRenderer {
       pointSize: gl.getUniformLocation(this.program, 'u_pointSize'),
       sizeAttenuation: gl.getUniformLocation(this.program, 'u_sizeAttenuation'),
       pointScale: gl.getUniformLocation(this.program, 'u_pointScale'),
+      pointSizeMax: gl.getUniformLocation(this.program, 'u_pointSizeMax'),
+      gpuPointSizeMax: gl.getUniformLocation(this.program, 'u_gpuPointSizeMax'),
       highlightScale: gl.getUniformLocation(this.program, 'u_highlightScale'),
       highlightColor: gl.getUniformLocation(this.program, 'u_highlightColor'),
+      highlightRingColor: gl.getUniformLocation(this.program, 'u_highlightRingColor'),
       ringWidth: gl.getUniformLocation(this.program, 'u_ringWidth'),
       haloStrength: gl.getUniformLocation(this.program, 'u_haloStrength'),
       haloShape: gl.getUniformLocation(this.program, 'u_haloShape'),
@@ -605,7 +615,7 @@ export class HighlightRenderer {
     this._cacheAtFullIntensity = false;
 
     // Visual style state (defaults mirror previous viewer.js values)
-    this.highlightColor = [0.4, 0.85, 1.0];
+    this.highlightColor = [...HIGHLIGHT_COLOR];
     this.highlightScale = 1.8;
     this.highlightRingWidth = 0.40;
     this.highlightHaloStrength = 0.7;
@@ -1278,10 +1288,10 @@ export class HighlightRenderer {
     }
 
     // Two exact ways to draw the same rings: from records of their own (XYZ
-    // gathered from the source positions, a colour word), in the candidates'
+    // gathered from the source positions, a color word), in the candidates'
     // order, or from the view's point store, in the store's order (with a
     // reduced level of detail the candidates are the level's members in that
-    // very order), with a colour word for each of its slots, written on the GPU
+    // very order), with a color word for each of its slots, written on the GPU
     // from the highlight and visibility bytes, and the cells not admitted
     // rejected by the vertex shader. The second is taken when it writes no
     // more bytes than the first: gathering millions of positions on the CPU
@@ -1416,7 +1426,7 @@ export class HighlightRenderer {
             onError: error => {
               // The next publication verifies again, as after any failure.
               viewBuffer.verifiedByteLength = 0;
-              getNotificationCenter().error(`Highlights of view "${vid}" could not be written: ${failureText(error)}`);
+              getNotificationCenter().error(`${joinFailure(`The highlights could not be drawn in a view`, sayFailure(error))}`, { category: 'render', ...failureDetails(error) });
             },
           }
         );
@@ -1639,11 +1649,18 @@ export class HighlightRenderer {
   /**
    * Whether the drawn highlights change with time. Only an animated style
    * (HIGHLIGHT_STYLES_BY_QUALITY) pulses and shimmers (`u_glow`, `u_time` in
-   * HP_FS_HIGHLIGHT); the others are a still picture, and a still picture must
-   * not keep the viewer redrawing every point every frame.
+   * HP_FS_HIGHLIGHT), and only while the person has not asked for reduced
+   * motion (`utils/reduced-motion.js`; the viewer redraws when that setting
+   * changes); otherwise the rings are a still picture, and a still picture
+   * must not keep the viewer redrawing every point every frame.
    */
   isAnimated() {
-    return this._totalHighlightedCount > 0 && this.highlightAnimated === true;
+    return this._totalHighlightedCount > 0 && this._pulses();
+  }
+
+  /** Whether the rings pulse: an animated style, motion not reduced. */
+  _pulses() {
+    return this.highlightAnimated === true && !prefersReducedMotion();
   }
 
   /**
@@ -2137,7 +2154,10 @@ export class HighlightRenderer {
     lightingStrength,
     lightDir,
     viewId,  // Required for per-view buffer lookup and LOD size multiplier
-    dimensionLevel
+    dimensionLevel,
+    // The sprite cap the pane's points were drawn with
+    // (rendering/point-sprite.js): the ring sits on its dot.
+    pointSizeMax
   }, frameTimeSeconds = this._readFrameTimeSeconds()) {
     const gl = this.gl;
     const vid = requireHighlightViewId(viewId);
@@ -2210,16 +2230,29 @@ export class HighlightRenderer {
       gl.uniform1f(this.uniformLocations.pointSize, highlightPointSize);
       gl.uniform1f(this.uniformLocations.sizeAttenuation, sizeAttenuation);
       gl.uniform1f(this.uniformLocations.pointScale, pointScale);
+      gl.uniform1f(this.uniformLocations.pointSizeMax, pointSizeMax);
+      // A context that does not say its largest point bounds the ring by
+      // nothing beyond its own size.
+      gl.uniform1f(
+        this.uniformLocations.gpuPointSizeMax,
+        this._gpuPointSizeMax ?? pointSizeMax * effectiveScale
+      );
       gl.uniform1f(this.uniformLocations.highlightScale, effectiveScale);
       gl.uniform3fv(this.uniformLocations.highlightColor, this.highlightColor);
+      // The ring follows the dot's color (one rule with the figure export).
+      gl.uniform3fv(
+        this.uniformLocations.highlightRingColor,
+        highlightRingColorFor(this.highlightColor)
+      );
       gl.uniform1f(this.uniformLocations.ringWidth, effectiveRingWidth);
       gl.uniform1f(this.uniformLocations.haloStrength, effectiveHaloStrength);
       gl.uniform1f(this.uniformLocations.haloShape, this.highlightHaloShape);
       gl.uniform1f(this.uniformLocations.ringStyle, this.highlightRingStyle);
 
-      // A still style is drawn at time zero: its mid-pulse glow and a fixed
-      // shimmer phase, the same picture on every frame.
-      const highlightTime = this.highlightAnimated === true
+      // A still style, or any style under reduced motion, is drawn at time
+      // zero: its mid-pulse glow and a fixed shimmer phase, the same picture
+      // on every frame.
+      const highlightTime = this._pulses()
         ? exactFrameTimeSeconds - this.startTime * 0.001
         : 0;
       gl.uniform1f(this.uniformLocations.time, highlightTime);
@@ -3002,7 +3035,7 @@ export class HighlightTools {
 
   _getTransparencyGenerations() {
     if (this._disposed === true) {
-      throw new Error(
+      throw new InternalError(
         'HighlightTools cannot access filtering generations after disposal.'
       );
     }
@@ -3666,7 +3699,7 @@ export class HighlightTools {
     );
   }
 
-  /** Be told when a k-NN expansion could not read the neighbour rows it needed (the gesture ends). */
+  /** Be told when a k-NN expansion could not read the neighbor rows it needed (the gesture ends). */
   setKnnFailureCallback(callback) {
     this.knnFailureCallback = requireCallback(callback, 'KNN failure callback');
   }
@@ -4072,7 +4105,7 @@ export class HighlightTools {
 
   _reportKnnFailure(error) {
     if (isCancellation(error)) return;
-    console.error('[HighlightTools] The k-NN expansion could not read its neighbour rows:', error);
+    console.error('[HighlightTools] The k-NN expansion could not read its neighbor rows:', error);
     this.knnFailureCallback?.(error);
   }
 
@@ -4369,7 +4402,8 @@ export class HighlightTools {
           vpInfo.vpHeight,
           vpInfo.vpAspect,
           rayViewMatrix,
-          vpInfo.projectionCenterNdcX
+          vpInfo.projectionCenterNdcX,
+          vpInfo.fov
         );
 
         if (ray) {

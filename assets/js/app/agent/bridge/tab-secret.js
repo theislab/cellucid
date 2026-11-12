@@ -15,6 +15,8 @@
  */
 
 import { TAB_SECRET_BYTES, TAB_SECRET_PATTERN } from './relay-protocol.js';
+import { webStorage } from '../../../utils/web-storage.js';
+import { base64UrlOfBytes } from '../../../utils/byte-text.js';
 
 export const TAB_SECRET_STORAGE_KEY = 'cellucid:agent-relay:tab-secret';
 
@@ -32,18 +34,11 @@ export class TabSecretError extends Error {
 
 function storageOf(storage) {
   if (storage !== undefined) return storage;
-  try {
-    return globalThis.localStorage;
-  } catch (cause) {
-    throw new TabSecretError(cause);
-  }
+  const kept = webStorage('localStorage');
+  if (kept === null) throw new TabSecretError(new Error('This browser keeps no localStorage for this site.'));
+  return kept;
 }
 
-function base64Url(bytes) {
-  let text = '';
-  for (const byte of bytes) text += String.fromCharCode(byte);
-  return btoa(text).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
-}
 
 /**
  * The tab secret this browser keeps, or null when it keeps none (never
@@ -72,7 +67,7 @@ export function readTabSecret({ storage } = {}) {
 export function ensureTabSecret({ storage, random = bytes => crypto.getRandomValues(bytes) } = {}) {
   const existing = readTabSecret({ storage });
   if (existing !== null) return existing;
-  const secret = base64Url(random(new Uint8Array(TAB_SECRET_BYTES)));
+  const secret = base64UrlOfBytes(random(new Uint8Array(TAB_SECRET_BYTES)));
   try {
     storageOf(storage).setItem(TAB_SECRET_STORAGE_KEY, secret);
   } catch (cause) {

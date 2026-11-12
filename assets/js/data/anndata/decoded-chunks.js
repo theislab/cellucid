@@ -6,7 +6,7 @@
  * A subsample's cells lie across the whole file (uniform, blocks), so every
  * step of a progressive opening's growth (`progressive-open.js`) reads, for
  * its added cells, rows of nearly every chunk an earlier step already
- * decoded: HLCA's 1 % blocks share decoded the 182 chunks of `X_umap` again
+ * decoded: HLCA's 1% blocks share decoded the 182 chunks of `X_umap` again
  * at its last step (7.8 MB, mostly page-cache hits, 575 ms). Here each chunk
  * a read decodes is kept, so a later step, or a column read again, copies
  * its rows out of it instead of decoding it again.
@@ -25,7 +25,7 @@
  * the open one still reads), and the chunks go only when the last of them
  * lets go. A chunk being decoded is shared by every read asking for it
  * (`SharedWorks`): its decode stops only once every one of them withdrew,
- * so a read cancelled never fails another.
+ * so a read canceled never fails another.
  *
  * @module data/anndata/decoded-chunks
  */

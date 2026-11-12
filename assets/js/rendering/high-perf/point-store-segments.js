@@ -165,7 +165,7 @@ function requireSegmentPoints(segmentPoints) {
  * A per-point vertex store: one GL buffer a segment. Its methods leave no
  * `ARRAY_BUFFER` bound, as the renderer's own uploads do. It stands where a
  * single `WebGLBuffer` stood for the renderer's point streams (positions,
- * colours, highlight words), so the ownership code that moves, lends and
+ * colors, highlight words), so the ownership code that moves, lends and
  * retires stores handles it as one object (`deleteGlObject` deletes every
  * segment's buffer).
  */
@@ -404,7 +404,7 @@ export class PointStore {
  * The vertex arrays a segmented point store is drawn through (binding them
  * leaves no VAO and no `ARRAY_BUFFER` bound): one VAO a
  * segment, each binding that segment's position stream at attribute 0
- * (`dimension` Float32 components, read as a `vec3`), its colour stream at
+ * (`dimension` Float32 components, read as a `vec3`), its color stream at
  * attribute 1 (RGBA8, normalized) when there is one, and any further
  * per-point streams the caller binds (`drawRange`'s `beforeSegment`). It stands where one
  * `WebGLVertexArrayObject` stood (`deleteGlObject` deletes every VAO).
@@ -417,7 +417,7 @@ export class SegmentedVertexArray {
     this.vaos = [];
     /** @type {ReadonlyArray<{first: number, count: number}>} */
     this.segments = [];
-    // Each VAO's position buffer: its colour attribute is released onto it
+    // Each VAO's position buffer: its color attribute is released onto it
     // (`releaseVertexAttribute`), a buffer the VAO holds already.
     /** @type {WebGLBuffer[]} */
     this.positionBuffers = [];
@@ -465,7 +465,7 @@ export class SegmentedVertexArray {
   setColors(colors) {
     const gl = this.gl;
     if (colors !== null && colors.segments.length !== this.vaos.length) {
-      throw new RangeError('A colour store must have the segments of the positions it is drawn with.');
+      throw new RangeError('A color store must have the segments of the positions it is drawn with.');
     }
     try {
       for (let index = 0; index < this.vaos.length; index++) {
@@ -562,7 +562,7 @@ export function splitRangesBySegment(segments, starts, counts, rangeCount, out, 
 function bindColorAttribute(gl, buffer, positionBuffer) {
   if (buffer === null) {
     // A vertex array keeps a deleted buffer alive while it references it:
-    // the colour attribute lets go of the old store by reading the VAO's own
+    // the color attribute lets go of the old store by reading the VAO's own
     // position buffer, disabled.
     releaseVertexAttribute(gl, 1, positionBuffer);
     return;
@@ -579,6 +579,6 @@ function requireMatchingSegments(positions, colors) {
   if (colors === null) return;
   if (!(colors instanceof PointStore) || colors.segments.length !== positions.segments.length
     || colors.segments.some((segment, index) => segment.count !== positions.segments[index].count)) {
-    throw new RangeError('A colour store must have the segments of the positions it is drawn with.');
+    throw new RangeError('A color store must have the segments of the positions it is drawn with.');
   }
 }

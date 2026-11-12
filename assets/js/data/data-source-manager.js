@@ -17,6 +17,8 @@ import {
 import { createLocalDemoDataSource } from './local-demo-source.js';
 import { createLinkDataSource } from './link-source.js';
 import { debug } from '../utils/debug.js';
+import { createListenerSet } from '../utils/listener-set.js';
+import { requireSignalOrNull } from '../utils/abort.js';
 
 /** The source types whose datasets come from a dataset catalog, which can
  * name a default view for a dataset (`datasets.json` `session`). */
@@ -88,23 +90,6 @@ function requireListener(callback, label) {
   return callback;
 }
 
-function notifyListeners(listeners, event, label) {
-  const errors = [];
-  for (const callback of [...listeners]) {
-    try {
-      callback(event);
-    } catch (error) {
-      errors.push(error);
-    }
-  }
-  if (errors.length > 0) {
-    throw new AggregateError(
-      errors,
-      `${label} listener publication failed.`
-    );
-  }
-}
-
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
  */
@@ -140,11 +125,9 @@ export class DataSourceManager {
     /** @type {DatasetMetadata|null} */
     this.activeDatasetMetadata = null;
 
-    /** @type {Set<Function>} */
-    this._onDatasetChangeCallbacks = new Set();
+    this._onDatasetChangeCallbacks = createListenerSet('the dataset shown');
 
-    /** @type {Set<Function>} */
-    this._onSourcesChangeCallbacks = new Set();
+    this._onSourcesChangeCallbacks = createListenerSet('the data sources');
 
     /** @type {boolean} */
     this._initialized = false;
@@ -154,6 +137,17 @@ export class DataSourceManager {
 
     /** @type {number} */
     this._selectionRevision = 0;
+    /**
+     * Committed changes of which dataset is shown (a selection, its rollback,
+     * None): what a stage is checked against when it commits. Unlike the
+     * revision it does not move when the shown dataset grows or is cut in
+     * place (`adoptResizedMetadata`): that growth runs until another dataset
+     * is published and never invalidates the change that replaces it (bug
+     * hunt R9V-2: a link opened while Suo grew failed "superseded before
+     * publication" and Suo stayed).
+     * @type {number}
+     */
+    this._selectionCommits = 0;
   }
 
   /**
@@ -437,9 +431,7 @@ export class DataSourceManager {
     const signal = Object.hasOwn(exactOptions, 'signal')
       ? exactOptions.signal
       : null;
-    if (signal !== null && !(signal instanceof AbortSignal)) {
-      throw new TypeError('Dataset selection signal must be an AbortSignal.');
-    }
+    requireSignalOrNull(signal, 'Dataset selection signal');
     const loadMethod = requireLoadMethod(
       Object.hasOwn(exactOptions, 'loadMethod')
         ? exactOptions.loadMethod
@@ -512,9 +504,9 @@ export class DataSourceManager {
       sourceType
     });
     datasetSelectionStages.set(stage, {
+      commits: this._selectionCommits,
       manager: this,
       registeredSource,
-      revision: this._selectionRevision,
       source,
       state: 'staged'
     });
@@ -541,7 +533,7 @@ export class DataSourceManager {
       );
     }
     if (
-      owner.revision !== this._selectionRevision ||
+      owner.commits !== this._selectionCommits ||
       this.sources.get(stage.sourceType) !== owner.registeredSource
     ) {
       owner.state = 'superseded';
@@ -577,6 +569,7 @@ export class DataSourceManager {
     this.activeDatasetMetadata = stage.metadata;
     this.lastLoadMethod = stage.loadMethod;
     this._selectionRevision++;
+    this._selectionCommits++;
     owner.state = 'committed';
 
     debug.log('[DataSourceManager] Switched dataset', {
@@ -671,6 +664,7 @@ export class DataSourceManager {
       owner.previousState.activeDatasetMetadata;
     this.lastLoadMethod = owner.previousState.lastLoadMethod;
     this._selectionRevision++;
+    this._selectionCommits++;
     owner.state = 'rolled-back';
   }
 
@@ -698,27 +692,10 @@ export class DataSourceManager {
       );
     }
     owner.state = 'published';
-    const errors = [];
-    if (owner.sourceChanged) {
-      try {
-        this._notifySourcesChange();
-      } catch (error) {
-        errors.push(error);
-      }
-    }
-    try {
-      this._notifyDatasetChange(publication);
-    } catch (error) {
-      errors.push(error);
-    }
-    if (errors.length > 0) {
-      throw errors.length === 1
-        ? errors[0]
-        : new AggregateError(
-            errors,
-            'Dataset registry and selection listener publication failed.'
-          );
-    }
+    // A listener that fails is reported (`utils/listener-set.js`): the
+    // dataset is open whatever one of them does.
+    if (owner.sourceChanged) this._notifySourcesChange();
+    this._notifyDatasetChange(publication);
   }
 
   /**
@@ -874,9 +851,9 @@ export class DataSourceManager {
       target: 'none'
     });
     datasetSelectionStages.set(stage, {
+      commits: this._selectionCommits,
       manager: this,
       registeredSource: null,
-      revision: this._selectionRevision,
       source: null,
       state: 'staged'
     });
@@ -902,7 +879,7 @@ export class DataSourceManager {
         'Dataset clear commit requires one current manager-owned None stage.'
       );
     }
-    if (owner.revision !== this._selectionRevision) {
+    if (owner.commits !== this._selectionCommits) {
       owner.state = 'superseded';
       throw new Error(
         'Dataset clear stage was superseded before publication.'
@@ -939,6 +916,7 @@ export class DataSourceManager {
     this.activeDatasetMetadata = null;
     this.lastLoadMethod = null;
     this._selectionRevision++;
+    this._selectionCommits++;
     owner.state = 'committed';
 
     const publication = Object.freeze({
@@ -1166,11 +1144,7 @@ export class DataSourceManager {
    * @private
    */
   _notifyDatasetChange(event) {
-    notifyListeners(
-      this._onDatasetChangeCallbacks,
-      event,
-      'Dataset-change'
-    );
+    this._onDatasetChangeCallbacks.notify(event);
   }
 
   /**
@@ -1178,11 +1152,7 @@ export class DataSourceManager {
    * @private
    */
   _notifySourcesChange() {
-    notifyListeners(
-      this._onSourcesChangeCallbacks,
-      undefined,
-      'Sources-change'
-    );
+    this._onSourcesChangeCallbacks.notify();
   }
 
   /**

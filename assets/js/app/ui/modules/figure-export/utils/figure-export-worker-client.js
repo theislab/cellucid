@@ -422,6 +422,7 @@ export function pointPassRenderState(renderState) {
     modelMatrix: renderState.modelMatrix,
     mvpMatrix: renderState.mvpMatrix,
     pointSize: renderState.pointSize,
+    pointSizeMax: renderState.pointSizeMax,
     projectionMatrix: renderState.projectionMatrix,
     shaderQuality: renderState.shaderQuality,
     sizeAttenuation: renderState.sizeAttenuation,
@@ -451,35 +452,30 @@ export function shareLodMembership(session, membership) {
 }
 
 /**
- * The axis bounds of one panel's drawn points (`coordinate-mapper.js`):
- * camera-space for a 3-D orbit view, embedding coordinates otherwise.
+ * Whether a figure of the pane draws any cell (`sourceHasDrawnCells`): the
+ * figure says "No visible cells" when it does not.
  *
  * @param {ReturnType<typeof openFigureExportWorkerSession>} session
  * @param {object} options
- * @returns {Promise<{minX: number, maxX: number, minY: number, maxY: number}|null>}
+ * @returns {Promise<boolean>}
  */
-export function requestVisibleBounds(session, {
-  camera,
+export function requestDrawnCells(session, {
   positions,
   dimension,
   transparency,
   lodMembership,
   renderState,
   crop,
-  normTransform,
 }) {
-  return session.request('visibleBounds', {
-    camera,
+  return session.request('drawnCells', {
     positions: session.share(positions),
     dimension,
     transparency: session.share(transparency),
     lodMembership: shareLodMembership(session, lodMembership),
     mvpMatrix: renderState.mvpMatrix,
-    viewMatrix: renderState.viewMatrix,
     viewportWidth: renderState.viewportWidth,
     viewportHeight: renderState.viewportHeight,
     crop,
-    ...(camera ? {} : { normTransform }),
   });
 }
 
@@ -598,16 +594,17 @@ export async function pagePixelsInBands(canvas, signal = null) {
 }
 
 /**
- * Encode a composed figure's pixels as PNG in the worker, with its `iTXt`
- * metadata. The pixels are handed over, not copied.
+ * Encode a composed figure's pixels as PNG in the worker, with its metadata:
+ * its resolution (`pHYs`) and text (`iTXt`). The pixels are handed over, not
+ * copied.
  *
  * @param {ReturnType<typeof openFigureExportWorkerSession>} session
  * @param {ImageData} pixels - `pagePixels`
- * @param {Record<string, string>} textMap
+ * @param {{text: Record<string, string>, dpi: number}} metadata
  * @returns {Promise<Blob>}
  */
-export function requestPngEncoding(session, pixels, textMap) {
-  return session.request('encodePng', { pixels, textMap }, [pixels.data.buffer]);
+export function requestPngEncoding(session, pixels, { text, dpi }) {
+  return session.request('encodePng', { pixels, text, dpi }, [pixels.data.buffer]);
 }
 
 /**

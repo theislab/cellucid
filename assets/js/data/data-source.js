@@ -21,6 +21,7 @@ import {
   hostFaultOfStatus,
   hostFaultSentence,
   isTransientAnswer,
+  isWebPageAnswer,
   spreadOf,
   transientStatusError,
   withRetries,
@@ -111,6 +112,24 @@ function sampleCatalogConfigurationError(message) {
   return error;
 }
 
+/**
+ * What the person is told of a `sampleCatalog` the link names that cannot be
+ * used: the link's, never "not in a format Cellucid can read" (R9E-2).
+ */
+const SAMPLE_CATALOG_LINK_SENTENCES = Object.freeze({
+  twice: 'This link names "sampleCatalog" more than once; a link names it once.',
+  address: 'This link\'s "sampleCatalog" is not the address of a folder of datasets: it is one web address '
+    + 'of a folder holding datasets.json, ending in "/" (https://host/folder/).',
+});
+
+/** The configuration failure of the link's `sampleCatalog`, said for the person. */
+function sampleCatalogLinkError(cause, sentence) {
+  const error = sampleCatalogConfigurationError(cause.message.replace(/^Sample dataset configuration: /, ''));
+  error.sentence = sentence;
+  error.parameter = SAMPLE_CATALOG_QUERY_KEY;
+  return error;
+}
+
 function requireCanonicalPathSegments(pathname, owner) {
   const segments = pathname.split('/').slice(1);
   if (segments.at(-1) === '') segments.pop();
@@ -186,18 +205,19 @@ function readSampleCatalogConfiguration() {
     const queryValues =
       pageUrl.searchParams.getAll(SAMPLE_CATALOG_QUERY_KEY);
     if (queryValues.length > 1) {
-      throw sampleCatalogConfigurationError(
-        `exactly one '${SAMPLE_CATALOG_QUERY_KEY}' query field is allowed`
+      throw sampleCatalogLinkError(
+        sampleCatalogConfigurationError(`exactly one '${SAMPLE_CATALOG_QUERY_KEY}' query field is allowed`),
+        SAMPLE_CATALOG_LINK_SENTENCES.twice
       );
     }
     if (queryValues.length === 1) {
-      return {
-        url: validateSampleCatalogUrl(
-          queryValues[0],
-          SAMPLE_CATALOG_QUERY_KEY
-        ),
-        error: null,
-      };
+      let url;
+      try {
+        url = validateSampleCatalogUrl(queryValues[0], SAMPLE_CATALOG_QUERY_KEY);
+      } catch (error) {
+        throw sampleCatalogLinkError(error, SAMPLE_CATALOG_LINK_SENTENCES.address);
+      }
+      return { url, error: null };
     }
 
     if (typeof document === 'undefined') {
@@ -302,7 +322,7 @@ function requireByteCeiling(maxBytes, label) {
 }
 
 /**
- * Read a response body into one Uint8Array, cancelling the source stream the
+ * Read a response body into one Uint8Array, canceling the source stream the
  * moment it grows past `maxBytes` or the read fails for any other reason.
  *
  * This enforces a *ceiling*, which is deliberately not the same contract as
@@ -503,7 +523,7 @@ export async function fetchWhenNotBusy(url, init = {}, { clock = new ResponseClo
   let answer;
   try {
     answer = await withRetries(async () => {
-      const got = await fetchOnce(url, rest, { fetchImpl: globalThis.fetch, signal, clock, wantsBody: () => rest.method !== 'HEAD' });
+      const got = await sendOnce(url, rest, signal, clock);
       const status = got.response.status;
       const said = got.bytes !== null && status >= 400 ? new TextDecoder().decode(got.bytes) : got.said;
       if (isTransientAnswer(got.response, said)) {
@@ -518,12 +538,43 @@ export async function fetchWhenNotBusy(url, init = {}, { clock = new ResponseClo
     if (!answered || busy === null || signal?.aborted) throw error;
     answer = busy;
   }
-  const { response, bytes } = answer;
+  return responseOf(answer);
+}
+
+/**
+ * The one request of `fetchWhenNotBusy` and `fetchAnswer`, through the one
+ * transport (`fetchOnce`), its body read (none for a `HEAD`).
+ */
+function sendOnce(url, init, signal, clock) {
+  return fetchOnce(url, init, { fetchImpl: globalThis.fetch, signal, clock, wantsBody: () => init.method !== 'HEAD' });
+}
+
+/** A `fetchOnce` answer as a `Response`, its body the bytes read. */
+function responseOf({ response, bytes }) {
   const bodiless = [101, 103, 204, 205, 304].includes(response.status);
   const answered = new Response(bodiless ? null : bytes, { status: response.status, statusText: response.statusText, headers: response.headers });
   // The final address after redirects, as `fetch` reports it.
   if (response.url) Object.defineProperty(answered, 'url', { value: response.url });
   return answered;
+}
+
+/**
+ * `fetch` asked once, whatever it answers, through the one transport
+ * (`fetchOnce`): sent within its host's request budget, never left hanging
+ * (a host that stops answering fails it as stalled), and a request that got
+ * no answer fails as one (`isUnanswered`, with its host, for the sentence
+ * that says who is at fault), never as the browser's bare `TypeError`. For a
+ * request never asked again: a person's "Try again" (`fetchCatalogFile`),
+ * a Cellucid server's (`remote-source.js`: its failures are terminal).
+ *
+ * @param {string} url
+ * @param {RequestInit} [init]
+ * @param {{clock?: import('../formats/io/link.js').ResponseClock}} [options]
+ * @returns {Promise<Response>}
+ */
+export async function fetchAnswer(url, init = {}, { clock = new ResponseClock() } = {}) {
+  const { signal = null, ...rest } = init;
+  return responseOf(await sendOnce(url, rest, signal, clock));
 }
 
 /**
@@ -535,7 +586,9 @@ export async function fetchWhenNotBusy(url, init = {}, { clock = new ResponseClo
  * A busy host is asked again ({@link fetchWhenNotBusy}) unless `askOnce` is
  * set. A person's "Try again" sets it: once a failure is on screen the person
  * decides when to ask again, so their retry is one request whose answer is
- * shown at once, not a schedule of requests running behind their notice.
+ * shown at once, not a schedule of requests running behind their notice
+ * ({@link fetchAnswer}: still within the host's budget, never left hanging,
+ * and a request without an answer said as one).
  *
  * @param {string} url
  * @param {RequestInit} [init]
@@ -550,7 +603,7 @@ export async function fetchCatalogFile(url, init, options = {}) {
   }
   const askOnce = requireAskOnce(options, 'Catalog file request');
   const request = { ...init, cache: CATALOG_FILE_CACHE };
-  const response = await (askOnce ? fetch(url, request) : fetchWhenNotBusy(url, request));
+  const response = await (askOnce ? fetchAnswer(url, request) : fetchWhenNotBusy(url, request));
   const length = Number(response.headers?.get?.('Content-Length'));
   getTransferLog().record(url, { bytes: Number.isSafeInteger(length) ? length : 0 });
   return response;
@@ -654,6 +707,7 @@ const HOST_FAULT_CODES = Object.freeze({
   failing: DataSourceErrorCode.NETWORK_ERROR,
   limiting: DataSourceErrorCode.NETWORK_ERROR,
   refusing: DataSourceErrorCode.NETWORK_ERROR,
+  silent: DataSourceErrorCode.NETWORK_ERROR,
   refused: DataSourceErrorCode.PERMISSION_DENIED,
   missing: DataSourceErrorCode.NOT_FOUND,
   offline: DataSourceErrorCode.NETWORK_ERROR,
@@ -661,7 +715,7 @@ const HOST_FAULT_CODES = Object.freeze({
 });
 
 /** The host faults asking again may cure (the person is offered Try again first). */
-export const PASSING_HOST_FAULTS = Object.freeze(new Set(['failing', 'limiting', 'refusing', 'offline', 'connection']));
+export const PASSING_HOST_FAULTS = Object.freeze(new Set(['failing', 'limiting', 'refusing', 'silent', 'offline', 'connection']));
 
 /**
  * A host that did not give what was asked for, said as who is at fault
@@ -903,6 +957,17 @@ export async function fetchJson(url, sourceType, options = {}) {
         { url, status: response.status }
       );
     }
+    if (isWebPageAnswer(response)) {
+      // A site's page for a path it has nothing at (a single-page site
+      // answers every unknown path with it, 200): nothing is there, as a 404
+      // says, not a network failure to try again.
+      throw new DataSourceError(
+        `Resource not found: ${url} (its host answered with a web page)`,
+        DataSourceErrorCode.NOT_FOUND,
+        sourceType,
+        { url }
+      );
+    }
     const payload = await readBoundedJson(response, {
       label: `Metadata ${url}`,
       signal,
@@ -916,7 +981,8 @@ export async function fetchJson(url, sourceType, options = {}) {
       `Network error: ${err.message}`,
       DataSourceErrorCode.NETWORK_ERROR,
       sourceType,
-      { url, originalError: err.message }
+      // The byte layer's own failure, so a caller can say who is at fault.
+      { url, originalError: err.message, cause: err }
     );
   }
 }

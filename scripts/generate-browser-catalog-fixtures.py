@@ -14,6 +14,8 @@
   folder picker and folder drops read too) -- each under its own id.
 - ``tests/browser/fixtures/uint32-categories.h5ad``: the current-ui dataset
   with 70,000 ``cell_type`` categories.
+- ``tests/browser/fixtures/integer-identifiers.h5ad``: the current-ui
+  dataset with ``donor_id``, unsigned 64-bit identifiers past 2^53 (F116).
 - ``tests/browser/fixtures/replay-other.h5ad``: the current-ui cells as
   another sample, for a history recorded on current-ui replayed on it: some
   names the same, some not.
@@ -367,6 +369,22 @@ def uint32_categories() -> anndata.AnnData:
     return adata
 
 
+def integer_identifiers() -> anndata.AnnData:
+    """The current-ui dataset with `donor_id`: unsigned 64-bit integers, four
+    of its five values past 2^53 (2^60 + 11, 2^60 + 22, 2^62 + 33, 2^63 + 44,
+    and 7), which the viewer reads as their exact decimal text (F116); and
+    `n_counts`, 64-bit integers within 2^53, which stay numbers; and `tissue`,
+    a categorical with an empty and a blank category (shown `(empty)` and
+    `(blank)`, R9D-8)."""
+    adata = current_ui()
+    donors = np.array([2**60 + 11, 2**60 + 22, 2**62 + 33, 2**63 + 44, 7], dtype=np.uint64)
+    adata.obs["donor_id"] = donors[np.arange(adata.n_obs) % donors.size]
+    adata.obs["n_counts"] = (np.arange(adata.n_obs, dtype=np.int64) * 37) % 5000
+    adata.obs["tissue"] = _categorical([("", " ", "lung")[i % 3] for i in range(adata.n_obs)], ["", " ", "lung"])
+    adata.uns["cellucid"] = {**adata.uns["cellucid"], "id": "integer-identifiers", "name": "Integer identifiers"}
+    return adata
+
+
 def replay_other() -> anndata.AnnData:
     """The current-ui cells as another sample, for replaying a history
     recorded on current-ui (`history-replay-other-dataset.spec.mjs`): its
@@ -430,6 +448,7 @@ def main() -> None:
 
     uint32_categories().write_h5ad(FIXTURES / "uint32-categories.h5ad", compression="gzip")
     replay_other().write_h5ad(FIXTURES / "replay-other.h5ad")
+    integer_identifiers().write_h5ad(FIXTURES / "integer-identifiers.h5ad")
 
     # Catalogs that cannot be read, each for one reason.
     good = (forms / "forms-h5ad.h5ad").read_bytes()

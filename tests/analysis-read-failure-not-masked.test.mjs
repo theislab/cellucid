@@ -15,6 +15,8 @@ function createLayer(readGeneColumn) {
   layer._datasetGeneration = 1;
   layer._destroyed = false;
   layer.readGeneColumn = readGeneColumn;
+  // The run's values: as stored (`DataLayer.runValues`).
+  layer.runValues = async () => null;
   return layer;
 }
 

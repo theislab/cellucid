@@ -3,6 +3,10 @@ import { readdir, readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { initVisualizationReset } from '../assets/js/app/ui/modules/visualization-reset.js';
+import { answerShortcutKey } from '../assets/js/app/ui/onboarding/keyboard-shortcuts.js';
+
+/** A key pressed on the page, as its key listener hears it. */
+const pressKey = (key, target) => answerShortcutKey({ key, target, defaultPrevented: false, preventDefault() {} });
 import { getActions } from '../assets/js/app/actions/index.js';
 import {
   POINT_SIZE_SLIDER_MINIMUM,
@@ -344,7 +348,7 @@ test('visualization reset restores every captured value without defaults or coer
     assert.deepEqual(harness.calls, [
       ['viewer', 'resetCamera'],
       ['viewer', 'setBackground', 'grid-dark'],
-      // Smoke's lower-layer colours follow the background.
+      // Smoke's lower-layer colors follow the background.
       ['render', 'markSmokeDirty'],
       ['viewer', 'getFocusedViewId'],
       ['viewer', 'getViewDimension', 'live'],
@@ -391,7 +395,7 @@ test('visualization reset restores every captured value without defaults or coer
     // R resets the focused view's camera only.
     harness.calls.length = 0;
     dispatched.length = 0;
-    documentListeners.get('keydown')({ key: 'r', target: { tagName: 'DIV' } });
+    pressKey('r', { tagName: 'DIV' });
     await new Promise(resolve => setTimeout(resolve, 0));
     assert.deepEqual(dispatched, [['camera.reset', { view: 'View 1' }]]);
     assert.deepEqual(harness.calls, [
@@ -401,7 +405,7 @@ test('visualization reset restores every captured value without defaults or coer
 
     harness.calls.length = 0;
     dispatched.length = 0;
-    documentListeners.get('keydown')({ key: 'R', target: { tagName: 'INPUT' } });
+    pressKey('R', { tagName: 'INPUT' });
     await new Promise(resolve => setTimeout(resolve, 0));
     assert.deepEqual(harness.calls, []);
     assert.deepEqual(dispatched, []);
@@ -476,16 +480,16 @@ test('visualization reset destruction detaches and fences retained reset intents
     const reset = initVisualizationReset(resetOptions(harness));
     const retainedButtonListener =
       harness.cameraDom.resetBtn.getListeners('click')[0];
-    const retainedDocumentListener = documentListeners.get('keydown')[0];
 
     mutateControls(harness);
     reset.destroy();
     reset.destroy();
 
     assert.equal(harness.cameraDom.resetBtn.getListeners('click').length, 0);
-    assert.equal(documentListeners.get('keydown').length, 0);
+    assert.equal(documentListeners.get('keydown')?.length ?? 0, 0);
     retainedButtonListener({ target: harness.cameraDom.resetBtn });
-    retainedDocumentListener({ key: 'r', target: { tagName: 'DIV' } });
+    // R (the shortcut table's `camera.reset`) is withdrawn with it.
+    pressKey('r', { tagName: 'DIV' });
     reset.resetVisualizationToDefaults();
     reset.captureInitialState();
 

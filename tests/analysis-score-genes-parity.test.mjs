@@ -54,6 +54,9 @@ function analysisOfFixture(generation) {
     getDatasetGeneration: () => generation,
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     getPageCells: pageIds => pageIds.map(pageId => ({
       pageId,
       pageName: 'All cells',
@@ -63,7 +66,6 @@ function analysisOfFixture(generation) {
       reads.push(genes);
       return genes.map(gene => COLUMNS.get(gene));
     },
-    performCacheCleanup() {},
   };
   analysis._computeManager = null;
   // Every gene's moments, as a marker run or the moments pass leaves them.

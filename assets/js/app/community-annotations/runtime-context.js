@@ -28,6 +28,7 @@ import { getAnnotationRepoForDataset } from './repo-store.js';
 import { getGitHubAuthSession, toGitHubUserKey } from './github-auth.js';
 import { toCacheScopeKey } from './cache-scope.js';
 import { getCommunityAnnotationScopeLock } from './scope-lock.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
 // ---------------------------------------------------------------- Paused here
 //
@@ -47,12 +48,10 @@ const HELD_ELSEWHERE = new Set(['LOCK_HELD', 'LOCK_VERIFY_FAILED', 'LOCK_LOST'])
 
 /** Scope keys paused in this tab. */
 const pausedScopes = new Set();
-const pauseListeners = new Set();
+const pauseListeners = createListenerSet('community annotation paused in this tab');
 
 function pauseChanged() {
-  for (const listener of [...pauseListeners]) {
-    try { listener(); } catch (error) { console.error('[community annotation] a pause listener failed', error); }
-  }
+  pauseListeners.notify();
 }
 
 /** Whether `error` is the scope lock saying another tab holds the scope. */
@@ -75,8 +74,7 @@ export function pauseAnnotationScopeHere(scopeKey) {
  * @param {() => void} listener
  */
 export function onAnnotationPauseChange(listener) {
-  pauseListeners.add(listener);
-  return () => pauseListeners.delete(listener);
+  return pauseListeners.add(listener);
 }
 
 /**

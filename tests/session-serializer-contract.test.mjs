@@ -16,8 +16,9 @@ import { createActionCatalog } from '../assets/js/app/actions/catalog.js';
 import { createActionDispatcher } from '../assets/js/app/actions/dispatcher.js';
 import { createDomainRegistry } from '../assets/js/app/actions/domains.js';
 import { createHistory } from '../assets/js/app/history/history.js';
-import { getNotificationCenter } from '../assets/js/app/notification-center.js';
-import { SessionSerializer } from '../assets/js/app/session/session-serializer.js';
+import { assertNewNotificationOptions, getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { SessionSerializer, describeUnrestored } from '../assets/js/app/session/session-serializer.js';
+import { CELL_TOTALS_DOING } from '../assets/js/app/state/managers/expression-values.js';
 import { SAVE_DEFAULTS, STATE_DEFAULTS } from '../assets/js/app/session/share-scope.js';
 import { openHistoryFile, readHistoryFileManifest } from '../assets/js/app/session/history-file.js';
 import { trimToPublishedDefault } from '../assets/js/app/session/published-default.js';
@@ -47,7 +48,7 @@ function selection(state) {
 /** The session-file progress entries and toasts, with Cancel on a progress entry. */
 async function withNotificationRecorder(run) {
   const notifications = getNotificationCenter();
-  const names = ['startDownload', 'updateDownload', 'completeDownload', 'failDownload', 'dismissDownload', 'error', 'success', 'info', 'warning', 'show', 'loading', 'dismiss'];
+  const names = ['startDownload', 'updateDownload', 'phaseDownload', 'completeDownload', 'failDownload', 'dismissDownload', 'error', 'success', 'info', 'warning', 'show', 'loading', 'dismiss'];
   const originals = new Map(names.map(name => [name, notifications[name]]));
   const events = [];
   const cancels = new Map();
@@ -59,6 +60,7 @@ async function withNotificationRecorder(run) {
     return id;
   };
   notifications.updateDownload = () => {};
+  notifications.phaseDownload = (id, doing) => events.push({ id, kind: 'phase', doing });
   notifications.completeDownload = (id, message) => events.push({ id, kind: 'complete', message });
   notifications.failDownload = (id, message) => events.push({ id, kind: 'fail', message });
   notifications.dismissDownload = id => events.push({ id, kind: 'dismiss' });
@@ -69,6 +71,8 @@ async function withNotificationRecorder(run) {
     return 'n';
   };
   notifications.show = options => {
+    // Refused as the real center refuses a new notice (a second load notice once carried `announce`).
+    assertNewNotificationOptions(options);
     events.push({ kind: 'ui-show', options });
     return 'n';
   };
@@ -91,7 +95,7 @@ function serializerWithColors(state, onRestore) {
   let colors = 'red';
   domains.provide('colors', {
     capture: () => colors,
-    restore: async (value, { signal }) => { await onRestore(value, signal); colors = value; },
+    restore: async (value, { signal, heavy }) => { await onRestore(value, signal, heavy); colors = value; },
   });
   domains.provide('highlights', { capture: () => ({ pages: state.highlightPages.length }), restore: () => {} });
   for (const id of domains.missing()) domains.provide(id, { capture: () => null, restore: () => {} });
@@ -187,10 +191,17 @@ test('trackers loaded beside the person\'s are offered back with one Undo, which
   let offer = null;
   await withNotificationRecorder(async recorded => {
     await loading.restoreFromBlob(blob);
-    offer = recorded.find(event => event.kind === 'ui-show' && event.options.action?.label === 'Undo')?.options ?? null;
+    // One notice announces the restore, names what it added and offers Undo (found 2026-11-10: a
+    // second notice said the same beside "Session fully restored."); the progress notice gives way to it.
+    assert.equal(recorded.filter(event => event.kind === 'complete').length, 0, 'the progress notice does not also complete');
+    assert.equal(recorded.filter(event => event.kind === 'dismiss').length, 1);
+    const shown = recorded.filter(event => event.kind === 'ui-show');
+    assert.equal(shown.length, 1, 'one notice');
+    offer = shown[0].options.action?.label === 'Undo' ? shown[0].options : null;
   });
   assert.ok(offer !== null, 'an Undo is offered');
-  assert.match(offer.message, /^Loaded "Tracker 1 \(shared\)" from .* beside yours\.$/);
+  assert.equal(offer.message, 'Session fully restored.');
+  assert.equal(offer.title, 'Loaded "Tracker 1 (shared)" beside yours');
   assert.equal(loading.history.trackers().length, 2);
   const said = [];
   await withNotificationRecorder(async recorded => {
@@ -384,18 +395,109 @@ test('a load that stops early releases the file it was reading', async () => {
     await assert.rejects(makeSerializer(makeDatasetState({ cellOrder: [5, 4, 3, 2, 1, 0], pages: emptyPages() })).restoreFromBlob(tracked), RangeError);
   });
   assert.deepEqual(sources, [{ cancelled: true }]);
-  // A value that cannot be put back once the eager chunks are read: the lazy ones are never read.
+  // Stopped once the eager chunks are read (Cancel while the head is put back): the lazy ones are never read.
   const twoTrackers = new TrackedBlob([await (await twoTrackerSession()).arrayBuffer()]);
-  const refusal = new Error('That colour cannot be put back');
-  const serializer = serializerWithColors(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }), value => {
-    if (value === 'blue') throw refusal;
+  let serializer;
+  serializer = serializerWithColors(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }), async value => {
+    // Not awaited here: the cancel settles once this restore has.
+    if (value === 'blue') void serializer.cancelRestore();
   });
   await withNotificationHarness(async () => {
-    await assert.rejects(serializer.restoreFromBlob(twoTrackers), error => error === refusal);
+    await assert.rejects(serializer.restoreFromBlob(twoTrackers), error => cancellationKind(error) === 'user');
   });
   assert.equal(sources.length, 2);
   assert.equal(sources[1].cancelled, true);
   assert.equal(serializer.colors(), 'red');
+});
+
+test('a value that cannot be put back is one part not restored (F155): the rest of the file is read and shown, the part named with its words under Details', async () => {
+  const blob = await twoTrackerSession();
+  const serializer = serializerWithColors(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }), value => {
+    if (value === 'blue') throw new Error('That color cannot be put back');
+  });
+  await withNotificationRecorder(async events => {
+    await serializer.restoreFromBlob(blob);
+    const shown = events.find(event => event.kind === 'ui-show');
+    assert.equal(shown.options.type, 'warning');
+    assert.equal(shown.options.message.startsWith('Session restored but for 1 part. Colors could not be restored: That color cannot be put back. It is left as it was shown.'), true, shown.options.message);
+    assert.match(shown.options.details, /^Colors: That color cannot be put back$/);
+    assert.equal(events.some(event => event.kind === 'complete'), false, 'never "fully restored"');
+  });
+  assert.equal(serializer.colors(), 'red', 'the part keeps what was shown');
+  const names = serializer.history.trackers().map(tracker => tracker.name);
+  assert.equal(names.filter(name => /Red|Blue/.test(name)).length >= 2, true, 'both trackers of the file are loaded');
+});
+
+test('a part another version wrote that this version cannot read is said as that, never as a problem inside Cellucid (F155)', async () => {
+  const blob = await twoTrackerSession();
+  const serializer = serializerWithColors(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }), value => {
+    // As the Expression values' owner refused `{normalise, log1p}` after the F149 rename.
+    if (value === 'blue') throw new TypeError('The colors to restore is exactly {name: string}');
+  });
+  // This page is a later release than the one that wrote the file.
+  serializer._version = () => '99.0.0';
+  await withNotificationRecorder(async events => {
+    await serializer.restoreFromBlob(blob);
+    const shown = events.find(event => event.kind === 'ui-show');
+    assert.match(shown.options.message, new RegExp(`Colors could not be restored: it was saved by an earlier version of Cellucid \\(${SESSION_TEST_VERSION.replaceAll('.', '\\.')}\\), and this version cannot read this part\\. It is left as it was shown\\.`));
+    assert.doesNotMatch(shown.options.message, /problem inside Cellucid/);
+    assert.match(shown.options.details, /exactly \{name: string\}/);
+  });
+  // Written by this very version, the same refusal is a problem inside Cellucid, its words under Details.
+  const same = serializerWithColors(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }), value => {
+    if (value === 'blue') throw new TypeError('The colors to restore is exactly {name: string}');
+  });
+  await withNotificationRecorder(async events => {
+    await same.restoreFromBlob(await twoTrackerSession());
+    const shown = events.find(event => event.kind === 'ui-show');
+    assert.match(shown.options.message, /Colors could not be restored: a problem inside Cellucid stopped it\. It is left as it was shown\./);
+  });
+});
+
+test('parts of the state this version does not have are said once, as left out, with the version that wrote them (F164)', () => {
+  const parts = [
+    { part: 'unknown-domain', domain: 'holograms' },
+    { part: 'unknown-domain', domain: 'sounds' },
+    { part: 'domain', domain: 'colors', error: new Error('That color cannot be put back') },
+  ];
+  const newer = describeUnrestored(parts, { other: { when: 'newer', version: '0.9.9' } });
+  assert.equal(newer.message, 'Session restored but for 3 parts. Parts of the state this version of Cellucid does not have ("holograms", "sounds") are left out: '
+    + 'it was saved by a newer version of Cellucid (0.9.9). Colors could not be restored: That color cannot be put back. It is left as it was shown.');
+  assert.equal(newer.details.split('\n')[0], 'State part "holograms": not a part of the state in this version of Cellucid; its changes are left out of every step.');
+  const view = describeUnrestored([parts[0]], { subject: 'Starting view' });
+  assert.equal(view.message, 'Starting view restored but for 1 part. A part of the state this version of Cellucid does not have ("holograms") is left out.');
+});
+
+test('heavy work a person\'s load finds is named on its progress line, in the words of the work, with its Cancel (F167)', async () => {
+  const totals = { ms: 20_000, bytes: 1e9, what: 'Sums all 3 genes of X once for each cell\'s total (normalized values)', doing: CELL_TOTALS_DOING };
+  const restoring = () => serializerWithColors(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }), async (value, signal, heavy) => {
+    if (value === 'blue') await heavy(totals);
+  });
+  // A session file, loaded by the person.
+  await withNotificationRecorder(async events => {
+    await restoring().restoreFromBlob(await twoTrackerSession());
+    const start = events.find(event => event.kind === 'start');
+    assert.deepEqual(events.filter(event => event.kind === 'phase'), [{ id: start.id, kind: 'phase', doing: 'Summing each cell\'s counts for normalized values…' }]);
+  });
+  // A saved state of this browser, loaded by the person: the same words on its own line.
+  const source = serializerWithColors(makeDatasetState({ cellOrder: IDENTITY_ORDER, pages: emptyPages() }), async () => {});
+  await source.history.startTracker({ name: 'Red' });
+  source.setColors('blue');
+  await source.history.startTracker({ name: 'Blue', start: 'shown' });
+  const saved = source.history.snapshot();
+  const values = new Map(source.history.pool.hashes().map(hash => [hash, source.history.pool.get(hash)]));
+  const header = (await openHistoryFile(await source.createSessionBundle(), { signal: null, onProgress: null })).manifest;
+  await withNotificationRecorder(async events => {
+    const asked = [];
+    await restoring().loadSavedHistory(async () => ({
+      header, content: 'history', stamps: { app: header.app },
+      readEager: async () => ({ history: saved, values }),
+      readRest: async () => ({ values: new Map(), chats: [], journals: [], params: [] }),
+      cancel: async () => {},
+    }), { label: 'Saved state', heavy: async estimate => { asked.push(estimate.what); } });
+    assert.deepEqual(events.filter(event => event.kind === 'phase').map(event => event.doing), [CELL_TOTALS_DOING]);
+    assert.deepEqual(asked, [totals.what], 'an agent\'s load is asked first, then names it');
+  });
 });
 
 test('Cancel stops a load mid-restore, puts back what was shown and says nothing more; a newer load supersedes silently', async () => {
@@ -568,8 +670,9 @@ test('a starting view is put back without a step, before the first tracker, on a
       signal: new AbortController().signal,
       refreshUi: ({ phase }) => { phases.push(phase); },
     });
-    // A sample's own view restores without a word.
-    assert.deepEqual(events.map(event => event.kind), ['start', 'dismiss']);
+    // A sample's own view restores without a word, and with no transfer line: it is a part of its
+    // dataset's opening, not a download ("Loading Starting view 0 B/s" at every start, round 9 close).
+    assert.deepEqual(events, []);
   });
   assert.deepEqual(phases, ['commit']);
   assert.equal(subsample.highlightPages[0].name, 'Starting page');

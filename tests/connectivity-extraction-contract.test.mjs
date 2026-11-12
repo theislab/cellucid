@@ -487,7 +487,7 @@ test('symmetry is checked entry by entry in one pass, in CSR and CSC, unsorted l
 });
 
 test('a self-loop is no edge: a unit diagonal (Seurat SNN) is left out, in dense, CSR and CSC alike', () => {
-  // Seurat's FindNeighbors counts each cell among its own neighbours: RNA_snn
+  // Seurat's FindNeighbors counts each cell among its own neighbors: RNA_snn
   // has 1 on its diagonal. The edges are the off-diagonal pairs.
   const withDiagonal = {
     format: 'csr',
@@ -519,7 +519,7 @@ function dense3(values) {
 }
 
 test('a graph read line by line gives the same edges as the graph held whole, one slab at a time', async () => {
-  // 40 cells on a ring with two neighbours each side, weights by distance; a unit diagonal.
+  // 40 cells on a ring with two neighbors each side, weights by distance; a unit diagonal.
   const n = 40;
   const rows = Array.from({ length: n }, (_, row) => [-2, -1, 0, 1, 2]
     .map(step => [(row + step + n) % n, step === 0 ? 1 : 1 / Math.abs(step)])

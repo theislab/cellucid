@@ -1,5 +1,5 @@
 /**
- * h5Seurat (SeuratDisk's own HDF5 layout of a Seurat object): recognised and
+ * h5Seurat (SeuratDisk's own HDF5 layout of a Seurat object): recognized and
  * refused with what to do (design decision D11: SeuratDisk is unmaintained
  * since 2023, and an `.rds` of the same object opens directly).
  *

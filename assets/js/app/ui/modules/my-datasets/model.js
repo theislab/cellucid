@@ -12,7 +12,7 @@
  */
 
 import { describeStorageFormat } from '../dataset-card.js';
-import { formatAgo } from '../state/model.js';
+import { formatAgo, savedStateWords } from '../state/model.js';
 import { formatWhen } from '../../../history/exports/report.js';
 import { describeSubsampleMethod } from '../../../../data/subsample.js';
 import { getProviderRegistry } from '../../../../data/sources/registry.js';
@@ -214,7 +214,7 @@ export function describeRowMeta(entry, saved) {
 export function describeSavedStateLine(state, now) {
   const trackers = state.trackers?.length ?? 0;
   return [
-    state.kind === 'named' ? `"${state.name}"` : 'Autosave',
+    savedStateWords(state),
     formatCountOf(state.steps, 'step'),
     trackers > 1 ? `${formatCountOf(trackers, 'tracker')} (${state.trackers.map(tracker => tracker.name).join(', ')})` : null,
     `${state.kind === 'named' ? 'saved' : 'changed'} ${formatAgo(state.updatedAt, now).long}`,

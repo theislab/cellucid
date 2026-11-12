@@ -8,7 +8,7 @@
 
 import { createElement } from '../../../../utils/dom-utils.js';
 import { showFigureExportModal } from './modal.js';
-import { onAbort } from '../../../../../utils/abort.js';
+import { onAbort, requireSignalOrNull } from '../../../../../utils/abort.js';
 
 /**
  * @typedef {object} ExportFidelityWarning
@@ -34,19 +34,7 @@ export function confirmExportFidelityWarnings({
   if (typeof heading !== 'string' || heading.trim().length === 0) {
     throw new TypeError('Figure export fidelity heading must be a non-empty string.');
   }
-  if (
-    signal !== null &&
-    (
-      typeof signal !== 'object' ||
-      typeof signal.aborted !== 'boolean' ||
-      typeof signal.addEventListener !== 'function' ||
-      typeof signal.removeEventListener !== 'function'
-    )
-  ) {
-    throw new TypeError(
-      'Figure export fidelity signal must be null or an AbortSignal.'
-    );
-  }
+  requireSignalOrNull(signal, 'Figure export fidelity signal');
   warnings.forEach((warning, index) => {
     if (
       warning === null ||

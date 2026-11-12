@@ -238,7 +238,7 @@ export function anndataZarrZip({ cells, genes = [], X = null, obs = {}, obsm = {
 }
 
 /**
- * Fulfil one request for a file as a web host serving it does: `HEAD` with
+ * Fulfill one request for a file as a web host serving it does: `HEAD` with
  * its size, a `Range` with 206 and that range, anything else with the whole
  * file.
  */

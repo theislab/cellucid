@@ -23,7 +23,7 @@
  *   original position, `originals[i]`, or `i` when `originals` is null (every
  *   cell open, in file order). This is every other opening: a file Cellucid
  *   did not write, opened whole, takes the default seed (in its cell order
- *   too); a `blocks` subsample, which opens whole runs of neighbours in their
+ *   too); a `blocks` subsample, which opens whole runs of neighbors in their
  *   run order, takes its own seed, so its levels of detail are a uniform
  *   sample of its cells and not of its runs; so does a share opened in the
  *   file's cell order (its cells in whole blocks) or, on a priority-ordered

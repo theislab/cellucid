@@ -20,6 +20,7 @@
  */
 
 import { parseCanonicalGitHubRepositoryReference } from './github-reference.js';
+import { webStorage } from '../../utils/web-storage.js';
 
 const CACHE_ROOT_PREFIX = 'cellucid:community-annotations:cache:';
 
@@ -123,8 +124,7 @@ const RETIRED_FILE_SHA_INDEX_SUFFIX = ':files:shas';
 export function removeRetiredFileShaIndexes(storage = undefined) {
   const retired = [];
   try {
-    // Reading localStorage itself throws where site data is blocked.
-    storage = storage === undefined ? globalThis.localStorage : storage;
+    storage = storage === undefined ? webStorage('localStorage') : storage;
     if (!storage) return 0;
     for (let index = 0; index < storage.length; index++) {
       const key = storage.key(index);

@@ -50,17 +50,41 @@ export function authorizeUrl({ clientId, redirectUri = CLAUDE_REDIRECT, challeng
   return url.href;
 }
 
-/** Start an authorization; returns the page and the connect code and page secret it shows. */
-export async function startAuthorization(worker, env, options) {
-  const response = await send(worker, env, authorizeUrl(options));
+export const APPROVER_COOKIE = '__Host-cellucid-approver';
+
+/**
+ * Start an authorization in a browser: `cookie` is the approver cookie that
+ * browser holds already (null: none). Returns the page, the connect code and
+ * page secret it shows, and the cookie the browser then holds (`cookie`:
+ * `name=value`, as its requests to the relay carry it).
+ */
+export async function startAuthorization(worker, env, { cookie = null, ...options }) {
+  const response = await send(worker, env, authorizeUrl(options), cookie === null ? {} : { headers: { Cookie: cookie } });
   const html = await response.text();
   const code = /data-code="([^"]+)"/.exec(html)?.[1] ?? null;
   const request = /data-request="([^"]+)"/.exec(html)?.[1] ?? null;
-  return { response, html, code, request };
+  const set = response.headers.get('Set-Cookie');
+  return { response, html, code, request, setCookie: set, cookie: set === null ? cookie : set.split(';')[0] };
+}
+
+/**
+ * Claim `code` as a Cellucid page of a browser does: `POST /oauth/claim`
+ * from `origin` with the tab secret, carrying `cookie` (the browser's
+ * approver cookie, or null). Returns the relay's `{ok, value|error}` (a
+ * socket reply's shape) with the HTTP `status` and `response`; a request
+ * refused before the approval is asked (4xx) as `{ok: false, error}`.
+ */
+export async function claimCode(worker, env, { code, secret = tabSecret(1), cookie = null, origin = APP_ORIGIN }) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (origin !== null) headers.Origin = origin;
+  if (cookie !== null) headers.Cookie = cookie;
+  const response = await send(worker, env, '/oauth/claim', { method: 'POST', headers, body: JSON.stringify({ code, secret }) });
+  const body = await response.json();
+  return response.ok ? { ...body, status: response.status, response } : { ok: false, status: response.status, error: body, response };
 }
 
 /** Open a tab's socket; resolves once the relay welcomed it. */
-export async function connectTab(worker, env, { secret = tabSecret(1), origin = APP_ORIGIN, protocol = 'cellucid-relay.1' } = {}) {
+export async function connectTab(worker, env, { secret = tabSecret(1), origin = APP_ORIGIN, protocol = 'cellucid-relay.2' } = {}) {
   const response = await send(worker, env, '/tab', {
     headers: { Upgrade: 'websocket', Origin: origin, 'Sec-WebSocket-Protocol': `${protocol}, cellucid-secret.${secret}` },
   });
@@ -71,7 +95,7 @@ export async function connectTab(worker, env, { secret = tabSecret(1), origin = 
 }
 
 let nextRef = 1;
-/** Send a tab request (claim, decide, connections, …) and wait for its reply. */
+/** Send a tab request (decide, connections, …) and wait for its reply. */
 export async function tabRequest(socket, message) {
   const ref = nextRef++;
   socket.send(JSON.stringify({ ...message, ref }));
@@ -109,10 +133,11 @@ export async function exchange(worker, env, fields) {
 export async function connectAgent(worker, env, { clientId = null, redirectUri = CLAUDE_REDIRECT, secret = tabSecret(1), tab = null } = {}) {
   const client = clientId ?? await register(worker, env, { redirectUris: [redirectUri] });
   const { verifier, challenge } = await pkce();
+  // The waiting page and the tab are in one browser: the claim carries the cookie the page set.
   const started = await startAuthorization(worker, env, { clientId: client, redirectUri, challenge });
   assert.equal(started.response.status, 200, started.html);
   const connected = tab ?? await connectTab(worker, env, { secret });
-  const claimed = await tabRequest(connected.socket, { type: 'claim', code: started.code });
+  const claimed = await claimCode(worker, env, { code: started.code, secret, cookie: started.cookie });
   assert.equal(claimed.ok, true, JSON.stringify(claimed));
   const decided = await tabRequest(connected.socket, { type: 'decide', code: started.code, allow: true });
   assert.equal(decided.ok, true, JSON.stringify(decided));

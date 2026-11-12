@@ -95,7 +95,10 @@ test('a sidebar panel undocks and docks from the keyboard, and still from the po
   await expect(undockButton).toBeFocused();
   await page.keyboard.press('Enter');
 
-  expect(await panelFloatingState(page)).toEqual({
+  // The key's undock is an action, applied in its turn: waited for, as the
+  // dock below is (read at once, the panel was still docked: Windows Firefox,
+  // nightly run 43141748516).
+  await expect.poll(() => panelFloatingState(page)).toEqual({
     floating: true,
     parentId: 'floating-panels-root',
   });
@@ -284,7 +287,7 @@ test('the category builder can be filled, reordered and confirmed from the keybo
   await page.keyboard.press('ArrowDown');
   await page.keyboard.press('Escape');
   await expect.poll(() => droppedLabels(page)).toEqual(['Page 2', 'Page 3', 'Page 1']);
-  expect(await liveRegionText(page)).toContain('Move cancelled');
+  expect(await liveRegionText(page)).toContain('Move canceled');
   expect(
     await page.evaluate(() =>
       document.querySelectorAll(
@@ -389,7 +392,7 @@ test('a legend category merges into another from the keyboard, and still by drag
   await expect.poll(() => liveRegionText(page)).toContain('Destination 2 of 2: gamma');
 
   await page.keyboard.press('Escape');
-  await expect.poll(() => liveRegionText(page)).toContain('Move cancelled');
+  await expect.poll(() => liveRegionText(page)).toContain('Move canceled');
   expect(
     await page.evaluate(() =>
       document.querySelectorAll(
@@ -406,20 +409,22 @@ test('a legend category merges into another from the keyboard, and still by drag
   const dialog = page.locator('.confirm-dialog');
   await expect(dialog).toContainText('Merge category "alpha" into "beta"?');
   await page.getByRole('button', { name: 'Merge', exact: true }).click();
-  /* The merge is an action: the legend is drawn again when it has run. */
+  /* The merge is an action: the legend is drawn again when it has run. The
+     rows keep the field's own order (F124): the merged category takes the
+     place of the one it was merged into. */
   await expect.poll(() => legendCategoryNames(page)).toEqual([
-    'gamma',
-    'merged alpha + beta'
+    'merged alpha + beta',
+    'gamma'
   ]);
 
   /* And the drag that was the only way in still works. */
   const remaining = page.locator('#legend .legend-item');
   await dispatchAppDrag(
-    remaining.nth(0).locator('.legend-label'),
-    remaining.nth(1),
+    remaining.nth(1).locator('.legend-label'),
+    remaining.nth(0),
     { expectedDataType: 'application/x-cellucid-category' }
   );
-  await expect(dialog).toContainText('Merge category "gamma" into');
+  await expect(dialog).toContainText('Merge category "gamma" into "merged alpha + beta"?');
   await page.getByRole('button', { name: 'Merge', exact: true }).click();
   await expect(page.locator('#legend .legend-item')).toHaveCount(1);
 

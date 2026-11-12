@@ -4,7 +4,7 @@
  * then jumps far back and forward that must give each fingerprint back
  * exactly. They drive the page's own history and dispatcher, so they hold for
  * any history implementation that keeps `window._cellucidHistories` and the
- * catalogue's actions.
+ * catalog's actions.
  */
 
 /**
@@ -106,10 +106,14 @@ export function camera(page, degrees) {
   }, degrees);
 }
 
-/** A run of 30 steps over the current-ui fixture that touches every kind of state. */
+/**
+ * A run of 30 steps over the current-ui fixture that touches every kind of
+ * state. The fixture opens colored by cell_type (its first coloring, part
+ * of the opening), so the run starts with a change of that coloring.
+ */
 export async function mixedRun(page) {
   return [
-    ['color.by', { field: CELL_TYPE }],
+    ['color.category', { field: CELL_TYPE, category: 'beta', color: '#654321' }],
     ['filter.category.visibility', { field: CELL_TYPE, categories: ['gamma'], visible: false }],
     ['category.rename', { field: CELL_TYPE, category: 'alpha', name: 'A' }],
     ['field.duplicate', { field: CELL_TYPE, name: 'copy' }],

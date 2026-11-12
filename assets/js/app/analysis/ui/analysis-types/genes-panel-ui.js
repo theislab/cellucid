@@ -27,23 +27,23 @@ import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
 import { DEFAULTS } from '../../genes-panel/constants.js';
 import { MARKER_OPTIONS } from '../../options/marker-options.js';
-import { defineOptions } from '../../options/option-schema.js';
-import { renderOptionsForm } from '../../options/render-options-form.js';
 import { HEATMAP_VIEW_CHOICES, HEATMAP_VIEW_KEYS, HEATMAP_VIEW_SWITCHES, MARKER_SHOW_CHOICES } from '../../options/analysis-views.js';
 import { listNames, namedError, quoteName } from '../../../actions/targets/names.js';
 import { countGeneFamilies, formatGmt, geneIdentities } from '../../shared/gene-sets.js';
-import { createSegmented } from '../../../ui/components/controls.js';
+import { buttonClassName, createSegmented } from '../../../ui/components/controls.js';
 import {
   createResultEnvelope,
   readResultEnvelope,
   requireDatasetGenes,
   requireDatasetVariable
 } from '../../shared/analysis-result-session.js';
-import { formatBytes, formatDuration, formatCount, formatCountOf } from '../../../../utils/format-units.js';
+import { formatBytes, formatDuration, formatCount, formatCountOf, formatPValue } from '../../../../utils/format-units.js';
 import { MARKER_RESULT_BYTES_PER_GROUP_GENE } from '../../genes-panel/marker-discovery-engine.js';
 import { residencyBudgetBytes } from '../../../../data/memory-budget.js';
-import { failureText } from '../../../../utils/errors.js';
+import { failureDetails, sayFailure } from '../../../../utils/errors.js';
 import { GENES_READ_PLACE } from '../../../../data/gene-read-plan.js';
+import { describeValues, isValuesRecord, transformWords } from '../../../../data/expression-transform.js';
+import { copyText } from '../../../utils/clipboard.js';
 
 /** A marker group in a session: its category, by value. */
 const GROUP_KEY_PREFIX = 'category:';
@@ -61,15 +61,6 @@ const METHOD_NAMES = Object.freeze({
   ttest_overestim_var: 't-test (overestimated variance)'
 });
 const CORRECTION_NAMES = Object.freeze({ bh: 'BH', bonferroni: 'Bonferroni' });
-
-/** The display options, as their own small form for the expanded view. */
-const DISPLAY_OPTIONS = defineOptions({
-  id: 'genesPanelDisplay',
-  groups: [],
-  options: MARKER_OPTIONS.entries
-    .filter(entry => MARKER_DISPLAY_KEYS.includes(entry.key))
-    .map(entry => ({ ...entry, group: 'essentials' }))
-});
 
 /**
  * The groups a marker run skipped, as its chip and notification say them:
@@ -172,7 +163,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   _getOptionsContext() {
     const categoricalFields = this.dataLayer.getAvailableVariables('categorical_obs')
       .filter(variable => (variable.categoryCount ?? variable.categories?.length ?? 2) >= 2)
-      .map(variable => ({ key: variable.key }));
+      .map(variable => ({ key: variable.key, categoryCount: variable.categoryCount ?? variable.categories?.length ?? null }));
     const genes = this.dataLayer.getAvailableVariables('gene_expression');
     if (this._familyCounts?.of !== genes) {
       this._familyCounts = { of: genes, counts: countGeneFamilies(genes.map(gene => gene.key)) };
@@ -189,6 +180,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     };
     return {
       categoricalFields,
+      colorField: this.dataLayer.getColoringCategoricalField(),
       groupsFor: (entry, record) => groupsOf(record),
       // While the field's categories are read, a saved group is kept, not refused.
       groupsKnown: record => {
@@ -246,7 +238,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       .catch(error => {
         if (this._isDestroyed || this._groupState.pending !== key) return;
         this._groupState = { key, described: null, pending: null, error };
-        this._notifications.error(`Marker genes groups: ${failureText(error)}`, { category: 'analysis' });
+        this._notifications.error(`Marker genes groups: ${sayFailure(error)}`, { ...failureDetails(error), category: 'analysis' });
         this._refreshOptionsContext();
       });
   }
@@ -319,6 +311,11 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     return this._controller;
   }
 
+  /** Every run reads genes (every gene it tests, whatever its options name). @override */
+  _readsGenes() {
+    return true;
+  }
+
   /** @override */
   _takesCellSample() {
     return true;
@@ -360,7 +357,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     return {
       type: 'genes_panel',
       plotType: 'gene-heatmap',
-      data: { matrix, clustering },
+      // `values`: what the heatmap's means are in (the run's, `metadata.values`).
+      data: { matrix, clustering, values: metadata.values ?? null },
       stats,
       selection,
       options: {
@@ -418,7 +416,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       }
       container.replaceChildren(header, this._renderRankedPreview(result));
       container.hidden = false;
-      this._renderPreviewExpandAction();
+      this._renderPreviewExpandAction(result);
       return container;
     }
     await import('../../plots/types/gene-heatmap.js');
@@ -456,7 +454,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       METHOD_NAMES[metadata.method],
       CORRECTION_NAMES[metadata.correction],
       formatCountOf(metadata.geneCount, 'gene'),
-      ...(metadata.matrix === 'mapped' ? [] : [metadata.matrixLabel])
+      ...(metadata.matrix === 'mapped' ? [] : [metadata.matrixLabel]),
+      ...(metadata.values == null ? [] : [transformWords(metadata.values)])
     ].join(' · ');
     header.appendChild(line);
 
@@ -484,7 +483,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       const cached = chip('Cached', 'The same run was answered from memory');
       const recompute = document.createElement('button');
       recompute.type = 'button';
-      recompute.className = 'analysis-link-btn';
+      recompute.className = buttonClassName('quiet');
       recompute.textContent = 'Recompute';
       recompute.addEventListener('click', () => {
         this._controller?.clearCache();
@@ -516,7 +515,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     const sendButton = (label, mode, presetOf) => {
       const button = document.createElement('button');
       button.type = 'button';
-      button.className = 'analysis-link-btn';
+      button.className = buttonClassName('quiet');
       button.textContent = label;
       button.addEventListener('click', () => {
         const preset = presetOf();
@@ -543,17 +542,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     list.className = 'marker-ranked-preview';
     const tested = selection.groups.filter(entry => entry.group.tested);
     if (selection.shownGenes.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'empty-state';
-      const genesTested = Math.max(0, ...stats.genesTestedByGroup);
-      empty.textContent = `No genes pass the filters (${formatCountOf(genesTested, 'gene')} tested in ${formatCountOf(metadata.testedCount, 'group')}).`;
-      const relax = document.createElement('button');
-      relax.type = 'button';
-      relax.className = 'analysis-link-btn';
-      relax.textContent = 'Relax filters';
-      relax.addEventListener('click', () => this._relaxFilters());
-      empty.appendChild(relax);
-      list.appendChild(empty);
+      list.appendChild(this._noGenesPass(result));
       return list;
     }
     for (const { group, markers, passing } of tested) {
@@ -583,6 +572,26 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     return list;
   }
 
+  /**
+   * No gene passes the filters: how many were tested, and Relax filters. The
+   * one empty state of a result, in the panel and in the expanded view (it
+   * said there only "No genes pass the filters.", with no way on: R9E-11).
+   */
+  _noGenesPass(result) {
+    const { stats, metadata } = result;
+    const empty = document.createElement('div');
+    empty.className = 'empty-state';
+    const genesTested = Math.max(0, ...stats.genesTestedByGroup);
+    empty.textContent = `No genes pass the filters (${formatCountOf(genesTested, 'gene')} tested in ${formatCountOf(metadata.testedCount, 'group')}).`;
+    const relax = document.createElement('button');
+    relax.type = 'button';
+    relax.className = buttonClassName('quiet');
+    relax.textContent = 'Relax filters';
+    relax.addEventListener('click', () => this._relaxFilters());
+    empty.appendChild(relax);
+    return empty;
+  }
+
   /** Show every tested gene ranked by score: the filters that hid them relaxed. */
   _relaxFilters() {
     const before = this._requireOptions();
@@ -602,31 +611,20 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     const plotDef = PlotRegistry.get(result.plotType);
     if (!plotDef) throw new RangeError(`Unknown plot type: ${result.plotType}`);
     const merged = PlotRegistry.mergeOptions(result.plotType, result.options || {});
+    // No gene passes: the panel's own empty state, Relax filters included.
+    if (result.data.matrix === null) {
+      return slot.render({
+        render: candidate => {
+          candidate.replaceChildren(this._noGenesPass(result));
+          return null;
+        },
+        onRendered: () => {}
+      }, { isCurrent });
+    }
     return slot.render({
       render: candidate => plotDef.render(result.data, merged, candidate, null),
       onRendered: candidate => this._setupHoverContext(candidate, result)
     }, { isCurrent });
-  }
-
-  /** The heatmap's look, and the display options (filters, ranking). */
-  _renderModalOptions(container) {
-    super._renderModalOptions(container);
-    if (this._options === null) return;
-    const form = renderOptionsForm({
-      schema: DISPLAY_OPTIONS,
-      value: markerDisplayOf(this._options),
-      context: {},
-      onChange: (record, key) => {
-        const before = this._requireOptions();
-        this._options = { ...this._options, ...record };
-        this._optionsForm?.setValue(this._options);
-        this._handleOptionsChanged(key);
-        // The display options are the analysis's options: a step, as in the panel.
-        this._recordOptionsChange(before);
-      }
-    });
-    form.root.classList.add('marker-modal-display');
-    container.prepend(form.root);
   }
 
   /** Heatmap options; clustering ones re-cluster, the rest re-draw. */
@@ -671,6 +669,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     if (metadata.method === 'wilcox') addRow('p-values', P_CONVENTION_NAMES[metadata.pConvention]);
     addRow('Multiple testing', CORRECTION_NAMES[metadata.correction]);
     addRow('Expression matrix', metadata.matrixLabel);
+    addRow('Values', describeValues(metadata.values, { counts: metadata.counts }));
     addRow('Fold change', metadata.foldChange.mode === 'log1p' ? 'Undo log1p' : 'As stored');
     addRow('Genes tested', formatCount(metadata.geneCount));
     addRow('Duration', metadata.cached ? 'Cached' : formatDuration(metadata.durationMs));
@@ -713,20 +712,25 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
 
     const copy = document.createElement('button');
     copy.type = 'button';
-    copy.className = 'analysis-link-btn';
+    copy.className = buttonClassName('quiet');
     copy.textContent = 'Copy genes';
     copy.addEventListener('click', () => {
-      void navigator.clipboard?.writeText(shown.map(i => stats.genes[i]).join('\n'));
+      // Said either way (it was silent, copied or not).
+      void copyText(shown.map(i => stats.genes[i]).join('\n'), {
+        what: formatCountOf(shown.length, 'gene'),
+        success: `Copied ${formatCountOf(shown.length, 'gene')}.`,
+        category: 'analysis',
+      });
     });
     const allCsv = document.createElement('button');
     allCsv.type = 'button';
-    allCsv.className = 'analysis-link-btn';
+    allCsv.className = buttonClassName('quiet');
     allCsv.textContent = 'All genes CSV';
     allCsv.title = 'Every gene of every group, with scanpy rank_genes_groups_df column names';
     allCsv.addEventListener('click', () => this._trackInteractiveTask(this._exportAllGenesCSV(), 'CSV export'));
     const gmt = document.createElement('button');
     gmt.type = 'button';
-    gmt.className = 'analysis-link-btn';
+    gmt.className = buttonClassName('quiet');
     gmt.textContent = 'GMT';
     gmt.title = 'The shown markers of each group as gene sets';
     gmt.addEventListener('click', () => this._trackInteractiveTask(this._exportGMT(), 'GMT export'));
@@ -757,7 +761,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     const format = (value, digits) => {
       if (typeof value === 'string') return value;
       if (!Number.isFinite(value)) return '—';
-      if (digits === 'p') return value.toExponential(2);
+      if (digits === 'p') return formatPValue(value);
       return value.toFixed(digits);
     };
     const renderRows = () => {
@@ -809,10 +813,14 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
   // Exports
   // ===========================================================================
 
-  /** The shown markers: one line per group and marker, scanpy's column names. */
-  _exportModalCSV() {
+  /**
+   * The shown markers: one line per group and marker, scanpy's column names;
+   * with `all`, every gene of every group (the All genes CSV).
+   */
+  async tableFile({ all = false } = {}) {
+    if (all) return this._allGenesFile();
     const result = this._lastResult;
-    if (!result?.selection) return;
+    if (!result?.selection) return null;
     // Genes by identifier, the shown name beside it (`geneNameColumns`).
     const { idOf } = geneIdentities(this.dataLayer.state?.varData);
     const shown = result.selection.groups.flatMap(({ markers }) => markers.map(marker => marker.gene));
@@ -836,45 +844,51 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
         ].join(','));
       }
     }
-    downloadCSV(lines.join('\n'), 'marker_genes', this._notifications);
+    return { name: 'marker_genes', csv: lines.join('\n') };
   }
 
-  /** Every gene of every group (long), written by the analysis workers. */
+  /** The All genes CSV button: every gene of every group. */
   async _exportAllGenesCSV() {
     if (await this._refuseStaleExport('CSV')) return;
-    const stats = this._lastResult?.stats;
-    if (!stats) return;
     try {
-      // The lanes move to the worker as copies; the groups not tested share
-      // one lane of each statistic, copied once.
-      const copies = new Map();
-      const copied = lanes => lanes.map(lane => {
-        if (!copies.has(lane)) copies.set(lane, lane.slice());
-        return copies.get(lane);
-      });
-      const { rows } = await getComputeManager().execute(
-        OperationType.COMPUTE_CSV_EXPORT,
-        {
-          layout: 'marker-statistics',
-          markers: {
-            genes: stats.genes,
-            ids: stats.genes.map(gene => geneIdentities(this.dataLayer.state?.varData).idOf(gene)),
-            groups: stats.groups.map(group => ({ name: String(group.groupName), tested: group.tested, small: group.small })),
-            scores: copied(stats.scoresByGroup),
-            logfoldchanges: copied(stats.log2FoldChangeByGroup),
-            pvals: copied(stats.pValuesByGroup),
-            pvalsAdj: copied(stats.adjustedPValuesByGroup),
-            pctIn: copied(stats.pctInByGroup),
-            pctRef: copied(stats.pctRefByGroup),
-            auroc: copied(stats.aurocByGroup)
-          }
-        },
-        { transfer: true }
-      );
-      downloadCSV(rows, 'marker_genes_all', this._notifications);
+      const file = await this._allGenesFile();
+      if (file !== null) downloadCSV(file.csv, file.name, this._notifications);
     } catch (error) {
-      this._notifications.error(`CSV export failed: ${failureText(error)}`, { category: 'download' });
+      this._notifications.error(`CSV export failed: ${sayFailure(error)}`, { ...failureDetails(error), category: 'download' });
     }
+  }
+
+  /** Every gene of every group (long), written by the analysis workers; null with no result. */
+  async _allGenesFile() {
+    const stats = this._lastResult?.stats;
+    if (!stats) return null;
+    // The lanes move to the worker as copies; the groups not tested share
+    // one lane of each statistic, copied once.
+    const copies = new Map();
+    const copied = lanes => lanes.map(lane => {
+      if (!copies.has(lane)) copies.set(lane, lane.slice());
+      return copies.get(lane);
+    });
+    const { rows } = await getComputeManager().execute(
+      OperationType.COMPUTE_CSV_EXPORT,
+      {
+        layout: 'marker-statistics',
+        markers: {
+          genes: stats.genes,
+          ids: stats.genes.map(gene => geneIdentities(this.dataLayer.state?.varData).idOf(gene)),
+          groups: stats.groups.map(group => ({ name: String(group.groupName), tested: group.tested, small: group.small })),
+          scores: copied(stats.scoresByGroup),
+          logfoldchanges: copied(stats.log2FoldChangeByGroup),
+          pvals: copied(stats.pValuesByGroup),
+          pvalsAdj: copied(stats.adjustedPValuesByGroup),
+          pctIn: copied(stats.pctInByGroup),
+          pctRef: copied(stats.pctRefByGroup),
+          auroc: copied(stats.aurocByGroup)
+        }
+      },
+      { transfer: true }
+    );
+    return { name: 'marker_genes_all', csv: rows };
   }
 
   /** The shown markers of each group as a GMT file. */
@@ -893,7 +907,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
         'marker_genes.gmt'
       );
     } catch (error) {
-      this._notifications.error(`GMT export failed: ${failureText(error)}`, { category: 'download' });
+      this._notifications.error(`GMT export failed: ${sayFailure(error)}`, { ...failureDetails(error), category: 'download' });
     }
   }
 
@@ -1000,7 +1014,7 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
       heatmap === null || typeof heatmap !== 'object' ||
       Object.keys(heatmap).sort().join(',') !== 'clusterCols,clusterRows,colorscale,distance,linkage,transform'
     ) {
-      throw new TypeError('Marker genes view heatmap must hold its transform, colours and clustering');
+      throw new TypeError('Marker genes view heatmap must hold its transform, colors and clustering');
     }
     this._show = view.show;
     this._selectedGroupId = view.selectedGroupId;
@@ -1103,7 +1117,35 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     return {
       columns: ['group', 'rank', 'gene', 'score', 'log2_fold_change', 'p_adjusted', 'percent_in_group', 'percent_rest', 'auroc'],
       rows,
-      total
+      total,
+      about: this._resultAbout(result, top)
+    };
+  }
+
+  /**
+   * How the markers were tested, as the expanded view's Statistics say it,
+   * with each tested group's cells (an agent weighed "a marker of 23
+   * cells" without knowing it was 23) and what each group is compared with.
+   */
+  _resultAbout(result, top) {
+    const metadata = result?.metadata;
+    const groups = result?.stats?.groups;
+    if (!metadata || !Array.isArray(groups)) return null;
+    const reference = groups.find(group => group.reference) ?? null;
+    return {
+      group_by: metadata.groupBy,
+      cells_per_group: groups.filter(group => group.tested).map(group => ({ name: String(group.groupName), cells: group.cellCount })),
+      compared_with: reference === null
+        ? 'the rest: the run\'s other cells (Rest includes)'
+        : `${String(reference.groupName)} (${formatCountOf(reference.cellCount, 'cell')})`,
+      groups_tested: `${metadata.testedCount} of ${metadata.groupCount}`,
+      test: `${METHOD_NAMES[metadata.method]}, cells as observations${metadata.method === 'wilcox' ? ` (${P_CONVENTION_NAMES[metadata.pConvention]})` : ''}`,
+      multiple_testing: metadata.correction === 'bh' ? 'Benjamini–Hochberg' : 'Bonferroni',
+      expression_matrix: metadata.matrixLabel,
+      values: describeValues(metadata.values, { counts: metadata.counts }),
+      fold_change: metadata.foldChange.mode === 'log1p' ? 'of the means after undoing log1p' : 'of the means as stored (log2 of their ratio; of log-scale values, such as log1p, a ratio of means is no fold change of expression)',
+      genes_tested: metadata.geneCount,
+      rows: `each group's top ${top} shown markers, best first (its filters and Rank by): top counts each group`
     };
   }
 
@@ -1137,7 +1179,8 @@ export class GenesPanelUI extends FormBasedAnalysisUI {
     if (
       !Array.isArray(stats?.groups) || !Array.isArray(stats.genes) ||
       typeof metadata?.groupBy !== 'string' || typeof metadata.matrix !== 'string' ||
-      typeof metadata.matrixLabel !== 'string'
+      typeof metadata.matrixLabel !== 'string' || typeof metadata.counts !== 'boolean' ||
+      !isValuesRecord(metadata.values)
     ) {
       throw new TypeError('A marker genes result must hold its statistics and metadata');
     }

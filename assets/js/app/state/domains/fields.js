@@ -5,7 +5,7 @@
  * key, `_originalKey`, whatever it is shown as after a rename), or, for a
  * field the person or a notebook made, `{source, user}` with its id
  * (`_userDefinedId`, kept by the `field-overlays` domain). So renaming a field
- * changes the `field-overlays` value only: the filters, colours and active
+ * changes the `field-overlays` value only: the filters, colors and active
  * field that name it are unchanged, and a rename undone or redone leaves them
  * alone. Never a position: a field's index moves when the inventory does.
  *
@@ -13,7 +13,8 @@
  */
 
 import { abortReason, awaitWithSignal, onAbort, throwIfAborted } from '../../../utils/abort.js';
-import { categoryLabel, listNames, namedError, quoteName } from '../../actions/targets/names.js';
+import { categoryDisplayName, listNames, namedError, quoteName } from '../../actions/targets/names.js';
+import { upperFirst } from '../../../utils/text-case.js';
 
 /**
  * @param {object} field
@@ -147,13 +148,13 @@ export function whenGenesListed(state, signal = null) {
  * @param {object} state
  * @param {object} ref
  * @param {object} cache
- * @param {string} what - What needed it ("a filter", "the colours")
+ * @param {string} what - What needed it ("a filter", "the colors")
  */
 export function requireField(state, ref, cache, what) {
   const found = findField(state, ref, cache);
   if (found === null) {
     const name = ref.key ?? ref.user;
-    throw namedError(RangeError, `${what[0].toUpperCase()}${what.slice(1)} names the ${ref.source} field ${quoteName(name)}, which this dataset does not have now.`);
+    throw namedError(RangeError, `${upperFirst(what)} names the ${ref.source} field ${quoteName(name)}, which this dataset does not have now.`);
   }
   return found;
 }
@@ -185,15 +186,15 @@ export function categoryPlaces(field) {
  * @param {object} field - a categorical field, loaded
  * @param {Map<string|boolean, number>} places - `categoryPlaces(field)`
  * @param {Iterable<string|boolean>} labels
- * @param {string} what - What names them ("A filter", "A colour")
+ * @param {string} what - What names them ("A filter", "A color")
  */
 export function requireCategoriesOf(field, places, labels, what) {
   if (field.discovered === true) return;
   for (const label of labels) {
     if (places.has(label)) continue;
     throw namedError(RangeError,
-      `${what} names the category ${quoteName(categoryLabel(label))}, which ${quoteName(field.key)} no longer has; `
-      + `its categories are ${listNames([...places.keys()].map(categoryLabel))}.`,
+      `${what} names the category ${quoteName(categoryDisplayName(label))}, which ${quoteName(field.key)} no longer has; `
+      + `its categories are ${listNames([...places.keys()].map(categoryDisplayName))}.`,
     );
   }
 }

@@ -11,9 +11,9 @@
  * anything to do about it, and the second does not even distinguish "never
  * arrived" from "arrived unusable". Four things are held here:
  *
- *   - `NaN` stays drawable and an infinity does not, because `NaN` has a colour
- *     (the neutral grey that means "not measured") and an infinity has no
- *     position on any scale and makes every other cell one colour;
+ *   - `NaN` stays drawable and an infinity does not, because `NaN` has a color
+ *     (the neutral gray that means "not measured") and an infinity has no
+ *     position on any scale and makes every other cell one color;
  *   - the refusal counts every offending value in the pass that was already
  *     being made, rather than reporting the first one and stopping;
  *   - a gene and an observation column get different remedies, because they come
@@ -50,7 +50,7 @@ function tallyOf(values) {
 
 // `varFields` is the live variable-field array the state object owns. A field is
 // a gene because it is in that array, not because a gene happens to be the
-// colour source at the time -- see `describeContinuousFieldSubject`.
+// color source at the time -- see `describeContinuousFieldSubject`.
 function makeColorOwner(values, activeFieldSource, varFields = []) {
   const owner = Object.create(DataStateColorMethods.prototype);
   owner.pointCount = values.length;
@@ -160,13 +160,13 @@ test('the reader refuses an infinite field and names it, in one pass', () => {
     },
   );
 
-  // The case that was wrong: an obs column validated while a gene is the colour
+  // The case that was wrong: an obs column validated while a gene is the color
   // source. `computeGlobalVisibility()` walks every filtered obs field on every
   // recompute, so this is the common path, not a corner. Reading the active
   // source made it a gene and handed the reader `adata.X` repair advice for a
   // column that is not in `adata.X`.
-  const geneWhileColoured = { kind: 'continuous', key: 'ACTB', values };
-  const mixedOwner = makeColorOwner(values, 'var', [geneWhileColoured]);
+  const geneWhileColored = { kind: 'continuous', key: 'ACTB', values };
+  const mixedOwner = makeColorOwner(values, 'var', [geneWhileColored]);
   assert.throws(
     () => mixedOwner.ensureContinuousMetadata({
       kind: 'continuous',

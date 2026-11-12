@@ -7,7 +7,7 @@ import {
   assertFigureExportSingleRequest,
 } from '../assets/js/app/ui/modules/figure-export/figure-export-contract.js';
 import {
-  embedPngTextChunks,
+  embedPngMetadata,
 } from '../assets/js/app/ui/modules/figure-export/utils/png-metadata.js';
 import {
   createFigureExportZip,
@@ -145,16 +145,22 @@ test('SVG requests require one exact, explicit strategy', () => {
   );
 });
 
-test('figure-export UI never chooses or changes an SVG strategy automatically', async () => {
+test('figure-export UI opens on Full vector and never changes the SVG strategy by itself (F160)', async () => {
   const uiSource = await source('figure-export-ui.js');
 
   assert.doesNotMatch(uiSource, /promptLargeDatasetStrategy|Large data:\s*Ask/);
   assert.doesNotMatch(uiSource, /value:\s*['"]hybrid['"][^)]*selected:\s*true/s);
-  // The only assignment restores the person's own saved choice from a session.
-  assert.doesNotMatch(uiSource, /strategySelect\.value\s*=(?!=)(?!\s*exact\.svgStrategy \?\? '';)/);
-  assert.equal(uiSource.match(/strategySelect\.value\s*=(?!=)/g)?.length, 1);
+  // Two assignments: the default it opens with (full vector: every first SVG export was refused
+  // until one was chosen, and people and agents always chose full vector), and the person's own
+  // saved choice a session or a step puts back. Nothing else picks one for them.
+  const assignments = uiSource.match(/strategySelect\.value\s*=(?!=)[^;]*;/g) ?? [];
+  assert.deepEqual(assignments.map(text => text.replace(/\s+/g, ' ')), [
+    'strategySelect.value = FIGURE_EXPORT_DEFAULT_SVG_STRATEGY;',
+    'strategySelect.value = exact.svgStrategy;',
+  ]);
   assert.doesNotMatch(uiSource, /strategy\s*!==\s*['"]hybrid['"]|requires Hybrid/i);
-  assert.match(uiSource, /value:\s*['"]['"][^)]*Choose SVG strategy/);
+  // No placeholder, no refusal for a strategy not chosen.
+  assert.doesNotMatch(uiSource, /Choose SVG strategy|needs a point strategy/);
 
   await assert.rejects(
     access(new URL('components/large-dataset-dialog.js', figureExportRoot)),
@@ -371,7 +377,7 @@ test('PNG renderer uses one browser backend and metadata failures are terminal',
   assert.match(pngSource, /pagePixelsInBands\(canvas, signal\)/);
   assert.match(pngSource, /requestPngEncoding\(/);
   assert.match(workerSource, /convertToBlob\(\{ type: 'image\/png' \}\)/);
-  assert.match(workerSource, /embedPngTextChunks\(blob, textMap\)/);
+  assert.match(workerSource, /embedPngMetadata\(blob, \{ text, dpi \}\)/);
   assert.match(pngSource, /payload\.format !== ['"]png['"]/);
   assert.doesNotMatch(metadataSource, /catch\s*\{|return blob/);
 
@@ -381,8 +387,9 @@ test('PNG renderer uses one browser backend and metadata failures are terminal',
       'base64'
     ),
   ], { type: 'image/png' });
-  const annotated = await embedPngTextChunks(onePixelPng, {
-    Comment: 'Exact UTF-8 metadata: hücre',
+  const annotated = await embedPngMetadata(onePixelPng, {
+    text: { Comment: 'Exact UTF-8 metadata: hücre' },
+    dpi: 300,
   });
   assert.equal(annotated.type, 'image/png');
   const annotatedBytes = new Uint8Array(await annotated.arrayBuffer());
@@ -396,9 +403,9 @@ test('PNG renderer uses one browser backend and metadata failures are terminal',
   );
 
   await assert.rejects(
-    embedPngTextChunks(
+    embedPngMetadata(
       new Blob(['not a png'], { type: 'image/png' }),
-      { Comment: 'must fail' }
+      { text: { Comment: 'must fail' }, dpi: 300 }
     ),
     /invalid PNG signature/i
   );

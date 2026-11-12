@@ -15,6 +15,8 @@
  * @module ui/components/controls
  */
 
+import { setControlAvailability } from '../core/control-availability.js';
+import { defineControlReadout } from '../core/control-readout.js';
 import { runBeforeNextFrame } from '../../../rendering/frame-phases.js';
 import { createDomId } from './dom-id.js';
 import { renderInfoTip } from './info-tips.js';
@@ -45,7 +47,8 @@ function optionalFunction(value, label) {
 
 function idPrefix(text) {
   const slug = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-  return /^[a-z]/.test(slug) ? slug.slice(0, 32).replace(/-+$/, '') : `control-${slug}`.slice(0, 32);
+  const named = /^[a-z]/.test(slug) ? slug : slug === '' ? 'control' : `control-${slug}`;
+  return named.slice(0, 32).replace(/-+$/, '');
 }
 
 /**
@@ -154,7 +157,7 @@ export function coalesceToFrame(fn) {
 }
 
 /**
- * A labelled range slider with its value readout.
+ * A labeled range slider with its value readout.
  *
  * `onInput` runs at most once per frame while the thumb moves (see
  * {@link coalesceToFrame}); `onCommit` runs once when the user lets go. The
@@ -221,8 +224,10 @@ export function createSliderField({
   root.appendChild(row);
 
   const read = () => Number(input.value);
+  // Its readout of any position, for the history as for the row (`core/control-readout.js`).
+  const readoutOf = defineControlReadout(input, value => format(Number(value)));
   const paint = () => {
-    readout.textContent = format(read());
+    readout.textContent = readoutOf(input.value);
   };
   const frame = coalesceToFrame(() => {
     paint();
@@ -368,29 +373,59 @@ export function createSwitch({ label, checked = false, onChange }) {
   return { root, setChecked };
 }
 
+/** The button variants and their classes (`components/_buttons.css`). */
+const BUTTON_VARIANT_CLASSES = Object.freeze({
+  primary: 'btn-primary',
+  secondary: null,
+  quiet: 'btn-quiet',
+  'quiet-primary': 'btn-quiet btn-quiet-primary',
+  danger: 'btn-danger',
+});
+
 /**
- * A button. `primary` is the one action that commits a panel's work (run,
- * export, load); everything else is `secondary`.
+ * The class list of a button of one variant, for markup built by a template
+ * or an element helper rather than by `createButton` (one variant table for
+ * both, so no module spells a variant's classes by hand).
+ *
+ * @param {'primary'|'secondary'|'quiet'|'quiet-primary'|'danger'} variant
+ * @param {string} [className] - Extra hook class for the caller.
+ * @returns {string}
+ */
+export function buttonClassName(variant, className) {
+  if (!Object.hasOwn(BUTTON_VARIANT_CLASSES, variant)) {
+    throw new TypeError(`Unknown button variant "${variant}"`);
+  }
+  return ['btn', BUTTON_VARIANT_CLASSES[variant], className].filter(Boolean).join(' ');
+}
+
+/**
+ * A button. Controls get quieter the deeper they sit:
+ * - `primary`: the one action that commits a panel's work (run, export, load);
+ * - `secondary`: every other action of a panel, a dialog or a card;
+ * - `quiet`: an action nested inside something smaller than a panel — a list
+ *   item's row or details, a chat turn, a row of a dialog's list;
+ * - `quiet-primary`: the one main action of such a nested area (accent text,
+ *   never filled);
+ * - `danger`: the confirmation that destroys something, wherever it is asked
+ *   (it appears only once the person asked for the removal).
  *
  * @param {object} options
  * @param {string} options.label - Sentence case; CSS sets the visual case.
- * @param {'primary'|'secondary'} [options.variant='secondary']
+ * @param {'primary'|'secondary'|'quiet'|'quiet-primary'|'danger'} [options.variant='secondary']
  * @param {string} [options.title]
+ * @param {string} [options.ariaLabel] - When the visible words need the row's subject ("Open Pancreas").
  * @param {string} [options.className] - Extra hook class for the caller.
  * @param {(event: MouseEvent) => void} [options.onClick]
  * @returns {HTMLButtonElement}
  */
-export function createButton({ label, variant = 'secondary', title, className, onClick }) {
+export function createButton({ label, variant = 'secondary', title, ariaLabel, className, onClick }) {
   requireText(label, 'Button label');
-  if (variant !== 'primary' && variant !== 'secondary') {
-    throw new TypeError(`Unknown button variant "${variant}"`);
-  }
   const button = document.createElement('button');
   button.type = 'button';
-  button.className = ['btn', variant === 'primary' ? 'btn-primary' : null, className]
-    .filter(Boolean).join(' ');
+  button.className = buttonClassName(variant, className);
   button.textContent = label;
   if (title !== undefined) button.title = requireText(title, 'Button title');
+  if (ariaLabel !== undefined) button.setAttribute('aria-label', requireText(ariaLabel, 'Button accessible name'));
   const handler = optionalFunction(onClick, 'Button click handler');
   if (handler) button.addEventListener('click', handler);
   return button;
@@ -434,7 +469,9 @@ export const ICONS = Object.freeze({
   copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
   rename: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>',
   delete: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
-  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>'
+  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>',
+  // A row's menu of further actions (a branch's actions).
+  more: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>'
 });
 
 /**
@@ -550,7 +587,7 @@ export function createInfoRow(control, info) {
 
 /**
  * A sub-section heading inside a panel, with an optional info button beside
- * it. The group that follows is labelled by the heading.
+ * it. The group that follows is labeled by the heading.
  *
  * @param {object} options
  * @param {string} options.title - Sentence case, no colon.
@@ -634,7 +671,8 @@ export function createEmptyState(text) {
  * @property {string} value - The fact itself, short
  * @property {string|null} [title] - The longer text behind the value (its
  *   tooltip): why, and what follows
- * @property {string} [href] - The value is a link there
+ * @property {string} [href] - The value is a link there (an http(s) address;
+ *   any other leaves the value as text)
  * @property {string[]} [lines] - Several facts: the row takes the table's
  *   whole width, each fact on its own line
  * @property {string} [id] - The value's element id (a value a test or a
@@ -668,7 +706,9 @@ export function renderFactList(list, rows) {
         fact.textContent = line;
         value.appendChild(fact);
       }
-    } else if (row.href !== undefined) {
+    } else if (row.href !== undefined && /^https?:\/\//i.test(row.href)) {
+      // Only a web address is a link: a dataset's own text names these (its
+      // citation, its source), and a `javascript:` or `data:` one would run.
       const link = doc.createElement('a');
       link.href = row.href;
       link.target = '_blank';
@@ -696,18 +736,21 @@ export function renderFactList(list, rows) {
  * @param {string} options.name
  * @param {string} [options.size] - A short figure at the right ("388 MB")
  * @param {string} options.meta - The facts under the name
- * @param {boolean} [options.disabled=false]
+ * @param {string|null} [options.unavailable=null] - Why the row cannot be
+ *   ticked (`setControlAvailability`), or null
  * @returns {{ root: HTMLLabelElement, checkbox: HTMLInputElement }}
  */
-export function createSelectItem({ name, size, meta, disabled = false }) {
+export function createSelectItem({ name, size, meta, unavailable = null }) {
   requireText(name, 'Selectable row name');
   requireText(meta, 'Selectable row facts');
-  if (typeof disabled !== 'boolean') throw new TypeError('Selectable row state must be boolean');
+  if (unavailable !== null && typeof unavailable !== 'string') {
+    throw new TypeError('Selectable row unavailability must be a reason or null');
+  }
   const root = document.createElement('label');
   root.className = 'select-item';
   const checkbox = document.createElement('input');
   checkbox.type = 'checkbox';
-  checkbox.disabled = disabled;
+  setControlAvailability(checkbox, unavailable);
   const body = document.createElement('span');
   body.className = 'select-item-body';
   const head = document.createElement('span');
@@ -882,10 +925,20 @@ export function restoreListItemFocus(list, captured, idKey) {
   list.focus({ preventScroll: true });
 }
 
-export function createListItem({ text, enabled, noun }) {
+/**
+ * One row of a list box: its switch, its name and, when given, its count in
+ * a column of its own (as the legend's rows have), which a long name never
+ * pushes out of sight; then its remove button.
+ *
+ * @param {{text: string, enabled: boolean, noun: string, count?: string|null, countTitle?: string|null}} options -
+ *   `count`: what the row counts, as a number (`36,214`); `countTitle`: what it is, said whole
+ */
+export function createListItem({ text, enabled, noun, count = null, countTitle = null }) {
   requireText(text, 'List item text');
   requireText(noun, 'List item noun');
   if (typeof enabled !== 'boolean') throw new TypeError('List item state must be boolean');
+  if (count !== null) requireText(count, 'List item count');
+  if (countTitle !== null) requireText(countTitle, 'List item count title');
   const root = document.createElement('div');
   root.className = 'list-item';
   if (!enabled) root.dataset.disabled = 'true';
@@ -908,6 +961,13 @@ export function createListItem({ text, enabled, noun }) {
   remove.setAttribute('aria-label', `Remove ${noun}: ${text}`);
   root.appendChild(checkbox);
   root.appendChild(textEl);
+  if (count !== null) {
+    const countEl = document.createElement('span');
+    countEl.className = 'list-item-count';
+    countEl.textContent = count;
+    if (countTitle !== null) countEl.title = countTitle;
+    root.appendChild(countEl);
+  }
   root.appendChild(remove);
   return { root, checkbox, remove };
 }

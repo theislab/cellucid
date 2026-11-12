@@ -213,7 +213,7 @@ test('details list what the reader knows, links where there is an address', () =
   const byLabel = Object.fromEntries(rows.map(row => [row.label, row]));
   assert.deepEqual(Object.keys(byLabel), [
     'Source', 'Citation', 'File', 'Format', 'Read', 'Cells', 'Genes', 'Obs fields',
-    'Embeddings', 'Layers', 'Raw', 'Neighbour graph', 'Latent space', 'Vector fields',
+    'Embeddings', 'Layers', 'Raw', 'Neighbor graph', 'Latent space', 'Vector fields',
   ]);
   assert.equal(byLabel.Source.href, 'https://www.ebi.ac.uk/biostudies/arrayexpress/studies/E-MTAB-11343');
   assert.equal(byLabel.Citation.href, 'https://doi.org/10.1126/science.abo0510');
@@ -222,7 +222,7 @@ test('details list what the reader knows, links where there is an address', () =
   assert.equal(byLabel.Cells.value, '561,947');
   assert.equal(byLabel['Obs fields'].value, '16 (14 categorical, 2 continuous)');
   assert.equal(byLabel.Embeddings.value, 'UMAP 2D, UMAP 3D (2 of 5 obsm arrays)');
-  assert.equal(byLabel['Neighbour graph'].value, '2M edges');
+  assert.equal(byLabel['Neighbor graph'].value, '2M edges');
   assert.equal(byLabel['Latent space'].value, 'scanvi');
   assert.equal(byLabel['Vector fields'].value, 'None');
 });
@@ -316,7 +316,7 @@ test('the details of a converted dataset say how it was read, where it is kept, 
   assert.deepEqual(Object.keys(byLabel).slice(0, 7), ['File', 'Format', 'Size', 'Read', 'Kept', 'Read in parts', 'Not read']);
   assert.equal(byLabel.Format.value, 'R object (.rds)');
   assert.equal(byLabel.Read.value, 'Whole, once, from start to end (it cannot be read in parts), from this computer; nothing is uploaded');
-  assert.equal(byLabel.Kept.value, "In this browser's storage (the origin-private file system) until it is cleared (Session › Stored, Clear) or the browser needs the room");
+  assert.equal(byLabel.Kept.value, "In this browser's storage (the origin-private file system) until it is removed (Session › Stored › Manage…) or the browser needs the room");
   assert.equal(byLabel['Read in parts'].value, READ_IN_PARTS_INSTEAD);
   assert.deepEqual(byLabel['Not read'].lines, NOT_READ);
   assert.equal(byLabel['Not read'].value, NOT_READ.join('\n'));
@@ -326,7 +326,7 @@ test('the details of a converted dataset say how it was read, where it is kept, 
   assert.equal(remoteRows.find(row => row.label === 'Read').value, 'Whole, once, from start to end (it cannot be read in parts), from ftp.ncbi.nlm.nih.gov');
 
   const reused = describeDetails(identity('pbmc_small'), { ...LOCAL_RDS, conversion: { kept: 'opfs', persistent: true, whole: true, reused: true, notes: [] } }, null);
-  assert.equal(reused.find(row => row.label === 'Kept').value, "In this browser's storage (the origin-private file system) until it is cleared (Session › Stored, Clear) or the browser needs the room; read when it was first opened, not again");
+  assert.equal(reused.find(row => row.label === 'Kept').value, "In this browser's storage (the origin-private file system) until it is removed (Session › Stored › Manage…) or the browser needs the room; read when it was first opened, not again");
   assert.equal(reused.some(row => row.label === 'Not read'), false, 'nothing left out, no row');
 
   const tab = describeDetails(identity('pbmc_small'), { ...LOCAL_RDS, conversion: { kept: 'opfs', persistent: false, whole: true, reused: false, notes: [] } }, null);

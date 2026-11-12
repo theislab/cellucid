@@ -192,12 +192,7 @@ const violinplotDefinition = {
   },
 
   exportCSV(pageData, options) {
-    return PlotFactory.exportDistributionCSV(pageData, {
-      metadata: {
-        plotType: 'violinplot',
-        variable: pageData[0]?.variableInfo?.name || 'Value'
-      }
-    });
+    return PlotFactory.exportDistributionCSV(pageData, { metadata: { plotType: 'violinplot' } });
   }
 };
 

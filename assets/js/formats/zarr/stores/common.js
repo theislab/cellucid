@@ -25,6 +25,7 @@
 
 import { isMacOSMetadata } from '../../zip/names.js';
 import { SharedWork, abortReason } from '../../../utils/abort.js';
+import { onNextMacrotask } from '../../../utils/yield-macrotask.js';
 
 /** Files that mark the root of a Zarr store. */
 export const ROOT_MARKERS = Object.freeze(['zarr.json', '.zgroup', '.zarray', '.zmetadata', '.zattrs']);
@@ -151,45 +152,26 @@ export function createLimiter(limit) {
 }
 
 /**
- * Run `callback` on a later macrotask: after the current task and all of its
- * promise continuations, so requests asked for in one burst are planned
- * together.
- */
-export const nextTask = (() => {
-  if (typeof setImmediate === 'function') return callback => setImmediate(callback);
-  if (typeof MessageChannel === 'function') {
-    const channel = new MessageChannel();
-    const queue = [];
-    channel.port1.onmessage = () => queue.shift()();
-    return callback => {
-      queue.push(callback);
-      channel.port2.postMessage(0);
-    };
-  }
-  return callback => setTimeout(callback, 0);
-})();
-
-/**
  * The longest slice ranges of a file on this computer (a picked folder's
  * file, a kept copy's blob) are merged into. Merging saves a read's
  * fixed cost; a longer slice only delays decoding its first chunk until its
  * last byte has arrived. A scheduling choice, measured in a Chromium worker
  * (Suo, Zarr v3, shards of 64 inner chunks; best of three): 1,000 cell rows
  * (inner chunks of 60 KB) take 744 ms read chunk by chunk, 519 ms merged to
- * 1 MiB, 510 ms to 32 MiB; the neighbour graph (inner chunks of 1 MB) 587,
+ * 1 MiB, 510 ms to 32 MiB; the neighbor graph (inner chunks of 1 MB) 587,
  * 554 and 687 ms.
  */
 export const LOCAL_MERGED_READ_BYTES = 1024 * 1024;
 
 /**
  * Ranges of one object asked for in the same task, by any number of reads,
- * planned together: neighbours at most `gap(object)` bytes apart (what one more
+ * planned together: neighbors at most `gap(object)` bytes apart (what one more
  * request costs on the store's link: the same rule for a folder on this
  * computer, a kept copy and a web host) are read as one range of at most
  * `maxBytes(object)`, so the reads of many genes' few entries in one chunk file
  * cost one read of it, not one each. A merged read is shared by the reads it
- * serves (`SharedWork`): cancelled only once every one of them withdrew;
- * a read cancelled before its task's plan is not asked for.
+ * serves (`SharedWork`): canceled only once every one of them withdrew;
+ * a read canceled before its task's plan is not asked for.
  *
  * @template O
  * @param {{read: (object: O, start: number, end: number, options: {signal: AbortSignal, activity: Object|null}) => Promise<Uint8Array|null>,
@@ -234,7 +216,7 @@ export function batchedRanges({ read, gap, maxBytes }) {
     return new Promise((resolve, reject) => {
       if (batch === null) {
         batch = new Map();
-        nextTask(flush);
+        onNextMacrotask(flush);
       }
       let asks = batch.get(object);
       if (asks === undefined) batch.set(object, asks = []);
@@ -244,7 +226,7 @@ export function batchedRanges({ read, gap, maxBytes }) {
 }
 
 /**
- * Normalise a relative path: `/` separators, no leading `./` or `/`.
+ * Normalize a relative path: `/` separators, no leading `./` or `/`.
  *
  * @param {string} path
  */

@@ -6,7 +6,9 @@ import { initRenderControls } from '../assets/js/app/ui/modules/render-controls.
 import {
   SmokeDensityBuildError,
 } from '../assets/js/rendering/smoke-cloud/smoke-density-contract.js';
+import { POINT_SPRITE_MAX_PX } from '../assets/js/rendering/point-sprite.js';
 import {
+  MAXIMUM_POINT_SIZE,
   MINIMUM_POINT_SIZE,
   POINT_SIZE_SLIDER_MINIMUM,
   formatPointSize,
@@ -141,7 +143,7 @@ function makeDom() {
     hpLodForceContainer: new FakeElement(),
     hpLodForceDisplay: new FakeElement(),
     // Antialiasing is owned here too. It publishes to storage rather than to
-    // the viewer because it is a context-creation attribute; its own behaviour
+    // the viewer because it is a context-creation attribute; its own behavior
     // is held by `antialias-setting-contract.test.mjs`.
     hpAntialiasCheckbox: new FakeElement({ checked: true }),
     hpAntialiasStatus: new FakeElement(),
@@ -419,7 +421,10 @@ test('range event failures propagate without publishing substituted values', t =
   assert.equal(viewer.calls.length, callsBefore);
 });
 
-test('background persistence failure preserves the current viewer state', t => {
+test('a background the browser does not keep is still chosen for this page', t => {
+  // A full or refusing store (or none: site data blocked) keeps nothing for
+  // the next visit; the pick is made all the same (R9E-5: it was refused, so
+  // the background could not be changed at all there).
   const storageFailure = new Error('browser storage write error');
   const restore = installDocument('grid', {
     getItem() {
@@ -437,13 +442,10 @@ test('background persistence failure preserves the current viewer state', t => {
   const callsBefore = viewer.calls.length;
 
   dom.backgroundSelect.value = 'black';
-  assert.throws(
-    () => dom.backgroundSelect.dispatch('change'),
-    error => error === storageFailure,
-  );
-  assert.equal(dom.backgroundSelect.value, 'grid');
-  assert.equal(globalThis.document.documentElement.dataset.viewerBackground, 'grid');
-  assert.equal(viewer.calls.length, callsBefore);
+  dom.backgroundSelect.dispatch('change');
+  assert.equal(dom.backgroundSelect.value, 'black');
+  assert.equal(globalThis.document.documentElement.dataset.viewerBackground, 'black');
+  assert.ok(viewer.calls.length > callsBefore);
 });
 
 test('public point-size conversion rejects out-of-contract values', t => {
@@ -454,7 +456,7 @@ test('public point-size conversion rejects out-of-contract values', t => {
 
   assert.throws(
     () => controls.pointSizeToSlider(0),
-    /point size.*between 0\.050 and 200/i,
+    /point size.*between 0\.053 and 160/i,
   );
   assert.throws(
     () => controls.pointSizeToSlider(Number.NaN),
@@ -465,7 +467,11 @@ test('public point-size conversion rejects out-of-contract values', t => {
   // position that was ever stored still means exactly the size it meant, and
   // the reach below 0.25 is added under it rather than folded into it.
   assert.equal(controls.pointSizeToSlider(0.25), 0);
-  assert.equal(controls.pointSizeToSlider(200), 100);
+  // The top is the largest sprite drawn (R9R-9): no travel past what can be drawn.
+  assert.equal(MAXIMUM_POINT_SIZE, POINT_SPRITE_MAX_PX);
+  assert.equal(controls.pointSizeToSlider(POINT_SPRITE_MAX_PX), 100);
+  assert.equal(formatPointSize(sliderPositionToPointSize(100)), '160.0');
+  assert.ok(sliderPositionToPointSize(99.5) < POINT_SPRITE_MAX_PX, 'the step below the top draws less than the cap');
   for (const position of [-24, -12, 0, 16.5, 50, 100]) {
     assert.ok(
       Math.abs(
@@ -475,11 +481,11 @@ test('public point-size conversion rejects out-of-contract values', t => {
       `slider position ${position} must survive a round trip`,
     );
   }
-  assert.ok(MINIMUM_POINT_SIZE < 0.0503 && MINIMUM_POINT_SIZE > 0.05);
-  assert.equal(formatPointSize(MINIMUM_POINT_SIZE), '0.050');
+  assert.ok(MINIMUM_POINT_SIZE < 0.0531 && MINIMUM_POINT_SIZE > 0.0529);
+  assert.equal(formatPointSize(MINIMUM_POINT_SIZE), '0.053');
   assert.equal(
-    Number(sliderPositionToPointSize(16.5).toFixed(4)),
-    0.7533,
+    Number(sliderPositionToPointSize(17).toFixed(4)),
+    0.7499,
   );
 });
 
@@ -742,7 +748,7 @@ test('smoke conflicts notify and roll back the selector while the public owner r
     0,
   );
   assert.deepEqual(warnings, [[
-    'Volumetric smoke requires a single view. Clear snapshots first.',
+    'Volumetric smoke draws one view; remove the kept views first (Clear, beside Layout).',
     { category: 'rendering' },
   ]]);
 
@@ -759,7 +765,7 @@ test('choosing smoke on a device that cannot run it says why and stays in Points
     supported: false,
     reason: 'float-blend',
     message: "Volumetric smoke isn't available on this device: its graphics driver "
-      + "can't blend high-precision colour, which the smoke cloud needs to add up "
+      + "can't blend high-precision color, which the smoke cloud needs to add up "
       + 'the cells. Points rendering works as usual.',
     detail: 'WebGL2 extension EXT_float_blend is unavailable.',
   });
@@ -1391,4 +1397,62 @@ test('frames the browser cannot time apart are not kept, and the tip says so, wi
   viewer.emitPresented('camera-settled');
   assert.deepEqual(viewer.calls, [['measureFullDetailFrameCost']]);
   controls.destroy();
+});
+
+test('a background never chosen follows the theme to its twin; a chosen one stays', t => {
+  let stored = null;
+  const restore = installDocument('studio', {
+    getItem: () => stored,
+    setItem: (key, value) => {
+      stored = value;
+    },
+    removeItem() {
+    },
+  });
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  const page = new FakeElement();
+  dom.backgroundSelect.ownerDocument = { defaultView: page };
+  initRenderControls({ viewer, dom, smoke });
+  const themeChange = theme => {
+    for (const listener of page.listeners.get('cellucid:theme-change') ?? []) {
+      listener({ detail: { theme } });
+    }
+  };
+
+  themeChange('dark');
+  assert.equal(dom.backgroundSelect.value, 'studio-dark');
+  assert.equal(globalThis.document.documentElement.dataset.viewerBackground, 'studio-dark');
+  assert.deepEqual(viewer.calls.at(-1), ['setBackground', 'studio-dark']);
+  assert.equal(stored, null, 'following the theme is not a choice and is not kept');
+  themeChange('light');
+  assert.equal(dom.backgroundSelect.value, 'studio');
+
+  dom.backgroundSelect.value = 'atelier';
+  dom.backgroundSelect.dispatch('change');
+  assert.equal(stored, 'atelier');
+  const callsBefore = viewer.calls.length;
+  themeChange('dark');
+  assert.equal(dom.backgroundSelect.value, 'atelier');
+  assert.equal(viewer.calls.length, callsBefore);
+});
+
+test('a background put back by a restore or an action is shown, not kept as the person\'s pick', t => {
+  let stored = null;
+  const restore = installDocument('studio', {
+    getItem: () => stored,
+    setItem: (key, value) => { stored = value; },
+    removeItem() {},
+  });
+  t.after(restore);
+  const { viewer, dom, smoke } = makeOptions();
+  initRenderControls({ viewer, dom, smoke });
+  dom.backgroundSelect.value = 'studio-dark';
+  dom.backgroundSelect.dispatch('change', { isTrusted: false });
+  assert.deepEqual(viewer.calls.at(-1), ['setBackground', 'studio-dark']);
+  assert.equal(globalThis.document.documentElement.dataset.viewerBackground, 'studio-dark');
+  assert.equal(stored, null, 'an undo of a theme step kept the background it put back');
+  dom.backgroundSelect.value = 'nebula';
+  dom.backgroundSelect.dispatch('change');
+  assert.equal(stored, 'nebula', 'a person\'s own pick is kept');
 });

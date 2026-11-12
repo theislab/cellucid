@@ -9,9 +9,9 @@ const THEME_URLS = Object.freeze({
   dark: new URL('../assets/css/themes/_dark.css', import.meta.url),
 });
 
-/* One convention for status colour, measured rather than assumed:
+/* One convention for status color, measured rather than assumed:
    `--color-<status>` is a fill or a border, `--color-<status>-text` is the
-   only status token allowed to colour glyphs. The saturated tokens sink well
+   only status token allowed to color glyphs. The saturated tokens sink well
    below AA as text in the light theme (`--color-warning` reaches 1.74:1 on
    `--color-surface-tertiary`) while passing comfortably in dark, so a
    dark-only review will not catch a regression here. */
@@ -104,7 +104,7 @@ function resolveOpaqueColor(value, theme, primitives) {
     /^color-mix\(in srgb,\s*var\((--[a-z0-9-]+)\)\s*(\d+(?:\.\d+)?)%,\s*var\((--[a-z0-9-]+)\)\)$/i,
   );
   if (mix === null) {
-    throw new Error(`Expected an opaque hex or two-colour mix, received "${value}"`);
+    throw new Error(`Expected an opaque hex or two-color mix, received "${value}"`);
   }
   const foreground = toRgb(resolve(mix[1], theme, primitives));
   const background = toRgb(resolve(mix[3], theme, primitives));
@@ -186,7 +186,7 @@ test('the muted text token stays a distinct step from the secondary text token',
   }
 });
 
-test('components colour status text with the -text token, never the saturated fill', () => {
+test('components color status text with the -text token, never the saturated fill', () => {
   const offenders = [];
   for (const [fileName, css] of componentStylesheets) {
     const lines = css.split('\n');
@@ -196,7 +196,7 @@ test('components colour status text with the -text token, never the saturated fi
       );
       if (match !== null) {
         offenders.push(
-          `${fileName}:${index + 1} uses --color-${match[1]} as a text colour;`
+          `${fileName}:${index + 1} uses --color-${match[1]} as a text color;`
           + ` use --color-${match[1]}-text`,
         );
       }
@@ -250,7 +250,7 @@ test('every status text token clears AA on the surfaces status panels use', () =
    message. Painting a result with it hides the result instead. The
    correlation table rendered "Very Weak / None" in it, so the one strength
    label a reader most needs to see was the one they could barely read. */
-test('the disabled text colour only paints rules that select a disabled state', () => {
+test('the disabled text color only paints rules that select a disabled state', () => {
   const offenders = [];
   const DISABLED_STATE = /:disabled|\[disabled\]|\[aria-disabled|\.disabled\b|\.is-disabled\b/;
   for (const [fileName, css] of componentStylesheets) {
@@ -273,15 +273,15 @@ test('the disabled text colour only paints rules that select a disabled state', 
 /* The history's branch lanes (History v2 §3.9) are lines and glyphs, so
    WCAG 2.2 SC 1.4.11 Non-text Contrast applies: 3:1 against the panel
    surfaces they are drawn on, in both themes, for all eight slots. */
-test('the eight history lane colours clear 3:1 on the panel surfaces in every theme', () => {
+test('the eight history lane colors clear 3:1 on the panel surfaces in every theme', () => {
   const failures = [];
   for (const [themeName, theme] of themes) {
     for (let lane = 0; lane < 8; lane++) {
       const token = `--history-lane-${lane}`;
       assert.equal(theme.has(token), true, `${themeName} theme declares ${token}`);
-      const colour = toRgb(resolve(token, theme, primitives));
+      const color = toRgb(resolve(token, theme, primitives));
       for (const surface of ['--color-surface-primary', '--color-surface-secondary']) {
-        const ratio = contrastRatio(colour, toRgb(resolve(surface, theme, primitives)));
+        const ratio = contrastRatio(color, toRgb(resolve(surface, theme, primitives)));
         if (ratio < 3) failures.push(`${themeName}: ${token} on ${surface} = ${ratio.toFixed(2)}:1`);
       }
     }

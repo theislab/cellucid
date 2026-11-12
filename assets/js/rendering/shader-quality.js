@@ -24,10 +24,10 @@ export const DEFAULT_SHADER_QUALITY = 'full';
  * What each quality draws, for the consumers that reproduce or depend on it
  * outside the shaders:
  *
- * - `fog`: points fade toward the fog colour with distance (the figure export's
+ * - `fog`: points fade toward the fog color with distance (the figure export's
  *   vector strategies reproduce it);
  * - `fogAlpha`: fog also thins the point, by `(0.1 + 0.9 * transmittance)`;
- *   a sculpted point is opaque and fog only recolours it;
+ *   a sculpted point is opaque and fog only recolors it;
  * - `sphere`: points are shaded as lit spheres (the orbit anchor draws its 3-D
  *   compass to match).
  */

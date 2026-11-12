@@ -16,6 +16,9 @@
  * @module data/sources/auth/token-store
  */
 
+import { webStorage } from '../../../utils/web-storage.js';
+import { createListenerSet } from '../../../utils/listener-set.js';
+
 /** A storage the browser refused (private mode, a full quota, a blocked site). */
 export class TokenStoreError extends Error {
   /**
@@ -35,19 +38,12 @@ const NAME = /^[a-z][a-z0-9-]*$/;
 /** The longest delay a browser timer keeps (a signed 32-bit millisecond count). */
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
-/** @type {Set<(change: {name: string, change: 'stored'|'removed'|'expired'}) => void>} */
-const listeners = new Set();
+const listeners = createListenerSet('the stored sign-ins');
 /** @type {Map<string, ReturnType<typeof setTimeout>>} The expiry timer of each account */
 const expiries = new Map();
 
 function announce(name, change) {
-  for (const listener of [...listeners]) {
-    try {
-      listener(Object.freeze({ name, change }));
-    } catch {
-      // One display that fails must not keep the others from hearing it.
-    }
-  }
+  listeners.notify(Object.freeze({ name, change }));
 }
 
 /**
@@ -58,9 +54,7 @@ function announce(name, change) {
  * @returns {() => void} Stop listening
  */
 export function onSignInChange(listener) {
-  if (typeof listener !== 'function') throw new TypeError('A sign-in listener is a function.');
-  listeners.add(listener);
-  return () => listeners.delete(listener);
+  return listeners.add(listener);
 }
 
 /**
@@ -107,8 +101,45 @@ export function signInStorageKey(name) {
 }
 
 function storage() {
-  if (typeof sessionStorage === 'undefined') throw new Error('sessionStorage is unavailable');
-  return sessionStorage;
+  const kept = webStorage('sessionStorage');
+  if (kept === null) throw new Error('sessionStorage is unavailable');
+  return kept;
+}
+
+/**
+ * Keep the state of a sign-in this tab starts (`cellucid:<name>-auth:pending`),
+ * until its answer comes back: the answer is taken only when it names it
+ * (a link carrying someone else's sign-in is not).
+ *
+ * @param {string} name
+ * @param {string} state
+ */
+export function writeSignInPending(name, state) {
+  const key = signInStorageKey(name).replace(/:session$/, ':pending');
+  if (typeof state !== 'string' || state === '') throw new TypeError('A sign-in state is text.');
+  try {
+    storage().setItem(key, state);
+  } catch (cause) {
+    throw new TokenStoreError('write', cause);
+  }
+}
+
+/**
+ * The state of the sign-in this tab started, taken (one answer per sign-in),
+ * or null when there is none or the browser keeps nothing.
+ *
+ * @param {string} name
+ * @returns {string|null}
+ */
+export function takeSignInPending(name) {
+  const key = signInStorageKey(name).replace(/:session$/, ':pending');
+  try {
+    const state = storage().getItem(key);
+    storage().removeItem(key);
+    return state;
+  } catch {
+    return null;
+  }
 }
 
 /**

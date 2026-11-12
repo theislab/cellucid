@@ -32,9 +32,9 @@ import {
 
 /** Pinned the same in cellucid-python and cellucid-r. */
 const SHA256 = Object.freeze({
-  session: '7118bfd010f4dbb7644223d28cd99d4142ed049338c4ed24ae4c0ab7b944ec96',
-  expected: '7df8be8f9fd7ff7cfc92a05bc7b68505b6b45284d4a9ebc3241dc5f92adddf44',
-  state: '4a592d66a26bcf61a489d4c165e8395a0d4b22fe6f467ca106ab183f6034bb31',
+  session: '9711bbc4dfd19fd91809a2ab3967cab54b6982c2a3907c73432200e72414ca4a',
+  expected: '8684353157ec936017b777c395e1d60342dcd4f393ef2a0648fe4a7891a67c34',
+  state: 'f9f0a6025679dacb91cbd00b0abd1cd6380ab1e829fa9ea529cbc59c1801e3dd',
 });
 
 const REGENERATE = 'Run node scripts/generate-history-golden.mjs (it writes the three copies) and pin the printed digests '
@@ -69,5 +69,7 @@ for (const target of historyGoldenTargets().slice(1)) {
     assert.equal(digest(readFileSync(target.session)), SHA256.session, `${target.session}. ${REGENERATE}`);
     assert.equal(digest(readFileSync(target.expected)), SHA256.expected, `${target.expected}. ${REGENERATE}`);
     assert.equal(digest(readFileSync(target.state)), SHA256.state, `${target.state}. ${REGENERATE}`);
+    // The copy a package ships as its help pages' example (cellucid-r's inst/extdata): the same session.
+    if (target.example !== null) assert.equal(digest(readFileSync(target.example)), SHA256.session, `${target.example}. ${REGENERATE}`);
   });
 }

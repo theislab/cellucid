@@ -1,5 +1,5 @@
 /**
- * @fileoverview The sparse form of a gene's column: what the page colours a
+ * @fileoverview The sparse form of a gene's column: what the page colors a
  * gene from, instead of every cell's value.
  *
  * A gene's column (one float32 an open cell) is mostly zeros, and on a gene
@@ -8,7 +8,7 @@
  * bytes: `{length, indices, values, readRows}`, cell `indices[k]` holding
  * `values[k]` (strictly increasing, all below `readRows`), every other cell
  * below `readRows` 0, and every cell from `readRows` on NaN (not read). At
- * 10M cells, colouring a gene and measuring its range from the form is a
+ * 10M cells, coloring a gene and measuring its range from the form is a
  * word fill and its few entries (~4 ms); from the column it is two passes
  * over every cell on the main thread (~50 ms; `continuous-colors.js`).
  *
@@ -16,7 +16,7 @@
  * the main thread (`sparseFormOf`), and only when it is smaller than the
  * column; a gene shown while its index is built (`onPartial`) crosses to the
  * page as its form alone. The page notes a column's form beside it
- * (`noteColumnForm`), and the colour kernels read the form of a column that
+ * (`noteColumnForm`), and the color kernels read the form of a column that
  * has one (`columnFormOf`). A column is never written in place (a field's
  * values are replaced, never edited: `color-manager.js`), so its form stays
  * exact as long as the column lives.
@@ -176,7 +176,7 @@ export function requireColumnForm(form, length) {
  * `min(from, to)` cells kept, then the cells added, whose column's form is
  * `added`), or null when the resized column's form cannot be told from
  * these (a part with no form; cells read after cells not read). Growing a
- * gene in place keeps it coloured from its entries.
+ * gene in place keeps it colored from its entries.
  *
  * @param {ColumnForm|null} form - The column's before
  * @param {number} from

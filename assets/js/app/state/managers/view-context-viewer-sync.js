@@ -348,7 +348,7 @@ export const viewContextViewerSyncMethods = {
         // exactly the field's lifetime: every view context clones this field
         // shallowly, so this one Map and this one Set are shared by all of
         // them. A per-clone `null` let a view kept before the field's first
-        // colouring normalize the shared arrays a second time.
+        // coloring normalize the shared arrays a second time.
         ...(field?.kind === 'category' ? { centroidsByLayout: new Map() } : {}),
         _normalizedLayouts: new Set()
       };
@@ -724,7 +724,7 @@ export const viewContextViewerSyncMethods = {
       outlierQuantiles,
       outlierThreshold,
       positions,
-      // How many times the colours and the visibility were handed out for
+      // How many times the colors and the visibility were handed out for
       // writing: with the arrays themselves, what a smoke volume read
       // (`sameSmokeInputs`), so a rebuild for the same inputs is answered
       // without copying or comparing them.

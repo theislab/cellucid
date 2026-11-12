@@ -17,6 +17,7 @@ import {
   PAGE_ENTRY,
   PAGE_EXTERNALS,
   buildPageBundle,
+  externalImports,
   stalePageFiles,
 } from '../scripts/build-page-bundle.mjs';
 import { contentTypeForAssetPath, renderPageBoot } from '../scripts/generate-web-asset-inventory.mjs';
@@ -96,6 +97,25 @@ test('modules that read their own address are imported at their version, never b
     }
   }
   assert.ok(code.includes(`"${posix.relative(PAGE_DIR, 'assets/js/workers/worker-script.js')}?v=`));
+});
+
+test('a module imported at its own address imports nothing but other such modules (no source on a deployed page)', async () => {
+  for (const path of PAGE_EXTERNALS) {
+    const text = await readFile(join(ROOT, ...path.split('/')), 'utf8');
+    for (const imported of externalImports(path, text)) {
+      assert.ok(PAGE_EXTERNALS.includes(imported), `${path} imports ${imported}, which is not in PAGE_EXTERNALS`);
+    }
+  }
+  // The builder refuses one (round 9: worker-script.js came to import
+  // utils/listener-set.js, not then an external, which a deployed page asked
+  // for from the sources beside its copy in the bundle).
+  const workerScript = 'assets/js/workers/worker-script.js';
+  const text = `import { cancel } from '../utils/abort.js';\n${await readFile(join(ROOT, ...workerScript.split('/')), 'utf8')}`;
+  assert.deepEqual(externalImports(workerScript, text), ['assets/js/utils/abort.js', 'assets/js/utils/listener-set.js']);
+  await assert.rejects(
+    buildPageBundle({ rootDir: ROOT, externalBytes: new Map([[workerScript, Buffer.from(text)]]) }),
+    /imports assets\/js\/utils\/abort\.js, which a deployed page would then ask for from the sources/
+  );
 });
 
 test('the bundle lives apart from the sources, in a folder of nothing but what the generator writes', async () => {

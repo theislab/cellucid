@@ -13,7 +13,7 @@
 
 import { DataSourceError, DataSourceErrorCode } from '../../data-source.js';
 import { describeRemoteFile } from '../remote-file.js';
-import { folderFormatOfName, titleOfName } from '../../input-formats.js';
+import { folderFormatOfName, storeFolderOfPath, titleOfName } from '../../input-formats.js';
 import { linkIdentity, publicLink } from '../link-credentials.js';
 
 /**
@@ -53,6 +53,11 @@ function parseHttpUrl(input) {
     return null;
   }
   url.hash = '';
+  // An address inside a store folder (`…/atlas.zarr/.zmetadata`, copied
+  // from a host's file listing) is the store. A signed address names its
+  // one object and is kept as it is.
+  const store = url.search === '' ? storeFolderOfPath(url.pathname) : null;
+  if (store !== null) url.pathname = `${store}/`;
   return url;
 }
 

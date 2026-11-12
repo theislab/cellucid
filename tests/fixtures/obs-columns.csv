@@ -1,5 +1,6 @@
 obs_name,cellucid_highlight__highlight_1,leiden,flag,score
 kind,highlight,categorical,categorical,continuous
+categories,,"[""10"",""1"",""0"",""unused, \""quoted\""""]","[""False"",""True""]",
 c0,true,0,True,0.5
 "c,1",false,1,False,
 c2,true,10,True,-1.25

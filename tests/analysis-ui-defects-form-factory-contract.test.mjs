@@ -4,7 +4,7 @@
  * kit (`ui/components/controls.js`), so these assertions pin the analysis
  * surface of that kit:
  *
- * - A labelled select binds its `<label for>` to the select, with an id that is
+ * - A labeled select binds its `<label for>` to the select, with an id that is
  *   unique per call: ids derived from the control's name alone repeated
  *   whenever an analysis mode was copied into a floating window, and the
  *   copy's label then operated the sidebar's control.

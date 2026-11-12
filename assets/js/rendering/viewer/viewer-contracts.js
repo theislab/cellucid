@@ -3,7 +3,7 @@
  * its public boundary.
  *
  * Everything here is a pure guard: it either returns the caller's value
- * unchanged, returns an exact normalised record derived from it, or throws.
+ * unchanged, returns an exact normalized record derived from it, or throws.
  * Nothing reads viewer state, touches WebGL, or allocates a GPU owner, so the
  * whole file can be exercised without a canvas.
  *

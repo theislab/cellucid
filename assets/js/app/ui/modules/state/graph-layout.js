@@ -14,8 +14,8 @@
  *   steps under it (expanded unless collapsed); **groups** (§3.15.2) as one
  *   node (collapsed unless expanded), which says when the step shown or a
  *   fork is inside it; **runs** of consecutive view or layout steps (camera
- *   moves, panels, open sections, colours: never one that changes what is
- *   coloured by or filtered) as one folded row, "Camera ×6 · Layout ×2"
+ *   moves, panels, open sections, colors: never one that changes what is
+ *   colored by or filtered) as one folded row, "Camera ×6 · Layout ×2"
  *   (§3.3.8): display only, undo still goes step by step;
  * - while recording is paused, a **paused** marker after the step shown.
  *
@@ -26,9 +26,9 @@
  * **Lanes.** Column 0 is the path; a stub and its expanded branch take the
  * next column, so columns are the nesting depth and are reused as soon as a
  * branch's rows end (straight lanes, no crossing). Each row lists the line
- * segments that cross it (`segments`: column, colour slot, top or bottom
- * half or all of it), so any window of rows draws on its own. Colours are
- * the branches' own slots (`Branch.lane`); colour is never the only cue.
+ * segments that cross it (`segments`: column, color slot, top or bottom
+ * half or all of it), so any window of rows draws on its own. Colors are
+ * the branches' own slots (`Branch.lane`); color is never the only cue.
  *
  * The layout walks the path shown once, and each expanded branch's own
  * steps: O(steps on the path + steps of the branches expanded), each step a
@@ -44,7 +44,7 @@ import { METHOD_DOMAINS } from '../../../history/exports/step-text.js';
 /**
  * Effects whose steps fold into runs: they present the analysis, they are
  * not it. A step of these effects that changes a part of the analysis (what
- * is coloured by, the filters: `METHOD_DOMAINS`) stays a row of its own.
+ * is colored by, the filters: `METHOD_DOMAINS`) stays a row of its own.
  */
 export const FOLDED_EFFECTS = Object.freeze(new Set(['view', 'layout']));
 
@@ -56,8 +56,7 @@ export const FOLDED_EFFECTS = Object.freeze(new Set(['view', 'layout']));
  * @property {Set<string>} [expandedRuns] - run row keys expanded
  * @property {((step: object) => boolean)|null} [filter] - search: whether a step matches
  * @property {Set<string>} [offDomains] - domains not recorded now (History settings): their steps dim
- * @property {(type: string) => (string|null)} [effectOf] - an action's effect (the catalogue)
- * @property {(step: object) => string} [categoryOf] - a folded step's category ("Camera")
+ * @property {(type: string) => (string|null)} [effectOf] - an action's effect (the catalog)
  */
 
 /**
@@ -68,7 +67,7 @@ export const FOLDED_EFFECTS = Object.freeze(new Set(['view', 'layout']));
  * @property {number} level - its tree level (aria-level, 1 for the path)
  * @property {number} indent - how many turns, groups or runs of its line it is inside
  * @property {number} column - its lane column
- * @property {number} color - its lane colour slot
+ * @property {number} color - its lane color slot
  * @property {string} chain - the line it is on (`c0` the path, `c:<branch>` a stub's)
  * @property {string[]} stepIds - the steps it stands for, first to last
  * @property {'past'|'head'|'undone'|null} position
@@ -103,7 +102,7 @@ const NONE = new Set();
  */
 export function layoutGraph(view, {
   expandedForks = NONE, collapsedTurns = NONE, expandedGroups = NONE, expandedRuns = NONE,
-  filter = null, offDomains = NONE, effectOf = () => null, categoryOf = () => 'Step',
+  filter = null, offDomains = NONE, effectOf = () => null,
 } = {}, previous = null) {
   const path = view.path();
   const headIndex = view.pathIndex().get(view.headId) ?? -1;
@@ -360,17 +359,18 @@ export function layoutGraph(view, {
 
   function emitRun(chain, from, to, where) {
     const key = `r:${chain[from].id}`;
-    const byCategory = new Map();
+    // What its steps did, by their own labels (as a step row says it), each with how many times.
+    const byLabel = new Map();
     let off = !filtering;
     for (let index = from; index <= to; index++) {
       if (!filtering) {
-        const name = categoryOf(chain[index]);
-        byCategory.set(name, (byCategory.get(name) ?? 0) + 1);
+        const label = chain[index].label;
+        byLabel.set(label, (byLabel.get(label) ?? 0) + 1);
       }
       off &&= isOff(chain[index]);
     }
     const row = containerRow('run', key, chain, from, to, where, {
-      categories: [...byCategory].map(([name, count]) => ({ name, count })),
+      changes: [...byLabel].map(([label, count]) => ({ label, count })),
       filtered: filtering,
       off,
     });
@@ -504,7 +504,7 @@ function placeSiblings(rows, from = 0) {
 /**
  * The line segments each row draws: the edge from each row to the previous
  * row of its chain (bottom of that row, every row between, top of this one),
- * coloured by the branch of the row it leads to, and each stub's elbow from
+ * colored by the branch of the row it leads to, and each stub's elbow from
  * its fork's column.
  */
 function drawLanes(rows, from = 0, lastOfChain = new Map()) {

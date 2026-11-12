@@ -25,6 +25,7 @@ import {
   SELECT_MODE_COMBINES
 } from '../../../../rendering/select-mode.js';
 import { requireExactKeys } from '../../../../utils/exact-record.js';
+import { isPageKey } from '../../../../utils/key-ownership.js';
 
 const MODE_HANDLER_NAMES = Object.freeze({
   annotation: 'restoreAnnotationSelection',
@@ -76,19 +77,19 @@ function hasSelectionInProgress(selectionState, mode) {
 }
 
 /**
- * Is this keystroke a plain Escape nobody else has already claimed?
+ * Is this keystroke a plain Escape the page may answer (`isPageKey`)?
  *
  * Modals and popovers in this app own Escape from a capture-phase listener and
  * stop the event or mark it handled, and inline renames call `preventDefault`
- * on their own input. Deferring to both keeps one Escape from closing a dialog
- * and throwing away a selection behind it.
+ * on their own input; a text field or a select keeps its own Escape.
+ * Deferring to them keeps one Escape from closing a dialog and throwing away
+ * a selection behind it.
  *
  * @param {KeyboardEvent} event
  * @returns {boolean}
  */
 function isUnclaimedEscape(event) {
   if (event.key !== 'Escape') return false;
-  if (event.defaultPrevented === true) return false;
   if (
     event.altKey === true
     || event.ctrlKey === true
@@ -97,13 +98,7 @@ function isUnclaimedEscape(event) {
   ) {
     return false;
   }
-  const target = event.target;
-  if (target === null || target === undefined) return true;
-  const tagName = String(target.tagName);
-  if (tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT') {
-    return false;
-  }
-  return target.isContentEditable !== true;
+  return isPageKey(event);
 }
 
 function requireModeHandlers(modeHandlers) {

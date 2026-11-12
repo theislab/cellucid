@@ -180,9 +180,9 @@ test('a job follows the reads of every cell it owns (a copy of the dataset), and
   assert.equal(job.readTotals().fetched, 10, 'its own reads only');
   assert.equal(isJobRead(copyRead), true, 'shown by the job, not the generic notifications');
   assert.equal(isJobRead({ ...copyRead, owner: null }), false, 'an export\'s reads of every cell stay the generic notifications\'');
-  job.succeed('Saved copy.zarr.zip (1 MB): 3 changes applied.', { details: 'Left out:\n• Colours' });
+  job.succeed('Saved copy.zarr.zip (1 MB): 3 changes applied.', { details: 'Left out:\n• Colors' });
   assert.equal(isJobRead(copyRead), false, 'an ended job shows nothing');
-  assert.deepEqual(notifications.calls.at(-1), ['success', 'Saved copy.zarr.zip (1 MB): 3 changes applied.', { category: 'calculation', details: 'Left out:\n• Colours', duration: 0 }]);
+  assert.deepEqual(notifications.calls.at(-1), ['success', 'Saved copy.zarr.zip (1 MB): 3 changes applied.', { category: 'calculation', details: 'Left out:\n• Colors', duration: 0 }]);
   assert.throws(() => new CancellableJob({ title: 'x', readKind: 'genes', notifications, log }), /Unknown job read kind/);
 });
 
@@ -215,7 +215,7 @@ test('a job joining a gene load a view started adopts its reads: one notificatio
     return new Promise(resolve => { release = resolve; });
   });
 
-  // A view colours by the gene: its read is long, and shown as a read.
+  // A view colors by the gene: its read is long, and shown as a read.
   const view = state.ensureVarFieldLoaded(0, { silent: true });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(loads.length, 1);
@@ -539,6 +539,9 @@ function differentialHarness({ execute }) {
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return ['Gene A', 'Gene B', 'Gene C'].map(key => ({ key, name: key }));
@@ -546,9 +549,6 @@ function differentialHarness({ execute }) {
     async readGeneColumn(gene, options) {
       reads.push({ gene, ...options });
       return { fieldIndex: 0, values: Float32Array.of(1, 2, 3, 4, 5, 6), owned: true };
-    },
-    performCacheCleanup() {
-      return { cleaned: 0, remaining: 0 };
     },
   };
   analysis._getComputeManager = async () => ({

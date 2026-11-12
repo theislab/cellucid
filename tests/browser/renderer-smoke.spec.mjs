@@ -1471,7 +1471,7 @@ test('smoke on a device without float blending stays in Points with a plain mess
   });
 
   const message = "Volumetric smoke isn't available on this device: its graphics "
-    + "driver can't blend high-precision colour, which the smoke cloud needs to "
+    + "driver can't blend high-precision color, which the smoke cloud needs to "
     + 'add up the cells. Points rendering works as usual.';
   for (let attempt = 1; attempt <= 2; attempt++) {
     await page.locator('#render-mode').selectOption('smoke');

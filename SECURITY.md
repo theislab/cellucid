@@ -48,7 +48,7 @@ permissions. Reports we particularly want:
 Out of scope: a model doing what the person's permissions allow, a model
 misled by marked text it was told to treat as data (the permissions, the
 confirm card and Undo turn are the backstop), and the switch's stated limit
-(it is not anonymisation: a summary of a very small group can still reveal
+(it is not anonymization: a summary of a very small group can still reveal
 its cells' values).
 
 ## What to expect

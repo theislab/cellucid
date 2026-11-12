@@ -23,8 +23,25 @@ export function unplacedCellsText({ kind, label, count, names, added = false }) 
   const more = count > names.length ? `, and ${formatCount(count - names.length)} more` : '';
   const named = names.length === 0 ? '' : `: ${names.join(', ')}${more}`;
   if (kind === 'vectors') {
-    return `${cells} ${one ? 'has' : 'have'} no vector in ${label} (NaN in the file) and ${one ? 'is' : 'are'} drawn without an arrow${named}.`;
+    return `${cells} ${one ? 'has' : 'have'} no vector in ${label} (NaN or infinite in the file) and ${one ? 'is' : 'are'} drawn without an arrow${named}.`;
   }
-  return `${cells} ${one ? 'has' : 'have'} no position in ${label} (NaN in the file) and ${one ? 'is' : 'are'} not drawn ` +
+  return `${cells} ${one ? 'has' : 'have'} no position in ${label} (NaN or infinite in the file) and ${one ? 'is' : 'are'} not drawn ` +
     `in views showing it${named}. Other views and analyses keep ${one ? 'it' : 'them'}.`;
+}
+
+/**
+ * The notice of a vector field that shows no motion at all: every vector of
+ * it, on the embedding it is drawn on, is shorter than the overlay draws
+ * (`VELOCITY_STILL_SPEED`), so turning the overlay on changes nothing on the
+ * screen (R9V-6). Said once, when the field is read.
+ *
+ * @param {{label: string, embedding: string, longest: number}} notice -
+ *   `longest`: the longest vector's length as drawn
+ * @returns {string}
+ */
+export function stillFieldText({ label, embedding, longest }) {
+  const why = longest === 0
+    ? 'every vector is zero'
+    : `every vector is too short to draw (the longest is ${longest.toExponential(1)})`;
+  return `No particle moves in ${label} on ${embedding}: ${why}.`;
 }

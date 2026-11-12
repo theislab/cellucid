@@ -17,6 +17,7 @@
  */
 
 import { createDomId } from '../../../ui/components/dom-id.js';
+import { buttonClassName } from '../../../ui/components/controls.js';
 import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 
 const ROW_HEIGHT_PX = 28;
@@ -95,7 +96,7 @@ export function createGroupPicker({
   const actionButton = (text, onClick) => {
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = 'analysis-link-btn';
+    button.className = buttonClassName('quiet');
     button.textContent = text;
     button.addEventListener('click', onClick, { signal });
     actions.appendChild(button);

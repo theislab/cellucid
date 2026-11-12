@@ -10,7 +10,7 @@ const {
 } = await import('../assets/js/rendering/camera-state-contract.js');
 const {
   interpolateCameraState,
-  resolveSegmentDurations
+  resolvePathTiming
 } = await import('../assets/js/app/ui/modules/cinematic-camera/interpolation-engine.js');
 const { createCameraDomain } = await import('../assets/js/app/state/domains/camera.js');
 const { createViewsDomain } = await import('../assets/js/app/state/domains/views.js');
@@ -105,6 +105,10 @@ test('the camera and views domains hold each view\'s camera and representation a
     getCentroidFlags(viewId) {
       assert.equal(viewId, 'live');
       return { points: true, labels: false };
+    },
+    getViewName(viewId) {
+      assert.equal(viewId, 'live');
+      return null;
     }
   };
   const state = {
@@ -281,7 +285,7 @@ test('camera-path interpolation rejects incomplete state and unsupported setting
     autoPaceSpeed: 1
   };
 
-  assert.deepEqual(resolveSegmentDurations([first, second], 1), [1]);
+  assert.deepEqual(resolvePathTiming([first, second], 1).transitions, [1]);
   assert.equal(
     isExactCameraState(interpolateCameraState([first, second], 0.5, options)),
     true
@@ -289,11 +293,11 @@ test('camera-path interpolation rejects incomplete state and unsupported setting
 
   const missingOrbit = { ...first, orbit: null };
   assert.throws(
-    () => resolveSegmentDurations([missingOrbit, second], 1),
+    () => resolvePathTiming([missingOrbit, second], 1),
     /keyframe 0/i
   );
   assert.throws(
-    () => resolveSegmentDurations([first, second], undefined),
+    () => resolvePathTiming([first, second], undefined),
     /autoPaceSpeed/i
   );
   assert.throws(

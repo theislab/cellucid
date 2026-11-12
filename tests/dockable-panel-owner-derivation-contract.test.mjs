@@ -23,7 +23,7 @@
  *   forces `height: auto` on a collapsed panel. Capturing the measurement threw
  *   away the size a collapsed panel would reopen at.
  * - **Whether a gesture was a drag.** `suppressNextClick` was armed on
- *   pointerup and disarmed only by the click that followed. A cancelled pointer
+ *   pointerup and disarmed only by the click that followed. A canceled pointer
  *   produces no click, so the flag survived to eat the user's next real one.
  *
  * The DOM here is a fake, but the rules it models are copied from
@@ -284,6 +284,20 @@ class FakeHTMLElement {
   focus() {
     this.focusCount += 1;
     this.ownerDocument.activeElement = this;
+  }
+
+  // A panel frame's laid-out size is its box (no transform here), read as a
+  // layout measurement like the box; any other element's is scripted.
+  get offsetHeight() {
+    return this.classList.contains('accordion-panel') ? this.getBoundingClientRect().height : this.ownOffsetHeight;
+  }
+
+  set offsetHeight(value) {
+    this.ownOffsetHeight = value;
+  }
+
+  get offsetWidth() {
+    return this.classList.contains('accordion-panel') ? this.getBoundingClientRect().width : 0;
   }
 
   getBoundingClientRect() {
@@ -830,7 +844,7 @@ test(
     });
 
     // Drag the floating panel, then let the browser take the pointer away.
-    // A cancelled pointer never produces a click.
+    // A canceled pointer never produces a click.
     dispatch(summary, 'pointerdown', { clientX: 720, clientY: 210 });
     dispatch(summary, 'pointermove', { clientX: 800, clientY: 260 });
     dispatch(summary, 'pointercancel', { clientX: 800, clientY: 260 });
@@ -1156,5 +1170,148 @@ test(
       'a window that cannot dock gets no dock controls',
     );
     assert.deepEqual(summary.children, []);
+  },
+);
+
+/* ------------------------------------------------------------------ *
+ * Dock all: the way back for every floating section at once.          *
+ * ------------------------------------------------------------------ */
+
+test(
+  'Dock all shows while a section floats and docks each into its own slot',
+  async (t) => {
+    // F126 (bug hunt): with its sections undocked the sidebar stayed a column
+    // of logo and footer, and the way back was each window's own button.
+    const doc = installDom(t);
+    const { sidebar, accordion, panels } = buildSidebar(doc, ['alpha', 'beta', 'gamma']);
+    const dispatcher = freshActions();
+    const dockable = initDockableAccordions({ sidebar, actions: dispatcher });
+
+    // One control, where the sections begin, hidden while nothing floats.
+    const button = sidebar.querySelector('.sidebar-dock-all');
+    assert.ok(button !== null, 'the sidebar holds a Dock all control');
+    assert.equal(button.tagName, 'BUTTON');
+    assert.equal(button.type, 'button');
+    assert.equal(button.parentElement, accordion.parentElement);
+    assert.equal(sidebar.children.indexOf(button), sidebar.children.indexOf(accordion) - 1);
+    assert.equal(button.hidden, true);
+
+    const undockButton = id => frameOf(panels.get(id).details).querySelector(':scope > .accordion-panel-actions')
+      .querySelector('.accordion-undock-btn');
+    for (const id of ['alpha', 'gamma']) {
+      const floated = applied(dispatcher, 'layout.panel.float');
+      dispatch(undockButton(id), 'click');
+      await floated;
+    }
+    assert.equal(button.hidden, false);
+    assert.equal(button.textContent, 'Dock all 2 panels');
+    assert.equal(button.getAttribute('aria-label'), 'Dock all 2 panels back into the sidebar');
+
+    // The one action, one step; each section through its own dock path.
+    const docked = applied(dispatcher, 'layout.panel.dock-all');
+    dispatch(button, 'click');
+    assert.deepEqual(await docked, { panels: ['alpha', 'gamma'] });
+    for (const id of ['alpha', 'beta', 'gamma']) assert.equal(isFloatingPanel(panels.get(id).details), false);
+    assert.deepEqual(
+      accordion.children.map(frame => frame.children.find(child => child.tagName === 'DETAILS').id),
+      ['alpha', 'beta', 'gamma'],
+      'each section docks back into its own slot',
+    );
+    assert.equal(button.hidden, true, 'the control goes once nothing floats');
+    assert.equal(doc.activeElement, undockButton('alpha'), 'focus moves to the first docked section');
+
+    // One floating section is named; with none, the action changes nothing.
+    await dispatcher.dispatch('layout.panel.float', { panel: 'beta' });
+    assert.equal(button.hidden, false);
+    assert.equal(button.textContent, 'Dock beta');
+    await dispatcher.dispatch('layout.panel.dock', { panel: 'beta' });
+    assert.equal(button.hidden, true, 'a section docked by its own button hides it too');
+    assert.equal((await dispatcher.dispatch('layout.panel.dock-all', {})).outcome, null);
+    assert.equal(dockable.isFloating(panels.get('beta').details), false);
+  },
+);
+
+test(
+  'Dock all leaves windows that cannot dock where they are',
+  async (t) => {
+    const doc = installDom(t);
+    const { sidebar, panels } = buildSidebar(doc, ['alpha']);
+    const dispatcher = freshActions();
+    const dockable = initDockableAccordions({ sidebar, actions: dispatcher });
+    const window_ = new FakeHTMLDetailsElement(doc);
+    window_.className = 'accordion-section analysis-window-panel';
+    const summary = new FakeHTMLElement(doc, 'summary');
+    summary.textContent = 'Comparison';
+    window_.appendChild(summary);
+    dockable.floatingRoot.appendChild(window_);
+    dockable.register(window_, { dockable: false });
+    dockable.float(window_, { left: 400, top: 100, preferredSize: { width: 300, height: 200 } });
+    const button = sidebar.querySelector('.sidebar-dock-all');
+    assert.equal(button.hidden, true, 'an analysis window is no sidebar section');
+
+    await dispatcher.dispatch('layout.panel.float', { panel: 'alpha' });
+    assert.equal(button.textContent, 'Dock alpha');
+    assert.deepEqual((await dispatcher.dispatch('layout.panel.dock-all', {})).outcome, { panels: ['alpha'] });
+    assert.equal(isFloatingPanel(panels.get('alpha').details), false);
+    assert.equal(isFloatingPanel(window_), true);
+  },
+);
+
+/* ------------------------------------------------------------------ *
+ * Floating windows fit the visible screen, by one measure.           *
+ * ------------------------------------------------------------------ */
+
+test(
+  'the windows\' height cap and their clamp take one area: the visible screen',
+  async (t) => {
+    // F126 (bug hunt): the CSS cap took the screen's height from `100dvh`
+    // and the area's edges from the dockable owner, two measures; and a
+    // phone's keyboard shortens only the visual viewport, so a window behind
+    // it was out of reach. The owner publishes the area's height it clamps by.
+    const doc = installDom(t, { viewportWidth: 1600, viewportHeight: 900 });
+    const listeners = new Map();
+    const visual = {
+      scale: 1,
+      offsetTop: 0,
+      height: 900,
+      addEventListener(type, handler) {
+        if (!listeners.has(type)) listeners.set(type, []);
+        listeners.get(type).push(handler);
+      },
+      fire(type) {
+        for (const handler of listeners.get(type) ?? []) handler();
+      },
+    };
+    doc.defaultView.visualViewport = visual;
+    const { sidebar, panels } = buildSidebar(doc, ['alpha']);
+    const dockable = initDockableAccordions({ sidebar, actions: freshActions() });
+    const area = () => dockable.floatingRoot.style.getPropertyValue('--floating-area-height');
+    assert.equal(area(), '900px');
+    await restorePanels(layoutOf(sidebar, dockable), [
+      panelAt('alpha', { left: 400, top: 500, width: 320, height: 300 }),
+    ]);
+    const details = panels.get('alpha').details;
+
+    // The keyboard opens: the visible screen is 600 px tall.
+    visual.height = 600;
+    visual.fire('resize');
+    for (const frame of doc.frames.splice(0)) frame();
+    assert.equal(area(), '600px');
+    assert.equal(pixels(details, '--pos-y'), 600 - 300 - 8, 'the window is moved above the keyboard');
+    assert.equal(pixels(details, '--pos-height'), 300, 'its size is kept, the cap only cuts it');
+
+    // A zoomed page lays fixed windows out against the window, not the zoom.
+    visual.scale = 2;
+    visual.height = 450;
+    visual.fire('resize');
+    for (const frame of doc.frames.splice(0)) frame();
+    assert.equal(area(), '900px');
+
+    // And the window shrinking is the same measure.
+    visual.scale = 1;
+    visual.height = 700;
+    doc.defaultView.resizeTo(1600, 700);
+    for (const frame of doc.frames.splice(0)) frame();
+    assert.equal(area(), '700px');
   },
 );

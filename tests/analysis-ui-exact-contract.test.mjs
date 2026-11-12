@@ -1196,6 +1196,8 @@ test('2D correlation and volcano plots preselect the cross-browser SVG scatter r
         pageName: 'Page A',
         xVariable: 'age',
         yVariable: 'n_genes',
+        xLabel: 'age',
+        yLabel: 'n_genes',
         xValues,
         yValues,
         r: 1,

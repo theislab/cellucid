@@ -4,7 +4,7 @@
  * stores with a source id:
  *
  * - nothing outside the renderer reaches its point buffers, vertex arrays,
- *   colour stores or draw-order records;
+ *   color stores or draw-order records;
  * - the one shader that reads a per-cell texture by vertex maps the stored
  *   slot back to its source index through the order's permutation;
  * - every per-cell CPU consumer (highlight rings, picking, the cell card,
@@ -64,7 +64,7 @@ test('nothing outside the renderer reaches its draw-ordered point stores', () =>
     ),
     [],
   );
-  // Draw-order and colour-store records exist only in the renderer.
+  // Draw-order and color-store records exist only in the renderer.
   assert.deepEqual(
     hits(/\bcolorOwner\b|\b_liveOrder\b|\bgeometry\.order\b|\b_advanceDrawOrderAdoption\b/, { except: [RENDERER] }),
     [],

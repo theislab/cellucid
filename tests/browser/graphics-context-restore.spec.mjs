@@ -18,7 +18,7 @@ const DATASET_URL =
  * driver timeout, memory pressure) and gives it back: the viewer makes every
  * GPU object again from what it holds on the CPU (`restoreLostGraphics`,
  * rendering/viewer.js), and sets again what it had set on the context itself,
- * whose every value is back at its initial one: the clear colour of the
+ * whose every value is back at its initial one: the clear color of the
  * background, the backdrop look. WEBGL_lose_context stands in for the
  * browser.
  *
@@ -188,14 +188,19 @@ function loseContext(page) {
   });
 }
 
+/**
+ * The app's graphics-reset dialog (`app/graphics-reset-session.js`; the
+ * renderer only reports the phases, F146): its words and shown buttons, or
+ * null while closed. It is modal and keeps Escape: the page behind is inert.
+ */
 function notice(page) {
   return page.evaluate(() => {
-    const overlay = document.getElementById('cellucid-webgl-context-overlay');
-    if (overlay === null || overlay.style.display === 'none') return null;
-    const buttons = [...overlay.querySelectorAll('button')]
-      .filter(button => button.style.display !== 'none')
+    const dialog = document.getElementById('graphics-reset-dialog');
+    if (dialog === null || !dialog.open || !dialog.matches(':modal')) return null;
+    const buttons = [...dialog.querySelectorAll('button')]
+      .filter(button => !button.hidden)
       .map(button => button.textContent);
-    return { text: overlay.textContent, buttons };
+    return { text: dialog.textContent, buttons, focused: document.activeElement?.textContent ?? null };
   });
 }
 
@@ -206,8 +211,8 @@ test(`a lost context is restored in place: the same pixels, kept views, highligh
   page.on('pageerror', error => pageErrors.push(error.message));
   await page.addInitScript(labelProgramsBySource);
   await openWithKeptViewAndHighlights(page);
-  // Black has nothing drawn over the clear colour: the background is the
-  // context's clear colour itself.
+  // Black has nothing drawn over the clear color: the background is the
+  // context's clear color itself.
   await page.locator('#background-select').selectOption(background);
   await settle(page);
   await page.evaluate(recordSubmissions);
@@ -221,6 +226,10 @@ test(`a lost context is restored in place: the same pixels, kept views, highligh
   const restoring = await notice(page);
   expect(restoring.buttons).toEqual(['Save session']);
   expect(restoring.text).toMatch(/Restoring them/);
+  expect(restoring.focused).toBe('Save session');
+  // Escape leaves it open: nothing behind it can be used until the graphics are back.
+  await page.keyboard.press('Escape');
+  expect(await notice(page)).not.toBe(null);
 
   await page.evaluate(async () => {
     const canvas = document.querySelector('#glcanvas');
@@ -280,7 +289,7 @@ test('a restored context shows the backdrop look it had, moving by itself as bef
   // The motion the page asked for comes back with the context.
   await expect.poll(() => page.evaluate(() => window._cellucidViewer.getBackdropLookDiagnostics().ambient)).toBe(true);
   // The look bakes again on the restored context and is shown as before, over
-  // the same clear colour. Waited for still, as before the loss: moving, every
+  // the same clear color. Waited for still, as before the loss: moving, every
   // frame draws the look again, and on hosted macOS Firefox a frame of it takes
   // about a minute (`helpers/hosted-gl.mjs`: 55 to 69 s a 1024² pass), so its
   // fade-in (0.35 s of frames) outlasted any wait there (nightly run

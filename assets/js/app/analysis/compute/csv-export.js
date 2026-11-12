@@ -31,11 +31,19 @@ export function toCSVCell(value) {
     return Number.isFinite(value) ? String(value) : '';
   }
 
-  const str = String(value);
-  if (/[",\n\r]/.test(str)) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
+  return csvText(String(value));
+}
+
+/**
+ * Text as one CSV cell, the one quoting rule of every CSV the app writes:
+ * quoted when it holds a quote, a comma or a line break (`\n` or `\r`), each
+ * quote doubled.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function csvText(text) {
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 /** Characters gathered before a batch is encoded into a Blob part. */
@@ -134,17 +142,25 @@ export function pageInOriginalOrder(page, identity) {
  * The header line of a per-cell CSV layout.
  *
  * @param {'page-data'|'signature-scores'} layout
- * @param {string} [variableName] - The value column of 'page-data'
+ * @param {string} [column] - 'page-data': the value column (a variable's
+ *   name); 'signature-scores': what the cells are scored per, `page` (the
+ *   highlight pages chosen) or `group` (the categories of a Group by field),
+ *   as the result's table names its rows
  * @returns {string}
  */
-export function perCellCSVHeader(layout, variableName) {
+export function perCellCSVHeader(layout, column) {
   if (layout === 'page-data') {
-    if (typeof variableName !== 'string') {
+    if (typeof column !== 'string') {
       throw new TypeError('A page-data CSV needs its variable name');
     }
-    return `page,cell_index,${toCSVCell(variableName)}`;
+    return `page,cell_index,${toCSVCell(column)}`;
   }
-  if (layout === 'signature-scores') return 'page,set,cell_index,score';
+  if (layout === 'signature-scores') {
+    if (column !== 'page' && column !== 'group') {
+      throw new TypeError('A signature-scores CSV is per page or per group');
+    }
+    return `${column},set,cell_index,score`;
+  }
   throw new RangeError(`Unknown CSV export layout: ${String(layout)}`);
 }
 
@@ -153,8 +169,8 @@ export function perCellCSVHeader(layout, variableName) {
  * and without a trailing break (an empty Blob when there is no line):
  * - 'page-data': `page,cell_index,value`, one line per value; a page without
  *   cell indices numbers its rows from `firstRow` (0 by default);
- * - 'signature-scores': `page,set,cell_index,score`, one line per finite
- *   score (`setName` names the gene set).
+ * - 'signature-scores': `page|group,set,cell_index,score`, one line per
+ *   finite score (`pageName` names the page or group, `setName` the gene set).
  * A file split into row ranges is these Blobs joined by line breaks.
  *
  * @param {'page-data'|'signature-scores'} layout

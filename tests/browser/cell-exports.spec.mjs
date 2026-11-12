@@ -62,17 +62,24 @@ for (const name of ['data-mapping-full.h5ad', 'data-mapping-full.zarr.zip']) {
     }, PICKED);
     await expect(page.locator('#export-highlights-h5ad')).toBeVisible();
 
-    // A header and a kind row, then one row per open cell; the picked ones true.
+    // A header, a kind and a categories row, then one row per open cell; the picked ones true.
     const csv = readFileSync(await saveDownload(page, '#export-highlights-csv', testInfo), 'utf8').trim().split('\n');
-    expect(csv.length).toBe(2 + CELLS);
+    expect(csv.length).toBe(3 + CELLS);
     expect(csv.filter(line => line.endsWith(',true')).length).toBe(PICKED.length);
 
     // The field chosen in its select exports at once.
     await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
     await expect(page.locator('#export-categorical-field')).toBeEnabled();
     const field = readFileSync(await saveDownload(page, '#export-categorical-field', testInfo), 'utf8').trim().split('\n');
-    expect(field.length).toBe(2 + CELLS);
+    expect(field.length).toBe(3 + CELLS);
     expect(field[0].split(',')[1]).toBe('cell_type');
+    // Its categories in the field's order, as a JSON array in one CSV cell.
+    const listed = field[2].slice('categories,'.length);
+    const shown = await page.evaluate(() => {
+      const state = window._cellucidState;
+      return state.getFields().find(candidate => candidate.key === 'cell_type').categories.map(String);
+    });
+    expect(JSON.parse(listed.slice(1, -1).replaceAll('""', '"'))).toEqual(shown);
 
     // The .h5ad subset opens in Cellucid: the picked cells, every gene.
     const subset = await saveDownload(page, '#export-highlights-h5ad', testInfo);

@@ -1,6 +1,6 @@
 /**
  * One number format for every measured value the app shows (audit NS-3):
- * the legends' colour bars, the filter list and figure provenance, exported
+ * the legends' color bars, the filter list and figure provenance, exported
  * figures' axes and legends, cell info, range labels and analysis summaries
  * all write a value through `formatSignificant` (`utils/format-units.js`).
  * Three significant figures by default — in every range, where the two
@@ -21,7 +21,7 @@ import {
   tickFigures
 } from '../assets/js/utils/format-units.js';
 import { tickLabels } from '../assets/js/app/ui/modules/figure-export/components/axes-builder.js';
-import { niceNumbers } from '../assets/js/app/ui/modules/figure-export/utils/tick-calculator.js';
+import { niceNumbers } from '../assets/js/utils/nice-ticks.js';
 import { formatCellValue } from '../assets/js/app/ui/modules/cell-info.js';
 
 test('three significant figures in every range; scientific outside 0.01 to 10,000', () => {
@@ -93,7 +93,7 @@ test('cell info writes a cell value to six figures, a count whole', () => {
   assert.equal(formatCellValue(12345), '12345');
   assert.equal(formatCellValue(1.6094379124341003), '1.60944');
   assert.equal(formatCellValue(0.000123), '1.23e-4');
-  assert.equal(formatCellValue(NaN), 'NaN');
+  assert.equal(formatCellValue(NaN), 'Missing', 'the word the legend and the filters use (R9D-9)');
 });
 
 test('no other module writes a shown value with its own significant-figure rule', () => {

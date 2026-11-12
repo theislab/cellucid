@@ -1,0 +1,66 @@
+{
+  "examples": [
+    {
+      "categories": [
+        "T cells"
+      ],
+      "color": "#e41a1c",
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "page": "Page 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "categories": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "minItems": 1,
+        "type": "array",
+        "uniqueItems": true
+      },
+      "color": {
+        "pattern": "^#[0-9a-fA-F]{6}$",
+        "type": "string"
+      },
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "obs",
+              "var"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "page": {
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "field",
+      "categories"
+    ],
+    "type": "object"
+  },
+  "type": "highlight.category",
+  "version": 2
+}

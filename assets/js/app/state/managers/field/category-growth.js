@@ -4,10 +4,10 @@
  * likewise a categorical coded by the categories its open cells hold (its
  * new categories in stored order, `AnnDataReader._readPresentCategorical`).
  * The column keeps every category it showed, by label: the new labels take
- * their places in label order, each category keeps its colour, its
+ * their places in label order, each category keeps its color, its
  * visibility and its display name (the rename registry, by label), and the
  * codes the page holds are recoded by label. A new label a restored session
- * set a visibility or colour for takes it (`pending-categories.js`). Nothing
+ * set a visibility or color for takes it (`pending-categories.js`). Nothing
  * is read again.
  *
  * @module state/managers/field/category-growth
@@ -20,7 +20,7 @@ import { carriedCategoryState } from '../../../utils/category-state.js';
 
 /**
  * Grow one loaded field's categories to `categories` (every label it has,
- * in label order) with their colours (`palette`), recoding `codes` (the
+ * in label order) with their colors (`palette`), recoding `codes` (the
  * cells it holds, under its present categories) when given.
  *
  * @param {Object} state - The data state (`_applyCategoryOverlay`)
@@ -50,7 +50,7 @@ export function growFieldCategories(state, field, { categories, palette, codes =
   }
 
   // What was set per category goes with its label; a new one opens in its
-  // own colour, shown.
+  // own color, shown.
   if (field._categoryColors !== undefined || field._categoryVisible !== undefined) {
     state.ensureCategoryMetadata(field);
     const from = new Int32Array(categories.length).fill(-1);

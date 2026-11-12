@@ -2,7 +2,7 @@
 
 Realistic shapes, written by the current anndata: an atlas-like obs (many
 categorical columns, numeric, boolean and nullable columns), embeddings, a
-neighbour graph, and X in each layout the readers treat differently — CSR,
+neighbor graph, and X in each layout the readers treat differently — CSR,
 CSC, dense chunked by gene strips, dense contiguous — as `.h5ad` (gzip, the
 way CELLxGENE and most portals ship them, and uncompressed, the anndata
 default) and as Zarr (v2 and v3, each as a folder and as a ZIP; v3 also

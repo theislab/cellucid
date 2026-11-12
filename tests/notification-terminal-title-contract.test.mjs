@@ -2,7 +2,7 @@
  * A notification's title is only as true as the moment it describes.
  *
  * Work in progress is published with a title that names the work while it
- * runs — "Downloading", "Processing", "Generating Data". Completing or failing
+ * runs — "Downloading", "Processing", "Generating data". Completing or failing
  * that notification replaced its message and its type but kept the title, so a
  * finished download stayed on screen as "DOWNLOADING — 2D cell positions (960 B
  * in 15ms)" and a failed figure export read "PROCESSING — <error>". The same
@@ -51,6 +51,13 @@ class FakeNode {
     child.parent = this;
     this.children.splice(this.children.indexOf(reference), 0, child);
     return child;
+  }
+
+  /** A card's Details go after its message (`notificationDetailsHtml`; this fake parses no HTML). */
+  after(node) {
+    if (node === undefined || node === null || this.parent === null) return;
+    node.parent = this.parent;
+    this.parent.children.splice(this.parent.children.indexOf(this) + 1, 0, node);
   }
 
   remove() {
@@ -166,6 +173,34 @@ test('a failed load says the loading failed', t => {
     dom: 'Loading failed',
     stored: 'Loading failed',
   });
+});
+
+test('a failed load keeps the failure\'s own words under Details, out of its sentence', t => {
+  const center = createCenter(t);
+  const tracker = center.startDownload('Saved state');
+  center.failDownload(tracker, 'it does not hold together as a history, so it was not opened; the history shown is unchanged.', {
+    details: 'tracker t-1: a group cuts the run of turn "u1" between steps "s5" and "s6"',
+  });
+  const { options } = center.notifications.get(`download-${tracker}`);
+  assert.equal(options.message, 'Saved state: it does not hold together as a history, so it was not opened; the history shown is unchanged.');
+  assert.match(options.details, /tracker t-1/);
+  assert.throws(() => center.failDownload(center.startDownload('x'), 'failed', { details: 3 }), /details must be a string/);
+});
+
+test('a broken invariant\'s sentence says its words are under Details, where the card has them (F141)', async t => {
+  const { failureDetails, sayFailure, failureSentence, INTERNAL_FAILURE, INTERNAL_FAILURE_WITH_DETAILS } = await import('../assets/js/utils/errors.js');
+  const bug = new TypeError('values.get is not a function');
+  const center = createCenter(t);
+  const tracker = center.startDownload('Saved state');
+  center.failDownload(tracker, sayFailure(bug), failureDetails(bug));
+  assert.equal(center.notifications.get(`download-${tracker}`).options.message, `Saved state: ${INTERNAL_FAILURE_WITH_DETAILS}`);
+  const id = center.error(`Export failed: ${sayFailure(bug)}`, { ...failureDetails(bug) });
+  assert.equal(center.notifications.get(id).options.message, `Export failed: ${INTERNAL_FAILURE_WITH_DETAILS}`);
+  const whole = center.error(failureSentence(bug), { ...failureDetails(bug) });
+  assert.equal(center.notifications.get(whole).options.message, `A${INTERNAL_FAILURE_WITH_DETAILS.slice(1)}`);
+  // Without Details (a status line, a chat note, a card given none) the sentence is said alone.
+  const bare = center.error(`Export failed: ${sayFailure(bug)}`);
+  assert.equal(center.notifications.get(bare).options.message, `Export failed: ${INTERNAL_FAILURE}`);
 });
 
 test('settled work retires an in-progress title it did not replace', t => {

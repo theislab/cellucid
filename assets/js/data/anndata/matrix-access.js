@@ -14,7 +14,7 @@
  *   the matrix, a Loom file's 64-gene strips among them): a gene reads only
  *   the chunks of its strip, in parallel, streamed within the store's decode
  *   budget. The store keeps decoded chunks (its decoded-chunk cache, sized by
- *   the `decodedBlocks` budget), so when a strip fits it the neighbouring
+ *   the `decodedBlocks` budget), so when a strip fits it the neighboring
  *   genes of a strip decode nothing again; that budget decides reuse only,
  *   never the route (`geneLayoutOf`).
  * - **CSR** (stored by cell), or **dense** stored in one piece or in chunks
@@ -52,7 +52,7 @@
 import { isGroup } from '../../formats/store.js';
 import { allocateTypedArray, copyTypedArray, RowMajorColumnIndex, sparseColumnOf, sparseColumnOfDense, sparseIndexPlan } from '../sparse-column-index.js';
 import { isAnnDataMatrixDataKind } from '../anndata-value-kinds.js';
-import { elementBytes, encodingType, shapeOf, validateArrayEncoding, valueKind } from './elements.js';
+import { AnnDataFormatError, elementBytes, encodingType, shapeOf, validateArrayEncoding, valueKind } from './elements.js';
 import { checkPointers, sparseContract } from './sparse.js';
 import { SLAB_BYTES, readIntegers, readNumbers, writeFloat32 } from './values.js';
 import { keepSubsetEntries, keepSubsetRun, sortSubsetEntries } from './subset-entries.js';
@@ -114,7 +114,7 @@ function chunkElements(array) {
  * A subsample's view of an array (`views/cell-subset.js` `gatheredArray`)
  * has chunks of its kept entries of each stored chunk: each one touched
  * costs the stored chunk it is part of, decoded whole (priced at its kept
- * entries, a 10 % share's DE groups were read by their rows, 161 MB priced,
+ * entries, a 10% share's DE groups were read by their rows, 161 MB priced,
  * against its gene index already built, and read and decoded 750 MB).
  */
 function touchedChunkBytes(array, starts, ends, count) {
@@ -165,8 +165,8 @@ function gallopRows(sorted, row, from) {
  * before its rows are read: the gene's entries taken as spread evenly over
  * the stored rows, so entry `start + (end - start) * row / nRows` is about
  * row `row`'s, and the kept rows' runs touch the value chunks of their
- * entries. A gene of a foreign gene-major file at a 1 % blocks subsample
- * leaves about half of its chunks untouched; at 10 % nearly none (each chunk
+ * entries. A gene of a foreign gene-major file at a 1% blocks subsample
+ * leaves about half of its chunks untouched; at 10% nearly none (each chunk
  * spans millions of rows).
  */
 function keptValueChunksSave(array, keptRuns, nRows, start, end) {
@@ -239,7 +239,7 @@ function checkedColumnEntries(rows, values, from, to, start, nObs) {
   for (let entry = from; entry < to; entry++) {
     const row = rows[entry];
     if (!(row >= 0 && row < nObs) || !Number.isInteger(row)) {
-      throw new RangeError(
+      throw new AnnDataFormatError(
         `Sparse column row index ${row} at entry ${start + entry} is outside its ${nObs}-row shape`
       );
     }
@@ -280,7 +280,7 @@ function widerThanFloat32(array) {
  * `create(options)`. Each build of the index -- started by the first column
  * asked for, or `prepare()` ahead of need -- gets its own activity
  * (`onIndexStart(label)`), which its reads count into and its progress
- * updates, finished when the index is built (or cancelled, when the last
+ * updates, finished when the index is built (or canceled, when the last
  * gene it was built for is withdrawn). `storedBytes(index, {values})` is what
  * a pass will read, for how much is left: a second pass (the store filled
  * from the matrix after an indices-only first pass) expects its bytes when it
@@ -624,7 +624,7 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
   if (isGroup(matrix)) {
     const sparse = sparseContract(matrix, format, `Sparse ${label}`);
     if (sparse.shape[0] !== nObs || sparse.shape[1] !== nVars) {
-      throw new Error(
+      throw new AnnDataFormatError(
         `Sparse ${label} shape ${sparse.shape[0]}×${sparse.shape[1]} does not match ${formatCountOf(nObs, 'cell')} and ${formatCountOf(nVars, 'gene')}`
       );
     }
@@ -645,8 +645,8 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
       // A gene's kept entries alone, when the value chunks it would skip
       // cost more than the round trip the extra read adds. Shared over the
       // genes read at once, that round trip looked cheaper; measured, the
-      // runs' extra requests made 100 genes of a 1 % subsample slower
-      // (3.2 s against 2.7 s, 150 ms at 5 MB/s) for 13 % fewer bytes.
+      // runs' extra requests made 100 genes of a 1% subsample slower
+      // (3.2 s against 2.7 s, 150 ms at 5 MB/s) for 13% fewer bytes.
       const entries = async (gene, options) => {
         const start = pointers[gene];
         const end = pointers[gene + 1];
@@ -673,7 +673,7 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
         for (let entry = 0; entry < stored.length; entry++) {
           const row = Number(stored[entry]);
           if (!(row >= 0 && row < nObs) || !Number.isInteger(row)) {
-            throw new RangeError(`Sparse column row index ${row} at entry ${start + entry} is outside its ${nObs}-row shape`);
+            throw new AnnDataFormatError(`Sparse column row index ${row} at entry ${start + entry} is outside its ${nObs}-row shape`);
           }
           // Rows stored out of order: the walk starts again.
           if (row < lastRow) position = 0;
@@ -701,7 +701,7 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
           for (let entry = 0; entry < rows.length; entry++) {
             const row = rows[entry];
             if (!(row >= 0 && row < nObs) || !Number.isInteger(row)) {
-              throw new RangeError(
+              throw new AnnDataFormatError(
                 `Sparse column row index ${row} at entry ${start + entry} is outside its ${nObs}-row shape`
               );
             }
@@ -768,11 +768,11 @@ export async function openMatrixColumns(matrix, { format, label, nObs, nVars, de
   validateArrayEncoding(matrix, format, `Dense ${label}`, 'array');
   const shape = shapeOf(matrix, `Dense ${label}`, 2);
   if (shape[0] !== nObs || shape[1] !== nVars) {
-    throw new Error(`Dense ${label} shape ${shape[0]}×${shape[1]} does not match ${formatCountOf(nObs, 'cell')} and ${formatCountOf(nVars, 'gene')}`);
+    throw new AnnDataFormatError(`Dense ${label} shape ${shape[0]}×${shape[1]} does not match ${formatCountOf(nObs, 'cell')} and ${formatCountOf(nVars, 'gene')}`);
   }
   // A boolean matrix (a mask, a detection call) reads as 0 and 1.
   if (!isAnnDataMatrixDataKind(valueKind(matrix))) {
-    throw new Error(`Dense ${label} must use a numeric or boolean dtype`);
+    throw new AnnDataFormatError(`Dense ${label} must use a numeric or boolean dtype`);
   }
   const bytes = elementBytes(matrix);
   if (!readsThroughRowIndex(matrix, { nObs, nVars, decodedChunkBytes, columnIndexBytes })) {
@@ -844,7 +844,7 @@ function sparseRowFrom(genes, values, nVars, label) {
   for (let entry = 0; entry < count; entry++) {
     const gene = genes[entry];
     if (!(gene >= 0 && gene < nVars) || !Number.isInteger(gene)) {
-      throw new RangeError(`${label} gene index ${gene} is outside its ${nVars}-gene shape`);
+      throw new AnnDataFormatError(`${label} gene index ${gene} is outside its ${nVars}-gene shape`);
     }
     if (entry > 0 && gene < genes[entry - 1]) sorted = false;
   }
@@ -989,7 +989,7 @@ class SubsetEntries {
 }
 
 /**
- * Read `reads` (each `{start, end, ...}`, in order) with at most
+ * Read `reads` (each `{start, end, ...}`, in order, by `request(read)`) with at most
  * `inFlightEntries` entries requested and not yet handled, handing each to
  * `handle(read, data)` in order. A read counts as no fewer entries than a
  * request is worth (`requestEntries`, `requestPriceOf`): every request in
@@ -998,7 +998,7 @@ class SubsetEntries {
  * row) are not all put in flight at once: a million of them held the
  * reader's heap past its limit (a two-group subset of a 10M-cell file).
  */
-export async function pipelined(reads, inFlightEntries, fetch, handle, requestEntries = 0) {
+export async function pipelined(reads, inFlightEntries, request, handle, requestEntries = 0) {
   const pending = [];
   let next = 0;
   let inFlight = 0;
@@ -1007,7 +1007,7 @@ export async function pipelined(reads, inFlightEntries, fetch, handle, requestEn
   const issue = () => {
     while (next < reads.length && (pending.length === 0 || inFlight + cost(reads[next]) <= inFlightEntries)) {
       const read = reads[next++];
-      const data = fetch(read);
+      const data = request(read);
       inFlight += cost(read);
       // Arrived, a read holds its entries only: the rest of its request's
       // worth is free for the next reads at once, though it waits its turn
@@ -1351,7 +1351,7 @@ export async function openMatrixRows(matrix, { format, label, nObs, nVars, index
   if (isGroup(matrix)) {
     const sparse = sparseContract(matrix, format, `Sparse ${label}`);
     if (sparse.shape[0] !== nObs || sparse.shape[1] !== nVars) {
-      throw new Error(
+      throw new AnnDataFormatError(
         `Sparse ${label} shape ${sparse.shape[0]}×${sparse.shape[1]} does not match ${formatCountOf(nObs, 'cell')} and ${formatCountOf(nVars, 'gene')}`
       );
     }
@@ -1451,7 +1451,7 @@ export async function openMatrixRows(matrix, { format, label, nObs, nVars, index
               for (let entry = pointers[cell] - read.start; entry < to; entry++) {
                 const gene = geneIndex[entry];
                 if (!(gene >= 0 && gene < nVars) || !Number.isInteger(gene)) {
-                  throw new RangeError(`Sparse ${label} gene index ${gene} is outside its ${nVars}-gene shape`);
+                  throw new AnnDataFormatError(`Sparse ${label} gene index ${gene} is outside its ${nVars}-gene shape`);
                 }
                 const g = slot[gene];
                 if (g >= 0) entries.add(g, position, values[entry]);
@@ -1470,11 +1470,11 @@ export async function openMatrixRows(matrix, { format, label, nObs, nVars, index
   validateArrayEncoding(matrix, format, `Dense ${label}`, 'array');
   const shape = shapeOf(matrix, `Dense ${label}`, 2);
   if (shape[0] !== nObs || shape[1] !== nVars) {
-    throw new Error(`Dense ${label} shape ${shape[0]}×${shape[1]} does not match ${formatCountOf(nObs, 'cell')} and ${formatCountOf(nVars, 'gene')}`);
+    throw new AnnDataFormatError(`Dense ${label} shape ${shape[0]}×${shape[1]} does not match ${formatCountOf(nObs, 'cell')} and ${formatCountOf(nVars, 'gene')}`);
   }
   // A boolean matrix (a mask, a detection call) reads as 0 and 1.
   if (!isAnnDataMatrixDataKind(valueKind(matrix))) {
-    throw new Error(`Dense ${label} must use a numeric or boolean dtype`);
+    throw new AnnDataFormatError(`Dense ${label} must use a numeric or boolean dtype`);
   }
   const bytes = elementBytes(matrix);
   const chunks = Array.isArray(matrix.chunks) ? matrix.chunks : null;

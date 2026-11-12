@@ -7,6 +7,8 @@ import {
 import {
   areLegendModelsSemanticallyEqual,
 } from '../assets/js/app/ui/modules/figure-export/utils/legend-model-equality.js';
+import { buildProvenanceDescription, buildProvenanceJson } from '../assets/js/app/ui/modules/figure-export/utils/figure-provenance.js';
+import { assertFigureExportPayload } from '../assets/js/app/ui/modules/figure-export/figure-export-contract.js';
 import './helpers/figure-export-worker-in-process.mjs';
 import { colorsOf, visibleOf } from './helpers/category-state.mjs';
 
@@ -17,9 +19,9 @@ const IDENTITY = Float32Array.from([
   0, 0, 0, 1,
 ]);
 
-function cameraState() {
+function cameraState(navigationMode = 'orbit') {
   return {
-    navigationMode: 'orbit',
+    navigationMode,
     orbit: {
       radius: 3,
       targetRadius: 3,
@@ -54,6 +56,8 @@ function renderState() {
     },
     bgColor: Float32Array.from([1, 1, 1]),
     cameraDistance: 3,
+    // The sprite cap (rendering/point-sprite.js).
+    pointSizeMax: 160,
     cameraPosition: [0, 0, 3],
     far: 100,
     fogColor: Float32Array.from([1, 1, 1]),
@@ -70,7 +74,13 @@ function renderState() {
     projectionMatrix: new Float32Array(IDENTITY),
     shaderQuality: 'full',
     sizeAttenuation: 1,
-    viewMatrix: new Float32Array(IDENTITY),
+    // The camera at (0, 0, 3) looking at the orbit target, the origin.
+    viewMatrix: Float32Array.from([
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, -3, 1,
+    ]),
     viewportHeight: 240,
     viewportWidth: 320,
   };
@@ -96,29 +106,35 @@ function categoryLegend() {
 function makeView({
   id,
   label,
+  // The name the view was given (`view.rename`): its panel's title.
+  name = null,
   transparency = 1,
   legendModel = null,
   fieldKey = legendModel === null ? null : 'cluster',
   filters = [],
+  // A 1-D or 2-D view is seen planar (its default), a 3-D one orbited.
+  dimension = 3,
 }) {
   return {
-    cameraState: cameraState(),
+    cameraState: cameraState(dimension === 3 ? 'orbit' : 'planar'),
     data: {
       centroidColors: null,
       centroidFlags: { labels: false, points: false },
+      vectorField: null,
       centroidLabelTexts: [],
       centroidPositions: null,
       colors: Uint8Array.from([255, 0, 0, 255]),
       pointCount: 1,
-      positions: Float32Array.from([0, 0, 0]),
+      positions: new Float32Array(dimension),
       transparency: Uint8Array.from([transparency]),
     },
     id,
     label,
+    name,
     renderState: renderState(),
     scientificState: {
       datasetGeneration: 7,
-      dimensionLevel: 3,
+      dimensionLevel: dimension,
       fieldKey,
       fieldKind: fieldKey === null ? null : 'category',
       filters,
@@ -144,6 +160,8 @@ function provenanceViews(views) {
     filters: [...view.scientificState.filters],
     id: view.id,
     label: view.label,
+    name: view.name,
+    vectorField: view.data.vectorField === null ? null : view.data.vectorField.label,
   }));
 }
 
@@ -164,6 +182,7 @@ function payload({
     dpi: null,
     format: 'svg',
     height,
+    gridColumns: views.length <= 3 ? views.length : Math.ceil(views.length / 2),
     meta: { views: provenanceViews(views) },
     options: {
       axisLabelFontSizePx: 12,
@@ -194,6 +213,7 @@ function payload({
     },
     selection: {
       highlightArray: null,
+      pageName: null,
       totalCount: 0,
       visibleCount: 0,
     },
@@ -316,7 +336,7 @@ test('multiview SVG shares only separately owned, semantically equal legends', a
   const missingSvg = await (
     await renderFigureToSvgBlob({ payload: missing })
   ).text();
-  // The coloured panel keeps its legend; the panel with no active field has
+  // The colored panel keeps its legend; the panel with no active field has
   // nothing to explain.
   assert.equal(
     occurrences(missingSvg, /font-weight="600">cluster<\/text>/g),
@@ -347,20 +367,31 @@ test('Times-family axes and legends remain well-formed escaped SVG attributes', 
   assert.doesNotMatch(svg, /font-family=""Times New Roman"/);
 });
 
-test('multiview SVG renders axes and orientation for every eligible pane', async () => {
+test('multiview SVG draws axes where they are rulers, the 3-D orientation where they are not', async () => {
+  // Found 2026-11-11 (F86): a grid of 3-D views carried X/Y rulers in camera
+  // units on the focal plane, read by everyone as embedding coordinates.
   const exact = payload({
     views: [
-      makeView({ id: 'live', label: 'Live' }),
+      makeView({ id: 'live', label: 'Live', dimension: 2 }),
       makeView({ id: 'snapshot', label: 'Snapshot' }),
     ],
   });
   const svg = await (await renderFigureToSvgBlob({ payload: exact })).text();
 
-  assert.equal(occurrences(svg, />UMAP 1<\/text>/g), 2);
-  assert.equal(occurrences(svg, />UMAP 2<\/text>/g), 2);
-  assert.equal(occurrences(svg, />az 0°<\/text>/g), 2);
+  // The flat 2-D panel has axes and no orientation; the 3-D one the reverse.
+  assert.equal(occurrences(svg, />UMAP 1<\/text>/g), 1);
+  assert.equal(occurrences(svg, />UMAP 2<\/text>/g), 1);
+  assert.equal(occurrences(svg, />az 0°<\/text>/g), 1);
   assert.match(svg, />A\. Live<\/text>/);
   assert.match(svg, />B\. Snapshot<\/text>/);
+
+  // A grid of 3-D views has no axes at all, whatever the Axes choice.
+  const orbit = payload({
+    views: [makeView({ id: 'live', label: 'Live' }), makeView({ id: 'snapshot', label: 'Snapshot' })],
+  });
+  const orbitSvg = await (await renderFigureToSvgBlob({ payload: orbit })).text();
+  assert.equal(occurrences(orbitSvg, />UMAP 1<\/text>/g), 0);
+  assert.equal(occurrences(orbitSvg, />az 0°<\/text>/g), 2);
 });
 
 test('single-view SVG emits orientation and selection annotations after every point overlay', async () => {
@@ -371,6 +402,7 @@ test('single-view SVG emits orientation and selection annotations after every po
   exact.options.emphasizeSelection = true;
   exact.selection = {
     highlightArray: Uint8Array.from([255]),
+    pageName: 'Page 1',
     totalCount: 1,
     visibleCount: 1,
   };
@@ -485,11 +517,12 @@ test('full-vector SVG depth sorting ignores earlier off-crop points without corr
 test('mixed multiview SVG replaces empty-pane axes with one message', async () => {
   const exact = payload({
     views: [
-      makeView({ id: 'visible', label: 'Visible' }),
+      makeView({ id: 'visible', label: 'Visible', dimension: 2 }),
       makeView({
         id: 'filtered',
         label: 'Filtered',
         transparency: 0,
+        dimension: 2,
       }),
     ],
   });
@@ -498,10 +531,10 @@ test('mixed multiview SVG replaces empty-pane axes with one message', async () =
   assert.equal(occurrences(svg, />UMAP 1<\/text>/g), 1);
   assert.equal(occurrences(svg, />UMAP 2<\/text>/g), 1);
   assert.equal(occurrences(svg, />No visible cells<\/text>/g), 1);
-  assert.equal(occurrences(svg, />az 0°<\/text>/g), 2);
+  assert.equal(occurrences(svg, />az 0°<\/text>/g), 0);
 });
 
-test('tiny multiview SVG panes keep bounded gutters and finite geometry', async () => {
+test('tiny multiview SVG panes keep finite geometry and grow to keep their legend', async () => {
   const exact = payload({
     width: 120,
     height: 100,
@@ -517,8 +550,41 @@ test('tiny multiview SVG panes keep bounded gutters and finite geometry', async 
 
   assert.doesNotMatch(svg, /(?:NaN|Infinity)/);
   assert.doesNotMatch(svg, /(?:width|height)="-/);
-  assert.doesNotMatch(svg, /font-weight="600">cluster<\/text>/);
+  // A 120 × 100 figure cannot hold four readable panels and their legend, so
+  // the figure grows: the shared legend is drawn once, never dropped.
+  assert.equal(occurrences(svg, /font-weight="600">cluster<\/text>/g), 1);
+  // The figure in figure pixels (the viewBox; its width and height say millimetres).
+  const [, svgWidth, svgHeight] = svg.match(/^<svg[^>]* viewBox="0 0 (\d+) (\d+)"/);
+  assert.ok(Number(svgWidth) > 120 && Number(svgHeight) > 100, `figure ${svgWidth} × ${svgHeight}`);
   for (const label of ['A. A', 'B. B', 'C. C', 'D. D']) {
     assert.match(svg, new RegExp(`>${label.replace('.', '\\.')}<\\/text>`));
   }
+});
+
+test('a grid panel is titled by the name its view was given, escaped; its provenance carries the name (F130)', async () => {
+  const views = [
+    makeView({ id: 'live', label: 'cluster', name: 'Early' }),
+    makeView({ id: 'snap_1', label: 'cluster', name: 'Late <b>&amp; "co"' }),
+    makeView({ id: 'snap_2', label: 'cluster • age: Mid' }),
+  ];
+  const exact = payload({ views, includeAxes: false, showOrientation: false });
+  const svg = await (await renderFigureToSvgBlob({ payload: exact })).text();
+  assert.match(svg, />A\. Early<\/text>/);
+  // A name is plain text: written as text, never as markup.
+  assert.match(svg, />B\. Late &lt;b&gt;&amp;amp; &quot;co&quot;<\/text>/);
+  assert.doesNotMatch(svg, /<b>/);
+  // An unnamed view's panel keeps its label.
+  assert.match(svg, />C\. cluster • age: Mid<\/text>/);
+
+  const json = JSON.parse(buildProvenanceJson(exact.meta, exact, 'svg'));
+  assert.deepEqual(json.views.map(view => [view.panel, view.name, view.label]), [
+    ['A', 'Early', 'cluster'],
+    ['B', 'Late <b>&amp; "co"', 'cluster'],
+    ['C', null, 'cluster • age: Mid'],
+  ]);
+  assert.match(buildProvenanceDescription(exact.meta), /^Views: A\. Early \(Field: none; Filters: none\) \| B\. Late <b>&amp; "co" \(Field: none; Filters: none\) \| C\. cluster • age: Mid /);
+  // The payload's record must name the panel's view's name.
+  const disagreeing = payload({ views });
+  disagreeing.meta.views[0] = { ...disagreeing.meta.views[0], name: 'Other' };
+  assert.throws(() => assertFigureExportPayload(disagreeing), /must describe the exported view "live"/);
 });

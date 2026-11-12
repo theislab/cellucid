@@ -8,9 +8,9 @@
  *
  * On the Current UI fixture, each action of a list that covers every area is
  * applied at a base state, and again after each of a set of perturbations
- * (one action each: a field renamed, a filter, a colour, hidden cells, a
+ * (one action each: a field renamed, a filter, a color, hidden cells, a
  * highlight, the camera, the camera path, a setting, the layout, a gene set,
- * the data mapping, the colouring, another share of the cells, a kept
+ * the data mapping, the coloring, another share of the cells, a kept
  * view). Which domains a perturbation changed is measured (the state
  * fingerprint), never assumed; a pair is checked when the perturbation
  * changed none of the domains the action touches or reads. Every action must
@@ -38,7 +38,7 @@ const SCORE = { source: 'obs', key: 'score' };
 
 /**
  * What the base state holds besides the fixture's start: a continuous
- * colouring and a page with cells. No analysis is open: with one open, an
+ * coloring and a page with cells. No analysis is open: with one open, an
  * undo of a highlight or field change leaves the `analysis` domain changed
  * (its selected pages, its options), outside any step, so the base could not
  * be put back; the analyses' inputs are checked here once that is fixed.
@@ -71,7 +71,7 @@ function actionsUnderTest(camera) {
     }],
     ['gene-set.save', { name: 'Mine', genes: ['CD3E'] }],
     ['highlight.cells', { cells: [7, 9, 11], label: 'Three' }],
-    ['highlight.category', { field: CELL_TYPE, category: 'gamma' }],
+    ['highlight.category', { field: CELL_TYPE, categories: ['gamma'] }],
     ['highlight.range', { field: SCORE, min: 0, max: 0.5 }],
     ['highlight.page.create', { name: 'Second' }],
     ['cells.visibility.set', { cells: [10, 11], visible: false }],

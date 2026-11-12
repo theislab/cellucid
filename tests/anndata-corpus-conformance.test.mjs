@@ -26,6 +26,7 @@ import './helpers/machine-at-rest.mjs';
 
 import { openDatasetStore } from '../assets/js/data/anndata/open.js';
 import { AnnDataReader } from '../assets/js/data/anndata/reader.js';
+import { UNSAFE_INTEGERS_AS_TEXT } from '../assets/js/data/anndata/values.js';
 import { createByteReader } from '../assets/js/formats/io/byte-reader.js';
 import { blobByteSource, bytesByteSource } from '../assets/js/formats/io/byte-source.js';
 import { openZipArchive } from '../assets/js/formats/zip/index.js';
@@ -71,6 +72,18 @@ const f32 = value => Math.fround(numberOf(value));
 
 /** Integer dtypes float32 cannot hold exactly: read as float64 (`values.js` `readContinuous`). */
 const WIDE_INTEGERS = /^(Int|UInt|int|uint)(32|64)$/;
+
+/**
+ * A column of 64-bit integers anndata read holding a value past 2^53 (the
+ * corpus's dtype extremes, -2^63 … 2^64 - 1): identifiers, read as the exact
+ * decimal text of each value (F116, `values.js` `readExactIntegers`); null
+ * for any other column.
+ */
+function identifierTexts(column) {
+  if (!/^(Int|UInt|int|uint)64$/.test(column.dtype ?? '')) return null;
+  const unsafe = column.values.some(value => value !== null && (BigInt(value) > 9007199254740991n || BigInt(value) < -9007199254740991n));
+  return unsafe ? column.values.map(value => (value === null ? null : BigInt(value).toString())) : null;
+}
 
 /** Equal as stored numbers: NaN equals NaN, and -0 equals 0 (a sparse sum loses the sign). */
 function sameNumber(actual, expected) {
@@ -227,11 +240,21 @@ async function checkObsColumn(reader, column, where, readsMore) {
     assert.deepEqual(Array.from(field.codes), column.values, `${where}: codes`);
     return;
   }
+  const texts = column.kind === 'numeric' || column.kind === 'nullable-integer' ? identifierTexts(column) : null;
+  if (texts !== null) {
+    // Identifiers past 2^53: a text column of their exact decimal texts, saying why.
+    assert.equal(field.dtype, 'categorical', `${where}: dtype`);
+    assert.equal(field.discovered, true, `${where}: categories found by reading it`);
+    assert.equal(field.asText, UNSAFE_INTEGERS_AS_TEXT, `${where}: why it is text`);
+    assert.deepEqual(Array.from(field.values), texts, `${where}: every value exactly`);
+    return;
+  }
   switch (column.kind) {
     case 'numeric': {
       assert.ok(['float', 'int', 'uint'].includes(field.dtype), `${where}: dtype ${field.dtype}`);
       // An integer wider than 16 bits stays exact (float64: every integer up
-      // to 2^53, the nearest double beyond); every other number is float32.
+      // to 2^53; a 64-bit column holding one beyond is text, above); every
+      // other number is float32.
       const exact = WIDE_INTEGERS.test(column.dtype ?? '');
       assert.equal(field.values instanceof Float64Array, exact, `${where}: ${exact ? 'float64' : 'float32'} values`);
       assertNumbers(field.values, column.values, exact ? numberOf : f32, where);

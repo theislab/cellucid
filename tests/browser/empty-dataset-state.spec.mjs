@@ -25,7 +25,10 @@ const APP_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&acceptance=empty-dataset-state-ci`;
 const SAMPLE_OPTION = 'dataset:local-demo:current-ui';
 const SAMPLE_NAME = 'Current UI fixture';
-const NO_CELLS_TO_MEASURE = 'Load a dataset or generate benchmark data first.';
+const NO_CELLS_TO_MEASURE = 'Open a dataset or load synthetic data first.';
+// What every analysis mode says with no dataset open (R9E-8): the same line,
+// never "Requires gene expression data.".
+const NO_DATASET_TO_ANALYZE = 'No dataset is open. Open one in Session › Open data to analyze it.';
 const GENE_MODES = Object.freeze(['differential', 'signature', 'genesPanel']);
 const OTHER_MODES = Object.freeze(['simple', 'detailed', 'correlation']);
 
@@ -156,23 +159,25 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
 
   await page.locator('#dataset-select').selectOption('__none__');
   await expect(page.locator('#dataset-name')).toHaveText('No dataset open');
+  // The empty viewer says what it waits for (R9E-10).
+  await expect(page.locator('.opening-overlay[data-state="empty"] .opening-title')).toHaveText('No dataset open');
   await openSections(page);
 
   // Keep view, Figure export and Save act on cells: unavailable, with a reason.
   const keepView = page.locator('#split-keep-view-btn');
   await expect(keepView).toBeDisabled();
-  await expect(keepView).toHaveAttribute('title', 'Load a dataset to keep views');
+  await expect(keepView).toHaveAttribute('title', 'Open a dataset to keep views.');
   const exportButton = page.locator('#figure-export-btn');
   await expect(exportButton).toBeDisabled();
   await expect(exportButton).toHaveAttribute(
     'title',
-    'Load a dataset to export a figure',
+    'Open a dataset to export a figure.',
   );
   const shareButton = page.locator('#history-share-btn');
   await expect(shareButton).toBeDisabled();
   await expect(shareButton).toHaveAttribute(
     'title',
-    'Load a dataset to share a session',
+    'Open a dataset to share a session.',
   );
 
   // Load stays available and names the dataset the session needs.
@@ -188,24 +193,22 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
   await expect(refusal).not.toContainText('current-ui');
   await expect(refusal).not.toContainText('0 cells');
 
-  // The modes built on gene expression say so instead of building a form.
-  for (const mode of GENE_MODES) {
+  // Every mode says no dataset is open instead of building a form.
+  for (const mode of [...GENE_MODES, 'composition', ...OTHER_MODES]) {
     const panel = await openMode(page, mode);
-    await expect(panel).toContainText('Requires gene expression data.');
+    await expect(panel, mode).toContainText(NO_DATASET_TO_ANALYZE);
     await expect(panel.locator('.analysis-run-btn')).toHaveCount(0);
     await closeMode(page, mode);
   }
-  for (const mode of OTHER_MODES) {
-    await openMode(page, mode);
-    await closeMode(page, mode);
-  }
   // Such a mode has no form, so there are no settings to copy into a window.
-  for (const mode of GENE_MODES) {
+  for (const mode of [...GENE_MODES, ...OTHER_MODES]) {
     await page
       .locator(`.analysis-mode[data-mode="${mode}"] .analysis-mode-copy-btn`)
       .click();
-    await expectInfo(page, 'Requires gene expression data.');
+    await expectInfo(page, NO_DATASET_TO_ANALYZE);
   }
+  // Camera path: nothing to clear is dimmed (R9E-9).
+  await expect(page.locator('#cinematic-clear-btn')).toBeDisabled();
   await expect(
     page.locator('#floating-panels-root .analysis-window-panel'),
   ).toHaveCount(0);
@@ -220,7 +223,7 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
   // A repository is connected per dataset.
   const annotation = page.locator('#community-annotation-controls');
   await expect(annotation).toContainText(
-    'Load a dataset to connect a repository.',
+    'Open a dataset to connect a repository.',
   );
   await expect(
     annotation.locator('[data-community-annotation-action="github-connection"]'),
@@ -231,6 +234,11 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
     await page.locator(`#highlight-mode-${tool}`).click();
     await selectAcrossCanvas(page);
   }
+  // KNN drag says there is no dataset, not that a dataset has no graph (R9E-8).
+  await expect(page.locator('.notification', {
+    hasText: 'No dataset is open. Open one in Session › Open data to select cells by their neighbors.',
+  })).not.toHaveCount(0);
+  await expect(page.locator('.notification', { hasText: 'no neighbor graph' })).toHaveCount(0);
   await page.locator('#highlight-select-mode').click();
   await expect(page.locator('#highlight-select-mode')).toHaveAttribute(
     'aria-checked',
@@ -248,6 +256,7 @@ test('None leaves every dataset action unavailable or truthful, and a sample res
   // Choosing a sample again restores every action.
   await page.locator('#dataset-select').selectOption(SAMPLE_OPTION);
   await expect(page.locator('#dataset-name')).toHaveText(SAMPLE_NAME);
+  await expect(page.locator('.opening-overlay')).toBeHidden();
   await expect(keepView).toBeEnabled();
   await expect(exportButton).toBeEnabled();
   await expect(shareButton).toBeEnabled();

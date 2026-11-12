@@ -8,7 +8,7 @@
  * 17,145, `indptr` in chunks of 1,251, each chunk deflated): its chunks are
  * made as they are asked for, so the file is never held. A 3,400-cell
  * blocks subsample is opened over a link slower than a disk (values read per
- * gene) and two genes are read, as a person colours by a gene and then
+ * gene) and two genes are read, as a person colors by a gene and then
  * another. While they are read, the process's JavaScript heap and
  * ArrayBuffer bytes are sampled: their peak growth must stay within the kept
  * entries' worth and the decoded-chunk budget, whatever the file's size.

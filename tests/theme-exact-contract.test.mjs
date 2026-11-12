@@ -213,18 +213,35 @@ test('ThemeManager rejects open and coercive options before mutation', async () 
   }
 });
 
-test('ThemeManager propagates storage and event owner failures', async () => {
+test('ThemeManager keeps a theme the browser refuses to store for this page, and propagates event owner failures', async () => {
+  // A full or refusing store (and a browser that keeps nothing for the site,
+  // `utils/web-storage.js`): the theme is chosen all the same, kept for this page.
   const storageFailure = new Error('storage write failed');
   const storageFixture = installThemeEnvironment({ setFailure: storageFailure });
   try {
     const { ThemeManager } = await importFreshThemeManager();
     ThemeManager.init();
-    assert.throws(
-      () => ThemeManager.setTheme('dark', { persist: true, withTransition: false }),
-      error => error === storageFailure,
-    );
+    ThemeManager.setTheme('dark', { persist: true, withTransition: false });
+    assert.equal(ThemeManager.getTheme(), 'dark');
+    assert.equal(storageFixture.root.dataset.theme, 'dark');
+    assert.equal(storageFixture.setCount, 1);
+    assert.equal(storageFixture.events.length, 1);
   } finally {
     storageFixture.restore();
+  }
+
+  const blockedFixture = installThemeEnvironment();
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    get() { throw new Error('SecurityError: access is denied for this document'); },
+  });
+  try {
+    const { ThemeManager } = await importFreshThemeManager();
+    ThemeManager.init();
+    ThemeManager.setTheme('dark', { persist: true, withTransition: false });
+    assert.equal(blockedFixture.root.dataset.theme, 'dark');
+  } finally {
+    blockedFixture.restore();
   }
 
   const eventFailure = new Error('theme listener failed');
@@ -289,23 +306,29 @@ test('theme bootstrap preserves declared defaults when preferences are absent', 
   assert.equal(result.body.dataset.viewerBackground, 'black');
 });
 
-test('theme bootstrap rejects invalid preferences instead of substituting defaults', async () => {
+test('theme bootstrap starts on the declared defaults over a stored value this version does not know', async () => {
+  // Another version wrote it, or it was edited: no choice of the person's, so
+  // the page starts as declared instead of not starting at all.
   const invalidTheme = await runBootstrap({ storedTheme: 'sepia' });
   assert.equal(invalidTheme.failure, null);
-  assert.match(String(invalidTheme.bootstrapFailure), /theme.*light.*dark/i);
+  assert.equal(invalidTheme.bootstrapFailure, undefined);
   assert.equal(invalidTheme.root.dataset.theme, 'light');
 
   const invalidBackground = await runBootstrap({ storedBackground: 'transparent' });
   assert.equal(invalidBackground.failure, null);
-  assert.match(String(invalidBackground.bootstrapFailure), /background.*grid/i);
+  assert.equal(invalidBackground.bootstrapFailure, undefined);
   assert.equal(invalidBackground.root.dataset.viewerBackground, 'grid');
 });
 
-test('theme bootstrap propagates storage access failure', async () => {
-  const failure = new Error('storage read failed');
-  const result = await runBootstrap({ getFailure: failure });
+test('theme bootstrap starts on the declared defaults where the browser keeps nothing for the site', async () => {
+  // Site data blocked: the read of a stored value throws (R9E-5). Cellucid
+  // starts all the same (it did not: "Cellucid could not start").
+  const failure = new Error('SecurityError: access is denied for this document');
+  const result = await runBootstrap({ theme: 'dark', viewerBackground: 'black', getFailure: failure });
   assert.equal(result.failure, null);
-  assert.equal(result.bootstrapFailure, failure);
+  assert.equal(result.bootstrapFailure, undefined);
+  assert.equal(result.root.dataset.theme, 'dark');
+  assert.equal(result.root.dataset.viewerBackground, 'black');
 });
 
 test('HTML declares the exact theme and background defaults before bootstrap', async () => {
@@ -317,7 +340,7 @@ test('HTML declares the exact theme and background defaults before bootstrap', a
 });
 
 test('the wordmark follows the theme instead of pinning a light surface', async () => {
-  // The wordmark is grey-scale ink drawn for a light surface. Its two surfaces
+  // The wordmark is gray-scale ink drawn for a light surface. Its two surfaces
   // (the sidebar card and the welcome header) used to opt into the light theme,
   // which left a white block in the dark sidebar. Now the surfaces follow the
   // theme and the dark theme inverts the artwork itself.

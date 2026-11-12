@@ -6,11 +6,8 @@
  * @module data/sources/auth/pkce
  */
 
-function base64Url(bytes) {
-  let text = '';
-  for (const byte of bytes) text += String.fromCharCode(byte);
-  return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
+import { base64UrlOfBytes, randomBytes } from '../../../utils/byte-text.js';
+import { sha256Bytes } from '../../../utils/sha256.js';
 
 /**
  * A random URL-safe string of `bytes` random bytes (43 characters for 32).
@@ -19,7 +16,7 @@ function base64Url(bytes) {
  * @returns {string}
  */
 function randomUrlSafe(bytes = 32) {
-  return base64Url(crypto.getRandomValues(new Uint8Array(bytes)));
+  return base64UrlOfBytes(randomBytes(bytes));
 }
 
 /**
@@ -29,8 +26,7 @@ function randomUrlSafe(bytes = 32) {
  * @returns {Promise<string>}
  */
 export async function codeChallengeOf(verifier) {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
-  return base64Url(new Uint8Array(digest));
+  return base64UrlOfBytes(await sha256Bytes(new TextEncoder().encode(verifier)));
 }
 
 /**

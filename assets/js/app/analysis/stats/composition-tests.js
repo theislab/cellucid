@@ -18,6 +18,31 @@
  * - `clr`: the centred log-ratio of each unit's counts (pseudocount 0.5),
  *   then Welch's t-test or ANOVA.
  *
+ * Paired (`paired`: the same samples in both of two conditions, a donor's
+ * liver and bone marrow), each sample with a unit in both conditions is a
+ * pair and the others are left out: `logit` and `clr` take Student's t of
+ * the pairs' differences (`scipy.stats.ttest_rel`; for complete pairs, the
+ * condition's t of the linear model `~ sample + condition`, propeller's and
+ * limma's blocked design without the moderation), `rank` the Wilcoxon
+ * signed-rank test of the proportions (as R `wilcox.test(paired = TRUE)`:
+ * zero differences dropped; exact below 50 pairs without ties, else the
+ * normal approximation with tie and continuity corrections).
+ *
+ * A type is tested over the pairs holding any of its cells (on either side):
+ * in a pair with none on both sides its two transformed proportions are the
+ * two units' sizes alone (`0.5 / (total + 0.5·K)`), so the difference is the
+ * log ratio of the units' sizes — the same sign for every donor whose one
+ * organ gave more cells than the other, which a paired t reads as a change
+ * of a type that is not there (F109: myelocytes, cells in one donor's
+ * spleen, came out adjusted p 0.03 from seven pairs). The signed-rank test
+ * already drops such a pair (a zero difference); the t-tests now drop it
+ * too, so the three methods test one set of pairs. Below
+ * `MIN_PAIRS_WITH_CELLS` such pairs a type is not tested (`TOO_FEW_PAIRS`):
+ * with two, a paired t has one degree of freedom and the signed-rank test
+ * cannot reach p < 0.5. It stays in the CLR centre and the pseudo-proportions'
+ * K (it has cells), out of the tests and the multiple-testing family.
+ * `pairsTested` gives each type's pairs.
+ *
  * Without samples the only replicates are cells, so the tests are
  * descriptive: a χ² test of type × condition, and for each type a 2 × k χ²
  * of that type against the rest (Fisher's exact test for a 2 × 2 table with
@@ -27,8 +52,9 @@
  *
  * p-values are adjusted over the types (Benjamini-Hochberg or Bonferroni).
  *
- * A type with no cells in any unit (a category the scope, a page or a
- * subsample left out) is not tested: its transformed proportions would
+ * A type with no cells in any unit the test reads (a category the scope, a
+ * page or a subsample left out; paired, one whose cells are all in units
+ * outside the pairs) is not tested: its transformed proportions would
  * depend only on the unit totals, so an absent type would look changed
  * whenever conditions differ in size. It stays out of the CLR centre, the
  * tests and the multiple-testing family, with NaN statistics and the test
@@ -43,15 +69,24 @@ import {
   kruskalWallis,
   mannWhitneyU,
   oneWayANOVA,
+  pairedTTest,
   tTest
 } from './statistical-tests.js';
 import { chiSquaredIndependence, fisherExact2x2 } from './categorical-tests.js';
+import { normalSurvival } from '../compute/math-utils.js';
 
 export const COMPOSITION_METHODS = Object.freeze(['logit', 'rank', 'clr']);
 export const COMPOSITION_CORRECTIONS = Object.freeze(['bh', 'bonferroni']);
 const PSEUDOCOUNT = 0.5;
 /** The test of a type with no cells in any unit: none, out of the family. */
 export const NO_CELLS = 'no cells';
+/**
+ * The test of a paired type with cells in fewer than `MIN_PAIRS_WITH_CELLS`
+ * pairs: none, out of the family.
+ */
+export const TOO_FEW_PAIRS = 'too few pairs';
+/** The pairs holding a type's cells a paired test of it needs. */
+export const MIN_PAIRS_WITH_CELLS = 3;
 
 /**
  * Per-unit values of one type for a method.
@@ -110,6 +145,97 @@ function adjust(pValues, correction) {
 }
 
 /**
+ * The exact null distribution of the signed-rank statistic for n pairs:
+ * `counts[v]` the subsets of ranks 1..n summing to v, of 2^n.
+ */
+function signedRankCounts(n) {
+  const max = (n * (n + 1)) / 2;
+  const counts = new Float64Array(max + 1);
+  counts[0] = 1;
+  for (let rank = 1; rank <= n; rank++) {
+    for (let v = max; v >= rank; v--) counts[v] += counts[v - rank];
+  }
+  return counts;
+}
+
+/**
+ * Wilcoxon signed-rank test of paired values `a[i] - b[i]`, two-sided, as R
+ * `wilcox.test(a, b, paired = TRUE)` computes it: zero differences dropped;
+ * `V` the sum of the ranks (mid-ranks for ties) of the positive
+ * differences; the exact p-value below 50 pairs with no tie, else the
+ * normal approximation with the tie correction of its variance and a
+ * continuity correction. No pair left: no test (NaN).
+ *
+ * @param {ArrayLike<number>} a
+ * @param {ArrayLike<number>} b
+ * @returns {{statistic: number, pValue: number, n: number, exact: boolean}}
+ */
+export function wilcoxonSignedRank(a, b) {
+  const d = [];
+  for (let i = 0; i < a.length; i++) {
+    if (!Number.isFinite(a[i]) || !Number.isFinite(b[i])) continue;
+    const difference = a[i] - b[i];
+    if (difference !== 0) d.push(difference);
+  }
+  const n = d.length;
+  if (n === 0) return { statistic: NaN, pValue: NaN, n, exact: false };
+  const order = d.map((value, index) => index).sort((x, y) => Math.abs(d[x]) - Math.abs(d[y]));
+  const ranks = new Float64Array(n);
+  let ties = false;
+  let tieTerm = 0;
+  for (let start = 0; start < n;) {
+    let end = start + 1;
+    while (end < n && Math.abs(d[order[end]]) === Math.abs(d[order[start]])) end++;
+    const size = end - start;
+    if (size > 1) {
+      ties = true;
+      tieTerm += size ** 3 - size;
+    }
+    const rank = (start + 1 + end) / 2;
+    for (let k = start; k < end; k++) ranks[order[k]] = rank;
+    start = end;
+  }
+  let statistic = 0;
+  for (let i = 0; i < n; i++) if (d[i] > 0) statistic += ranks[i];
+  if (n < 50 && !ties) {
+    const counts = signedRankCounts(n);
+    const total = 2 ** n;
+    let lower = 0;
+    for (let v = 0; v <= statistic; v++) lower += counts[v];
+    let upper = 0;
+    for (let v = statistic; v < counts.length; v++) upper += counts[v];
+    return { statistic, pValue: Math.min(1, 2 * Math.min(lower, upper) / total), n, exact: true };
+  }
+  const mean = (n * (n + 1)) / 4;
+  const sigma = Math.sqrt((n * (n + 1) * (2 * n + 1)) / 24 - tieTerm / 48);
+  if (!(sigma > 0)) return { statistic, pValue: NaN, n, exact: false };
+  const centred = statistic - mean;
+  const z = (centred - Math.sign(centred) * 0.5) / sigma;
+  return { statistic, pValue: Math.min(1, 2 * normalSurvival(Math.abs(z))), n, exact: false };
+}
+
+/**
+ * The pairs of a paired composition test: each sample with a unit in both
+ * conditions (0 and 1), its unit in each.
+ *
+ * @param {Int32Array} unitSample - Each unit's sample
+ * @param {Int32Array} conditionOfUnit - Each unit's condition (0 or 1)
+ * @returns {{first: Int32Array, second: Int32Array, unpaired: number}} The
+ *   pairs' units in condition 0 and in condition 1, in sample order; the
+ *   units of a sample in one condition only
+ */
+export function compositionPairs(unitSample, conditionOfUnit) {
+  const unitOf = [new Map(), new Map()];
+  for (let unit = 0; unit < unitSample.length; unit++) unitOf[conditionOfUnit[unit]].set(unitSample[unit], unit);
+  const samples = [...unitOf[0].keys()].filter(sample => unitOf[1].has(sample)).sort((x, y) => x - y);
+  return {
+    first: Int32Array.from(samples, sample => unitOf[0].get(sample)),
+    second: Int32Array.from(samples, sample => unitOf[1].get(sample)),
+    unpaired: unitSample.length - 2 * samples.length,
+  };
+}
+
+/**
  * Test every cell type.
  *
  * @param {object} input
@@ -119,6 +245,9 @@ function adjust(pValues, correction) {
  * @param {Int32Array} input.conditionOfUnit - Each unit's condition index.
  * @param {number} input.conditionCount
  * @param {boolean} input.samples - Whether units are samples (replicates).
+ * @param {Int32Array} [input.unitSample] - Each unit's sample (paired only)
+ * @param {boolean} [input.paired=false] - Pair each sample's units of the
+ *   two conditions (`compositionPairs`); needs samples and two conditions
  * @param {'logit'|'rank'|'clr'} input.method
  * @param {'bh'|'bonferroni'} input.correction
  * @returns {{
@@ -130,15 +259,24 @@ function adjust(pValues, correction) {
  *   typeTest: string[],
  *   adjustedP: Float64Array,
  *   unitsPerCondition: Uint32Array,
+ *   pairs: number|null,
+ *   pairsTested: Int32Array|null,
  *   overall: {statistic: number, df: number, pValue: number}|null
- * }} `meanProportion[type * conditionCount + condition]`; `log2Ratio` is the
- *   second condition's mean proportion over the first's (NaN with other than
- *   two conditions).
+ * }} `pairs`: the samples in both conditions (null unpaired);
+ *   `pairsTested[type]`: the pairs holding its cells, which its test took
+ *   (null unpaired); `meanProportion[type * conditionCount + condition]`
+ *   (paired: over the pairs' samples alone); `log2Ratio` is the second
+ *   condition's mean proportion over the first's (NaN with other than two
+ *   conditions).
  */
 export function testComposition(input) {
   const {
-    counts, typeCount, unitCount, conditionOfUnit, conditionCount, samples, method, correction
+    counts, typeCount, unitCount, conditionOfUnit, conditionCount, samples, method, correction,
+    unitSample = null, paired = false
   } = input;
+  if (paired && (!samples || conditionCount !== 2 || !(unitSample instanceof Int32Array) || unitSample.length !== unitCount)) {
+    throw new RangeError('A paired composition test needs samples, each unit\'s sample, and two conditions');
+  }
   if (!COMPOSITION_METHODS.includes(method)) throw new RangeError(`Unknown composition test "${method}"`);
   if (!COMPOSITION_CORRECTIONS.includes(correction)) {
     throw new RangeError(`Unknown multiple-testing correction "${correction}"`);
@@ -163,17 +301,30 @@ export function testComposition(input) {
   const unitsPerCondition = new Uint32Array(conditionCount);
   for (let unit = 0; unit < unitCount; unit++) unitsPerCondition[conditionOfUnit[unit]] += 1;
 
-  // Mean proportion per condition: over its samples, or pooled over its
-  // cells without samples (one unit per condition).
+  // Paired, the samples in both conditions: the test reads them alone, and so
+  // do the mean proportions and their ratio (live-7 L25-12: with every sample,
+  // a donor with 2 liver cells and none in the marrow turned LYVE1+
+  // macrophages' log2 ratio toward the liver while the paired test, 6 of 6
+  // donors, found more in the marrow).
+  const pairing = paired ? compositionPairs(unitSample, conditionOfUnit) : null;
+  const meanUnits = pairing === null ? null : new Uint8Array(unitCount);
+  if (pairing !== null) for (const unit of [...pairing.first, ...pairing.second]) meanUnits[unit] = 1;
+  const unitsOfMean = new Uint32Array(conditionCount);
+  for (let unit = 0; unit < unitCount; unit++) {
+    if (meanUnits === null || meanUnits[unit] === 1) unitsOfMean[conditionOfUnit[unit]] += 1;
+  }
+  // Mean proportion per condition: over its samples (paired: those in both
+  // conditions), or pooled over its cells without samples (one unit per condition).
   const meanProportion = new Float64Array(typeCount * conditionCount);
   for (let type = 0; type < typeCount; type++) {
     const sums = new Float64Array(conditionCount);
     for (let unit = 0; unit < unitCount; unit++) {
+      if (meanUnits !== null && meanUnits[unit] === 0) continue;
       if (totals[unit] > 0) sums[conditionOfUnit[unit]] += counts[type * unitCount + unit] / totals[unit];
     }
     for (let condition = 0; condition < conditionCount; condition++) {
-      meanProportion[type * conditionCount + condition] = unitsPerCondition[condition] > 0
-        ? sums[condition] / unitsPerCondition[condition]
+      meanProportion[type * conditionCount + condition] = unitsOfMean[condition] > 0
+        ? sums[condition] / unitsOfMean[condition]
         : NaN;
     }
   }
@@ -193,8 +344,50 @@ export function testComposition(input) {
   let test;
   let overall = null;
 
+  let pairs = null;
+  let pairsTested = null;
   if (conditionCount < 2) {
     test = 'none';
+  } else if (paired) {
+    const { first, second } = pairing;
+    // The test reads the pairs only: a type with cells only in units left
+    // out (a sample in one condition) has none in any unit it tests, and its
+    // transformed proportions there would be the pairs' sizes alone (L11-7:
+    // one Langerhans cell in a spleen-only donor came out "significant",
+    // adjusted p 0.04, from seven pairs without it). It is not tested.
+    const inPairs = new Uint8Array(typeCount);
+    for (let type = 0; type < typeCount; type++) {
+      for (const unit of [...first, ...second]) {
+        if (counts[type * unitCount + unit] > 0) { inPairs[type] = 1; break; }
+      }
+      if (inPairs[type] === 0) typeTest[type] = NO_CELLS;
+    }
+    const values = transformedProportions(method, counts, typeCount, unitCount, totals, inPairs);
+    pairs = first.length;
+    pairsTested = new Int32Array(typeCount);
+    test = method === 'rank' ? 'Wilcoxon signed-rank (paired)' : 'paired t-test';
+    for (let type = 0; type < typeCount; type++) {
+      if (inPairs[type] === 0) continue;
+      // Only the pairs holding its cells (F109, above).
+      const a = [];
+      const b = [];
+      for (let pair = 0; pair < pairs; pair++) {
+        const one = first[pair];
+        const two = second[pair];
+        if (counts[type * unitCount + one] === 0 && counts[type * unitCount + two] === 0) continue;
+        a.push(values[type * unitCount + one]);
+        b.push(values[type * unitCount + two]);
+      }
+      pairsTested[type] = a.length;
+      if (a.length < MIN_PAIRS_WITH_CELLS) {
+        typeTest[type] = TOO_FEW_PAIRS;
+        continue;
+      }
+      const result = method === 'rank' ? wilcoxonSignedRank(a, b) : pairedTTest(a, b);
+      statistic[type] = result.statistic;
+      pValue[type] = result.pValue;
+      typeTest[type] = test;
+    }
   } else if (samples) {
     const values = transformedProportions(method, counts, typeCount, unitCount, totals, present);
     const two = conditionCount === 2;
@@ -254,6 +447,8 @@ export function testComposition(input) {
     typeTest,
     adjustedP: adjust(pValue, correction),
     unitsPerCondition,
+    pairs,
+    pairsTested,
     overall
   };
 }

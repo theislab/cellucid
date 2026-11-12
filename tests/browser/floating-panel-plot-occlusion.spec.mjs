@@ -12,7 +12,7 @@ import { expectFloatingSettled } from './helpers/panels.mjs';
    Chromium's software compositor culled the canvas under it at the vertically
    mirrored position (the canvas texture is bottom-left origin, and the culled
    part of it was drawn flipped), so the page background showed through at the
-   scroller's mirror image across the canvas centre: a band under the Session
+   scroller's mirror image across the canvas center: a band under the Session
    panel, the same width as the panel, until the panel was docked again. The
    canvas's own pixels were right all along; only what reached the screen was
    wrong. `_accordion.css` now composites each floating window as one surface,
@@ -53,7 +53,7 @@ async function undock(page, panelId, edge = 's') {
   await frame.locator('> .accordion-panel-actions > .accordion-undock-btn').click();
   // The region beside the frame is measured from its box and its card's
   // shadow, so both must be the settled ones: read during the lift, the box
-  // was up to 4 % short and the shadow `--shadow-sm`/`--shadow-md` instead of
+  // was up to 4% short and the shadow `--shadow-sm`/`--shadow-md` instead of
   // `--shadow-lg`, and the region then ran under the frame (WebKit: the panel
   // "covers" it) or under the tail of its final shadow (Firefox, Chromium:
   // the region's top device rows three levels dark).
@@ -85,7 +85,7 @@ async function undock(page, panelId, edge = 's') {
 
 /**
  * The plot region beside a floating frame, on the side of its mirror image
- * across the canvas centre: below a frame in the top half of the canvas,
+ * across the canvas center: below a frame in the top half of the canvas,
  * above one in the bottom half. Kept clear of the frame's shadow and of the
  * viewport edges.
  *
@@ -101,7 +101,7 @@ async function regionBeside(frame) {
   return frame.evaluate(element => {
     const box = element.getBoundingClientRect();
     const plot = document.getElementById('glcanvas').getBoundingClientRect();
-    // Reflecting a y across the canvas centre gives `mirror - y`.
+    // Reflecting a y across the canvas center gives `mirror - y`.
     const mirror = plot.top + plot.bottom;
     const below = box.top + box.bottom < mirror;
     // How far outside the frame any outset shadow of it or its card reaches.
@@ -109,7 +109,7 @@ async function regionBeside(frame) {
     for (const caster of [element, ...element.children]) {
       const shadows = getComputedStyle(caster).boxShadow;
       if (shadows === 'none') continue;
-      // Each layer is a colour and then its lengths, `x y blur spread`.
+      // Each layer is a color and then its lengths, `x y blur spread`.
       for (const layer of shadows.split(/,(?![^(]*\))/)) {
         if (/\binset\b/.test(layer)) continue;
         const [x = 0, y = 0, blur = 0, spread = 0] = (

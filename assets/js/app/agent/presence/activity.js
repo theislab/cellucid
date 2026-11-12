@@ -48,17 +48,24 @@ export function turnKey(agent, turn, connection = null) {
  * An agent named with the way it came in, as its line and its questions
  * show it: "Claude (chat)" for the chat bar; "Claude Code (local)" for an
  * agent app on this computer (`cellucid mcp`, named by the app); through the
- * connector, the client's own name when it is not the agent's ("Claude
- * (Claude Desktop)"), else the host it connected from, else "connector"; the
- * bare name when the way is not known.
+ * connector, the client's own name when a site vouches for it and it is
+ * not the agent's ("Claude (Claude Desktop)"), else the host it connected
+ * from, else "connector"; an app no site vouches for is named as Manage…
+ * names it, its host (or an app on this computer) with the name it gives
+ * itself only quoted ("evil.example (calls itself “Claude”)": the relay
+ * client names it so, `appName`), so two such apps are told apart and none
+ * passes for Claude (F122, L26-4); the bare name when the way is not known.
  * @param {string} agent
- * @param {{kind: string, client?: string|null, host?: string|null}|null|undefined} connection
+ * @param {{kind: string, client?: string|null, host?: string|null, known?: boolean}|null|undefined} connection
  */
 export function agentLabel(agent, connection) {
   if (typeof agent !== 'string' || agent.length === 0) return 'An agent';
   if (!connection) return agent;
   if (connection.kind === 'chat') return `${agent} (chat)`;
   if (connection.kind === 'local') return `${agent} (local)`;
+  // An app no site vouches for is named already as Manage… names it (`connect/model.js` `appName`:
+  // "evil.example (calls itself “Claude”)"), by the relay client: nothing is added to it.
+  if (connection.known === false && typeof connection.client === 'string' && connection.client.length > 0 && connection.client !== agent) return agent;
   const via = [connection.client, connection.host].find(name => typeof name === 'string' && name.length > 0 && name !== agent);
   return `${agent} (${via ?? 'connector'})`;
 }
@@ -104,7 +111,7 @@ export function countOutside(acts) {
 
 /**
  * @param {{titleOf?: (type: string) => string, outsideOf?: (type: string, params: object, outcome: unknown) => ({one: string, other: string}|null)}} [options] -
- *   `titleOf`: an action's title by type (the catalogue); `outsideOf`: what an act outside the
+ *   `titleOf`: an action's title by type (the catalog); `outsideOf`: what an act outside the
  *   state that no undo takes back did, counted (`catalog.js` `outsideActOf`), else null
  */
 export function createAgentActivity({ titleOf = type => type, outsideOf = () => null } = {}) {
@@ -123,7 +130,7 @@ export function createAgentActivity({ titleOf = type => type, outsideOf = () => 
       }
       entry = {
         key, agent, turn: turn ?? null, way, connection: connection?.kind ?? null, label: agentLabel(agent, connection),
-        running: new Map(), steps: 0, outside: [], lastLabel: null, state: 'acting', attached: null, surface: null,
+        running: new Map(), steps: 0, stepIds: new Set(), outside: [], lastLabel: null, state: 'acting', attached: null, surface: null,
       };
       turns.set(key, entry);
     }
@@ -166,7 +173,10 @@ export function createAgentActivity({ titleOf = type => type, outsideOf = () => 
       } else if (event.kind === 'done' || event.kind === 'failed') {
         entry.running.delete(meta);
         if (event.kind === 'done' && event.step !== null && event.step !== undefined) {
-          entry.steps += 1;
+          // Steps, not actions: a change merged into the step before (a
+          // slider set again, coalesced) is that one step (R9R-6).
+          entry.stepIds.add(event.step.id);
+          entry.steps = entry.stepIds.size;
           entry.lastLabel = event.step.label;
         }
         const act = event.kind === 'done' && (event.step === null || event.step === undefined) ? outsideOf(event.type, event.params, event.outcome) : null;

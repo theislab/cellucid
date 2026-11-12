@@ -3,8 +3,8 @@
  * agent's tool call is: its outcome, or its refusal's code and sentence.
  *
  * This is the one way a spec replaces the dataset while a modal dialog of the
- * page is open. A modal (`components/modal-background-owner.js`, a `<dialog>`
- * opened with `showModal()`) makes the rest of the page inert, so the person
+ * page is open. A modal dialog (a `<dialog>` opened with `showModal()`,
+ * `components/app-dialog.js`) makes the rest of the page inert, so the person
  * cannot reach the dataset picker until they answer or close it, and since
  * Playwright 1.65 an action on an inert control waits for it to stop being
  * inert as a person would. An agent's call (the in-app chat, a connector) is
@@ -13,7 +13,7 @@
 
 /**
  * @param {import('@playwright/test').Page} page
- * @param {{name: string, kind?: string}} params
+ * @param {{name: string, kind?: string, count?: number, fraction?: number, method?: string, seed?: number}} params
  * @param {{agent?: string, turn?: string}} [meta]
  */
 export function openDatasetAsAgent(page, params, { agent = 'Claude', turn = 't1' } = {}) {

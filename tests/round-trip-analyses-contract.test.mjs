@@ -362,7 +362,7 @@ test('a share\'s rows are priced at the stored chunks they lie in: groups spread
 test('a share\'s cells kept by their rows are read in store order: each stored chunk of X once, but at a read\'s boundary', async () => {
   // A uniform share's rows lie spread through the store: read in open
   // order, each read of the run's pipeline decoded nearly every stored
-  // chunk again (a 50 % share's DE groups read 7.5 GB of a 2.6 GB file).
+  // chunk again (a 50% share's DE groups read 7.5 GB of a 2.6 GB file).
   const { tree, values } = csrTree();
   const { store, reads } = countingStore(tree);
   const root = await openZarr(store, { decodedChunkCacheBytes: 0 });

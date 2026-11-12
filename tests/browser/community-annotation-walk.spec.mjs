@@ -7,9 +7,11 @@
  * - a vote in the dialog shows as not published, and Publish writes it;
  * - without write access and without a fork, Publish links to forking on
  *   GitHub (Cellucid never creates a fork); forked, it opens the pull request;
- * - an agent's vote or suggestion publishes only itself (never the person's
- *   drafts or an author's staged settings), asks with what it is and where
- *   it goes, publishes nothing when nothing changes, and never opens a dialog;
+ * - an agent's votes and suggestions publish only themselves (never the
+ *   person's drafts or an author's staged settings), all of a call as one
+ *   commit asked once (F145: one agent turn, one commit), with what they are
+ *   and where they go; one refused, none is published and nothing is asked;
+ *   nothing is published when nothing changes, and no dialog opens;
  * - Stop while a vote is written says honestly what happened, and the next
  *   Publish works;
  * - a category or field renamed here is a display name: votes and
@@ -78,7 +80,7 @@ async function openConnected(page, { url = deepLink() } = {}) {
 
 async function syncModal(page) {
   await section(page).getByRole('button', { name: 'GitHub sync…', exact: true }).click();
-  return page.locator('.community-annotation-modal-overlay').last();
+  return page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)').last();
 }
 
 async function pull(page) {
@@ -89,7 +91,7 @@ async function pull(page) {
   await expect(modal).toBeHidden();
 }
 
-async function colourBy(page, key) {
+async function colorBy(page, key) {
   const option = page.locator('#categorical-field option').filter({ hasText: key }).first();
   await page.locator('#categorical-field').selectOption({ label: await option.innerText() });
   await expect(page.locator('[aria-label^="Vote on category"]').first()).toBeVisible();
@@ -147,7 +149,7 @@ test.describe('community annotation walk', () => {
     await expect(root.locator('.community-annotation-pending')).toContainText('1 change not published');
     await root.locator('.community-annotation-pending').getByRole('button', { name: 'Publish' }).click();
     await expect(root.locator('.community-annotation-pending')).toHaveCount(0);
-    await colourBy(page, 'cell_type');
+    await colorBy(page, 'cell_type');
     await page.locator('[aria-label="Vote on category alpha"]').click();
     await voteButton(page, 'Alpha cell', 'up').click();
     await expect(voteButton(page, 'Alpha cell', 'up')).toHaveAttribute('aria-pressed', 'true');
@@ -208,7 +210,7 @@ test.describe('community annotation walk', () => {
     await expect(section(page).locator('.community-annotation-pending')).toContainText('not published');
     await openChat(page);
     await queueReplies(page, [
-      { text: 'Voting.', calls: [{ name: 'annotation_vote', args: { field: FIELD, category: 'alpha', suggestion: 'Alpha cell', vote: 'up' } }] },
+      { text: 'Voting.', calls: [{ name: 'annotation_publish', args: { votes: [{ field: FIELD, category: 'alpha', suggestion: 'Alpha cell', vote: 'up' }] } }] },
       { text: 'Done.' },
     ]);
     const before = repository.mutations.length;
@@ -218,7 +220,7 @@ test.describe('community annotation walk', () => {
     await expect(card).toHaveCount(1);
     // The question names the vote and where it goes, and that nothing else is published.
     await expect(card).toContainText('Alpha cell');
-    await expect(card).toContainText(`publishes this one vote to ${REPO}@main`);
+    await expect(card).toContainText(`publishes 1 vote to ${REPO}@main as one commit`);
     await expect(card).toContainText('Nothing else is published');
     await card.locator('.agent-confirm-allow').click();
     await waitForTurnEnd(page);
@@ -227,19 +229,19 @@ test.describe('community annotation walk', () => {
     expect(writes[0].decoded).not.toContain('UNPUBLISHED DRAFT');
     expect(remoteUserFile(repository).datasets[DATASET].votes).toEqual({ 'ghid_51_alpha-1': 'up' });
     const result = resultJson(await lastToolText(page));
-    expect(result).toMatchObject({ published: 'repository', pull_request: null, suggestion: 'Alpha cell', vote: 'up' });
+    expect(result).toMatchObject({ published: 'repository', pull_request: null, votes: [{ category: 'alpha', suggestion: 'Alpha cell', vote: 'up' }], suggestions: [] });
     expect(result.not_published).toBeGreaterThanOrEqual(2);
     // The draft and the settings are still the person's, not published.
     await expect(section(page).locator('.community-annotation-pending')).toContainText('not published');
 
     // The same vote again: nothing is asked, nothing is written.
     const settled = repository.mutations.length;
-    await queueReplies(page, [{ calls: [{ name: 'annotation_vote', args: { field: FIELD, category: 'alpha', suggestion: 'Alpha cell', vote: 'up' } }] }, { text: 'ok' }]);
+    await queueReplies(page, [{ calls: [{ name: 'annotation_publish', args: { votes: [{ field: FIELD, category: 'alpha', suggestion: 'Alpha cell', vote: 'up' }] } }] }, { text: 'ok' }]);
     await page.locator('#agent-chat-input').fill('upvote it again');
     await page.locator('#agent-chat-input').press('Enter');
     await waitForTurnEnd(page);
     expect(repository.mutations.length).toBe(settled);
-    expect(resultJson(await lastToolText(page))).toMatchObject({ published: 'unchanged', vote: 'up' });
+    expect(resultJson(await lastToolText(page))).toMatchObject({ published: 'unchanged', votes: [{ suggestion: 'Alpha cell', vote: 'up' }] });
   });
 
   test('an agent reads the consensus, the people and its own vote, in pages; a label two people proposed is one suggestion', async ({ page }) => {
@@ -262,10 +264,33 @@ test.describe('community annotation walk', () => {
     expect(first).toMatchObject({ mine: null, mine_delegated: false });
     // Named by its label, the vote goes to that one suggestion.
     await allowPublishing(page);
-    const voted = await dispatchAsAgent(page, 'annotation.vote', { field: FIELD, category: 'alpha', suggestion: 'Alpha cell', vote: 'up' }, 'vote');
+    const voted = await dispatchAsAgent(page, 'annotation.publish', { votes: [{ field: FIELD, category: 'alpha', suggestion: 'Alpha cell', vote: 'up' }] }, 'vote');
     expect(voted, JSON.stringify(voted)).toHaveProperty('outcome');
-    expect(voted.outcome).toMatchObject({ published: 'repository', suggestion: 'Alpha cell', vote: 'up' });
+    expect(voted.outcome).toMatchObject({ published: 'repository', votes: [{ suggestion: 'Alpha cell', vote: 'up' }] });
     expect(remoteUserFile(repository).datasets[DATASET].votes).toEqual({ 'ghid_51_alpha-1': 'up' });
+  });
+
+  test('an agent reading a repository this browser never pulled reads it pulled, not empty; pull: false reads what is kept', async ({ page }) => {
+    // L18-6 (live pass 5): connected, never pulled, the read said "no suggestions" of a repository full of them.
+    await signedIn(page);
+    const repository = await installAnnotationRepository(page, { config: config({ minAnnotators: 2 }), users: communityUsers() });
+    await openConnected(page);
+    const read = await dispatchAsAgent(page, 'annotation.suggestions', { field: FIELD, category: 'alpha' }, 'read');
+    expect(read, JSON.stringify(read)).toHaveProperty('outcome');
+    expect(read.outcome.pulled_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(read.outcome.categories[0].suggestions.map(entry => entry.label)).toEqual(expect.arrayContaining(['Alpha cell', 'Alpha (immature)']));
+    // The rule each consensus follows, as the repository sets it for the field (L18-7).
+    expect(read.outcome.consensus_rule).toEqual({ voters_needed: 2, threshold: 0.5 });
+    // Another contributor's suggestion lands on GitHub: kept as read until a pull is asked for.
+    const users = communityUsers();
+    users.ghid_88.datasets[DATASET].suggestions = { 'cell_type:alpha': [suggestion('ghid_88_alpha-3', 'Glucagon+ cell', 88)] };
+    repository.put('annotations/users/ghid_88.json', users.ghid_88);
+    const kept = await dispatchAsAgent(page, 'annotation.suggestions', { field: FIELD, category: 'alpha' }, 'kept');
+    expect(kept.outcome.categories[0].suggestions.map(entry => entry.label)).not.toContain('Glucagon+ cell');
+    const pulled = await dispatchAsAgent(page, 'annotation.suggestions', { field: FIELD, category: 'alpha', pull: true }, 'pulled');
+    expect(pulled.outcome.categories[0].suggestions.map(entry => entry.label)).toContain('Glucagon+ cell');
+    // A read publishes nothing.
+    expect(repository.mutations).toEqual([]);
   });
 
   test('an agent\'s vote never opens the identity dialog', async ({ page }) => {
@@ -274,10 +299,10 @@ test.describe('community annotation walk', () => {
     await openConnected(page);
     await pull(page);
     await allowPublishing(page);
-    const voted = await dispatchAsAgent(page, 'annotation.vote', { field: FIELD, category: 'beta', suggestion: 'ghid_51_beta-1', vote: 'down' }, 'no-profile');
+    const voted = await dispatchAsAgent(page, 'annotation.publish', { votes: [{ field: FIELD, category: 'beta', suggestion: 'ghid_51_beta-1', vote: 'down' }] }, 'no-profile');
     expect(voted, JSON.stringify(voted)).toHaveProperty('outcome');
-    expect(voted.outcome).toMatchObject({ published: 'repository', vote: 'down' });
-    await expect(page.locator('.community-annotation-modal-overlay')).toHaveCount(0);
+    expect(voted.outcome).toMatchObject({ published: 'repository', votes: [{ vote: 'down' }] });
+    await expect(page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)')).toHaveCount(0);
     const file = remoteUserFile(repository);
     expect(file.login).toBe(AUTH_USER.login);
     expect(file.datasets[DATASET].votes).toEqual({ 'ghid_51_beta-1': 'down' });
@@ -295,15 +320,83 @@ test.describe('community annotation walk', () => {
       session.setFieldCategories('cell_type', ['alpha', 'beta', 'gamma']);
       session.vote('cell_type', 'beta', 'ghid_51_beta-1', 'down');
     });
-    const suggested = await dispatchAsAgent(page, 'annotation.suggest', { field: FIELD, category: 'gamma', label: 'Gamma cell', ontology_id: 'CL:0000173' }, 'suggest');
+    const suggested = await dispatchAsAgent(page, 'annotation.publish', { suggestions: [{ field: FIELD, category: 'gamma', label: 'Gamma cell', ontology_id: 'CL:0000173' }] }, 'suggest');
     expect(suggested, JSON.stringify(suggested)).toHaveProperty('outcome');
-    expect(suggested.outcome).toMatchObject({ published: 'repository', label: 'Gamma cell', not_published: 1 });
+    expect(suggested.outcome).toMatchObject({ published: 'repository', suggestions: [{ category: 'gamma', label: 'Gamma cell' }], not_published: 1 });
     const own = remoteUserFile(repository).datasets[DATASET];
     expect(own.suggestions['cell_type:gamma'].map(entry => entry.label)).toEqual(['Gamma cell']);
-    expect(own.votes).toEqual({ [suggested.outcome.id]: 'up' }, 'the unpublished vote on beta stays unpublished');
-    const again = await dispatchAsAgent(page, 'annotation.suggest', { field: FIELD, category: 'alpha', label: 'Alpha cell' }, 'suggest');
+    expect(own.votes).toEqual({ [suggested.outcome.suggestions[0].id]: 'up' }, 'the unpublished vote on beta stays unpublished');
+    const again = await dispatchAsAgent(page, 'annotation.publish', { suggestions: [{ field: FIELD, category: 'alpha', label: 'Alpha cell' }] }, 'suggest');
     expect(again.code).toBe('exists');
     expect(again.message).toContain('ghid_51_alpha-1');
+  });
+
+  test('one agent turn is one commit: its votes and suggestions in one call, asked once; one refused, none published (F145)', async ({ page }) => {
+    await page.addInitScript(installScriptedModel);
+    await signedIn(page);
+    const repository = await installAnnotationRepository(page, { config: config(), users: communityUsers() });
+    await openConnected(page);
+    await pull(page);
+    await openChat(page);
+    const before = repository.mutations.length;
+    // One refused change (a label already suggested) refuses the whole call: nothing asked, nothing written.
+    await queueReplies(page, [
+      { text: 'Publishing.', calls: [{ name: 'annotation_publish', args: {
+        votes: [{ field: FIELD, category: 'alpha', suggestion: 'Alpha cell', vote: 'up' }],
+        suggestions: [{ field: FIELD, category: 'alpha', label: 'Alpha cell' }],
+      } }] },
+      { text: 'Refused.' },
+    ]);
+    await page.locator('#agent-chat-input').fill('vote and suggest');
+    await page.locator('#agent-chat-input').press('Enter');
+    await waitForTurnEnd(page);
+    expect(await lastToolText(page)).toContain('Nothing of this call was published');
+    expect(await lastToolText(page)).toContain('ghid_51_alpha-1');
+    expect(repository.mutations.length).toBe(before);
+    await expect(page.locator('#agent-presence .agent-confirm')).toHaveCount(0);
+
+    // Three votes (one taking a vote back) and two suggestions, one with a Unicode label: one question, one write.
+    await queueReplies(page, [
+      { text: 'Publishing.', calls: [{ name: 'annotation_publish', args: {
+        votes: [
+          { field: FIELD, category: 'alpha', suggestion: 'Alpha cell', vote: 'up' },
+          { field: FIELD, category: 'alpha', suggestion: 'Alpha (immature)', vote: 'down' },
+          { field: FIELD, category: 'beta', suggestion: 'ghid_51_beta-1', vote: 'up' },
+        ],
+        suggestions: [
+          { field: FIELD, category: 'gamma', label: 'Gamma cell', ontology_id: 'CL:0000173', evidence: 'Sst+' },
+          { field: FIELD, category: 'beta', label: 'β-Zelle (insulin⁺) 胰岛β细胞' },
+        ],
+      } }] },
+      { text: 'Done.' },
+    ]);
+    await page.locator('#agent-chat-input').fill('vote and suggest, all at once');
+    await page.locator('#agent-chat-input').press('Enter');
+    const card = page.locator('#agent-presence .agent-confirm');
+    await expect(card).toHaveCount(1);
+    await expect(card).toContainText(`publishes 3 votes and 2 suggestions (each with your upvote) to ${REPO}@main as one commit`);
+    await card.locator('.agent-confirm-allow').click();
+    await waitForTurnEnd(page);
+    const writes = repository.mutations.slice(before);
+    expect(writes.map(write => write.contentPath)).toEqual([OWN_FILE]);
+    const result = resultJson(await lastToolText(page));
+    expect(result).toMatchObject({
+      published: 'repository',
+      votes: [
+        { category: 'alpha', suggestion: 'Alpha cell', vote: 'up' },
+        { category: 'alpha', suggestion: 'Alpha (immature)', vote: 'down' },
+        { category: 'beta', suggestion: 'Beta cell', vote: 'up' },
+      ],
+      suggestions: [{ category: 'gamma', label: 'Gamma cell' }, { category: 'beta', label: 'β-Zelle (insulin⁺) 胰岛β细胞' }],
+    });
+    const own = remoteUserFile(repository).datasets[DATASET];
+    const [gamma, beta] = result.suggestions.map(entry => entry.id);
+    expect(own.votes).toEqual({ 'ghid_51_alpha-1': 'up', 'ghid_77_alpha-2': 'down', 'ghid_51_beta-1': 'up', [gamma]: 'up', [beta]: 'up' });
+    expect(own.suggestions['cell_type:gamma'].map(entry => [entry.label, entry.ontologyId, entry.evidence])).toEqual([['Gamma cell', 'CL:0000173', 'Sst+']]);
+    expect(own.suggestions['cell_type:beta'].map(entry => entry.label)).toEqual(['β-Zelle (insulin⁺) 胰岛β细胞']);
+    // The turn's record counts one publication (what the activity line and Undo turn say).
+    const outside = await page.evaluate(() => [...window._cellucidHistories.current().active.turns.values()].flatMap(turn => turn.outside.map(act => act.type)));
+    expect(outside).toEqual(['annotation.publish']);
   });
 
   test('Stop while a vote is written says what happened, and the next Publish works', async ({ page }) => {
@@ -314,7 +407,7 @@ test.describe('community annotation walk', () => {
     await fillProfile(page);
     await allowPublishing(page);
     const held = repository.hold();
-    const voting = dispatchAsAgent(page, 'annotation.vote', { field: FIELD, category: 'alpha', suggestion: 'ghid_51_alpha-1', vote: 'down' }, 'turn-stop');
+    const voting = dispatchAsAgent(page, 'annotation.publish', { votes: [{ field: FIELD, category: 'alpha', suggestion: 'ghid_51_alpha-1', vote: 'down' }] }, 'turn-stop');
     await held.waiting;
     await page.evaluate(async () => {
       const { getActions } = await import('/assets/js/app/actions/index.js');
@@ -364,13 +457,20 @@ test.describe('community annotation walk', () => {
     const root = await openSection(page);
     await expect(root).toContainText(REPO);
     await pull(page);
-    await colourBy(page, 'cell_type');
+    await colorBy(page, 'cell_type');
     await page.locator('[aria-label="Vote on category Alpha renamed"]').click();
-    const dialog = page.locator('.community-annotation-modal-overlay').last();
+    const dialog = page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)').last();
     // The other people's suggestions for alpha are there, under the local name.
     await expect(dialog).toContainText('Alpha cell');
     await expect(dialog).toContainText('Alpha (immature)');
     await expect(dialog).toContainText('in the repository: cell_type • alpha');
+    // The leader first, as the consensus line names it (R9A-2), and no "0 characters" under empty boxes (R9A-7).
+    await expect(dialog.locator('.community-annotation-vote-btn.vote-up').first()).toHaveAttribute('aria-label', /^Upvote Alpha cell;/);
+    await expect(dialog).not.toContainText('0 characters');
+    const comment = dialog.getByRole('textbox', { name: 'Comment' }).first();
+    await comment.fill('Gcg');
+    await expect(dialog).toContainText('3 characters');
+    await comment.fill('');
     await page.keyboard.press('Escape');
 
     // The agent names the category as shown; the vote goes to alpha's suggestion.
@@ -378,8 +478,8 @@ test.describe('community annotation walk', () => {
     const read = await dispatchAsAgent(page, 'annotation.suggestions', { field: FIELD, category: 'Alpha renamed' }, 'r1');
     expect(read.outcome.categories[0]).toMatchObject({ category: 'Alpha renamed', repository_category: 'alpha' });
     expect(read.outcome.categories[0].suggestions.map(entry => entry.id).sort()).toEqual(['ghid_51_alpha-1', 'ghid_77_alpha-2']);
-    const voted = await dispatchAsAgent(page, 'annotation.vote', { field: FIELD, category: 'Alpha renamed', suggestion: 'Alpha cell', vote: 'up' }, 'r1');
-    expect(voted.outcome).toMatchObject({ published: 'repository', vote: 'up' });
+    const voted = await dispatchAsAgent(page, 'annotation.publish', { votes: [{ field: FIELD, category: 'Alpha renamed', suggestion: 'Alpha cell', vote: 'up' }] }, 'r1');
+    expect(voted.outcome).toMatchObject({ published: 'repository', votes: [{ category: 'Alpha renamed', vote: 'up' }] });
     const own = remoteUserFile(repository).datasets[DATASET];
     expect(own.votes).toEqual({ 'ghid_51_alpha-1': 'up' });
     expect(Object.keys(own.suggestions ?? {})).not.toContain('cell_type:Alpha renamed');
@@ -402,7 +502,7 @@ test.describe('community annotation walk', () => {
     });
     expect(jumped.categories).toContain('alpha');
     expect(jumped.locked).toBe(true);
-    await colourBy(page, 'cell_type');
+    await colorBy(page, 'cell_type');
     await page.locator('[aria-label="Vote on category alpha"]').click();
     await expect(voteButton(page, 'Alpha cell', 'up')).toHaveAttribute('aria-pressed', 'true');
   });
@@ -429,8 +529,8 @@ test.describe('community annotation walk', () => {
     await allowPublishing(page);
     const read = await dispatchAsAgent(page, 'annotation.suggestions', { field: { source: 'obs', key: 'Cell type (mine)' }, category: 'beta' }, 'f1');
     expect(read.outcome).toMatchObject({ annotated: true, repository_field: 'cell_type' });
-    const voted = await dispatchAsAgent(page, 'annotation.vote', { field: { source: 'obs', key: 'Cell type (mine)' }, category: 'beta', suggestion: 'Beta cell', vote: 'down' }, 'f1');
-    expect(voted.outcome).toMatchObject({ published: 'repository', vote: 'down' });
+    const voted = await dispatchAsAgent(page, 'annotation.publish', { votes: [{ field: { source: 'obs', key: 'Cell type (mine)' }, category: 'beta', suggestion: 'Beta cell', vote: 'down' }] }, 'f1');
+    expect(voted.outcome).toMatchObject({ published: 'repository', votes: [{ vote: 'down' }] });
     expect(remoteUserFile(repository).datasets[DATASET].votes).toEqual({ 'ghid_51_beta-1': 'down' });
     // Locked under its local name too.
     const lock = await dispatchAsAgent(page, 'field.rename', { field: { source: 'obs', key: 'Cell type (mine)' }, name: 'Other' }, 'f1');
@@ -475,7 +575,7 @@ test.describe('community annotation walk', () => {
     }));
     const root = await openConnected(page);
     await pull(page);
-    await colourBy(page, 'cell_type');
+    await colorBy(page, 'cell_type');
     await page.locator('[aria-label="Vote on category beta"]').click();
     await voteButton(page, 'Beta cell', 'down').click();
     await expect(voteButton(page, 'Beta cell', 'down')).toHaveAttribute('aria-pressed', 'true');
@@ -485,13 +585,45 @@ test.describe('community annotation walk', () => {
     await page.locator('#dataset-select').selectOption('dataset:local-demo:current-ui-vector');
     await expect(page.locator('#dataset-name')).toHaveText('Current UI vector fixture');
     await expect(root).toContainText('Not connected.');
-    await expect(page.locator('.community-annotation-modal-overlay')).toHaveCount(0);
+    await expect(page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)')).toHaveCount(0);
 
     await page.locator('#dataset-select').selectOption('dataset:local-demo:current-ui');
     await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
     await expect(root).toContainText(REPO);
     await expect(root.locator('.community-annotation-pending')).toContainText('1 change not published');
     expect(productErrors(errors)).toEqual([]);
+  });
+
+  test('your file changed on GitHub since the last Pull (another device): Publish pulls, merges and publishes both, never "Pull first"', async ({ page }) => {
+    await signedIn(page);
+    const repository = await installAnnotationRepository(page, { config: config(), users: communityUsers() });
+    const root = await openConnected(page);
+    await pull(page);
+    await fillProfile(page);
+    const voteHere = (category, id, direction) => page.evaluate(async ([c, i, d]) => {
+      const { getCommunityAnnotationSession } = await import('/assets/js/app/community-annotations/session.js');
+      const session = getCommunityAnnotationSession();
+      session.setFieldCategories('cell_type', ['alpha', 'beta', 'gamma']);
+      session.vote('cell_type', c, i, d);
+    }, [category, id, direction]);
+    await voteHere('alpha', 'ghid_51_alpha-1', 'up');
+    const pending = root.locator('.community-annotation-pending');
+    await pending.getByRole('button', { name: 'Publish' }).click();
+    await expect(pending).toHaveCount(0);
+    // The same person on another device votes beta down and publishes there.
+    const there = remoteUserFile(repository);
+    there.datasets[DATASET].votes['ghid_51_beta-1'] = 'down';
+    there.updatedAt = '2026-11-11T10:00:00.000Z';
+    repository.put(OWN_FILE, there);
+    // Here, without a Pull: another vote, then Publish.
+    await voteHere('alpha', 'ghid_77_alpha-2', 'down');
+    await pending.getByRole('button', { name: 'Publish' }).click();
+    await expect(pending).toHaveCount(0);
+    await expect.poll(() => remoteUserFile(repository).datasets[DATASET].votes).toEqual({
+      'ghid_51_alpha-1': 'up', 'ghid_51_beta-1': 'down', 'ghid_77_alpha-2': 'down',
+    });
+    await expect(root).not.toContainText('changed since your last Pull');
+    await expect(page.locator('.notification-center .notification-message', { hasText: /Pull first|changed since your last Pull/ })).toHaveCount(0);
   });
 
   test('a dropped connection while publishing is never said as not published; a refused sign-in signs out and keeps the work', async ({ page }) => {
@@ -519,6 +651,10 @@ test.describe('community annotation walk', () => {
     modal = await syncModal(page);
     await modal.getByRole('button', { name: 'Publish', exact: true }).click();
     await expect(root).toContainText('Your GitHub sign-in expired or was revoked');
+    // Said once, in its own words: no raw "GitHub PUT … failed with HTTP 401" card beside it (R9A-6).
+    const messages = page.locator('.notification-center .notification-message');
+    await expect(messages.filter({ hasText: 'Your GitHub sign-in expired or was revoked' })).toHaveCount(1);
+    await expect(messages.filter({ hasText: /HTTP 401/ })).toHaveCount(0);
     // Signed out here; the repository stays connected for this GitHub user and the vote stays.
     const kept = await page.evaluate(async () => {
       const { getAnnotationRepoForDataset } = await import('/assets/js/app/community-annotations/repo-store.js');

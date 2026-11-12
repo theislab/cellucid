@@ -1,9 +1,9 @@
 /**
- * Every way a gene is chosen in the Gene expression search colours by it or
+ * Every way a gene is chosen in the Gene expression search colors by it or
  * says why not (`app/utils/gene-lookup.js`,
  * `ui/modules/field-selector-gene-expression.js`).
  *
- * - Enter colours by a gene id with a dot (`AC058791.1`), a symbol typed in
+ * - Enter colors by a gene id with a dot (`AC058791.1`), a symbol typed in
  *   another case, and an Ensembl accession typed with another version than
  *   the one listed; a name that is no gene is said.
  * - Before the gene names are read, the search says so and cannot be typed
@@ -87,7 +87,7 @@ async function open(page, query = '') {
   await openCollapsedPanels(page);
 }
 
-/** The gene the cells are coloured by, with its values read, or null. */
+/** The gene the cells are colored by, with its values read, or null. */
 function shownGene(page) {
   return page.evaluate(() => {
     const state = window._cellucidState;
@@ -109,7 +109,7 @@ async function typeAndEnter(page, text) {
 
 const geneStatus = page => page.locator('#gene-expression-container [role="status"]');
 
-test('Enter colours by a dotted id, a symbol in any case and an Ensembl accession of another version, and says when a name is no gene', async ({ page }) => {
+test('Enter colors by a dotted id, a symbol in any case and an Ensembl accession of another version, and says when a name is no gene', async ({ page }) => {
   const errors = collectBrowserErrors(page);
   await serve(page);
   await open(page);
@@ -159,7 +159,7 @@ test('before the gene names are read the search says so, a gene from elsewhere i
   await expect(search).toBeDisabled();
   await expect(search).toHaveAttribute('placeholder', 'Reading gene names…');
   expect(await page.evaluate(() => window._cellucidState.areGenesPending())).toBe(true);
-  // An analysis result's "colour by this gene" link.
+  // An analysis result's "color by this gene" link.
   const refused = await page.evaluate(() => window._cellucidUi.colorByGene('CD3E').then(() => null, error => error.message));
   expect(refused).toBe('Gene names are still being read: CD3E can be chosen once they are listed.');
 

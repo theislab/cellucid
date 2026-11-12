@@ -248,6 +248,7 @@ export function collectDOMReferences(root) {
     // bar (app/agent/).
     agent: {
       dock: byId('agent-dock'),
+      dockGrip: byId('agent-dock-grip'),
       presence: byId('agent-presence'),
       toggle: byId('agent-chat-toggle'),
       toggleLabel: byId('agent-chat-toggle-label'),
@@ -274,6 +275,8 @@ export function collectDOMReferences(root) {
       connectPermissionsChange: byId('agent-connect-permissions-change'),
       instructions: byId('agent-chat-instructions'),
       budget: byId('agent-chat-budget'),
+      cacheRow: byId('agent-chat-cache-row'),
+      cache: byId('agent-chat-cache'),
       settingsStatus: byId('agent-chat-settings-status'),
       usage: byId('agent-chat-usage'),
       log: byId('agent-chat-log'),
@@ -289,6 +292,7 @@ export function collectDOMReferences(root) {
     fieldSelector: {
       categoricalSelect: byId('categorical-field'),
       categoricalCopyBtn: byId('copy-categorical-field'),
+      categoricalGroupBtn: byId('group-categorical-field'),
       categoricalRenameBtn: byId('rename-categorical-field'),
       categoricalDeleteBtn: byId('delete-categorical-field'),
       categoricalClearBtn: byId('clear-categorical-field'),
@@ -559,6 +563,7 @@ export function collectDOMReferences(root) {
       easingSelect: byId('cinematic-easing'),
       loopCheckbox: byId('cinematic-loop'),
       autoplayCheckbox: byId('cinematic-autoplay'),
+      captionsCheckbox: byId('cinematic-captions'),
     },
   };
 }

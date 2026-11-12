@@ -15,12 +15,12 @@
  * Elements: obs (categorical codes, continuous, boolean, strings), obsm
  * embeddings in 2 and 3 dimensions (switching back to one read before is
  * the page's: `base-anndata-adapter.js` keeps it), a velocity
- * field, a neighbour graph's induced subgraph, X as CSR (a gene builds the
+ * field, a neighbor graph's induced subgraph, X as CSR (a gene builds the
  * kept rows' gene index: their entries, nothing else), CSC (a gene's
  * entries) and dense (the gene's column chunks of kept rows), a layer,
  * raw.X, the stored outlier quantiles, and a priority-ordered file's
  * gene-major X read as the kept prefix of each gene. Shares: every cell,
- * 10 % blocks, 1 % uniform. The same store as Zarr v3 with every array
+ * 10% blocks, 1% uniform. The same store as Zarr v3 with every array
  * sharded (four chunks a shard along the cells): its inner chunks are held
  * to the same floor, and each shard index is read once. A later visit of a
  * remote file whose parts this browser kept (`formats/io/kept-parts.js`):
@@ -92,7 +92,7 @@ function matrix(seed, rowsOrder = null) {
   return { csr, csc };
 }
 
-/** A symmetric neighbour graph of the stored rows (no self-loops): about six neighbours a cell. */
+/** A symmetric neighbor graph of the stored rows (no self-loops): about six neighbors a cell. */
 function graphOf(seed) {
   const next = random(seed);
   const rows = Array.from({ length: N }, () => new Map());
@@ -363,8 +363,8 @@ async function measure(layout, request, { priority = false, sharded = false } = 
 
 const SHARES = [
   ['every cell', { mode: 'all' }],
-  ['10 % blocks', { mode: 'subsample', method: 'blocks', fraction: 0.1, seed: 2 }],
-  ['1 % uniform', { mode: 'subsample', method: 'uniform', fraction: 0.01, seed: 2 }],
+  ['10% blocks', { mode: 'subsample', method: 'blocks', fraction: 0.1, seed: 2 }],
+  ['1% uniform', { mode: 'subsample', method: 'uniform', fraction: 0.01, seed: 2 }],
 ];
 
 const bytesOf = (keys, entries) => keys.reduce((sum, key) => sum + entries.get(key).length, 0);
@@ -751,7 +751,7 @@ test('a Loom matrix (genes x cells, read transposed): a gene reads only its stri
   // of its bytes, read alone (`formats/zarr/array.js`), so two genes of one
   // strip read two ranges of one chunk key.
   const asked = [3, 20, 40, 90];
-  for (const [label, request] of [...SHARES, ['1 % blocks', { mode: 'subsample', method: 'blocks', fraction: 0.01, seed: 3 }]]) {
+  for (const [label, request] of [...SHARES, ['1% blocks', { mode: 'subsample', method: 'blocks', fraction: 0.01, seed: 3 }]]) {
     const { store, fetched } = countingStore(tree, { name: 'floor.loom' });
     const root = await LOOM_VIEW.view(await openZarr(store, { decodedChunkCacheBytes: 64 * 1024 * 1024 }), { name: 'floor.loom' });
     const reader = new AnnDataReader();
@@ -777,12 +777,12 @@ test('a Loom matrix (genes x cells, read transposed): a gene reads only its stri
   }
 });
 
-for (const entryChunk of [16384, 2 ** 18]) test(`a served store at 1 % (X in chunks of ${entryChunk} entries): an analysis over every gene and many genes read each gene's counted entries and the next, no other byte of X`, async () => {
+for (const entryChunk of [16384, 2 ** 18]) test(`a served store at 1% (X in chunks of ${entryChunk} entries): an analysis over every gene and many genes read each gene's counted entries and the next, no other byte of X`, async () => {
   // As `cellucid serve` / `cellucid_serve` answer a dataset: priority order,
   // a gene-major X whose chunks are their values' bytes (2^18 entries a
   // chunk, `SERVED_ENTRY_CHUNK_ELEMENTS` / `.chunk_elements_served`: a request
   // over loopback costs more than a smaller chunk moves; 2^14 as a prepared
-  // file's), the prefix counts beside it. A 1 % uniform subsample under the
+  // file's), the prefix counts beside it. A 1% uniform subsample under the
   // file's seed is its first k rows, and a gene's open values its first
   // entries: read in part, however large the chunk.
   const built = storeTree('csc', { priority: true, entryChunk });
@@ -842,9 +842,9 @@ test('a latent space\'s columns of a subsample read the kept rows\' bytes, never
   // run of rows is its own range of the chunk, two columns of thirty the
   // rows' bytes from the first column to the second.
   for (const [label, request, priority] of [
-    ['1 % uniform', { mode: 'subsample', method: 'uniform', fraction: 0.01, seed: 2 }, false],
-    ['1 % blocks', { mode: 'subsample', method: 'blocks', fraction: 0.01, seed: 2, blockSize: 20 }, false],
-    ['a served store\'s 1 % (its prefix)', { mode: 'subsample', method: 'uniform', fraction: 0.01, seed: 0 }, true],
+    ['1% uniform', { mode: 'subsample', method: 'uniform', fraction: 0.01, seed: 2 }, false],
+    ['1% blocks', { mode: 'subsample', method: 'blocks', fraction: 0.01, seed: 2, blockSize: 20 }, false],
+    ['a served store\'s 1% (its prefix)', { mode: 'subsample', method: 'uniform', fraction: 0.01, seed: 0 }, true],
   ]) {
     const built = storeTree('csr', { priority });
     const { store, reads } = countingStore(built.tree);
@@ -1077,7 +1077,7 @@ test('the share grid judges each downstream against every cell of the same store
   ];
   const table = ratioTable(rows);
   const cell = (step, metric) => table.find(r => r.step === step && r.metric === metric);
-  // A gene that takes longer at 1 % than with every cell open breaks the rule (beyond the noise floor).
+  // A gene that takes longer at 1% than with every cell open breaks the rule (beyond the noise floor).
   assert.equal(cell('gene', 'loadMs').break, true);
   assert.equal(cell('gene', 'loadMs').ratio, 1.33);
   // Fewer bytes than every cell, but far from the share's fraction: flagged, not a break.

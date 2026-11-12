@@ -1,6 +1,6 @@
 {
-  "_about": "Shared conformance cases for the Cellucid data mapping. The same file is kept byte-for-byte in cellucid-python (tests/fixtures/data_mapping_conformance.json), cellucid-r (tests/testthat/fixtures/data_mapping_conformance.json) and the web app (tests/fixtures/data-mapping-conformance.json); each repository pins its SHA-256. Every 'expected' value is the canonical output of the reference rule; an 'error' value is the stable reason code, not a message. Version 5 adds the 'modality' key, present only in the mapping of a dataset of several modalities (feature spaces over the same cells), with defaultModality (the modality a dataset opens with) and mappingModality (a mapping's modality checked against the dataset's). Version 7 adds MuData namespaces: an obsm key '<modality>:<key>' is read within its modality's namespace (vectorFieldKeys entries name their embeddingKey; embeddingSlots cases may name the modality the dataset opens with, whose representations follow the dataset's own); defaultExpression reads raw when it holds more genes than X or X is scaled, and says why (reason); and defaultGraph, the neighbour graph a dataset opens with.",
-  "version": 7,
+  "_about": "Shared conformance cases for the Cellucid data mapping. The same file is kept byte-for-byte in cellucid-python (tests/fixtures/data_mapping_conformance.json), cellucid-r (tests/testthat/fixtures/data_mapping_conformance.json) and the web app (tests/fixtures/data-mapping-conformance.json); each repository pins its SHA-256. Every 'expected' value is the canonical output of the reference rule; an 'error' value is the stable reason code, not a message. Version 5 adds the 'modality' key, present only in the mapping of a dataset of several modalities (feature spaces over the same cells), with defaultModality (the modality a dataset opens with) and mappingModality (a mapping's modality checked against the dataset's). Version 7 adds MuData namespaces: an obsm key '<modality>:<key>' is read within its modality's namespace (vectorFieldKeys entries name their embeddingKey; embeddingSlots cases may name the modality the dataset opens with, whose representations follow the dataset's own); defaultExpression reads raw when it holds more genes than X or X is scaled, and says why (reason); and defaultGraph, the neighbor graph a dataset opens with. Version 8: defaultGraph takes the connectivities of the MuData modality a dataset opens with ('<modality>:connectivities', a MuData modality's own graph, as scanpy and prepare() write it) after the dataset's own. Version 9: every width is treated alike: the default rule names its UMAP's widths and every slot it leaves empty takes the best-ranked array of exactly that width (guessed), so X_umap beside X_umap_3d names both 2d and 3d; only a file naming no slot falls back to a wide array in 2d.",
+  "version": 9,
   "makeUniqueNames": [
     {
       "name": "already unique names come back unchanged",
@@ -801,6 +801,200 @@
       }
     },
     {
+      "name": "every width takes its best-ranked array: X_umap beside X_umap_3d names 2d and 3d",
+      "obsm": [
+        {
+          "key": "X_umap",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "X_umap_3d",
+          "width": 3,
+          "usable": true
+        }
+      ],
+      "latentKey": null,
+      "loadFailures": {},
+      "expected": {
+        "slots": {
+          "1d": null,
+          "2d": {
+            "key": "X_umap",
+            "columns": [
+              0,
+              1
+            ]
+          },
+          "3d": {
+            "key": "X_umap_3d",
+            "columns": [
+              0,
+              1,
+              2
+            ]
+          }
+        },
+        "guessed": [
+          "embeddings.2d"
+        ],
+        "rejected": []
+      }
+    },
+    {
+      "name": "the UMAP names its width and every other width is guessed by the one ranked order",
+      "obsm": [
+        {
+          "key": "X_umap",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "X_tsne",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "X_spatial",
+          "width": 3,
+          "usable": true
+        },
+        {
+          "key": "X_phate",
+          "width": 3,
+          "usable": true
+        },
+        {
+          "key": "X_line",
+          "width": 1,
+          "usable": true
+        },
+        {
+          "key": "X_pca",
+          "width": 50,
+          "usable": true
+        }
+      ],
+      "latentKey": null,
+      "loadFailures": {},
+      "expected": {
+        "slots": {
+          "1d": {
+            "key": "X_line",
+            "columns": [
+              0
+            ]
+          },
+          "2d": {
+            "key": "X_umap",
+            "columns": [
+              0,
+              1
+            ]
+          },
+          "3d": {
+            "key": "X_phate",
+            "columns": [
+              0,
+              1,
+              2
+            ]
+          }
+        },
+        "guessed": [
+          "embeddings.1d",
+          "embeddings.3d"
+        ],
+        "rejected": []
+      }
+    },
+    {
+      "name": "a guessed width beside the UMAP skips a candidate that fails its load check",
+      "obsm": [
+        {
+          "key": "X_umap",
+          "width": 2,
+          "usable": true
+        },
+        {
+          "key": "X_tsne_3d",
+          "width": 3,
+          "usable": true
+        },
+        {
+          "key": "X_spatial",
+          "width": 3,
+          "usable": true
+        }
+      ],
+      "latentKey": null,
+      "loadFailures": {
+        "X_tsne_3d": "not representable as float32 at cell 3"
+      },
+      "expected": {
+        "slots": {
+          "1d": null,
+          "2d": {
+            "key": "X_umap",
+            "columns": [
+              0,
+              1
+            ]
+          },
+          "3d": {
+            "key": "X_spatial",
+            "columns": [
+              0,
+              1,
+              2
+            ]
+          }
+        },
+        "guessed": [
+          "embeddings.3d"
+        ],
+        "rejected": [
+          [
+            "X_tsne_3d",
+            "not representable as float32 at cell 3"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "a wide array is no width's default beside a narrow one",
+      "obsm": [
+        {
+          "key": "X_umap",
+          "width": 3,
+          "usable": true
+        },
+        {
+          "key": "X_pca",
+          "width": 50,
+          "usable": true
+        }
+      ],
+      "latentKey": null,
+      "loadFailures": {},
+      "expected": {
+        "slots": {
+          "1d": null,
+          "2d": null,
+          "3d": {
+            "key": "X_umap",
+            "columns": [
+              0,
+              1,
+              2
+            ]
+          }
+        },
+        "guessed": [],
+        "rejected": []
+      }
+    },
+    {
       "name": "a wide X_umap is not a default and is guessed as a wide candidate",
       "obsm": [
         {
@@ -1229,9 +1423,18 @@
               1
             ]
           },
-          "3d": null
+          "3d": {
+            "key": "X_UMAP",
+            "columns": [
+              0,
+              1,
+              2
+            ]
+          }
         },
-        "guessed": [],
+        "guessed": [
+          "embeddings.3d"
+        ],
         "rejected": []
       }
     },
@@ -1268,7 +1471,7 @@
       }
     },
     {
-      "name": "a Seurat object's weighted-nearest-neighbour UMAP comes before its Azimuth reference UMAP",
+      "name": "a Seurat object's weighted-nearest-neighbor UMAP comes before its Azimuth reference UMAP",
       "obsm": [
         {
           "key": "X_ref.umap",
@@ -1337,7 +1540,7 @@
       }
     },
     {
-      "name": "dimensional UMAP keys come before every single conventional UMAP",
+      "name": "dimensional UMAP keys come before every single conventional UMAP, whose width is then guessed",
       "obsm": [
         {
           "key": "X_UMAP",
@@ -1355,7 +1558,13 @@
       "expected": {
         "slots": {
           "1d": null,
-          "2d": null,
+          "2d": {
+            "key": "X_UMAP",
+            "columns": [
+              0,
+              1
+            ]
+          },
           "3d": {
             "key": "X_umap_3d",
             "columns": [
@@ -1365,7 +1574,9 @@
             ]
           }
         },
-        "guessed": [],
+        "guessed": [
+          "embeddings.2d"
+        ],
         "rejected": []
       }
     },
@@ -6563,7 +6774,36 @@
       "expected": "connectivities"
     },
     {
-      "name": "Seurat's shared-nearest-neighbour graph, never its directed one",
+      "name": "the dataset's connectivities before a MuData modality's",
+      "keys": [
+        "rna:connectivities",
+        "connectivities"
+      ],
+      "modality": "rna",
+      "expected": "connectivities"
+    },
+    {
+      "name": "then the connectivities of the MuData modality the dataset opens with",
+      "keys": [
+        "prot:connectivities",
+        "rna:distances",
+        "rna_snn",
+        "rna:connectivities"
+      ],
+      "modality": "rna",
+      "expected": "rna:connectivities"
+    },
+    {
+      "name": "another modality's connectivities are not the dataset's graph",
+      "keys": [
+        "prot:connectivities",
+        "rna:distances"
+      ],
+      "modality": "rna",
+      "expected": null
+    },
+    {
+      "name": "Seurat's shared-nearest-neighbor graph, never its directed one",
       "keys": [
         "RNA_nn",
         "RNA_snn"
@@ -6592,7 +6832,7 @@
       "expected": "SNN"
     },
     {
-      "name": "no undirected neighbour graph: none",
+      "name": "no undirected neighbor graph: none",
       "keys": [
         "distances",
         "RNA_nn",

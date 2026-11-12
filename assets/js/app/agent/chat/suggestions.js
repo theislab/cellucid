@@ -1,9 +1,15 @@
 /**
  * @fileoverview What the empty chat offers to start with, made from the
- * dataset shown: a first look; annotating the clusters of its first
- * categorical field (one known to have a single category is passed over);
- * comparing that field's two largest groups; and, once the history holds
- * steps, explaining them.
+ * dataset shown: a first look; labeling its clustering with cell types when
+ * it has one (`utils/field-roles.js` `clusterField`: leiden, louvain,
+ * clusters, …), else finding the marker genes of its field of the cells'
+ * identity (`identityField`: a cell type, annotation, lineage or cluster
+ * name first; never a sample, batch, id or quality flag; one known to have a
+ * single category is passed over); comparing that field's two largest
+ * groups; and, once the history holds steps, explaining them. (Found
+ * 2026-11-10: on Suo it offered "Annotate the clusters of sample_ID", its
+ * first categorical field; 2026-11-11: on Pancreas "Annotate the clusters of
+ * cell_type", a field that already names the cell types, beside `clusters`.)
  *
  * Only what the dataset says of itself is read (`fields.list`, as the
  * person, which records nothing): no field's values are read for a
@@ -12,25 +18,32 @@
  *
  * @module app/agent/chat/suggestions
  */
+import { clusterField, identityField, isNeverFirstColoring } from '../../utils/field-roles.js';
+
+/** What the empty chat offers with no dataset open: the agent opens one (R9E-8). */
+export const NO_DATASET_SUGGESTION = 'Open a sample dataset and give me a first look at it';
 
 /**
- * @param {{field?: string|null, steps?: number}} facts - `field`: the key of the first categorical field
- *   not known to have a single category; `steps`: steps in the history shown
+ * @param {{identity?: string|null, cluster?: string|null, steps?: number, dataset?: boolean}} facts -
+ *   `identity`: the field of the cells' identity, `cluster`: the clustering
+ *   (`readSuggestionFacts`); `steps`: steps in the history shown; `dataset`:
+ *   whether a dataset is open (none: "a first look at this dataset" would
+ *   ask about nothing)
  * @returns {string[]}
  */
-export function suggestionsFor({ field = null, steps = 0 } = {}) {
+export function suggestionsFor({ identity = null, cluster = null, steps = 0, dataset = true } = {}) {
+  if (!dataset) return [NO_DATASET_SUGGESTION];
   const out = ['Give me a first look at this dataset'];
-  if (field !== null) {
-    out.push(`Annotate the clusters of ${field}`);
-    out.push(`Compare the two largest groups of ${field}`);
-  }
+  if (cluster !== null) out.push(`Label each cluster in "${cluster}" with a cell type`);
+  else if (identity !== null) out.push(`Find the marker genes of each group in "${identity}"`);
+  if (identity !== null) out.push(`Compare the two largest groups in "${identity}"`);
   if (steps > 0) out.push('Explain what was done so far and write a methods paragraph');
   return out;
 }
 
 /**
- * The facts the suggestions are made from, read from the page; a null field
- * when there is no dataset or no categorical field.
+ * The facts the suggestions are made from, read from the page: null fields
+ * when there is no dataset, no categorical field or no clustering.
  * @param {{dispatch: Function}} actions
  * @param {number} steps
  */
@@ -38,9 +51,18 @@ export async function readSuggestionFacts(actions, steps) {
   try {
     const { outcome } = await actions.dispatch('fields.list', { kind: 'categorical' });
     // A field's categories are counted only once it was read: an uncounted one may have several.
-    const first = (outcome?.fields ?? []).find(candidate => candidate.categories === undefined || candidate.categories > 1);
-    return { field: first?.key ?? null, steps };
+    const fields = (outcome?.fields ?? []).map(candidate => ({
+      key: candidate.key,
+      categoryCount: Number.isInteger(candidate.categories) ? candidate.categories : null,
+    })).filter(candidate => candidate.categoryCount === null || candidate.categoryCount > 1);
+    const identity = identityField(fields);
+    const cluster = clusterField(fields);
+    return {
+      identity: identity === '' || isNeverFirstColoring(identity) ? null : identity,
+      cluster: cluster === '' ? null : cluster,
+      steps,
+    };
   } catch {
-    return { field: null, steps };
+    return { identity: null, cluster: null, steps };
   }
 }

@@ -15,21 +15,42 @@
 
 import { getNotificationCenter } from '../../notification-center.js';
 import { coalesceToFrame } from '../components/controls.js';
-import {
-  formatCompactCount,
-  formatDecimal,
-  formatMultiplier,
-  formatPercent,
-  formatWithUnit
-} from '../components/display-format.js';
+import { formatDecimal, formatMultiplier, formatWithUnit } from '../components/display-format.js';
+import { formatPercent, formatCompactCount } from '../../../utils/format-units.js';
 import {
   parseIntegerInput,
   parseRangeInput
 } from '../core/numeric-input-contract.js';
 import { isCancellation } from '../../../utils/abort.js';
-import { failureText } from '../../../utils/errors.js';
+import { setControlAvailability } from '../core/control-availability.js';
+import { defineControlReadout } from '../core/control-readout.js';
+import { PLACES } from '../place-names.js';
+import { representationOptionText } from '../../../data/representation-names.js';
+import { failureDetails, joinFailure, sayFailure } from '../../../utils/errors.js';
 
-const VELOCITY_NUMERIC_INPUTS = Object.freeze({
+/**
+ * Why `Show overlay` (and the Vector field select) cannot be used now, in the
+ * words the control says (`setControlAvailability`): each names the cause
+ * and what to do.
+ */
+/** "UMAP · 2D", or "one of UMAP · 2D, t-SNE · 2D". */
+const oneOf = names => (names.length === 1 ? names[0] : `one of ${names.join(', ')}`);
+
+export const SWITCH_UNAVAILABLE = Object.freeze({
+  noField: 'this dataset has no vector field (a per-cell vector array in obsm, '
+    + 'bound to an embedding); open a dataset with one',
+  notShown: embeddings => `no vector field is bound to the embedding this view shows; show ${embeddings} in it`,
+  noneSelected: `no vector field is selected; choose one under ${PLACES.vectorField.name}`,
+  loading: 'the vector field is loading; try again once it has loaded',
+});
+
+/**
+ * Every overlay slider's input: its dom key, whether it moves in whole
+ * steps, the label its control shows (a rejected value names the control the
+ * person sees) and its range, as `index.html` gives them
+ * (`velocity-overlay-labels-contract.test.mjs` holds the two together).
+ */
+export const VELOCITY_NUMERIC_INPUTS = Object.freeze({
   density: Object.freeze({
     domKey: 'velocityDensityInput',
     integer: true,
@@ -96,7 +117,7 @@ const VELOCITY_NUMERIC_INPUTS = Object.freeze({
   trailFade: Object.freeze({
     domKey: 'velocityTrailFadeInput',
     integer: false,
-    label: 'Trail fade',
+    label: 'Trail persistence',
     maximum: 0.995,
     minimum: 0.9
   }),
@@ -212,8 +233,9 @@ const VELOCITY_SLIDERS = Object.freeze([
     read: raw => raw / 100, format: value => formatMultiplier(value, value < 0.1 ? 2 : 1) },
   { name: 'lifetime', config: 'lifetime', display: 'velocityLifetimeDisplay',
     read: raw => raw / 100, format: value => formatWithUnit(value, 1, 's') },
+  // Half steps: one decimal, but a whole size of 10 or more fits as is ("12").
   { name: 'size', config: 'particleSize', display: 'velocitySizeDisplay',
-    read: raw => raw, format: value => formatDecimal(value, value < 10 ? 1 : 0) },
+    read: raw => raw, format: value => formatDecimal(value, value >= 10 && Number.isInteger(value) ? 0 : 1) },
   { name: 'opacity', config: 'opacity', display: 'velocityOpacityDisplay',
     read: raw => raw / 100, format: value => formatPercent(value * 100) },
   { name: 'intensity', config: 'intensity', display: 'velocityIntensityDisplay',
@@ -383,10 +405,14 @@ export function initVelocityOverlayControls(options) {
   const colormapSelect = dom.velocityColormapSelect;
   const syncLodCheckbox = dom.velocitySyncLodCheckbox;
 
-  let enabling = false;
   let suppressFieldChange = false;
   let destroyed = false;
   let operationGeneration = 0;
+  // The operation whose field load is under way, or null. The newest
+  // operation owns the block (`acquireOperationOwner`): one that supersedes a
+  // load takes the loading state over with it, so a load can never be left
+  // "loading" by an operation that no longer owns it.
+  let loadingOwner = null;
   let destructionPromise = null;
   const activeOperations = new Set();
   const domLifecycle = new AbortController();
@@ -403,6 +429,11 @@ export function initVelocityOverlayControls(options) {
       owner !== null &&
       owner === operationGeneration
     );
+  }
+
+  /** Whether the current operation is loading a field. */
+  function isLoading() {
+    return loadingOwner !== null && isOperationOwnerCurrent(loadingOwner);
   }
 
   function trackOperation(operation) {
@@ -508,20 +539,29 @@ export function initVelocityOverlayControls(options) {
   };
 
   /**
-   * The names of every embedding some vector field is bound to: its label and,
-   * when they differ, its id ("UMAP · X_umap_3d"), since one dataset can label
-   * several embeddings alike.
+   * The names of every embedding some vector field is bound to, as the
+   * **View N shows** picker names them ("UMAP · 2D", "t-SNE · 2D"): the place
+   * the person shows one. Two embeddings named alike there ("UMAP · 2D" of
+   * two arrays) add their array key ("UMAP · 2D (X_umap_raw)").
    */
   const getBoundEmbeddingLabels = () => {
     const dimensionManager = state.getDimensionManager();
-    const labels = new Set();
-    for (const field of getAllFields()) {
-      for (const layoutKey of field.layoutKeys) {
-        const { label } = dimensionManager.getLayout(layoutKey);
-        labels.add(label === layoutKey ? layoutKey : `${label} · ${layoutKey}`);
-      }
+    // As the picker lists them: higher dimensions first.
+    const layouts = [...new Set(getAllFields().flatMap(field => field.layoutKeys))]
+      .map(layoutKey => dimensionManager.getLayout(layoutKey))
+      .sort((left, right) => right.dimension - left.dimension);
+    const names = new Map();
+    for (const layout of layouts) {
+      names.set(layout.layoutKey, representationOptionText({
+        name: state.representationNameOf(layout),
+        dimension: layout.dimension,
+      }));
     }
-    return [...labels];
+    const counts = new Map();
+    for (const name of names.values()) counts.set(name, (counts.get(name) ?? 0) + 1);
+    return [...names].map(([layoutKey, name]) => (
+      counts.get(name) > 1 ? `${name} (${layoutKey})` : name
+    ));
   };
 
   const getDefaultFieldId = () => {
@@ -535,6 +575,21 @@ export function initVelocityOverlayControls(options) {
     }
     return id;
   };
+
+  /**
+   * Whether `Show overlay` can be turned on now, and if not why
+   * (`ui/core/control-availability.js`: the tooltip on the dimmed control,
+   * and the reason a `setting.set` refusal gives).
+   * @param {string|null} reason
+   */
+  function setSwitchUnavailable(reason) {
+    setControlAvailability(enabledCheckbox, reason);
+  }
+
+  /** The Vector field select, likewise (`setControlAvailability`). */
+  function setFieldSelectUnavailable(reason) {
+    setControlAvailability(fieldSelect, reason);
+  }
 
   function setInfo(message) {
     if (typeof message !== 'string') {
@@ -590,6 +645,10 @@ export function initVelocityOverlayControls(options) {
     const defaultId = getDefaultFieldId();
     if (defaultId && fieldsForDim.some((f) => f.id === defaultId)) return defaultId;
 
+    // The only field bound to this embedding: there is nothing to choose.
+    // Among several, none is guessed; the person picks one.
+    if (fieldsForDim.length === 1) return fieldsForDim[0].id;
+
     return '';
   }
 
@@ -630,8 +689,8 @@ export function initVelocityOverlayControls(options) {
     renderFieldSelectForActiveDim();
 
     if (!hasAny) {
-      enabledCheckbox.disabled = true;
-      fieldSelect.disabled = true;
+      setSwitchUnavailable(SWITCH_UNAVAILABLE.noField);
+      setFieldSelectUnavailable(SWITCH_UNAVAILABLE.noField);
       setInfo('');
       if (enabledCheckbox.checked) {
         disableOverlayUi();
@@ -642,13 +701,23 @@ export function initVelocityOverlayControls(options) {
     }
 
     const hasSelectedField = getSelectedFieldId().length > 0;
+    const loading = isLoading();
 
-    enabledCheckbox.disabled = enabling || !hasForDim || !hasSelectedField;
+    setSwitchUnavailable(
+      loading ? SWITCH_UNAVAILABLE.loading
+        : !hasForDim ? SWITCH_UNAVAILABLE.notShown(oneOf(boundLabels))
+          : !hasSelectedField ? SWITCH_UNAVAILABLE.noneSelected
+            : null
+    );
     if (!hasForDim && enabledCheckbox.checked) {
       disableOverlayUi();
     }
 
-    fieldSelect.disabled = enabling || !hasForDim;
+    setFieldSelectUnavailable(
+      loading ? SWITCH_UNAVAILABLE.loading
+        : !hasForDim ? SWITCH_UNAVAILABLE.notShown(oneOf(boundLabels))
+          : null
+    );
 
     const embeddingList = boundLabels.join(', ');
     if (!hasForDim) {
@@ -693,54 +762,69 @@ export function initVelocityOverlayControls(options) {
     return true;
   }
 
-  async function handleEnabledChange() {
-    const owner = acquireOperationOwner();
-    if (owner === null) return;
-    if (!enabledCheckbox.checked) {
-      disableOverlayUi();
-      syncAvailability();
-      return;
-    }
-
-    if (getFieldsForActiveLayout().length === 0) {
-      disableOverlayUi();
-      syncAvailability();
-      return;
-    }
-
-    enabling = true;
-    enabledCheckbox.disabled = true;
+  /**
+   * Show the selected field: load it for every embedding an open view shows
+   * that it is bound to, then turn the overlay on with the sidebar's settings.
+   * The one path of turning the overlay on, choosing another field and showing
+   * another embedding. The newest operation owns the outcome: a newer one
+   * (another field, the switch turned off, another embedding, another dataset)
+   * takes the block over, and this one ends without touching it.
+   * @param {number} owner
+   */
+  async function showSelectedField(owner) {
+    loadingOwner = owner;
+    setSwitchUnavailable(SWITCH_UNAVAILABLE.loading);
+    setFieldSelectUnavailable(SWITCH_UNAVAILABLE.loading);
     setInfo('Loading vector field…');
     let failureInfo = null;
-
     try {
-      await ensureFieldForShownLayouts(owner);
-      if (!isOperationOwnerCurrent(owner)) return;
+      if (!(await ensureFieldForShownLayouts(owner))) return;
       viewer.setVectorFieldOverlayEnabled(true);
       applyConfigFromUi();
-      updateSettingsVisibility();
-      syncAvailability();
     } catch (error) {
       if (!isOperationOwnerCurrent(owner)) return;
       // A read superseded (another dataset, or the open cells changed and
       // the field is read again for them) is not a failure.
       if (isCancellation(error)) return;
-      const exactError =
-        error instanceof Error && error.message.length > 0
-          ? error
-          : new TypeError(
-              'Vector field overlay loading failed with an invalid error.'
-            );
-      getNotificationCenter().error(exactError.message, { category: 'render' });
+      getNotificationCenter().error(`${joinFailure(`The vector field could not be shown`, sayFailure(error))}`, { category: 'render', ...failureDetails(error) });
       disableOverlayUi();
-      failureInfo = 'Failed to load vector field.';
+      failureInfo = 'The vector field could not be shown.';
     } finally {
-      if (!isOperationOwnerCurrent(owner)) return;
-      enabling = false;
-      enabledCheckbox.disabled = false;
-      syncAvailability();
-      if (failureInfo !== null) setInfo(failureInfo);
+      if (isOperationOwnerCurrent(owner)) {
+        loadingOwner = null;
+        setSwitchUnavailable(null);
+        setFieldSelectUnavailable(null);
+        syncAvailability();
+        if (failureInfo !== null) setInfo(failureInfo);
+      }
     }
+  }
+
+  /**
+   * Show the selected field when the switch is on and the view shows an
+   * embedding it is bound to; otherwise switch the overlay off and say why.
+   * @param {number} owner
+   */
+  async function showOrSwitchOff(owner) {
+    syncAvailability();
+    if (!enabledCheckbox.checked) {
+      disableOverlayUi();
+      syncAvailability();
+      return;
+    }
+    // Nothing to show here: no field bound to this embedding, or none chosen.
+    if (getSelectedFieldId().length === 0) {
+      disableOverlayUi();
+      syncAvailability();
+      return;
+    }
+    await showSelectedField(owner);
+  }
+
+  async function handleEnabledChange() {
+    const owner = acquireOperationOwner();
+    if (owner === null) return;
+    await showOrSwitchOff(owner);
   }
 
   async function handleDimensionChanged() {
@@ -755,98 +839,27 @@ export function initVelocityOverlayControls(options) {
     ) {
       fieldSelect.value = '';
     }
-    syncAvailability();
-    if (!enabledCheckbox.checked) return;
-
     // Keep the overlay on across layout switches, but only while the view
     // shows an embedding some field is bound to.
-    if (getFieldsForActiveLayout().length === 0) {
-      disableOverlayUi();
-      syncAvailability();
-      return;
-    }
-
-    let failureInfo = null;
-    try {
-      enabling = true;
-      enabledCheckbox.disabled = true;
-      setInfo('Loading vector field…');
-      await ensureFieldForShownLayouts(owner);
-      if (!isOperationOwnerCurrent(owner)) return;
-      viewer.setVectorFieldOverlayEnabled(true);
-      applyConfigFromUi();
-      syncAvailability();
-    } catch (error) {
-      if (!isOperationOwnerCurrent(owner)) return;
-      // A read superseded (another dataset, or the open cells changed and
-      // the field is read again for them) is not a failure.
-      if (isCancellation(error)) return;
-      const exactError =
-        error instanceof Error && error.message.length > 0
-          ? error
-          : new TypeError(
-              'Vector field dimension loading failed with an invalid error.'
-            );
-      getNotificationCenter().error(exactError.message, { category: 'render' });
-      disableOverlayUi();
-      failureInfo = 'Failed to load vector field.';
-    } finally {
-      if (!isOperationOwnerCurrent(owner)) return;
-      enabling = false;
-      enabledCheckbox.disabled = false;
-      syncAvailability();
-      if (failureInfo !== null) setInfo(failureInfo);
-    }
+    await showOrSwitchOff(owner);
   }
 
   async function handleFieldChanged() {
+    if (suppressFieldChange) return;
     const owner = acquireOperationOwner();
     if (owner === null) return;
-    if (suppressFieldChange) return;
     syncAvailability();
+    // With the switch off, the choice waits for it.
     if (!enabledCheckbox.checked) return;
-    if (enabling) return;
-
-    enabling = true;
-    enabledCheckbox.disabled = true;
-    fieldSelect.disabled = true;
-    setInfo('Loading vector field…');
-    let failureInfo = null;
-    try {
-      await ensureFieldForShownLayouts(owner);
-      if (!isOperationOwnerCurrent(owner)) return;
-      applyConfigFromUi();
-      syncAvailability();
-    } catch (error) {
-      if (!isOperationOwnerCurrent(owner)) return;
-      // A read superseded (another dataset, or the open cells changed and
-      // the field is read again for them) is not a failure.
-      if (isCancellation(error)) return;
-      const exactError =
-        error instanceof Error && error.message.length > 0
-          ? error
-          : new TypeError(
-              'Vector field selection loading failed with an invalid error.'
-            );
-      getNotificationCenter().error(exactError.message, { category: 'render' });
-      disableOverlayUi();
-      failureInfo = 'Failed to load vector field.';
-    } finally {
-      if (!isOperationOwnerCurrent(owner)) return;
-      enabling = false;
-      enabledCheckbox.disabled = false;
-      fieldSelect.disabled = false;
-      syncAvailability();
-      if (failureInfo !== null) setInfo(failureInfo);
-    }
+    await showOrSwitchOff(owner);
   }
 
   function handleVectorFieldsChanged() {
     if (destroyed) return;
     operationGeneration += 1;
-    enabling = false;
-    enabledCheckbox.disabled = false;
-    fieldSelect.disabled = false;
+    loadingOwner = null;
+    setSwitchUnavailable(null);
+    setFieldSelectUnavailable(null);
     // Dataset swap: reset toggle state so we don’t keep an overlay enabled across datasets.
     fieldSelect.value = '';
     disableOverlayUi();
@@ -863,9 +876,11 @@ export function initVelocityOverlayControls(options) {
   const sliderFrames = [];
   for (const slider of VELOCITY_SLIDERS) {
     const input = dom[VELOCITY_NUMERIC_INPUTS[slider.name].domKey];
+    // Its readout of any position, for the history as for the row (`core/control-readout.js`).
+    defineControlReadout(input, raw => slider.format(slider.read(Number(raw))));
     const apply = () => {
       const value = readSlider(slider);
-      if (enabledCheckbox.checked && !enabling) {
+      if (enabledCheckbox.checked && !isLoading()) {
         viewer.setVectorFieldConfig(slider.config, value);
       }
     };
@@ -885,10 +900,10 @@ export function initVelocityOverlayControls(options) {
     }
   }
   listen(colormapSelect, 'change', () => {
-    if (enabledCheckbox.checked && !enabling) viewer.setVectorFieldConfig('colormapId', colormapSelect.value);
+    if (enabledCheckbox.checked && !isLoading()) viewer.setVectorFieldConfig('colormapId', colormapSelect.value);
   });
   listen(syncLodCheckbox, 'change', () => {
-    if (enabledCheckbox.checked && !enabling) {
+    if (enabledCheckbox.checked && !isLoading()) {
       viewer.setVectorFieldConfig('syncWithLOD', syncLodCheckbox.checked);
     }
   });
@@ -1018,8 +1033,8 @@ export function initVelocityOverlayControls(options) {
       }
       try {
         getNotificationCenter().error(
-          `Velocity rendering stopped: ${failureText(error)}`,
-          { category: 'render' }
+          `Velocity rendering stopped: ${sayFailure(error)}`,
+          { category: 'render', ...failureDetails(error) }
         );
       } catch (notificationError) {
         collectFailure(

@@ -104,6 +104,9 @@ function stubDataLayer(columns, pointCount, { subsets = true } = {}) {
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     async getGeneKeys() { return [...columns.keys()]; },
     getAvailableVariables: () => [...columns.keys()].map(key => ({ key })),
     isGeneDeliverable: gene => columns.has(gene),
@@ -111,7 +114,6 @@ function stubDataLayer(columns, pointCount, { subsets = true } = {}) {
       reads.push({ kind: 'column', genes: 1 });
       return { fieldIndex: 0, values: columns.get(gene), owned: false };
     },
-    performCacheCleanup() {},
   };
   if (subsets) {
     layer.readsGeneCellSubsets = () => true;
@@ -332,7 +334,7 @@ test('genes per task follow the genes\' bytes as read: a sparse run is a few lar
   const poolSize = 8;
   const cells = new Uint32Array(1_900_000);
   for (let k = 0; k < cells.length; k++) cells[k] = 5 * k;
-  // A gene holds 50,000 entries in the cells (2.6 %), 8 B each, as read.
+  // A gene holds 50,000 entries in the cells (2.6%), 8 B each, as read.
   const bytesPerGene = 50_000 * CELL_SUBSET_ENTRY_BYTES;
   let nextId = 0;
   const route = {
@@ -462,6 +464,9 @@ async function runSignature(columns, pointCount, method, geneSets) {
     getDatasetGeneration: () => Symbol(method),
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     getPageCells: pageIds => pageIds.map((pageId, page) => ({
       pageId,
       pageName: pageId,
@@ -476,7 +481,6 @@ async function runSignature(columns, pointCount, method, geneSets) {
         return { length: column.length, indices: Uint32Array.from(indices), values: Float32Array.from(indices, cell => column[cell]) };
       });
     },
-    performCacheCleanup() {},
   };
   analysis._computeManager = null;
   const result = await analysis.computeSignatureScore({ geneSets, pageIds: ['P0', 'P1'], method });

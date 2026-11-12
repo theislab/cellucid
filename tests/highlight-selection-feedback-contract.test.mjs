@@ -188,6 +188,8 @@ function createState(field) {
       getActiveField() {
         return this.activeField;
       },
+      // What a field's values are in (an annotation group on a gene names them).
+      getLegendModel() { return { values: null }; },
       getFieldForView() {
         return this.activeField;
       },
@@ -700,7 +702,7 @@ test('the selection bar mirrors the step controls and says when a tap missed', (
   assert.equal(bar['select-bar-undo'].disabled, panelUndo.disabled);
   assert.equal(bar['select-bar-notice'].hidden, true);
 
-  // Cancelling hides the mirror with the panel's block.
+  // Canceling hides the mirror with the panel's block.
   tool.run(() => {
     tool.annotation.handleAnnotationStep({ cancelled: true, step: 0, candidateCount: 0 });
   });

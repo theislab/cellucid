@@ -43,6 +43,7 @@ import { assertDatasetSourceRecord, captureDatasetSourceRecord } from '../sessio
 import { requireSubsampleSpec } from '../../data/subsample.js';
 import { forgetLocalFiles } from './local-file-handles.js';
 import { listSavedStates, removeSavedStates } from '../history/autosave.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
 const DB_NAME = 'cellucid-library';
 const STORE_NAME = 'datasets';
@@ -285,17 +286,11 @@ export function createLibrary({ store = null, now = Date.now } = {}) {
   let kept = store;
   /** Whether the browser's store answered once: a later failure is that write's, not the store's. */
   let reached = false;
-  const listeners = new Set();
+  const listeners = createListenerSet('My datasets');
   let queue = Promise.resolve();
 
   function announce() {
-    for (const listener of [...listeners]) {
-      try {
-        listener();
-      } catch (error) {
-        console.error('[My datasets] listener failed', error);
-      }
-    }
+    listeners.notify();
   }
 
   /** Run `work` on the store in use; a browser store that never answered gives way to memory. */
@@ -435,8 +430,7 @@ export function createLibrary({ store = null, now = Date.now } = {}) {
      * @returns {() => void}
      */
     onChange(listener) {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
+      return listeners.add(listener);
     },
   });
 }

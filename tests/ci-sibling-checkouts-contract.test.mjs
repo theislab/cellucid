@@ -11,7 +11,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { ACTION_CATALOG_MIRRORS, MCP_TOOLS_MIRRORS } from '../scripts/generate-action-catalog.mjs';
-import { HISTORY_GOLDEN_MIRRORS } from '../scripts/generate-history-golden.mjs';
+import { HISTORY_GOLDEN_MIRRORS, PACKAGE_SESSION_NAME } from '../scripts/generate-history-golden.mjs';
 import { HISTORY_MODEL_MIRRORS } from '../scripts/generate-history-model.mjs';
 
 const WORKFLOW = readFileSync(new URL('../.github/workflows/test.yml', import.meta.url), 'utf8');
@@ -23,12 +23,19 @@ function sparseList(repository) {
   return step[1].trim().split('\n').map(line => line.trim());
 }
 
-/** What the generators write of `repository`: its copies, and the golden history's folder. */
+/**
+ * What the generators write of `repository`: its copies, the golden history's
+ * folder, and the session a package ships as its help pages' example (`example`:
+ * cellucid-r's `inst/extdata`, read by `history-golden-fixture.test.mjs`; left
+ * out of the list once, CI run 42812443830).
+ */
 function generated(repository) {
   const files = [ACTION_CATALOG_MIRRORS, MCP_TOOLS_MIRRORS, HISTORY_MODEL_MIRRORS]
     .flatMap(mirrors => mirrors.filter(mirror => mirror.repository === repository).map(mirror => mirror.file));
-  const golden = HISTORY_GOLDEN_MIRRORS.filter(mirror => mirror.repository === repository).map(mirror => `${mirror.dir}/`);
-  return [...files, ...golden];
+  const mirrors = HISTORY_GOLDEN_MIRRORS.filter(mirror => mirror.repository === repository);
+  const golden = mirrors.map(mirror => `${mirror.dir}/`);
+  const examples = mirrors.filter(mirror => mirror.example !== null).map(mirror => `${mirror.example}/${PACKAGE_SESSION_NAME}`);
+  return [...files, ...golden, ...examples];
 }
 
 test('the Node job checks out every file the contracts read of cellucid-python', () => {
@@ -48,6 +55,14 @@ test('the Node job checks out every file the contracts read of cellucid-r', () =
   ].sort());
 });
 
-test('the Node job checks out the published session presets of cellucid-datasets', () => {
-  assert.deepEqual(sparseList('cellucid-datasets'), ['anndata/datasets.json', 'anndata/*.cellucid-session']);
+test('the Node job checks out the published session presets of cellucid-datasets, and their reader', () => {
+  assert.deepEqual(sparseList('cellucid-datasets'), [
+    'anndata/datasets.json',
+    'anndata/*.cellucid-session',
+    // `state-record-added-keys.test.mjs` reads the starting views as they are
+    // published (`readStartingView()`); the module imports its store reader.
+    // Left out once, CI run 43106620008.
+    'scripts/publish_session_preset.mjs',
+    'scripts/anndata_store.mjs',
+  ]);
 });

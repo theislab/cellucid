@@ -89,7 +89,7 @@ test('situation reporter distinguishes exact renderer memory from its pre-public
   assert.equal(exact.gpuMemoryEstimated, false);
 
   // Before publication the estimate follows what the points renderer stores
-  // per cell: 4 bytes per position axis, 4 of RGBA colour and 1 of alpha —
+  // per cell: 4 bytes per position axis, 4 of RGBA color and 1 of alpha —
   // 13 B in 2D and 17 B in 3D, as measured; an unknown dimension counts as 3D.
   for (const [dimension, bytesPerPoint] of [[2, 13], [3, 17], [null, 17]]) {
     const estimated = reporter._collectRendererSnapshot(null, {

@@ -9,7 +9,7 @@
  *
  * A name becomes a store path only if it is relative, uses `/`, and has no
  * empty, `.` or `..` parts: an archive can never address anything outside
- * itself. Parts are normalised to Unicode NFC, so a name written on macOS
+ * itself. Parts are normalized to Unicode NFC, so a name written on macOS
  * (decomposed) and one written elsewhere (composed) are the same path.
  *
  * @module formats/zip/names

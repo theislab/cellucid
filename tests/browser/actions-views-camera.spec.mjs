@@ -273,6 +273,18 @@ test('each view and camera action dispatched directly leaves the exact state; na
     out.viewsAfterRemove = viewer.getSnapshotViews().length;
     out.refusals.clear = await refusal('view.clear', {});
     out.refusals.removeLive = await refusal('view.remove', { view: 'View 1' });
+    // With one kept view, removing View 1 (the live view) hides it and keeps the kept view, which is
+    // then View 1 and the last view (F144); Clear shows the live view again.
+    await actions.dispatch('view.keep', { name: 'Kept' });
+    out.removeLiveOfTwo = (await actions.dispatch('view.remove', { view: 'View 1' })).outcome;
+    out.afterRemoveLive = {
+      liveHidden: viewer.getLiveViewHidden(),
+      kept: viewer.getSnapshotViews().map(view => viewer.getViewName(view.id)),
+      active: state.getActiveViewId() === viewer.getSnapshotViews()[0].id,
+    };
+    out.refusals.removeLast = await refusal('view.remove', { view: 'View 1' });
+    out.clearAfterRemoveLive = (await actions.dispatch('view.clear', {})).outcome;
+    out.liveHiddenAfterClear = viewer.getLiveViewHidden();
     return out;
   });
   expect(result).toEqual({
@@ -282,7 +294,8 @@ test('each view and camera action dispatched directly leaves the exact state; na
     activeAfterFocus: 'live',
     layout: 'single',
     linked: false,
-    set3d: { view: 'View 2' },
+    // Named as the picker names it ("UMAP · 3D"), as its step says it.
+    set3d: { view: 'View 2', embedding: expect.stringMatching(/ · 3D$/) },
     keptDimension: 3,
     liveDimension: 3,
     default1d: { view: 'View 1', embedding: expect.any(String) },
@@ -307,9 +320,14 @@ test('each view and camera action dispatched directly leaves the exact state; na
       smokeless: true,
       clear: 'ActionRefused: There are no kept views to remove.',
       removeLive: 'ActionRefused: The live view is the only view; keep a view before removing it.',
+      removeLast: 'ActionRefused: The last view cannot be removed.',
     },
     remove: { view: 'View 2' },
     viewsAfterRemove: 0,
+    removeLiveOfTwo: { view: 'View 1' },
+    afterRemoveLive: { liveHidden: true, kept: ['Kept'], active: true },
+    clearAfterRemoveLive: { views: 1 },
+    liveHiddenAfterClear: false,
   });
   expect(errors).toEqual([]);
 });

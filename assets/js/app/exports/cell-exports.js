@@ -12,12 +12,17 @@
  *   where a cell has none; a row per open cell.
  *
  *   An obs-column CSV declares itself: a header row (`obs_name`, then each
- *   column's name), a kind row (`kind`, then each column's kind), then a
- *   row per cell, named by obs name. A reader never guesses a column's kind
- *   from its values (labels `0`, `1`, `10` stay labels; `True`/`False`
- *   labels stay labels), and a cell the file does not list is unknown --
- *   a subsample's unopened cells. (`tests/fixtures/obs-columns.csv` pins the
- *   format for the web app, Python and R.)
+ *   column's name), a kind row (`kind`, then each column's kind), a
+ *   categories row (`categories`, then each `categorical` column's
+ *   categories in the field's order as a JSON array of strings, empty for
+ *   the other kinds), then a row per cell, named by obs name. A reader
+ *   never guesses a column's kind from its values (labels `0`, `1`, `10`
+ *   stay labels; `True`/`False` labels stay labels), never orders a
+ *   categorical's categories by the rows (a trajectory's order, a category
+ *   no cell holds, come back as the field has them), and a cell the file
+ *   does not list is unknown -- a subsample's unopened cells.
+ *   (`tests/fixtures/obs-columns.csv` pins the format for the web app,
+ *   Python and R.)
  * - **Highlighted cells as an `.h5ad` subset** (`formats/hdf5/writer.js`):
  *   the cells' obs names and every obs field (user-defined ones included),
  *   each highlight group as a boolean column, the genes, the rows of the
@@ -25,7 +30,7 @@
  *   embeddings the mapping shows; continuous fields and embeddings keep
  *   their float32 or float64, a categorical its order flag, its categories
  *   in their own type (numbers stay numbers, booleans booleans) and its
- *   colours as `uns['<key>_colors']`. Only the highlighted cells' rows of
+ *   colors as `uns['<key>_colors']`. Only the highlighted cells' rows of
  *   the obs names and the embeddings (read as the cells listed, in the
  *   stored order) are read, and a field read
  *   for the export is let go again under the residency budget once its
@@ -52,7 +57,7 @@
  * @module app/exports/cell-exports
  */
 
-import { downloadBlob } from '../utils/download.js';
+import { downloadBlob, safeFileName } from '../utils/download.js';
 import {
   booleanAttribute,
   group,
@@ -66,11 +71,16 @@ import { orderByKey } from '../../utils/radix-order.js';
 import { yieldToMacrotask } from '../../utils/yield-macrotask.js';
 import { releaseInactiveFieldsOverBudget } from '../state/managers/field/residency.js';
 import { throwIfAborted } from '../../utils/abort.js';
+import { hexOfRgb01 } from '../../utils/hex-color.js';
+import { portableElementName } from '../../data/anndata/write/names.js';
+import { csvText } from '../analysis/compute/csv-export.js';
 
 /** The first column of an obs-column CSV. */
 export const OBS_NAME_COLUMN = 'obs_name';
 /** The first cell of an obs-column CSV's kind row. */
 export const KIND_ROW = 'kind';
+/** The first cell of an obs-column CSV's categories row. */
+export const CATEGORIES_ROW = 'categories';
 /** What a column of an obs-column CSV holds. */
 export const CSV_KINDS = Object.freeze(['highlight', 'categorical', 'continuous']);
 /** A highlight group's column, as `pull` in Python and R names it. */
@@ -83,8 +93,7 @@ const ENCODING = (type, version) => ({ 'encoding-type': type, 'encoding-version'
 
 /** One CSV cell, quoted when it holds a comma, a quote or a line break. */
 export function csvCell(value) {
-  const text = value === null || value === undefined ? '' : String(value);
-  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  return csvText(value === null || value === undefined ? '' : String(value));
 }
 
 /**
@@ -198,7 +207,7 @@ function obsNamesOf(adapter, cells) {
 }
 
 /**
- * An obs-column CSV as a Blob: its header and kind rows, then a row per
+ * An obs-column CSV as a Blob: its header, kind and categories rows, then a row per
  * cell of `cells` (open positions, in order), named by obs name, built a
  * batch at a time with a yield between batches (no long task, no string of
  * millions of rows), reporting progress and stopping at `signal`. Each
@@ -208,7 +217,9 @@ function obsNamesOf(adapter, cells) {
  * the file will be (its bytes a row so far, times its rows), before the rest
  * is written.
  *
- * @param {Array<[string, string]>} columns - Each column's name and kind
+ * @param {Array<[string, string, ReadonlyArray<string|number|boolean>?]>} columns -
+ *   Each column's name, kind and, for a `categorical` column (only), its
+ *   categories in the field's order (written as text, as its cells are)
  * @param {Object} adapter
  * @param {Uint32Array} cells
  * @param {(row: number, cell: number) => string} valuesAt - Row `row`'s
@@ -216,14 +227,21 @@ function obsNamesOf(adapter, cells) {
  * @param {{onProgress?: (done: number, total: number, expectedBytes: number) => void, signal?: AbortSignal|null}} [options]
  */
 async function csvBlob(columns, adapter, cells, valuesAt, { onProgress = () => {}, signal = null } = {}) {
-  for (const [, kind] of columns) {
+  for (const [, kind, categories] of columns) {
     if (!CSV_KINDS.includes(kind)) throw new TypeError(`An obs-column CSV column is of kind ${CSV_KINDS.join(', ')}`);
+    if ((kind === 'categorical') !== Array.isArray(categories)) {
+      throw new TypeError('An obs-column CSV lists the categories of each categorical column, and of no other');
+    }
   }
   const header = [OBS_NAME_COLUMN, ...columns.map(([column]) => column)];
   const kinds = [KIND_ROW, ...columns.map(([, kind]) => kind)];
+  const categoryLists = [
+    CATEGORIES_ROW,
+    ...columns.map(([, , categories]) => (categories === undefined ? '' : JSON.stringify(categories.map(String)))),
+  ];
   const encoder = new TextEncoder();
   const spool = await createSpool('csv');
-  const head = encoder.encode(`${header.map(csvCell).join(',')}\n${kinds.join(',')}\n`);
+  const head = encoder.encode(`${[header.map(csvCell), kinds, categoryLists.map(csvCell)].map(row => row.join(',')).join('\n')}\n`);
   await spool.write(head);
   let written = head.byteLength;
   const namesAt = obsNamesOf(adapter, cells);
@@ -288,10 +306,10 @@ export async function fieldCsv({ state, adapter, fieldIndex, onProgress, signal 
   // Read under the export: its card says it and its Cancel stops the read.
   const field = await state.ensureFieldLoaded(fieldIndex, { signal, silent: true });
   const valueAt = columnReader(field);
-  const kind = field.kind === FieldKind.CATEGORY ? 'categorical' : 'continuous';
+  const column = field.kind === FieldKind.CATEGORY ? [field.key, 'categorical', field.categories] : [field.key, 'continuous'];
   const every = inOriginalOrder(state);
   const filename = `${fileStem(field.key)}.csv`;
-  const blob = await csvBlob([[field.key, kind]], adapter, every, (row, cell) => csvCell(valueAt(cell)), { onProgress, signal });
+  const blob = await csvBlob([column], adapter, every, (row, cell) => csvCell(valueAt(cell)), { onProgress, signal });
   return { blob, filename };
 }
 
@@ -347,31 +365,25 @@ function categoriesDataset(categories) {
   return stringDataset(categories.map(String), ENCODING('string-array', '0.2.0'));
 }
 
-/** An RGB triplet (0–1) as Scanpy's `#rrggbb`. */
-function hexColor(rgb) {
-  return `#${rgb.map(channel => Math.round(channel * 255).toString(16).padStart(2, '0')).join('')}`;
-}
-
+/** A page's or field's name as the start of a file name: safe, its white space as `_`. */
 function fileStem(name) {
-  const stem = String(name).replace(/[\\/:*?"<>|\s]+/g, '_').replace(/^_+|_+$/g, '');
-  return stem.length > 0 ? stem : 'cellucid';
+  return safeFileName(String(name).replace(/\s+/g, '_').replace(/^_+|_+$/g, ''), 'cellucid');
 }
 
 /**
  * The name a column (or embedding) takes in the `.h5ad`, and why it differs
- * from its key: an HDF5 link name holds no "/" and is never "." (AnnData
- * refuses both as keys), so each "/" is written "_", "." is written "_", and
- * a name taken already gets "_2", "_3"... `renamed` collects each change, which
- * the export reports.
+ * from its key: the portable element name every writer of the app gives a
+ * name it did not choose (`data/anndata/write/names.js`
+ * `portableElementName`: "/" and the other characters no file name holds as
+ * "_", "." as "_", a name too long for a file name cut, and one taken
+ * already, in any letter case, "_2", "_3"...), so the file converts to Zarr
+ * wherever it is copied. `taken` holds the `folderKey`s of the names written;
+ * `renamed` collects each change, which the export reports.
  */
 export function columnName(key, taken, renamed = null) {
-  let name = String(key).replace(/\//g, '_');
-  if (name.length === 0 || name === '.') name = '_';
-  let candidate = name;
-  for (let n = 2; taken.has(candidate); n++) candidate = `${name}_${n}`;
-  taken.add(candidate);
-  if (candidate !== String(key)) renamed?.push({ key: String(key), name: candidate });
-  return candidate;
+  const name = portableElementName(String(key), taken);
+  if (name !== String(key)) renamed?.push({ key: String(key), name });
+  return name;
 }
 
 /**
@@ -403,7 +415,7 @@ function storageFull(error) {
  * `SPOOL_SEGMENT_BYTES` written, when the browser offers one to a page,
  * else memory. `finish()` returns the bytes as one Blob of those files
  * (read from disk as the download streams it); `discard()` removes them
- * (a copy of the dataset that failed or was cancelled). The files of an earlier
+ * (a copy of the dataset that failed or was canceled). The files of an earlier
  * page's exports are removed when the next one starts: a download reads its
  * file after the export returns. When the site's storage is full (a private
  * window's is a few hundred MB; gene indexes kept for a revisit share it),
@@ -518,7 +530,7 @@ export async function createSpool(name, { segmentBytes = SPOOL_SEGMENT_BYTES } =
       return new Blob(parts);
     },
     /**
-     * Drop what was written (a copy that failed or was cancelled): its
+     * Drop what was written (a copy that failed or was canceled): its
      * files are removed from the private storage, nothing is downloaded.
      */
     async discard() {
@@ -577,7 +589,7 @@ export async function highlightsH5ad({ state, adapter, pageId, onProgress = () =
   /** @type {Array<{key: string, name: string}>} Keys written under another name. */
   const renamed = [];
   const columns = [];
-  /** `uns['<column>_colors']` of each categorical: its colours as shown. */
+  /** `uns['<column>_colors']` of each categorical: its colors as shown. */
   const colors = [];
   const fields = state.getFields() ?? [];
   for (let index = 0; index < fields.length; index++) {
@@ -602,7 +614,7 @@ export async function highlightsH5ad({ state, adapter, pageId, onProgress = () =
       ])]);
       if (count > 0) {
         colors.push([`${name}_colors`, stringDataset(
-          field.categories.map((_, code) => hexColor(state.getColorForCategory(field, code))),
+          field.categories.map((_, code) => hexOfRgb01(state.getColorForCategory(field, code))),
           ENCODING('string-array', '0.2.0')
         )]);
       }

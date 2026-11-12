@@ -32,7 +32,7 @@ import { cellSampleFilterOf } from '../category-cell-sample.js';
 
 /**
  * Resolve the filters that can hide a cell once per count: every category,
- * range (obs field or gene) and outlier filter, whatever is coloured (as the
+ * range (obs field or gene) and outlier filter, whatever is colored (as the
  * visibility pass applies them).
  *
  * The count loops used to walk every field for every cell and re-derive each
@@ -466,7 +466,7 @@ export class FieldSummaryMethods {
       ? this
       : this.viewContexts.get(key);
     if (!view) return [];
-    const lines = collectViewFilters(view, { geneSampled: (this.getGeneSample?.() ?? null) !== null })
+    const lines = collectViewFilters(view, { geneSampled: (this.getGeneSample?.() ?? null) !== null, geneValues: this.getShownExpressionTransform?.() ?? null })
       .filter((filter) => filter.enabled)
       .map((filter) => filter.text);
     return lines.length > 0 ? lines : ['No filters active'];
@@ -676,7 +676,7 @@ export class FieldSummaryMethods {
           : this.obsData?.fields?.[filter.fieldIndex];
       // Counted now, from the current filters: `_categoryCounts` is refreshed
       // only while its field is the active one, so a row for any other field
-      // would otherwise report the counts from when it was last coloured.
+      // would otherwise report the counts from when it was last colored.
       if (
         !field
         || !isCategoricalCodes(field.codes)

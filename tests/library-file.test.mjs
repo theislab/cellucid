@@ -32,6 +32,7 @@ import { createAutosave, keepAsSavedState, listSavedStates, openSavedState } fro
 import { readHistoryFile, writeHistoryFile } from '../assets/js/app/session/history-file.js';
 import { readBundle } from '../assets/js/app/session/bundle/reader.js';
 import { writeBundle } from '../assets/js/app/session/bundle/writer.js';
+import { DAMAGED_FILE, failureDetails, sayFailure } from '../assets/js/utils/errors.js';
 import { LIBRARY_FILE_NOT_A_SESSION_MESSAGE } from '../assets/js/app/session/bundle/format.js';
 import { getActionCatalog } from '../assets/js/app/actions/index.js';
 import { actionStamps } from '../assets/js/app/session/app-stamp.js';
@@ -290,6 +291,11 @@ test('damaged, foreign and truncated files are refused before anything is added'
     assert.deepEqual(await listSavedStates(to.store), []);
   };
   const tryImport = async file => (await refusal(importLibrary(file, { library: to.library, store: to.store }))).message;
+  // A damaged file is said so, its technical words under Details (F141); a foreign one says what it is.
+  const said = async file => {
+    const error = await refusal(importLibrary(file, { library: to.library, store: to.store }));
+    return { sentence: sayFailure(error), details: failureDetails(error).details ?? null };
+  };
 
   // Foreign: not a library file at all, or too short to be one.
   for (const text of ['', 'CELLUCID', 'PNG image bytes long enough to hold a signature']) {
@@ -301,6 +307,12 @@ test('damaged, foreign and truncated files are refused before anything is added'
   assert.match(await tryImport(new Blob([bytes.slice(0, bytes.length - 100)])), /truncated|end of file/i);
   // Trailing bytes.
   assert.match(await tryImport(new Blob([bytes, new Uint8Array([1, 2, 3])])), /trailing bytes/);
+  for (const damagedFile of [new Blob([bytes.slice(0, bytes.length - 100)]), new Blob([bytes, new Uint8Array([1, 2, 3])])]) {
+    const { sentence, details } = await said(damagedFile);
+    assert.equal(sentence, DAMAGED_FILE);
+    assert.match(details, /truncated|end of file|trailing bytes/i);
+  }
+  assert.deepEqual(await said(new Blob(['CELLUCID'])), { sentence: NOT_A_LIBRARY_FILE_MESSAGE, details: null });
 
   // Damaged: one byte of the history's session file changed (its last chunk's bytes).
   const flipped = bytes.slice();
@@ -324,7 +336,12 @@ test('damaged, foreign and truncated files are refused before anything is added'
   const notSession = new TextEncoder().encode('not a session file');
   assert.match(await tryImport(writeBundle({
     manifest: { ...manifest, chunks: [{ ...manifest.chunks[0], storedBytes: notSession.byteLength }] }, chunks: [notSession], signature: LIBRARY_SIGNATURE,
-  })), /is not a session file this version reads: This file is not a Cellucid session file/);
+  })), /is not a session file this version reads\.$/);
+  const { sentence, details } = await said(writeBundle({
+    manifest: { ...manifest, chunks: [{ ...manifest.chunks[0], storedBytes: notSession.byteLength }] }, chunks: [notSession], signature: LIBRARY_SIGNATURE,
+  }));
+  assert.equal(sentence, DAMAGED_FILE);
+  assert.match(details, /is not a session file this version reads.*This file is not a Cellucid session file/);
   await nothingAdded();
 });
 

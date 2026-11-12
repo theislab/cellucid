@@ -1,4 +1,4 @@
-/* components/_jobs.css - The running, cancelled and failed states of a
+/* components/_jobs.css - The running, canceled and failed states of a
    cancellable job in the panel that started it (app/jobs/job-status-view.js). */
 
 .job-status {

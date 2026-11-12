@@ -9,7 +9,7 @@
  * at once, with no permutation and no gather.
  *
  * A tree's draw order (`draw-order.js`) is adopted for frustum culling and
- * for the spatial coherence of drawing neighbours together. Its bands are
+ * for the spatial coherence of drawing neighbors together. Its bands are
  * fixed runs of ranks, and each band of the order holds exactly the cells of
  * its ranks, so a store can take the order **one band at a time** while it
  * is drawn: after any number of bands, slots `[0, adopted)` hold the order,

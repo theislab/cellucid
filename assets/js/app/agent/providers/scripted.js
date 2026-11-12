@@ -10,8 +10,10 @@
  *
  * - `text`: the reply's words, streamed in `chunks` pieces (default 1),
  *   `delayMs` apart (default 0), each wait stopped by the call's signal;
- * - `calls`: `[{name, args}]`, tool calls after the text (ids `call-<n>`,
- *   counted per provider, so a run is the same every time);
+ * - `calls`: `[{name, args, note?}]`, tool calls after the text (ids
+ *   `call-<n>`, counted per provider, so a run is the same every time); a
+ *   call's `note` is streamed before it as `progress`, as a model that
+ *   writes notes between its calls does (`providers/anthropic.js`);
  * - `stop`: `refusal` or `max-tokens` instead of the reason the calls imply,
  *   with `detail` for a refusal;
  * - `error`: `{kind, message, retryAfterMs?}`, a failure of the call instead
@@ -81,6 +83,7 @@ export function createScriptedProvider(script) {
       const calls = Array.isArray(step?.calls) ? step.calls : [];
       for (const call of calls) {
         await wait(step?.delayMs ?? 0, signal);
+        if (typeof call.note === 'string' && call.note !== '') yield { type: 'progress', text: call.note };
         yield { type: 'tool-call', id: `call-${nextCall++}`, name: call.name, args: call.args ?? {} };
       }
       const input = step?.usage?.input ?? Math.ceil(JSON.stringify(messages).length / 4);

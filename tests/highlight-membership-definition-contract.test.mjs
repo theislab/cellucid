@@ -101,7 +101,7 @@ test('the displayed page count is the set the renderer is asked to paint', () =>
 });
 
 test('a page can never be counted larger than the set it renders', () => {
-  // The membership a page claims and the membership the renderer can honour
+  // The membership a page claims and the membership the renderer can honor
   // are the same question asked twice. Whatever a page holds -- including a
   // cell index that belongs to a dataset that is no longer loaded -- the two
   // answers must agree, or both must refuse.
@@ -406,7 +406,7 @@ test('highlight accessors expose no second definition of page membership', () =>
 
 /**
  * The page list counts every page on each highlight and page change (a page
- * colour drag fires one per input event). A count is a pass over every
+ * color drag fires one per input event). A count is a pass over every
  * enabled cell of the page, so it is kept while the page has the same
  * enabled cell lists, and taken again when one of them changes.
  */
@@ -423,7 +423,7 @@ test('a page is counted again only when its enabled cell lists change', () => {
   };
   assert.equal(state.getHighlightedCellCountForPage('page_1'), 1001);
   assert.equal(state.getHighlightedCellCountForPage('page_1'), 1001);
-  // A recolour or rename changes no cell list.
+  // A recolor or rename changes no cell list.
   page.color = '#00ff00';
   page.name = 'renamed';
   assert.equal(state.getHighlightedCellCountForPage('page_1'), 1001);

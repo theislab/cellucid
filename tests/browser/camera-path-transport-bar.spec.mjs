@@ -60,6 +60,8 @@ test('the transport bar occupies a bounded strip and leaves the rest of the view
   const productErrors = observeProductErrors(page);
   await openCameraPathWithTwoKeyframes(page);
   await expect(page.locator('.cinematic-transport-bar')).toHaveClass(/visible/);
+  // Ready and stopped, it says the path's length (found 2026-11-10: "0:00 / 0:00" until played).
+  await expect(page.locator('.cinematic-time-readout')).toHaveText(/^0:00 \/ (?!0:00$)\d+:\d\d$/);
 
   const layout = await page.evaluate(() => {
     const bar = document.querySelector('.cinematic-transport-bar');
@@ -86,7 +88,7 @@ test('the transport bar occupies a bounded strip and leaves the rest of the view
   // It never overlaps the sidebar.
   expect(layout.barLeft).toBeGreaterThan(layout.sidebarRight);
 
-  // The positioning track spans the viewport so the bar can centre inside it.
+  // The positioning track spans the viewport so the bar can center inside it.
   // It must stay transparent to the pointer, or it swallows canvas clicks.
   const hitTests = await page.evaluate((box) => {
     const y = Math.round(box.barTop + box.barHeight / 2);
@@ -230,7 +232,7 @@ test('navigation lives in its own panel, and Camera Path follows it', async ({
   await expect(tip).toContainText('With two or more, a playback bar appears');
   await expect(tip.locator('a.info-tip-link')).toHaveAttribute(
     'href',
-    /^https:\/\/docs\.cellucid\.com\/en\/latest\/user_guide\/web_app\/c_core_interactions\/02_camera_controls_advanced\.html#camera-path-playback-is-opt-in$/
+    /^https:\/\/docs\.cellucid\.com\/en\/latest\/user_guide\/web_app\/c_core_interactions\/08_camera_path\.html#the-keyframes-list$/
   );
 
   expect(productErrors).toEqual([]);
@@ -311,7 +313,7 @@ test('keyframe list editing is keyboard operable, rejects bad durations, and kee
 test('the shown transport bar never covers a multiview title chip', async ({
   page
 }) => {
-  // Each multiview cell centres its title chip 20px below the top of the plot,
+  // Each multiview cell centers its title chip 20px below the top of the plot,
   // which is exactly the strip the transport bar occupies. With a camera path
   // and two views the bar used to sit on the second view's chip, hiding its
   // name and taking the click that focuses that view.
@@ -336,7 +338,7 @@ test('the shown transport bar never covers a multiview title chip', async ({
   });
   await expect.poll(overlaps).toEqual([false, false]);
 
-  // Every chip stays the topmost element at its own centre, so it is clickable.
+  // Every chip stays the topmost element at its own center, so it is clickable.
   const topmost = await page.evaluate(() =>
     [...document.querySelectorAll('.view-title-chip')].map(chip => {
       const box = chip.getBoundingClientRect();

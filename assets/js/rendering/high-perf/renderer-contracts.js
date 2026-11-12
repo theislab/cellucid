@@ -25,6 +25,8 @@ const REQUIRED_RENDER_SCALAR_KEYS = Object.freeze([
   'lightingStrength',
   'fogDensity',
   'cameraDistance',
+  // The sprite cap every pass draws with (rendering/point-sprite.js).
+  'pointSizeMax',
 ]);
 const REQUIRED_RENDER_VECTOR_CONTRACTS = Object.freeze([
   Object.freeze(['mvpMatrix', 16]),

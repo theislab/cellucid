@@ -154,7 +154,7 @@ test('a cell without a value (NaN, an infinity) is out of the mean, the share an
     assert.deepEqual([...summary.sizes], [3, 3]);
     assert.deepEqual([...summary.measured], [2, 2]);
     const values = groupSummaryValues(summary);
-    // DE over the same cells: means 1 and 2.5, 50 % and 100 % above 0.
+    // DE over the same cells: means 1 and 2.5, 50% and 100% above 0.
     assert.deepEqual([...values.mean], [1, 2.5]);
     assert.deepEqual([...values.fraction], [0.5, 1]);
     assert.deepEqual([...values.meanExpressing], [2, 2.5]);

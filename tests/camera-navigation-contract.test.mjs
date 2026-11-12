@@ -203,7 +203,7 @@ test('releasing a choice hands that view and dimension back to the dimension rul
   owner.release('live', 3);
   assert.equal(owner.choiceFor('live', 3), null);
   assert.equal(owner.choiceFor('live', 2), 'orbit', 'releasing one dimension keeps the other');
-  assert.equal(owner.choiceFor('snap_1', 3), 'planar', 'releasing one view keeps its neighbours');
+  assert.equal(owner.choiceFor('snap_1', 3), 'planar', 'releasing one view keeps its neighbors');
   // Releasing what was never chosen is a no-op, not an error.
   owner.release('snap_2', 1);
   assert.equal(owner.choiceFor('snap_2', 1), null);
@@ -380,20 +380,12 @@ test('the navigation selector forwards exact values to the viewer', () => {
 
 test('representation, view-row, and session boundaries preserve exact camera ownership', () => {
   // The picker forwards the exact layout key it lists; the keyboard forwards
-  // the exact dimension its key names. Neither parses or coerces.
+  // the exact dimension its key names. Neither parses or coerces. What reaches
+  // the state is checked by behavior in `representation-controls-contract`
+  // ("choosing a representation is the view.embedding.set action…": the exact
+  // `setViewEmbeddingRef(view, {key, columns})`; "keys 1, 2 and 3…": the exact
+  // `cycleRepresentation(view, dimension)`), not by the call's spelling here.
   assert.doesNotMatch(representationControlsSource, /parseInt\(|Number\(select\.value\)/);
-  assert.match(
-    representationControlsSource,
-    /const layoutKey = select\.value;\s*void act\(\(\) => showAction\(viewId, layoutKey\)\)/
-  );
-  assert.match(
-    representationControlsSource,
-    /await state\.setViewEmbeddingRef\(viewId, embedding\)/
-  );
-  assert.match(
-    representationControlsSource,
-    /await state\.cycleRepresentation\(viewId, dimension\)/
-  );
   // A view row's navigation badge is the `camera.navigation.set` action of its
   // view; the action moves the focused view through the panel's mode and any
   // other view through its own.

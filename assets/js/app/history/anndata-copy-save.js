@@ -20,7 +20,8 @@
  *    names the provenance by its SHA-256). The head's state is planned
  *    against the dataset as stored (`exports/anndata-copy.js`, reading through
  *    `BaseAnnDataAdapter.readCopyTarget`: the obs columns, those the plan
- *    reads whole, `uns['cellucid']`), with the open cells as the cells the
+ *    reads whole, the `uns` keys and the colors of the columns it renames,
+ *    relabels or recolors, `uns['cellucid']`), with the open cells as the cells the
  *    state is known on; then copied (`BaseAnnDataAdapter.writeAnnDataCopy`).
  * 3. **How far it is.** One cancellable job (`app/jobs/cancellable-job.js`):
  *    its notification shows the copy's reads (kind `cells`, owned by the
@@ -46,8 +47,10 @@ import { findField, loadField } from '../state/domains/fields.js';
 import { cancelled, isCancellation, onAbort } from '../../utils/abort.js';
 import { formatBytes, formatCountOf } from '../../utils/format-units.js';
 import { pageVersion } from '../utils/page-version.js';
-import { failureText } from '../../utils/errors.js';
+import { failureSentence } from '../../utils/errors.js';
 import { fileFormatOfName } from '../../data/input-formats.js';
+import { sha256Hex } from '../../utils/sha256.js';
+import { safeFileName } from '../utils/download.js';
 
 /** The ending every copy's file has (owner decision Q3: `.zarr.zip` only). */
 export const ANNDATA_COPY_SUFFIX = '.zarr.zip';
@@ -55,8 +58,7 @@ const TITLE = 'Save AnnData with this state';
 
 /** A file name for the copy of a dataset named `name`. */
 export function copyFileName(name) {
-  const stem = (typeof name === 'string' && name.trim() !== '' ? name.trim() : 'Cellucid dataset').replace(/[/\\<>:"|?*\u0000-\u001f]+/g, '_');
-  return `${stem} with this state${ANNDATA_COPY_SUFFIX}`;
+  return `${safeFileName(name, 'Cellucid dataset')} with this state${ANNDATA_COPY_SUFFIX}`;
 }
 
 /**
@@ -65,14 +67,9 @@ export function copyFileName(name) {
  * the copy's ending added.
  */
 export function copyFileNamed(file) {
-  const format = fileFormatOfName(file);
-  return (format?.format === 'zarr' || format?.format === 'mudata-zarr') && format.layout === 'zip' ? file : `${file}${ANNDATA_COPY_SUFFIX}`;
-}
-
-/** The SHA-256 of a Blob, as lower-case hex. */
-async function sha256Of(blob) {
-  const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
-  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  const safe = safeFileName(file);
+  const format = fileFormatOfName(safe);
+  return (format?.format === 'zarr' || format?.format === 'mudata-zarr') && format.layout === 'zip' ? safe : `${safe}${ANNDATA_COPY_SUFFIX}`;
 }
 
 /**
@@ -177,7 +174,7 @@ export function provideAnnDataCopyAction({
       return await saveCopy(params, context);
     } catch (error) {
       // Refused in one sentence, told once (a failure is told by its job).
-      if (error instanceof ActionRefused) notifications.warning(failureText(error), { category: 'download' });
+      if (error instanceof ActionRefused) notifications.warning(failureSentence(error), { category: 'download' });
       throw error;
     }
   });
@@ -207,8 +204,8 @@ export function provideAnnDataCopyAction({
     try {
       job.step('Planning the copy');
       // What is shown is what is saved; the "Current state only" file names it.
-      const { blob: stateFile } = await serializer.writeShare({ choice: STATE_DEFAULTS });
-      const sessionSha256 = await sha256Of(stateFile);
+      const { blob: stateFile } = await serializer.writeShare({ choice: STATE_DEFAULTS, signal });
+      const sessionSha256 = await sha256Hex(new Uint8Array(await stateFile.arrayBuffer()));
       const shown = histories.current();
       if (shown !== history) throw new ActionRefused('Another dataset was opened while the copy was being planned; nothing was saved.', { code: 'refused' });
       const unhold = history.pool.hold();
@@ -228,6 +225,11 @@ export function provideAnnDataCopyAction({
           nObs: stored.nObs,
           obsColumns: stored.obsColumns,
           modalityColumns: new Set(stored.modalityColumns),
+          unsKeys: stored.unsKeys,
+          colors: async column => {
+            const read = await source.readCopyTarget([], { signal: job.signal, owner: job.id, varModality, colors: [column] });
+            return read.colors[column] ?? null;
+          },
           cellucid: stored.cellucid,
           known: identity?.kept ?? null,
           column: async column => {
@@ -287,7 +289,7 @@ export function provideAnnDataCopyAction({
       if (!written) await destination.discard();
       if (signal?.aborted || job.signal.aborted || isCancellation(error)) {
         job.cancel();
-        throw isCancellation(error) ? error : cancelled('user', `${TITLE} was cancelled.`, error);
+        throw isCancellation(error) ? error : cancelled('user', `${TITLE} was canceled.`, error);
       }
       if (error instanceof ActionRefused) job.cancel();
       else job.fail(error);

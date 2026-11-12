@@ -8,10 +8,11 @@
  *   its code (⧉ copies it); what it changed (What changed › compares it with
  *   the step before); a squashed step's count and authors; Show this
  *   step's view (its camera, the history not moved); its notes; then
- *   Show, Branch here, Compare…, and ⋯ (Bookmark…, Revert, Branch without
- *   this step, Copy code, Delete…).
+ *   Show, Branch here, Compare…, and More… (the row's menu: Bookmark…,
+ *   Revert, Branch without this step, Copy code, Group…, Merge into one
+ *   step…, Delete…).
  * - **A branch** (a fork stub): where it starts, its steps, who made it,
- *   main or locked, its notes; Show, Rename…, Compare, ⋯.
+ *   main or locked, its notes; Show, Rename…, Compare, More….
  * - **A turn:** the agent, its model, what it was asked, when, its steps and
  *   summary; Undo turn, Merge into one step….
  * - **A group:** its steps by kind, who acted, when; its notes; Rename…,
@@ -28,16 +29,18 @@ import { outsideOfTurn } from '../../../agent/history-link.js';
 import { outsideText } from '../../../agent/presence/activity.js';
 import { authorOf, flagOf, formatStepTime, runLabel } from './model.js';
 import { notesBlock } from './notes.js';
+import { createButton } from '../../components/controls.js';
 import { idNumber } from '../../../history/model.js';
 import { parameterFacts } from '../../../history/exports/step-text.js';
-import { formatCountOf } from '../../../../utils/format-units.js';
+import { staleReasons } from '../../../history/provenance.js';
+import { formatCountOf, formatDuration } from '../../../../utils/format-units.js';
 
 /**
  * @typedef {object} DetailsContext
  * @property {Document} doc
  * @property {import('./history-source.js').TrackerView} view
  * @property {(type: string, params: object) => Promise<unknown>} act - a history action
- * @property {object|null} catalog - the action catalogue (parameter schemas)
+ * @property {object|null} catalog - the action catalog (parameter schemas)
  * @property {(domain: string) => string} domainName
  * @property {() => number} now
  * @property {object} ops - the panel's operations (index.js)
@@ -57,13 +60,16 @@ function fact(doc, label, value, className = '') {
   return row;
 }
 
-function button(doc, label, run, { title = null, disabled = false, primary = false, ariaLabel = null } = {}) {
-  const element = doc.createElement('button');
-  element.type = 'button';
-  element.className = `btn btn-compact${primary ? ' btn-primary' : ''}`;
-  element.textContent = label;
-  if (title) element.title = title;
-  if (ariaLabel) element.setAttribute('aria-label', ariaLabel);
+// A row's details sit nested inside the history list: their actions are
+// quiet (`.btn-quiet`), the main one accent text — never pills or a filled
+// button louder than the panel around them (`components/_buttons.css`).
+function button(label, run, { title = null, disabled = false, primary = false, ariaLabel = null } = {}) {
+  const element = createButton({
+    label,
+    variant: primary ? 'quiet-primary' : 'quiet',
+    ...(title ? { title } : {}),
+    ...(ariaLabel ? { ariaLabel } : {}),
+  });
   element.disabled = disabled;
   element.addEventListener('click', event => {
     event.stopPropagation();
@@ -111,7 +117,7 @@ function byLine(doc, by, type, { turn = null, ops }) {
   span.textContent = by?.origin === 'agent' && by.model ? `${author.name} (${by.model})` : author.name;
   if (turn !== null && ops.canOpenChat(turn)) {
     span.append(' · ');
-    span.append(button(doc, 'turn ↗', () => ops.openChat(turn), { ariaLabel: 'Show this turn in the chat' }));
+    span.append(button('turn ↗', () => ops.openChat(turn), { ariaLabel: 'Show this turn in the chat' }));
   }
   return span;
 }
@@ -122,21 +128,19 @@ function stepDetails(row, { doc, view, act, catalog, domainName, now, ops }) {
   if (step.parent !== null) out.push(fact(doc, 'By', byLine(doc, step.by, step.type, { turn: step.by?.turn ?? null, ops })));
   const when = [formatStepTime(step.at, now())];
   if (step.merged > 1) when.push(`${step.merged} changes`);
-  if (Number.isFinite(step.ms) && step.ms >= 100) when.push(`took ${(step.ms / 1000).toFixed(step.ms >= 10_000 ? 0 : 1)} s`);
+  if (Number.isFinite(step.ms) && step.ms >= 100) when.push(`took ${formatDuration(step.ms)}`);
   when.push(`branch ${view.branch(step.branch)?.name ?? step.branch}`);
   out.push(fact(doc, 'When', when.join(' · ')));
   if (row.stale !== null) {
-    const cause = row.stale.cause === null ? 'the result no longer matches its inputs'
-      : `step ${idNumber(row.stale.cause.id)} (“${row.stale.cause.label}”)`;
-    const changed = row.stale.inputs.map(input => (input === 'history' ? 'the branch it shows moved on' : `${domainName(input)} changed`));
+    // Each input that changed with its own cause (F156), as history.stale and history.step say it.
     const box = doc.createElement('div');
     box.className = 'history-detail-warning';
-    box.append(line(doc, `⚠ Stale since ${cause}${changed.length > 0 ? `: ${changed.join(', ')}.` : '.'}`));
+    box.append(line(doc, `⚠ Stale: ${staleReasons(row.stale, { quote: text => `“${text}”` }).join(' ')}`));
     // Only an action whose dispatch again brings this result up to date
-    // (`rerun` in the catalogue); another adds a second of what it made, or
+    // (`rerun` in the catalog); another adds a second of what it made, or
     // changes nothing.
     if (step.type !== null && catalog?.has?.(step.type) && catalog.get(step.type).rerun) {
-      box.append(button(doc, 'Run again', () => ops.runAgain(step), { title: 'Bring this result up to date with what it reads now, as a new step' }));
+      box.append(button('Run again', () => ops.runAgain(step), { title: 'Bring this result up to date with what it reads now, as a new step' }));
     }
     out.push(box);
   }
@@ -153,7 +157,7 @@ function stepDetails(row, { doc, view, act, catalog, domainName, now, ops }) {
     const code = doc.createElement('span');
     const text = doc.createElement('code');
     text.textContent = step.code;
-    code.append(text, ' ', button(doc, '⧉', () => ops.copyCode(step), { ariaLabel: 'Copy the code', title: 'Copy the code' }));
+    code.append(text, ' ', button('⧉', () => ops.copyCode(step), { ariaLabel: 'Copy the code', title: 'Copy the code' }));
     out.push(fact(doc, 'Code', code, 'history-detail-code'));
   } else if (step.kind === 'action' || step.kind === 'outside') {
     const definition = step.type !== null && catalog?.has?.(step.type) ? catalog.get(step.type) : null;
@@ -162,7 +166,7 @@ function stepDetails(row, { doc, view, act, catalog, domainName, now, ops }) {
   if (step.touches.length > 0) {
     const changed = doc.createElement('span');
     changed.append(step.touches.map(domainName).join(', '), ' ');
-    changed.append(button(doc, 'What changed ›', () => ops.whatChanged(step), { title: 'Compare the state before and after this step' }));
+    changed.append(button('What changed ›', () => ops.whatChanged(step), { title: 'Compare the state before and after this step' }));
     out.push(fact(doc, 'Changed', changed));
   } else if (step.parent !== null && step.kind !== 'squashed') {
     out.push(fact(doc, 'Changed', step.reason ?? 'Nothing'));
@@ -171,7 +175,7 @@ function stepDetails(row, { doc, view, act, catalog, domainName, now, ops }) {
   // Its camera, as the step kept it, without moving the history (§3.15.5:
   // applied even while camera moves are not recorded, as it is asked for).
   if (ops.canShowView()) {
-    out.push(fact(doc, 'View', button(doc, 'Show this step’s view', () => ops.showView(step), {
+    out.push(fact(doc, 'View', button('Show this step’s view', () => ops.showView(step), {
       title: 'Put the camera where it was at this step; nothing else changes',
     })));
   }
@@ -181,10 +185,10 @@ function stepDetails(row, { doc, view, act, catalog, domainName, now, ops }) {
   out.push(fact(doc, 'Notes', notes));
   const shown = view.headId === step.id;
   out.push(actions(doc,
-    button(doc, shown ? 'Shown' : 'Show', () => ops.show(row), { disabled: shown, primary: !shown }),
-    button(doc, 'Branch here', () => ops.branchHere(step.id), { title: 'The next change starts a new branch from this step' }),
-    button(doc, 'Compare…', () => ops.compare(step.id)),
-    button(doc, '⋯', anchor => ops.stepMenu(row, anchor), { ariaLabel: `More for step ${idNumber(step.id)}` }),
+    button(shown ? 'Shown' : 'Show', () => ops.show(row), { disabled: shown, primary: !shown }),
+    button('Branch here', () => ops.branchHere(step.id), { title: 'The next change starts a new branch from this step' }),
+    button('Compare…', () => ops.compare(step.id)),
+    button('More…', anchor => ops.stepMenu(row, anchor), { ariaLabel: `More for step ${idNumber(step.id)}` }),
   ));
   return out;
 }
@@ -202,10 +206,10 @@ function branchDetails(row, { doc, view, act, now, ops }) {
   notes.append(notesBlock({ doc, notes: branch.notes ?? [], target: { branch: branch.id }, act, now }));
   out.push(fact(doc, 'Notes', notes));
   out.push(actions(doc,
-    button(doc, 'Show', () => ops.show(row), { primary: true, title: 'Show its last step and continue on it' }),
-    button(doc, 'Rename…', () => ops.renameBranch(branch.id), { disabled: branch.locked, title: branch.locked ? 'Unlock it first' : '' }),
-    button(doc, 'Compare', () => ops.compareBranch(branch.id), { title: 'Its last step beside the shown one, in kept views' }),
-    button(doc, '⋯', anchor => ops.branchMenu(branch.id, anchor), { ariaLabel: `More for branch “${branch.name}”` }),
+    button('Show', () => ops.show(row), { primary: true, title: 'Show its last step and continue on it' }),
+    button('Rename…', () => ops.renameBranch(branch.id), { disabled: branch.locked, title: branch.locked ? 'Unlock it first' : '' }),
+    button('Compare', () => ops.compareBranch(branch.id), { title: 'Its last step beside the shown one, in kept views' }),
+    button('More…', anchor => ops.branchMenu(branch.id, anchor), { ariaLabel: `More for branch “${branch.name}”` }),
   ));
   return out;
 }
@@ -228,8 +232,8 @@ function turnDetails(row, { doc, view, act, now, ops }) {
   }
   const undone = row.position === 'undone';
   out.push(actions(doc,
-    button(doc, undone ? 'Undone' : 'Undo turn', () => ops.undoTurn(row.turnId), { disabled: undone || row.position === null }),
-    button(doc, 'Merge into one step…', () => ops.squash(row.stepIds[0], row.stepIds[row.stepIds.length - 1]), { disabled: row.count < 2 }),
+    button(undone ? 'Undone' : 'Undo turn', () => ops.undoTurn(row.turnId), { disabled: undone || row.position === null }),
+    button('Merge into one step…', () => ops.squash(row.stepIds[0], row.stepIds[row.stepIds.length - 1]), { disabled: row.count < 2 }),
   ));
   return out;
 }
@@ -259,10 +263,10 @@ function groupDetails(row, { doc, view, act, now, domainName, ops }) {
   notes.append(notesBlock({ doc, notes: group.notes ?? [], target: { group: group.id }, act, now }));
   out.push(fact(doc, 'Notes', notes));
   out.push(actions(doc,
-    button(doc, 'Show last step', () => ops.show(row)),
-    button(doc, 'Rename…', () => ops.renameGroup(group.id)),
-    button(doc, 'Ungroup', () => ops.ungroup(group.id)),
-    button(doc, 'Merge into one step…', () => ops.squash(row.stepIds[0], row.stepIds[row.stepIds.length - 1]), { disabled: row.count < 2 }),
+    button('Show last step', () => ops.show(row)),
+    button('Rename…', () => ops.renameGroup(group.id)),
+    button('Ungroup', () => ops.ungroup(group.id)),
+    button('Merge into one step…', () => ops.squash(row.stepIds[0], row.stepIds[row.stepIds.length - 1]), { disabled: row.count < 2 }),
   ));
   return out;
 }
@@ -273,9 +277,9 @@ function runDetails(row, { doc, view, domainName, now, ops }) {
   out.push(fact(doc, 'When', `${formatStepTime(row.first, now())}–${formatStepTime(row.last, now())}`));
   if (!row.filtered) out.push(line(doc, `${runLabel(row)}: folded for reading. Undo still goes step by step.`, 'history-detail-hint'));
   out.push(actions(doc,
-    button(doc, row.expanded ? 'Fold' : 'Expand', () => ops.toggleRow(row)),
-    button(doc, 'Group…', () => ops.group(row.stepIds[0], row.stepIds[row.stepIds.length - 1])),
-    button(doc, 'Merge into one step…', () => ops.squash(row.stepIds[0], row.stepIds[row.stepIds.length - 1]), { disabled: row.count < 2 }),
+    button(row.expanded ? 'Fold' : 'Expand', () => ops.toggleRow(row)),
+    button('Group…', () => ops.group(row.stepIds[0], row.stepIds[row.stepIds.length - 1])),
+    button('Merge into one step…', () => ops.squash(row.stepIds[0], row.stepIds[row.stepIds.length - 1]), { disabled: row.count < 2 }),
   ));
   return out;
 }

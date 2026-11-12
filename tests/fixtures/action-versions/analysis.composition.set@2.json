@@ -1,0 +1,189 @@
+{
+  "examples": [
+    {
+      "in": "panel",
+      "options": {
+        "barsBy": "sample",
+        "cellTypes": "x",
+        "cells": "x",
+        "condition": "x",
+        "correction": "bh",
+        "method": "logit",
+        "onlyTypes": {
+          "mode": "all"
+        },
+        "order": "field",
+        "paired": false,
+        "samples": "x",
+        "values": "proportion"
+      },
+      "show": false
+    },
+    {
+      "in": "panel",
+      "options": {
+        "barsBy": "sample",
+        "cellTypes": "x",
+        "cells": "x",
+        "condition": "x",
+        "correction": "bh",
+        "method": "logit",
+        "onlyTypes": {
+          "mode": "all"
+        },
+        "order": "field",
+        "paired": false,
+        "samples": "x",
+        "values": "proportion"
+      },
+      "show": false
+    },
+    {
+      "in": "panel",
+      "options": {
+        "barsBy": "sample",
+        "cellTypes": "x",
+        "cells": "x",
+        "condition": "x",
+        "correction": "bh",
+        "method": "logit",
+        "onlyTypes": {
+          "ids": [
+            "x"
+          ],
+          "mode": "subset"
+        },
+        "order": "field",
+        "paired": false,
+        "samples": "x",
+        "values": "proportion"
+      },
+      "show": false
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "in": {
+        "default": "panel",
+        "oneOf": [
+          {
+            "const": "panel",
+            "type": "string"
+          },
+          {
+            "minimum": 1,
+            "type": "integer"
+          }
+        ]
+      },
+      "options": {
+        "additionalProperties": false,
+        "properties": {
+          "barsBy": {
+            "enum": [
+              "sample",
+              "condition"
+            ],
+            "type": "string"
+          },
+          "cellTypes": {
+            "type": "string"
+          },
+          "cells": {
+            "type": "string"
+          },
+          "condition": {
+            "type": "string"
+          },
+          "correction": {
+            "enum": [
+              "bh",
+              "bonferroni"
+            ],
+            "type": "string"
+          },
+          "method": {
+            "enum": [
+              "logit",
+              "rank",
+              "clr"
+            ],
+            "type": "string"
+          },
+          "onlyTypes": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "mode": {
+                    "const": "all",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "ids": {
+                    "items": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "mode": {
+                    "const": "subset",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode",
+                  "ids"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "order": {
+            "enum": [
+              "field",
+              "abundance",
+              "change"
+            ],
+            "type": "string"
+          },
+          "paired": {
+            "type": "boolean"
+          },
+          "samples": {
+            "type": "string"
+          },
+          "values": {
+            "enum": [
+              "proportion",
+              "count"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "show": {
+        "default": false,
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "options"
+    ],
+    "type": "object"
+  },
+  "type": "analysis.composition.set",
+  "version": 2
+}

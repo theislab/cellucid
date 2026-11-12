@@ -1,9 +1,9 @@
 /**
  * Cell info: the hover card switched on under Coloring & filtering → Legend (ui/modules/cell-info.js).
  *
- * The card's promises are behavioural, and each one is held here against the
+ * The card's promises are behavioral, and each one is held here against the
  * running app: it is off until switched on; it names the value the pane under
- * the pointer is coloured by; it never picks while the camera is being dragged;
+ * the pointer is colored by; it never picks while the camera is being dragged;
  * it picks at most once per animation frame however fast the pointer moves; it
  * follows panes in a grid; and on a touch screen it answers a held press.
  */
@@ -44,7 +44,7 @@ async function findCell(page, viewId = null) {
   return point;
 }
 
-/** The category label the colouring field of a pane gives one cell. */
+/** The category label the coloring field of a pane gives one cell. */
 function expectedLabel(page, { viewId, cellIndex }) {
   return page.evaluate(({ viewId: id, cellIndex: index }) => {
     const field = window._cellucidState.getFieldForView(id);
@@ -121,7 +121,7 @@ test('cell info is on by default; unticked, a hover shows nothing', async ({ pag
   await expect(page.locator('#cell-info-card')).toBeHidden();
 });
 
-test('a hover names the value the pane is coloured by, and leaving hides it', async ({ page }) => {
+test('a hover names the value the pane is colored by, and leaving hides it', async ({ page }) => {
   await openDataset(page);
   await enable(page);
   const cell = await findCell(page);
@@ -157,7 +157,7 @@ test('a hover names the value the pane is coloured by, and leaving hides it', as
   await expect(card).toBeHidden();
 });
 
-test('a continuous field shows its value on the colour scale', async ({ page }) => {
+test('a continuous field shows its value on the color scale', async ({ page }) => {
   await openDataset(page);
   await page.locator('#continuous-field').selectOption({ label: 'score' });
   await enable(page);
@@ -173,7 +173,7 @@ test('a continuous field shows its value on the colour scale', async ({ page }) 
   expect(Number(await card.locator('.cell-info-value').textContent()))
     .toBeCloseTo(value, 3);
   await expect(card.locator('.cell-info-scale')).toBeVisible();
-  // Only the field the pane is coloured by: nothing left over from the
+  // Only the field the pane is colored by: nothing left over from the
   // categorical field shown before, and no category count.
   await expect(card).not.toContainText('cell_type');
   await expect(card.locator('.cell-info-count')).toBeHidden();
@@ -187,6 +187,89 @@ test('a continuous field shows its value on the colour scale', async ({ page }) 
   await page.mouse.move(cell.x + 1, cell.y);
   await page.mouse.move(cell.x, cell.y);
   await expect(card.locator('.cell-info-rows')).toBeHidden();
+});
+
+test('a long or unicode label and a long field name are shown whole, inside the window', async ({ page }) => {
+  // R9U-4: the card is aria-hidden and takes no pointer, so a label cut with
+  // an ellipsis could not be read anywhere on it.
+  await openDataset(page);
+  await enable(page);
+  const cell = await findCell(page);
+  const category = await expectedLabel(page, cell);
+  const label = 'CD4-positive, alpha-beta memory T cell, tissue-resident, expressing IL7R and CCR7 (naïve-like) — 記憶T細胞';
+  const fieldName = 'cell type as annotated by the second round of the consortium, with tissue of origin';
+  const dispatch = (type, params) => page.evaluate(async ({ type: kind, params: values }) => {
+    const { getActions } = await import('/assets/js/app/actions/index.js');
+    await getActions().dispatch(kind, values, { origin: 'user' });
+  }, { type, params });
+  await dispatch('category.rename', { field: { source: 'obs', key: 'cell_type' }, category, name: label });
+  await dispatch('field.rename', { field: { source: 'obs', key: 'cell_type' }, name: fieldName });
+  await page.mouse.move(cell.x - 10, cell.y - 10);
+  await page.mouse.move(cell.x, cell.y, { steps: 3 });
+  const card = page.locator('#cell-info-card');
+  await expect(card.locator('.cell-info-value')).toHaveText(label);
+  await expect(card.locator('.cell-info-field')).toHaveText(fieldName);
+  // Whole: no line of the card is wider than its box, and the card is inside the window.
+  for (const part of ['.cell-info-value', '.cell-info-field']) {
+    expect(await card.locator(part).evaluate(element => element.scrollWidth <= element.clientWidth), part).toBe(true);
+  }
+  const box = await card.boundingBox();
+  const viewport = page.viewportSize();
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.y).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(viewport.width);
+  expect(box.y + box.height).toBeLessThanOrEqual(viewport.height);
+
+  // The other loaded fields' rows too.
+  await page.locator('#continuous-field').selectOption({ label: 'score' });
+  await page.locator('#cell-info-categories-toggle').check();
+  await page.mouse.move(cell.x + 1, cell.y);
+  await page.mouse.move(cell.x, cell.y);
+  await expect(card.locator('.cell-info-rows dt')).toHaveText([fieldName]);
+  await expect(card.locator('.cell-info-rows dd')).toHaveText([label]);
+  for (const part of ['.cell-info-rows dt', '.cell-info-rows dd']) {
+    expect(await card.locator(part).evaluate(element => element.scrollWidth <= element.clientWidth), part).toBe(true);
+  }
+});
+
+test.describe('in a short window', () => {
+  // The window is short from the start: resized mid-test, the view refits after a
+  // poll for a still camera can already pass, and the cell found moves away.
+  test.use({ viewport: { width: 1280, height: 520 } });
+
+  test('many loaded fields flow into columns as wide as their names, inside the window', async ({ page }) => {
+    // R9U-4: once rows could wrap, a card of several columns shrank to the
+    // narrowest its words allowed and broke "cell_type (copy 12)" mid-word.
+    await openDataset(page);
+    await enable(page);
+    await page.evaluate(async () => {
+      const { getActions } = await import('/assets/js/app/actions/index.js');
+      for (let index = 0; index < 40; index++) {
+        await getActions().dispatch('field.duplicate', { field: { source: 'obs', key: 'cell_type' } }, { origin: 'user' });
+      }
+    });
+    await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+    await page.locator('#cell-info-categories-toggle').check();
+    await expect.poll(() => cameraMotion(page)).toBe('still');
+    const cell = await findCell(page);
+    await page.mouse.move(cell.x - 10, cell.y - 10);
+    await page.mouse.move(cell.x, cell.y, { steps: 3 });
+    const card = page.locator('#cell-info-card');
+    await expect(card.locator('.cell-info-rows dt').first()).toBeVisible();
+    const layout = await card.evaluate(element => {
+      const box = element.getBoundingClientRect();
+      const names = [...element.querySelectorAll('.cell-info-rows dt')];
+      const lineHeight = parseFloat(getComputedStyle(names[0]).lineHeight);
+      return {
+        columns: Number(getComputedStyle(element).getPropertyValue('--cell-info-columns')),
+        inside: box.left >= 0 && box.top >= 0 && box.right <= innerWidth && box.bottom <= innerHeight,
+        broken: names.filter(name => name.getBoundingClientRect().height > lineHeight * 1.5).map(name => name.textContent),
+      };
+    });
+    expect(layout.columns).toBeGreaterThan(1);
+    expect(layout.inside).toBe(true);
+    expect(layout.broken).toEqual([]);
+  });
 });
 
 test('no pick runs while the camera is dragged or the pointer sweeps; one runs on rest', async ({ page }) => {

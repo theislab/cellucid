@@ -13,7 +13,7 @@ import { ActionRefused } from '../dispatcher.js';
 import { describeUnavailableGene, resolveExactGene } from '../../utils/gene-lookup.js';
 import { getFieldRegistry } from '../../utils/field-registry.js';
 import { StateValidator } from '../../utils/state-validator.js';
-import { categoryLabel, listNames, quoteName } from './names.js';
+import { categoryDisplayName, categoryLabel, listNames, quoteName } from './names.js';
 
 const KIND_WORDS = Object.freeze({ category: 'categorical', continuous: 'continuous' });
 
@@ -118,9 +118,14 @@ export async function resolveLoadedField(state, ref, { kind = null, signal = nul
  */
 export function resolveCategory(field, label) {
   const categories = Array.isArray(field.categories) ? field.categories : [];
+  // A category is named by what it is shown as too (`(empty)`, `(blank)`, `" x "`:
+  // `categoryDisplayName`), unless a category is named so.
+  const named = categories.some(category => categoryLabel(category) === label);
   let found = -1;
   for (let index = 0; index < categories.length; index++) {
-    if (categoryLabel(categories[index]) !== label) continue;
+    const matches = categoryLabel(categories[index]) === label
+      || (!named && categoryDisplayName(categories[index]) === label);
+    if (!matches) continue;
     if (found >= 0) {
       throw new ActionRefused(`${quoteName(field.key)} lists the category ${quoteName(label)} twice; rename one first.`, { code: 'ambiguous-category' });
     }
@@ -129,7 +134,7 @@ export function resolveCategory(field, label) {
   if (found < 0) {
     const open = field.discovered === true ? ' its open cells hold' : '';
     throw new ActionRefused(
-      `There is no category ${quoteName(label)} in ${quoteName(field.key)}; the categories${open} are ${listNames(categories.map(categoryLabel))}.`,
+      `There is no category ${quoteName(label)} in ${quoteName(field.key)}; the categories${open} are ${listNames(categories.map(categoryDisplayName))}.`,
       { code: 'no-such-category', missing: { kind: 'category', name: label, field: field.key } },
     );
   }
@@ -137,8 +142,8 @@ export function resolveCategory(field, label) {
 }
 
 /**
- * The field the view in focus is coloured by, which `ref` must name: a
- * colour setting of a continuous field, a range or outlier filter.
+ * The field the view in focus is colored by, which `ref` must name: a
+ * color setting of a continuous field, a range or outlier filter.
  */
 export function resolveShownField(state, ref, { kind }) {
   const target = resolveField(state, ref, { kind });
@@ -146,7 +151,7 @@ export function resolveShownField(state, ref, { kind }) {
   if (shown !== target.field) {
     const now = shown === null ? 'nothing' : `${state.activeFieldSource === 'var' ? 'gene ' : ''}${quoteName(shown.key)}`;
     throw new ActionRefused(
-      `The view in focus is coloured by ${now}, not by ${quoteName(ref.key)}; colour it by ${quoteName(ref.key)} first.`,
+      `The view in focus is colored by ${now}, not by ${quoteName(ref.key)}; color it by ${quoteName(ref.key)} first.`,
       { code: 'not-shown' },
     );
   }
@@ -159,7 +164,7 @@ export function resolveShownField(state, ref, { kind }) {
  *
  * @returns {{field: object, index: number, source: 'obs'|'var', userDefinedId: string|null}}
  */
-export function resolveDeletedField(state, ref) {
+export function resolveDeletedField(state, ref, which = undefined) {
   const deleted = getFieldRegistry().getDeletedFields(ref.source);
   const matches = deleted.filter(entry => entry.field.key === ref.key);
   if (matches.length === 0) {
@@ -168,11 +173,36 @@ export function resolveDeletedField(state, ref) {
       { code: 'no-such-deleted-field' },
     );
   }
-  if (matches.length > 1) {
-    throw new ActionRefused(`Two deleted fields are named ${quoteName(ref.key)}; restore or purge one from Deleted fields.`, { code: 'ambiguous-field' });
+  // Several of one name (one deleted, another renamed to its name and
+  // deleted too): `which` names one by its place among them, as Deleted
+  // fields lists them.
+  if (which === undefined && matches.length > 1) {
+    const places = matches.map((_, place) => place + 1);
+    throw new ActionRefused(
+      `${matches.length} deleted fields are named ${quoteName(ref.key)}; say which with \`which\`: ${places.slice(0, -1).join(', ')} or ${places.at(-1)}, in the order Deleted fields lists them.`,
+      { code: 'ambiguous-field' },
+    );
   }
-  const [{ field, index }] = matches;
+  if (which !== undefined && which > matches.length) {
+    throw new ActionRefused(
+      `There ${matches.length === 1 ? 'is one deleted field' : `are ${matches.length} deleted fields`} named ${quoteName(ref.key)}; \`which\` ${which} names none.`,
+      { code: 'no-such-deleted-field' },
+    );
+  }
+  const { field, index } = matches[(which ?? 1) - 1];
   return { field, index, source: ref.source, userDefinedId: index < 0 ? field._userDefinedId : null };
+}
+
+/**
+ * Refuse `label` as a category label given now (a rename, a merge, a group,
+ * a page's label): the one rule, `StateValidator.validateNewCategoryLabel`.
+ */
+export function requireNewCategoryLabel(label) {
+  try {
+    StateValidator.validateNewCategoryLabel(label);
+  } catch (error) {
+    throw new ActionRefused(`${quoteName(label)} cannot be a category label: ${error.message}.`, { code: 'bad-name' });
+  }
 }
 
 /**

@@ -31,7 +31,7 @@
  */
 
 import { ARRAY_KEY, NUMBER_KEY, PART_KEY, requireUnreservedKeys, specialNumberName, typedArrayDigest } from './value-pool.js';
-import { sha256Hex } from '../utils/sha256.js';
+import { sha256Hex } from '../../utils/sha256.js';
 import { formatCountOf } from '../../utils/format-units.js';
 
 /**

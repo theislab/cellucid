@@ -32,6 +32,7 @@
  */
 
 import { FEWEST_OPEN_CELLS, FEWEST_OPEN_CELLS_REASON, STRATIFIED_ALLOCATIONS, SUBSAMPLE_METHODS } from '../data/subsample.js';
+import { askedCellsOf } from '../data/cell-subset-policy.js';
 import { formatCountOf } from '../utils/format-units.js';
 
 /** Every subsample parameter, in the order a link writes them. */
@@ -46,7 +47,9 @@ const METHOD_PARAMETERS = Object.freeze({
 
 
 function refuse(message) {
-  return new Error(`The link's subsample: ${message}`);
+  // Said after "The link's cell subsample was left out:" (`main.js`): the
+  // reason alone, never its own prefix again (R9F: the prefix said twice).
+  return new Error(message);
 }
 
 function one(params, name) {
@@ -151,6 +154,24 @@ export function subsampleUrlEntries(spec) {
     entries.push(['grid', String(spec.gridSize)]);
   }
   return entries;
+}
+
+/**
+ * The subsample a link reproduces of the open cells (`getCellSubset`), or
+ * null: every cell, cells fitted to the device, or a restored set its
+ * specification no longer gives. A progressive opening's step is not what
+ * was asked for: what it grows to is (`cell-subset-policy.js` `askedCellsOf`).
+ * Read from the step, the address and the Share link of a dataset opened
+ * whole kept the first 131,072 cells after it had grown to all (bug hunt
+ * F60).
+ *
+ * @param {Object|null} subset
+ * @returns {Readonly<import('../data/subsample.js').SubsampleSpec>|null}
+ */
+export function linkedSubsampleSpec(subset) {
+  const asked = askedCellsOf(subset);
+  if (asked === null || asked.autoFit !== null || asked.reproduced === false) return null;
+  return asked.spec;
 }
 
 /**

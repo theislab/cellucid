@@ -40,7 +40,7 @@ test('the smoke is reconstructed at the world positions the splat wrote', async 
     const step = indexStepWorld(gridSize);
     const results = [];
     // The boundary shell and the interior. A reader that addresses the volume
-    // as if the splat had been voxel-centred lands half a texel inwards at
+    // as if the splat had been voxel-centered lands half a texel inwards at
     // index 0, half a texel outwards at the last index, and exactly right in
     // the middle -- so only the shell reveals the error.
     for (const columnIndex of [0, 3, 16, 28, gridSize - 1]) {
@@ -94,7 +94,7 @@ test('the smoke is reconstructed at the world positions the splat wrote', async 
         reachLow,
         reachHigh,
         offsetTexels: (centroid - worldX) / step,
-        // where a voxel-centred reader would have put it
+        // where a voxel-centered reader would have put it
         voxelCentredOffsetTexels:
           ((2 * (columnIndex + 0.5)) / gridSize - 1 - worldX) / step,
       });
@@ -137,7 +137,7 @@ test('the smoke is reconstructed at the world positions the splat wrote', async 
     }
   }
   // The measurement has to be able to see the error it exists to catch: away
-  // from the centre a voxel-centred reader is a large fraction of a step out,
+  // from the center a voxel-centered reader is a large fraction of a step out,
   // many times the tolerance above.
   const offCentre = measurements.find(m => m.columnIndex === 3);
   expect(Math.abs(offCentre.voxelCentredOffsetTexels)).toBeGreaterThan(0.35);

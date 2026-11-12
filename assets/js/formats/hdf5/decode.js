@@ -85,7 +85,7 @@ const PREFIX_SPREAD = 1.125;
  * @param {number} count
  * @param {ArrayLike<number>} rows - Element ranges asked for, `[from, to, ...]`
  * @param {Array<{bytes: Uint8Array, count: number}>} [beside] - Other
- *   references (the neighbouring chunks'), naming objects only
+ *   references (the neighboring chunks'), naming objects only
  * @returns {Map<number, number> & {unnamed: number}} Collection address ->
  *   bytes of it to read; `unnamed`: the objects asked for some of whose
  *   predecessors no element names (their bytes taken from the mean)
@@ -98,7 +98,7 @@ export function rowHeapNeeds(file, type, bytes, count, rows, beside = []) {
   };
   const header = 8 + file.lengthSize;
   // Every element's object, by collection: its index and the bytes it takes;
-  // the elements beside (`beside`: the neighbouring chunks' references) name
+  // the elements beside (`beside`: the neighboring chunks' references) name
   // more objects of the collections these point into (one collection holds
   // the end of a chunk's strings and the start of the next's).
   const objects = new Map();
@@ -211,7 +211,7 @@ export function heapAddresses(file, type, bytes, count, into = new Map()) {
       const address = readUintLE(bytes, at + 4, file.offsetSize, fail);
       if (address === null || address === 0) continue;
       const index = readUintLE(bytes, at + 4 + file.offsetSize, 4, fail) ?? 0;
-      // Neighbouring elements usually share a collection.
+      // Neighboring elements usually share a collection.
       if (address !== lastAddress) {
         last = seen.get(address);
         if (last === undefined) {
@@ -292,7 +292,7 @@ function scalarReader(type, context) {
         throw formatError('Variable-length data', NaN, problem);
       };
       if (type.variable === 'string') {
-        // Neighbouring strings are usually in the same collection: remember the last.
+        // Neighboring strings are usually in the same collection: remember the last.
         let lastAddress = -1;
         let last = null;
         return (bytes, view, offset) => {

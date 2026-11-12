@@ -10,11 +10,11 @@
  *
  * Arrays a view still needs are always resident: the active field of every
  * view, every field carrying filter state in any view (every filter applies
- * whatever is coloured, and a disabled filter or a deleted field can come back
+ * whatever is colored, and a disabled filter or a deleted field can come back
  * without a reload), every field mid-load, and a user-defined field's own
  * arrays, which no file can give back (its codes, a pushed column's values:
  * only a copy of a file's column reads its values again). A released field
- * keeps what was set on it, its colours, every category shown and its full
+ * keeps what was set on it, its colors, every category shown and its full
  * range; the visibility pass reads no array for those. An inactive gene whose column has a
  * sparse form (`data/column-forms.js`: nearly every gene) keeps that form
  * alone, its entries instead of four bytes a cell (40 MB at 10M cells), and
@@ -63,7 +63,7 @@ function viewsOf(state) {
 
 /**
  * Whether a field carries a filter in some state (enabled or not): its arrays
- * stay, since every filter applies whatever is coloured.
+ * stay, since every filter applies whatever is colored.
  */
 function hasFilterState(field) {
   // A deleted field's filter applies again when the field comes back.

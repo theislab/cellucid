@@ -8,7 +8,7 @@ import {
 } from '../assets/js/app/notification-center.js';
 import {
   formatBytes,
-  formatCompactNumber,
+  formatCompactCount,
   formatDuration,
 } from '../assets/js/utils/format-units.js';
 
@@ -44,9 +44,9 @@ test('notification cancellation publishes rejection and restores the control', a
   assert.equal(button.attributes.has('aria-disabled'), false);
   assert.deepEqual(observed, [{
     message: 'Cancel failed: synthetic cancellation failure',
+    // One sentence (no title repeating it, never "Cancellation Error").
     options: {
       category: 'default',
-      title: 'Cancellation Error',
     },
   }]);
 });
@@ -83,7 +83,7 @@ test('notification and formatter inputs reject coercion and missing trackers', (
   );
   assert.throws(() => formatBytes('1024'), /bytes must be/i);
   assert.throws(() => formatDuration(Number.NaN), /duration must be/i);
-  assert.throws(() => formatCompactNumber('1000'), /number must be finite/i);
+  assert.throws(() => formatCompactCount('1000'), /must be a finite number/i);
   assert.throws(
     () => center.updateDownload('missing', 0),
     /tracker.*does not exist/i,
@@ -231,7 +231,7 @@ test('a notification renders the line breaks its message carries', async () => {
   // it into a space, turning a role failure and its status into the run-on
   // "Unable to determine your role for … . Not Found Disconnected annotation
   // repo." (CEL-0178). The break belongs to the message, so the rule that
-  // honours it belongs to the element the message is written into, not to the
+  // honors it belongs to the element the message is written into, not to the
   // call sites.
   const [css, controls] = await Promise.all([
     readFile(
@@ -283,7 +283,7 @@ test('a card retired to make room is kept in the overflow list, never lost', () 
   });
   center._evictNonActiveUntil(center.maxNotifications);
   assert.deepEqual(center.overflowMessages, [
-    { type: NotificationType.ERROR, title: 'Load failed', message: 'Disk full' },
+    { id: 'first-error', type: NotificationType.ERROR, title: 'Load failed', message: 'Disk full', action: null, secondaryAction: null },
   ]);
   assert.equal(center.hasNotification('second'), true);
 });

@@ -9,7 +9,7 @@
  * @module ui/modules/community-annotation/consensus-math
  */
 
-import { formatPercent } from '../../components/display-format.js';
+import { formatPercent } from '../../../../utils/format-units.js';
 
 /**
  * The minimum-annotator count an input field holds: a non-negative whole

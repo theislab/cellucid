@@ -1,7 +1,7 @@
 /**
  * @fileoverview The parameter schemas several areas name things with, and
  * the pure helpers that word them in labels and pseudocode. Each is defined
- * once here, so a field, a category, a colour, a set of cells, a view, an
+ * once here, so a field, a category, a color, a set of cells, a view, an
  * embedding and a highlight page read the same in every tool an agent sees.
  *
  * A field is `{source, key}`: `obs` for a column of the cells, `var` for a
@@ -15,7 +15,8 @@
  * @module app/actions/definitions/params
  */
 
-import { formatCountOf } from '../../../utils/format-units.js';
+import { formatCountOf, formatPercent } from '../../../utils/format-units.js';
+import { SUBSAMPLE_METHODS } from '../../../data/subsample.js';
 import { PLAIN_QUOTE } from '../targets/names.js';
 
 export const FIELD_SOURCES = Object.freeze(['obs', 'var']);
@@ -23,19 +24,21 @@ export const FIELD_SOURCES = Object.freeze(['obs', 'var']);
 /**
  * What decides which cells the view in focus shows (its visibility): the open
  * cells and the cells genes are read for, the data mapping (a gene's values,
- * the latent space an outlier filter uses), the fields' values (user fields),
+ * the latent space an outlier filter uses), the expression values a gene is
+ * shown in (`expression`), the fields' values (user fields),
  * and the filters and hidden cells of the view in focus (`views`). An action
  * that takes the cells the view shows reads these (`reads`, `catalog.js`).
  */
-export const VISIBLE_CELLS_READS = Object.freeze(['cells', 'mapping', 'field-overlays', 'filters', 'visibility', 'views']);
+export const VISIBLE_CELLS_READS = Object.freeze(['cells', 'mapping', 'expression', 'field-overlays', 'filters', 'visibility', 'views']);
 
 /**
- * What a setting of the field the view in focus is coloured by reads (a
- * continuous colour setting, a range or outlier filter): the field it names
- * (renames and user fields; a gene by the mapping's gene names), which must
- * be the one the view in focus (`views`) is coloured by (`active-field`).
+ * What a setting of the field the view in focus is colored by reads (a
+ * continuous color setting, a range or outlier filter): the field it names
+ * (renames and user fields; a gene by the mapping's gene names, its values
+ * in the expression values shown, `expression`), which must be the one the
+ * view in focus (`views`) is colored by (`active-field`).
  */
-export const SHOWN_FIELD_READS = Object.freeze(['field-overlays', 'mapping', 'active-field', 'views']);
+export const SHOWN_FIELD_READS = Object.freeze(['field-overlays', 'mapping', 'expression', 'active-field', 'views']);
 
 /** A field (`obs`) or gene (`var`) by the name the app shows. */
 export const FIELD = Object.freeze({
@@ -55,7 +58,8 @@ export const CATEGORY_FIELD = Object.freeze({
   ...FIELD,
   description: 'A categorical column of the cells by name (source "obs").',
   properties: {
-    source: { type: 'string', const: 'obs', description: 'Categories belong to columns of the cells.' },
+    // The const says it; a description here repeated the field's own in every tool (~230 tokens a call).
+    source: { type: 'string', const: 'obs' },
     key: { type: 'string', minLength: 1, description: 'The column name as the app shows it.' },
   },
 });
@@ -68,18 +72,18 @@ export const CATEGORY_LABEL = Object.freeze({
   examples: ['T cells'],
 });
 
-/** A `#rrggbb` colour. */
+/** A `#rrggbb` color. */
 export const COLOR = Object.freeze({
   type: 'string',
   pattern: '^#[0-9a-fA-F]{6}$',
-  description: 'A colour as six hex digits, "#e41a1c".',
+  description: 'A color as six hex digits, "#e41a1c".',
   examples: ['#e41a1c'],
 });
 
 /** Cells by original position (their 0-based row of `obs`). */
 export const CELLS = Object.freeze({
   type: 'array', items: { type: 'integer', minimum: 0 }, 'x-cells': true, minItems: 1,
-  description: 'Cells by original position (0-based row of obs), each once, in any order.',
+  description: 'Cells by original position, each once, in any order: the 0-based row of obs in the order the data was given. A file prepare() wrote holds its rows in priority order, so a row of it read as stored is not that position: its obs["cellucid_original_position"] gives the row\'s (or pass obs names).',
   examples: [[0, 1, 2]],
 });
 
@@ -100,6 +104,17 @@ export const VIEW = Object.freeze({
   examples: ['View 1'],
 });
 
+/**
+ * The name a view is given (`view.rename`, `view.keep`): shown beside its
+ * number in its row, on its pane and as its panel's title in a figure. Not
+ * of the form "View N" (`checkViewLabel`, `app/actions/targets/views.js`).
+ */
+export const VIEW_NAME = Object.freeze({
+  type: 'string', minLength: 1, pattern: TRIMMED_NAME,
+  description: 'A name for the view, one line of text ("Early", "Day 7, treated"): its row and its pane show it beside its number ("2 · Early"), a figure\'s panel after its letter ("B. Early": the figure letters its panels A, B, … in order, so a name needs no letter of its own). Not "View N".',
+  examples: ['Early'],
+});
+
 /** An embedding a view shows: an obsm array and the columns of it plotted. */
 export const EMBEDDING = Object.freeze({
   type: 'object', additionalProperties: false, required: ['key', 'columns'],
@@ -114,6 +129,57 @@ export const EMBEDDING = Object.freeze({
   examples: [{ key: 'X_umap', columns: [0, 1] }],
 });
 
+/**
+ * Which cells an opening reads, as `cells.open` (the open dataset read again)
+ * and `dataset.open` (another dataset opened) both take them: how many (an
+ * exact `count` or a `fraction` of the dataset's cells, one of them), how
+ * they are chosen and with which seed, and what the method needs. One
+ * definition, so both take a subsample the same way; `cellsToOpenRequestOf`
+ * (`app/actions/targets/cells-to-open.js`) checks them and makes the
+ * reader's request (`data/anndata/subsample-plan.js`).
+ */
+export const CELLS_TO_OPEN = Object.freeze({
+  count: {
+    type: 'integer', minimum: 1,
+    description: 'How many cells, exactly (at least 2; the dataset\'s count or more opens every cell). Not with fraction.',
+  },
+  fraction: {
+    type: 'number', exclusiveMinimum: 0, maximum: 1,
+    description: 'The share of the dataset\'s cells: 0.1 opens a tenth, 1 every cell. Not with count.',
+  },
+  method: {
+    type: ['string', 'null'], enum: [...SUBSAMPLE_METHODS, null], default: null,
+    description: 'How the cells are chosen; null for the file\'s default.',
+  },
+  seed: { type: ['integer', 'null'], minimum: 0, maximum: 0xffffffff, default: null, description: 'The subsample\'s seed; null for the file\'s.' },
+  field: { type: 'string', minLength: 1, description: 'Stratified: the categorical column it is stratified by.' },
+  allocation: { type: 'string', enum: ['proportional', 'balanced'], default: 'proportional', description: 'Stratified: how the cells are split over the categories.' },
+  embedding: { type: 'string', minLength: 1, description: 'Spatial: the obsm embedding it thins.' },
+});
+
+/** Whether the parameters of `CELLS_TO_OPEN` name a size (`count` or `fraction`). */
+export function namesCellsToOpen(params) {
+  return params.count !== undefined || params.fraction !== undefined;
+}
+
+/** "10% of the cells", "56,195 cells": the size `CELLS_TO_OPEN` names, in a step's words. */
+export function cellsToOpenWords(params) {
+  const size = params.fraction === undefined
+    ? formatCountOf(params.count, 'cell')
+    : `${formatPercent(params.fraction * 100, { figures: 6 })} of the cells`;
+  return `${size}${params.method === null || params.method === undefined ? '' : ` (${params.method})`}`;
+}
+
+/** `["fraction=0.1", "method=\"blocks\"", "seed=7"]`: the pseudocode arguments of `CELLS_TO_OPEN` given. */
+export function cellsToOpenArguments(params) {
+  return [
+    params.count === undefined ? null : `count=${params.count}`,
+    params.fraction === undefined ? null : `fraction=${params.fraction}`,
+    params.method === null || params.method === undefined ? null : `method=${JSON.stringify(params.method)}`,
+    params.seed === null || params.seed === undefined ? null : `seed=${params.seed}`,
+  ].filter(argument => argument !== null);
+}
+
 /** The words a field is named with in a sentence: "cell_type", "gene CD3E". */
 export function fieldWords(field, quote = PLAIN_QUOTE) {
   return field.source === 'var' ? `gene ${quote.bare(field.key)}` : quote.bare(field.key);
@@ -124,11 +190,14 @@ export function fieldArgument(field) {
   return field.source === 'var' ? `gene=${JSON.stringify(field.key)}` : JSON.stringify(field.key);
 }
 
-/** "T cells", or "3 categories" past a few. */
-export function categoriesWords(labels, quote = PLAIN_QUOTE) {
+/**
+ * "T cells", or "3 categories" past a few; `noun` counts them as something
+ * else ("4 groups" for the groups a field is grouped into).
+ */
+export function categoriesWords(labels, quote = PLAIN_QUOTE, noun = ['category', 'categories']) {
   if (labels.length === 1) return quote.bare(labels[0]);
   if (labels.length <= 3) return `${labels.slice(0, -1).map(quote.bare).join(', ')} and ${quote.bare(labels.at(-1))}`;
-  return formatCountOf(labels.length, 'category', 'categories');
+  return formatCountOf(labels.length, ...noun);
 }
 
 /** A coalescing key for steps on one field (a slider drag on its range). */

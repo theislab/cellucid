@@ -1,6 +1,6 @@
 /**
  * A fake page for the history and its session file: four state domains
- * (highlights with cell sets, colours with a Float64Array, a camera holding
+ * (highlights with cell sets, colors with a Float64Array, a camera holding
  * NaN, -0 and Infinity, a cell mask), three actions on them, a history over
  * them, and the dataset header a session file of them carries.
  */
@@ -28,7 +28,7 @@ export const HEADER = Object.freeze({
   requires: { obs: ['cell_type'], var: [] },
 });
 
-/** A page of four domains (highlights with cell sets, a colour, a camera with NaN and -0, a mask) and three actions. */
+/** A page of four domains (highlights with cell sets, a color, a camera with NaN and -0, a mask) and three actions. */
 export function page() {
   const state = {
     highlights: { groups: [] },
@@ -58,9 +58,9 @@ const DEFINITIONS = [
     touches: ['highlights'], reads: [], effect: 'state', describe: p => `Highlighted ${p.label}`, code: p => `highlight(${JSON.stringify(p.label)})`,
   }),
   defineAction({
-    type: 'color.by', title: 'Colour by', summary: 'Colour by a field.', group: 'Colours',
+    type: 'color.by', title: 'Color by', summary: 'Color by a field.', group: 'Colors',
     params: { type: 'object', additionalProperties: false, required: ['field'], properties: { field: { type: 'string' } } },
-    touches: ['colors'], reads: [], effect: 'view', describe: p => `Coloured by ${p.field}`, code: p => `color_by(${JSON.stringify(p.field)})`,
+    touches: ['colors'], reads: [], effect: 'view', describe: p => `Colored by ${p.field}`, code: p => `color_by(${JSON.stringify(p.field)})`,
   }),
   defineAction({
     type: 'camera.set', title: 'Camera', summary: 'Place the camera.', group: 'Camera',

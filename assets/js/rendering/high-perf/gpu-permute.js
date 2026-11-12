@@ -1,7 +1,7 @@
 /**
  * GPU gather of vertex stores into a geometry's draw order.
  *
- * A point store's positions and colours are kept in its tree's draw order
+ * A point store's positions and colors are kept in its tree's draw order
  * (see `SpatialIndex#drawOrder`), while they are published in source order.
  * Gathering them on the CPU reads the source at random, which costs hundreds
  * of milliseconds at millions of points. Here the source words go into a
@@ -15,7 +15,7 @@
  * When the source-order words are already in a GPU buffer (a store that
  * still holds its source order, gathered in place), the source texture is
  * drawn from that buffer instead of uploaded: one point a word, each at its
- * own texel, into the texture as an R32UI colour attachment
+ * own texel, into the texture as an R32UI color attachment
  * (`_drawSource`). The copy stays on the GPU and the page uploads nothing
  * (10M 3-D positions are 120 MB). An upload from the buffer bound as
  * `PIXEL_UNPACK_BUFFER` would be the obvious copy, but Firefox on macOS
@@ -40,7 +40,7 @@
  * consecutive slots. Each segment is written in place.
  *
  * Outputs:
- * - `writeWords`: 1, 2 or 3 32-bit words a point -- RGBA8 colours (1), or
+ * - `writeWords`: 1, 2 or 3 32-bit words a point -- RGBA8 colors (1), or
  *   x / xy / xyz Float32 positions (1-3).
  *
  * The pass leaves every binding it touches as it found it, and releases the
@@ -155,11 +155,11 @@ const WORD_VS = {
   3: wordProgram('uvec3', 'uvec3(wordAt(base), wordAt(base + 1), wordAt(base + 2))'),
 };
 
-// The highlight colour word of every slot of a point store: the cell at the
+// The highlight color word of every slot of a point store: the cell at the
 // slot is admitted when its highlight byte is at least u_minHighlight and it
 // is shown (visibility byte 1); its word is the RGBA8 bytes (255, 255, 255,
-// highlight), HighlightRenderer's colour word; any other slot gets 0 (alpha
-// 0, which HP_VS_HIGHLIGHT rejects before rasterisation).
+// highlight), HighlightRenderer's color word; any other slot gets 0 (alpha
+// 0, which HP_VS_HIGHLIGHT rejects before rasterization).
 WORD_VS.highlight = `${VS_HEAD}uniform highp usampler2DArray u_highlight;
 uniform ivec2 u_highlightLayout;
 uniform highp usampler2DArray u_visible;
@@ -174,7 +174,7 @@ void main() {
 
 // One source word a point, drawn to its texel of a linear texture's layer
 // (\`_drawSource\`): the word's index is the segment's first word plus the
-// vertex id, its texel the linear texture's, at the texel's centre.
+// vertex id, its texel the linear texture's, at the texel's center.
 const SOURCE_DRAW_VS = `#version 300 es
 precision highp int;
 precision highp float;
@@ -526,7 +526,7 @@ export class GpuPermuter {
   }
 
   /**
-   * Write the highlight colour word of slots `[0, slots)` of a point store
+   * Write the highlight color word of slots `[0, slots)` of a point store
    * into `target` (one word a slot), slot `s` holding the source point
    * `order[s]` (or `s` without an order): see `WORD_VS.highlight`.
    *

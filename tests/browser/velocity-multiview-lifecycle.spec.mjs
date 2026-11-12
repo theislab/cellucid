@@ -533,7 +533,7 @@ test(
     await checkbox.click();
     await expect(checkbox).not.toBeChecked();
     await expect(page.locator('#velocity-overlay-info')).toHaveText(
-      'Failed to load vector field.',
+      'The vector field could not be shown.',
     );
     await expect(page.locator('.notification-error')).toContainText(
       'transform-feedback',

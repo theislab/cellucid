@@ -16,7 +16,9 @@ const HTML_ESCAPE_MAP = {
 };
 
 /**
- * Escape HTML entities by using the browser's DOM serializer.
+ * Text as HTML writes it, in an element or a quoted attribute: `& < > " '`
+ * as entities. The one HTML escape of the app (the history report, the
+ * share dialog's embed code, the analysis views); `escapeXml` builds on it.
  * @param {string} value
  * @returns {string}
  */

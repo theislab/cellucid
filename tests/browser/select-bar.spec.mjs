@@ -116,6 +116,19 @@ async function turnOnSelectModeFromBar(page) {
   await whenActionsShown(page);
 }
 
+/**
+ * Wait until the next tap is a press of its own. A tap within the platform's
+ * double-tap time of the last, near it, continues that press (its click's
+ * `detail` is 2), and after a primary button the page drops it
+ * (`ui/core/press-guard.js`): what took the button's place is not pressed by
+ * an accidental double tap. A person reads the bar between two choices;
+ * waiting past the double-tap time (Chromium counts taps 400 ms apart, a
+ * desktop's double click 500 ms) makes the spec's next tap one too.
+ */
+async function nextPress(page) {
+  await page.waitForTimeout(800);
+}
+
 const groupsOf = page => page.evaluate(
   () => window._cellucidState.getHighlightedGroups().length,
 );
@@ -173,7 +186,9 @@ test.describe('on a phone', () => {
     await expect(page.locator('#select-bar-count')).toHaveText(countText);
     await expect(page.locator('#select-bar-page')).toBeVisible();
 
-    // Clear empties the page exactly as the panel's Clear does.
+    // Clear empties the page exactly as the panel's Clear does: a press of
+    // its own, not the second tap of Confirm's.
+    await nextPress(page);
     await page.locator('#select-bar-clear').tap();
     await expect.poll(() => groupsOf(page)).toBe(0);
     await expect(page.locator('#select-bar-page')).toBeHidden();

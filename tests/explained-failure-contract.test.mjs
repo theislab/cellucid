@@ -153,3 +153,37 @@ test('a failed opening over the empty viewer says the reason itself, and whether
   assert.equal(screen.kind, 'data');
   assert.equal(screen.sentence, refusal.message);
 });
+
+test('an explained failure is said with the caller\'s own verb', () => {
+  // Found 2026-11-10: the samples' listing, offline, said "Sample datasets could not be opened".
+  const explained = explainedFailure('The AnnData reader could not start.', DataSourceErrorCode.NETWORK_ERROR, 'local-demo');
+  assert.equal(
+    describeDataSourceFailure('Sample datasets', 'could not be loaded', explained),
+    'Sample datasets could not be loaded: The AnnData reader could not start.'
+  );
+});
+
+test('a subsample this dataset cannot be read with is a settled refusal said in its own words, never a connection problem (R9M-12)', async () => {
+  const { isSettledDataSourceFailure, classifyDataSourceFailure } = await import('../assets/js/app/ui/modules/dataset-connections.js');
+  const refused = explainedFailure(
+    "A spatial subsample needs the embedding obsm['X_sparse'], which this dataset does not have as a dense array.",
+    DataSourceErrorCode.UNSUPPORTED
+  );
+  // Across the reader worker's wire, as the reading again meets it.
+  const rebuilt = rebuildReaderError(toWire(refused));
+  for (const error of [refused, rebuilt]) {
+    const sentence = describeDataSourceFailure('"messy"', 'could not be read again with these cells', error);
+    assert.equal(sentence, "\"messy\" could not be read again with these cells: A spatial subsample needs the embedding obsm['X_sparse'], which this dataset does not have as a dense array.");
+    assert.doesNotMatch(sentence, /connection|network/i);
+    assert.equal(isSettledDataSourceFailure(error), true);
+  }
+  // A link that did not answer may pass; a 404 does not.
+  const offline = new DataSourceError('Network error', DataSourceErrorCode.NETWORK_ERROR, 'link');
+  assert.equal(classifyDataSourceFailure(offline), 'unreachable');
+  assert.equal(isSettledDataSourceFailure(offline), false);
+  assert.equal(isSettledDataSourceFailure(new DataSourceError('gone', DataSourceErrorCode.NOT_FOUND, 'link')), true);
+  // The subsample plan refuses that way: every refusal of the request is explained and settled.
+  const source = readFileSync(new URL('../assets/js/data/anndata/subsample-plan.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /throw new Error\(`?'?A (spatial|stratified) subsample/);
+  assert.match(source, /throw subsampleRefused\(`A spatial subsample needs the embedding/);
+});

@@ -3,7 +3,7 @@
  *
  * On by default; the "Show cell info" checkbox in Coloring & filtering turns
  * it off. Hovering a cell in any pane shows its value of the field that pane
- * is coloured by and, for a categorical field, how many cells of that category
+ * is colored by and, for a categorical field, how many cells of that category
  * are visible in the pane: exactly the cells selecting the category would pick.
  *
  * The cost is what decides every rule here, because a million-cell view is the
@@ -15,14 +15,14 @@
  *   Those indices are built in a worker in idle time, at any size; smaller
  *   panes are scanned directly.
  * - The per-category counts are one pass over the pane's codes and visibility,
- *   made once and reused until that pane's colouring or visibility changes.
+ *   made once and reused until that pane's coloring or visibility changes.
  * - A pointer move only records the position; a lookup runs once the pointer
  *   has rested for REST_MS, never while it sweeps, and none while the camera is
  *   moving or a drag or touch gesture is in progress. A pointer that moved less
  *   than two pixels since the last lookup reuses it.
  * - The card is an absolutely positioned DOM element moved with a transform. It
  *   never asks the scene to redraw.
- * - It reads only data that is already in memory: the pane's colours and the
+ * - It reads only data that is already in memory: the pane's colors and the
  *   loaded fields. A hover never loads a field.
  *
  * On a touch screen the card appears on a press held still for a moment, and
@@ -32,10 +32,14 @@
  */
 
 import { formatCount, formatCountOf, formatSignificant } from '../../../utils/format-units.js';
+import { setControlAvailability } from '../core/control-availability.js';
 import { POINT_VISIBILITY_THRESHOLD } from '../../../rendering/alpha-visibility.js';
 import { drawnCellRgb } from '../../../rendering/read-cell-layer.js';
 import { GENES_READ_PLACE, geneSampleText } from '../../../data/gene-read-plan.js';
+import { RAW_VALUES, geneValueLabel } from '../../../data/expression-transform.js';
 import { categoryCssAt } from '../../utils/category-state.js';
+import { MISSING_LABEL } from '../../state/managers/filter-manager.js';
+import { categoryDisplayName, isUnnamedCategory } from '../../actions/targets/names.js';
 
 const PICK_MOVE_THRESHOLD_PX = 2;
 // A lookup runs only once the pointer has rested this long, like a tooltip:
@@ -73,23 +77,31 @@ function requireMethods(owner, label, names) {
 
 /**
  * A cell's value, in the one number format (`formatSignificant`) to six
- * significant figures: a count up to 999,999 is written whole.
+ * significant figures: a count up to 999,999 is written whole; no value
+ * (NaN) is "Missing", the word the legend and the filters use
+ * (`MISSING_LABEL`).
  */
 export function formatCellValue(value) {
-  return Number.isFinite(value) ? formatSignificant(value, 6) : 'NaN';
+  return Number.isFinite(value) ? formatSignificant(value, 6) : MISSING_LABEL;
 }
 
+/** A cell's category as shown (`categoryDisplayName`), or null for none. */
 function categoryLabel(field, cellIndex) {
   const code = field.codes[cellIndex];
   const categories = field.categories;
   if (!(code >= 0 && code < categories.length)) return null;
-  const label = categories[code];
-  return typeof label === 'string' ? label : String(label);
+  return categoryDisplayName(categories[code]);
+}
+
+/** Whether a cell's category has no name (shown quietly, as a missing value is). */
+function unnamedAt(field, cellIndex) {
+  const code = field.codes[cellIndex];
+  return code >= 0 && code < field.categories.length && isUnnamedCategory(field.categories[code]);
 }
 
 /**
- * The colour cell `cellIndex` is drawn in: its own, or, for a cell beneath
- * (no value) or not read, its layer's colour over the view's background
+ * The color cell `cellIndex` is drawn in: its own, or, for a cell beneath
+ * (no value) or not read, its layer's color over the view's background
  * (`layerColors`, `rendering/read-cell-layer.js`).
  */
 function cssColor(colors, cellIndex, layerColors) {
@@ -288,13 +300,13 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
     }
     parts.scaleBar.style.setProperty('--cell-info-stops', colormap.cssStops.join(', '));
     parts.scaleMarker.style.setProperty('--cell-info-t', String(t));
-    // The scale's ends as the legend's colour bar writes them.
+    // The scale's ends as the legend's color bar writes them.
     parts.scaleMin.textContent = formatSignificant(domain.min);
     parts.scaleMax.textContent = formatSignificant(domain.max);
     parts.scale.hidden = false;
   }
 
-  // Visible cells per category in one pane, for the field it is coloured by.
+  // Visible cells per category in one pane, for the field it is colored by.
   // A count is one pass over every cell (tens of milliseconds at ten million),
   // so it never runs on the hover path: a hover reads a finished count or asks
   // for one in idle time, and the card fills the number in when it is ready.
@@ -370,11 +382,11 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
         continue;
       }
       const label = categoryLabel(field, cellIndex);
-      // A field no view has coloured holds no colours yet: its row has no dot.
+      // A field no view has colored holds no colors yet: its row has no dot.
       const color = label === null || field._categoryColors === undefined
         ? null
         : categoryCssAt(field._categoryColors, field.codes[cellIndex]);
-      rows.push({ key: field.key, label, color });
+      rows.push({ key: field.key, label, color, quiet: label === null || unnamedAt(field, cellIndex) });
     }
     const fragment = ownerDocument.createDocumentFragment();
     for (const row of rows) {
@@ -390,8 +402,9 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
         dot.style.background = row.color;
         dd.append(dot);
       }
-      dd.append(row.label ?? 'missing');
-      if (row.label === null) dd.classList.add('is-missing');
+      // A cell without a category: the legend's Missing row names it so.
+      dd.append(row.label ?? MISSING_LABEL);
+      if (row.quiet) dd.classList.add('is-missing');
       pair.append(dt, dd);
       fragment.append(pair);
     }
@@ -410,8 +423,8 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
 
     if (field && field.kind === 'category' && field.codes && field.codes.length > cellIndex) {
       const label = categoryLabel(field, cellIndex);
-      parts.value.textContent = label ?? 'missing';
-      parts.value.classList.toggle('is-missing', label === null);
+      parts.value.textContent = label ?? MISSING_LABEL;
+      parts.value.classList.toggle('is-missing', label === null || unnamedAt(field, cellIndex));
       parts.field.textContent = field.key;
       parts.scale.hidden = true;
       const code = field.codes[cellIndex];
@@ -428,7 +441,9 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
       parts.value.textContent = unread ? 'not read' : formatCellValue(value);
       parts.value.title = unread ? `${geneSampleText(sample)}; this cell is not among them (read genes for more cells in ${GENES_READ_PLACE}).` : '';
       parts.value.classList.toggle('is-missing', unread || !Number.isFinite(value));
-      parts.field.textContent = field.key;
+      // A gene's values not as stored are named in their units (Data
+      // mapping › Expression values); a gene made in the app keeps its own.
+      parts.field.textContent = geneValueLabel(field.key, source === 'var' && field._isUserDefined !== true ? (state.getShownExpressionTransform?.() ?? RAW_VALUES) : null);
       fillScale(field, cellIndex);
       parts.count.textContent = '';
     } else {
@@ -470,6 +485,18 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
     }
     card.style.setProperty('--cell-info-columns', String(columns));
     size = { width: card.offsetWidth, height: card.offsetHeight };
+    // Rows wrap (a long name or label), so they are not all one height and
+    // the estimate above can leave the card taller than the window: take the
+    // last rows away, naming them, until it fits.
+    const left = Array.from(rows.children);
+    let named = pairs.length - left.length;
+    while (size.height > available && left.length > 0) {
+      left.pop().remove();
+      named += 1;
+      more.textContent = `+${formatCount(named)} more loaded fields (no room in the window)`;
+      more.hidden = false;
+      size = { width: card.offsetWidth, height: card.offsetHeight };
+    }
     return size;
   }
 
@@ -695,7 +722,7 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
 
   function setEnabled(next) {
     // The option only means something while the card is on.
-    categoriesToggle.disabled = !next;
+    setControlAvailability(categoriesToggle, next ? null : 'the cell card is off; turn Show cell info on first');
     if (next === enabled) return;
     enabled = next;
     if (enabled) {
@@ -737,7 +764,7 @@ export function initCellInfo({ viewer, state, toggle, categoriesToggle, canvas }
     prepare();
     refresh();
   };
-  // A recoloured or refiltered pane changes what the resting card says.
+  // A recolored or refiltered pane changes what the resting card says.
   function refresh() {
     countsMemo = null;
     cancelCountIdle();

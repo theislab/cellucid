@@ -43,7 +43,7 @@ import { createSavedStatesDialog } from './saved-states-dialog.js';
 import { createTour } from './tour.js';
 import { createHistorySharing } from './share.js';
 import { bindHistoryKeys } from './keyboard.js';
-import { openMenu } from './menu.js';
+import { openMenu } from '../../components/menu.js';
 import { statusWords } from './model.js';
 import { askHistory, commandKey, reportHistoryFailure, toastEdit, undoKeys } from './shared.js';
 import {
@@ -65,12 +65,15 @@ const plainOrNull = text => (text === null ? null : plainSentence(text));
 import { domainName } from '../../../actions/domains.js';
 import { summarizeReplay } from '../../../history/replay.js';
 import { getNotificationCenter } from '../../../notification-center.js';
-import { formatCountOf } from '../../../../utils/format-units.js';
+import { formatCountOf, formatDuration } from '../../../../utils/format-units.js';
 import { viewNameInValue } from '../../../actions/targets/views.js';
 import { cancelled, isCancellation } from '../../../../utils/abort.js';
 import { registerStepRevealer, revealTurn, subscribeTurns, undoAgentTurn } from '../../../agent/history-link.js';
 import { ActionRefused } from '../../../actions/dispatcher.js';
 import { downloadBlob } from '../../../utils/download.js';
+import { HISTORY_WAITS_FOR_DATASET, openADatasetTo } from '../../no-dataset.js';
+import { copyText } from '../../../utils/clipboard.js';
+import { lowerFirst } from '../../../../utils/text-case.js';
 
 const REQUIRED = [
   'section', 'shareButton', 'loadButton', 'searchButton', 'undoButton', 'redoButton', 'settingsButton', 'menuButton',
@@ -178,7 +181,6 @@ export function initStateSection({
       filter: stepMatcher(query, { effectOf, stale }),
       offDomains: offDomains(),
       effectOf,
-      categoryOf: step => (step.touches?.length > 0 ? domainName(step.touches[0]) : 'Step'),
     };
   }
 
@@ -234,7 +236,7 @@ export function initStateSection({
       line.append(control);
       nodes.push(line);
       if (row.tip !== undefined) {
-        const info = createInfoTip({ tip: row.tip, label: `About ${setting.label.charAt(0).toLowerCase()}${setting.label.slice(1)}` });
+        const info = createInfoTip({ tip: row.tip, label: `About ${lowerFirst(setting.label)}` });
         line.classList.add('checkbox-info-row');
         line.append(info.button);
         nodes.push(info.popover);
@@ -452,12 +454,7 @@ export function initStateSection({
       }, 'Showing the step’s view');
     },
     async copyCode(step) {
-      try {
-        await navigator.clipboard.writeText(step.code ?? '');
-        notify('Copied the code.', 'success');
-      } catch (error) {
-        reportHistoryFailure('Copying the code', error);
-      }
+      await copyText(step.code ?? '', { what: 'the code', category: 'session' });
     },
     openChat(turnId) { revealTurn(turnId); },
     /** A turn of the chat bar keeps its conversation (a connector's has none here: no ↗). */
@@ -514,7 +511,7 @@ export function initStateSection({
       const plan = await run(() => history.deletePlan(stepId), 'Deleting the step');
       if (plan === undefined || view === null) return;
       const starts = view.branchesFrom(stepId);
-      const seconds = plan.ms >= 1000 ? ` (about ${Math.round(plan.ms / 1000)} s)` : '';
+      const seconds = plan.ms >= 1000 ? ` (about ${formatDuration(plan.ms)})` : '';
       const answer = await ask({
         title: `Delete ${stepLabel(stepId)}?`,
         lines: [
@@ -1036,13 +1033,15 @@ export function initStateSection({
       const focus = history.shownValue('views').focus;
       return history.valueAt(stepId, 'camera').views[focus] ?? null;
     },
+    // Anyone else changing the history while the tour plays ends it where they are.
+    subscribe: listener => (history === null ? () => {} : history.subscribe(listener)),
   });
   const sharing = createHistorySharing({
     ownerDocument,
     history: () => history,
     view: () => view,
     read: (type, params) => actions.act(type, params),
-    jump: stepId => actions.act('history.jump', { step: stepId }),
+    jump: (stepId, how) => actions.act('history.jump', { step: stepId }, how),
     datasetFacts,
     pictures,
     reportDom: {
@@ -1058,7 +1057,7 @@ export function initStateSection({
 
   function refuseWithoutHistory(type) {
     if (history?.active == null || view === null) {
-      throw new ActionRefused('The history starts once the dataset is open.', { code: 'unavailable', type });
+      throw new ActionRefused(HISTORY_WAITS_FOR_DATASET, { code: 'unavailable', type });
     }
   }
 
@@ -1094,7 +1093,7 @@ export function initStateSection({
    * as text. A window opens only from the person's click, so an agent never
    * gets one.
    */
-  async function reportAction({ as, pictures: choice, file }, confirm) {
+  async function reportAction({ as, pictures: choice, file }, confirm, signal) {
     const type = 'history.report';
     refuseWithoutHistory(type);
     if (as === 'text' && choice !== 'none') {
@@ -1102,7 +1101,7 @@ export function initStateSection({
     }
     const name = file ?? `${datasetFacts().name ?? 'Cellucid'} history report.html`;
     if (as === 'file') await confirm(`It writes the history report ${name} to this computer${choice === 'none' ? '' : ', showing each step chosen for a picture in turn'}.`);
-    const report = await sharing.report({ pictures: choice });
+    const report = await sharing.report({ pictures: choice, signal });
     const covers = { tracker: report.tracker, branch: report.branch, to: report.to, steps: report.steps, pictures: report.pictures };
     if (as === 'text') {
       return { as, ...covers, file: null, bytes: new TextEncoder().encode(report.html).length, html: report.html };
@@ -1118,7 +1117,7 @@ export function initStateSection({
       const stopped = await tour.stop();
       return { stopped, head: getCurrentHistory()?.active?.headId ?? null };
     }),
-    provide('history.report', (params, { confirm }) => reportAction(params, confirm)),
+    provide('history.report', (params, { confirm, signal }) => reportAction(params, confirm, signal)),
   ];
 
   /**
@@ -1222,7 +1221,7 @@ export function initStateSection({
   }, { signal });
   dom.staleButton.addEventListener('click', () => search.showFlagged(), { signal });
   dom.memoryButton.addEventListener('click', () => memoryDialog.open(dom.memoryButton), { signal });
-  dom.pendingCancel.addEventListener('click', () => void act('history.branch.cancel', {}, 'Cancelling the new branch'), { signal });
+  dom.pendingCancel.addEventListener('click', () => void act('history.branch.cancel', {}, 'Canceling the new branch'), { signal });
   dom.shareButton.addEventListener('click', () => share.open(dom.shareButton), { signal });
   dom.loadButton.addEventListener('click', () => saved.open(dom.loadButton), { signal });
 
@@ -1282,7 +1281,7 @@ export function initStateSection({
     dom.menuButton.disabled = view === null || tour.playing;
     dom.searchButton.disabled = view === null;
     dom.shareButton.disabled = view === null;
-    dom.shareButton.title = view === null ? 'Load a dataset to share a session' : 'Write a session file: the history, the current state only, or the steps only';
+    dom.shareButton.title = view === null ? openADatasetTo('share a session') : 'Write a session file: the history, the current state only, or the steps only';
     const jumpParams = catalog()?.has?.('history.jump') ? catalog().get('history.jump').params?.properties ?? {} : {};
     for (const item of menuItems) {
       const command = item.dataset.historyCommand;
@@ -1326,7 +1325,7 @@ export function initStateSection({
     dom.recording.disabled = view === null || busy > 0;
     if (view === null) {
       dom.recording.hidden = true;
-      dom.status.textContent = 'History starts when a dataset is open.';
+      dom.status.textContent = HISTORY_WAITS_FOR_DATASET;
       dom.status.dataset.tone = 'muted';
       dom.staleButton.hidden = true;
       dom.pendingCancel.hidden = true;

@@ -1,5 +1,5 @@
 /**
- * The field, colour, filter and data actions (`assets/js/app/actions/
+ * The field, color, filter and data actions (`assets/js/app/actions/
  * definitions/{fields,coloring,filters,mapping}.js`): their definitions,
  * the parameters they name things by, the pure helpers that convert a data
  * mapping, the category that keeps only some of its cells
@@ -13,6 +13,7 @@ import test from 'node:test';
 import { getActionCatalog, getActions } from '../assets/js/app/actions/index.js';
 import { catalogDocument } from '../assets/js/app/actions/catalog.js';
 import { ActionRefused } from '../assets/js/app/actions/dispatcher.js';
+import { StateValidator } from '../assets/js/app/utils/state-validator.js';
 import { DOMAIN_IDS } from '../assets/js/app/actions/domains.js';
 import { exampleOf, schemaProblem } from '../assets/js/app/actions/schema.js';
 import { mappingActions, mappingChangesOf, mappingParamsOf } from '../assets/js/app/actions/definitions/mapping.js';
@@ -27,6 +28,7 @@ import {
 import { DataStateFilterMethods, collectViewFilters } from '../assets/js/app/state/managers/filter-manager.js';
 import { FieldSummaryMethods } from '../assets/js/app/state/managers/field/summary.js';
 import { installFieldActions } from '../assets/js/app/state/actions/field-actions.js';
+import { applyCategoryIndexMapping, buildGroupCategoriesTransform, carryCategoryStateThroughGroup } from '../assets/js/app/utils/categorical-ops.js';
 import { openCellsValueOf, requestOfOpenCellsValue } from '../assets/js/app/state/domains/cells.js';
 import { rankOf } from '../assets/js/data/subsample.js';
 import { createCellIdentity } from '../assets/js/data/cell-identity.js';
@@ -38,8 +40,8 @@ const AREA_TYPES = Object.freeze([
   'category.delete', 'category.merge', 'category.rename',
   'cells.open', 'cells.read-genes',
   'color.by', 'color.category', 'color.continuous.colormap', 'color.continuous.log', 'color.continuous.range',
-  'color.continuous.rescale', 'color.continuous.zero-gray',
-  'field.consensus', 'field.create-from-pages', 'field.delete', 'field.duplicate', 'field.purge', 'field.push', 'field.rename',
+  'color.continuous.rescale', 'color.continuous.zero-gray', 'expression.transform.set',
+  'field.consensus', 'field.create-from-pages', 'field.delete', 'field.duplicate', 'field.group', 'field.purge', 'field.push', 'field.rename',
   'field.restore', 'field.revert-name',
   'filter.category.all', 'filter.category.cell-count', 'filter.category.missing', 'filter.category.visibility',
   'filter.continuous.range', 'filter.continuous.reset', 'filter.enable', 'filter.outlier', 'filter.remove',
@@ -68,7 +70,7 @@ test('every action of the area is defined once, changes state, and names the dom
   }
   const listed = [...fieldActions, ...coloringActions, ...filterActions, ...mappingActions].map(definition => definition.type);
   assert.deepEqual(listed.sort(), [...AREA_TYPES].sort(), 'no action of the area is missing from this list');
-  // The catalogue document is byte-stable.
+  // The catalog document is byte-stable.
   assert.equal(JSON.stringify(catalogDocument(catalog)), JSON.stringify(catalogDocument(getActionCatalog())));
 });
 
@@ -83,9 +85,9 @@ test('every example parameter set is valid and is described in one line, past te
       assert.ok(text.length > 0 && !text.includes('\n') && text.trim() === text, `${type} ${label}: ${JSON.stringify(text)}`);
     }
   }
-  assert.equal(catalog.get('color.by').describe({ field: { source: 'var', key: 'CD3E' } }, null), 'Coloured by gene CD3E');
+  assert.equal(catalog.get('color.by').describe({ field: { source: 'var', key: 'CD3E' } }, null), 'Colored by gene CD3E');
   assert.equal(catalog.get('color.by').code({ field: { source: 'obs', key: 'cell_type' } }), 'color_by("cell_type")');
-  assert.equal(catalog.get('color.by').describe({ field: null }, null), 'Cleared the colouring');
+  assert.equal(catalog.get('color.by').describe({ field: null }, null), 'Cleared the coloring');
   assert.equal(
     catalog.get('filter.category.visibility').describe({ field: { source: 'obs', key: 'leiden' }, categories: ['1', '2', '5'], visible: false }, null),
     'Hid 1, 2 and 5 of leiden',
@@ -104,7 +106,7 @@ test('a step names fields, categories, genes and pages, never a position', () =>
       assert.doesNotMatch(path, /index|position|Idx|_id\b|Id\b/i, `${type}: ${path}`);
     }
   }
-  // A field is {source, key}; a category its label; colour maps by id.
+  // A field is {source, key}; a category its label; color maps by id.
   const params = getActionCatalog().get('color.category').params;
   assert.deepEqual(params.properties.field.required, ['source', 'key']);
   assert.equal(params.properties.category.type, 'string');
@@ -387,6 +389,89 @@ test('the consensus column is a step that names the outcome of each category: it
   assert.equal(definition.code(params), 'consensus_column("community_cell_type", of="Cell type", mapping={"T": "T cell", "B": "disputed"})');
 });
 
+test('grouping categories is one step making a new field of groups; a category no group lists keeps its name or joins rest (F89)', async t => {
+  const source = {
+    kind: 'category', key: 'clusters', categories: ['Ductal', 'Ngn3 low EP', 'Alpha', 'Beta', 'Delta'],
+    codes: Uint8Array.from([0, 1, 2, 3, 4, 255, 2]), loaded: true,
+  };
+  const grouped = [];
+  const fields = [source, { kind: 'category', key: 'clusters (grouped)', categories: ['x'], codes: new Uint8Array(7), loaded: true }];
+  const state = {
+    pointCount: 7,
+    getFields: () => fields,
+    getVarFields: () => [],
+    ensureFieldLoaded: async () => {},
+    groupCategoriesToNewField(fieldIndex, options) {
+      grouped.push({ fieldIndex, options });
+      return { newFieldIndex: 2, newKey: options.newKey, categories: options.groups.length + 1 };
+    },
+  };
+  const remove = installFieldActions({ state });
+  t.after(remove);
+  const actions = getActions();
+  const field = { source: 'obs', key: 'clusters' };
+  const lineage = [{ label: 'Progenitor', categories: ['Ductal', 'Ngn3 low EP'] }, { label: 'Endocrine', categories: ['Alpha', 'Beta'] }];
+  const { outcome } = await actions.dispatch('field.group', { field, groups: lineage });
+  // The default name is free beside the fields there are; Delta, listed by no group, keeps its name.
+  assert.deepEqual(outcome, { name: 'clusters (grouped) 2', categories: 3, kept: 1 });
+  assert.deepEqual(grouped[0], {
+    fieldIndex: 0,
+    options: { groups: [{ label: 'Progenitor', members: [0, 1] }, { label: 'Endocrine', members: [2, 3] }], restLabel: null, newKey: 'clusters (grouped) 2' },
+  });
+  await actions.dispatch('field.group', { field, groups: lineage, rest: 'Other', name: 'lineage' });
+  assert.deepEqual(grouped[1].options.restLabel, 'Other');
+  assert.equal(grouped[1].options.newKey, 'lineage');
+  const refused = async (params, pattern) => {
+    await assert.rejects(actions.dispatch('field.group', { field, ...params }), error => error instanceof ActionRefused && pattern.test(error.message));
+  };
+  await refused({ groups: [{ label: 'A', categories: ['Ductal'] }, { label: 'B', categories: ['Ductal'] }] }, /^"Ductal" is listed in "A" and "B"; a category joins one group\.$/);
+  await refused({ groups: [{ label: 'A', categories: ['Ductal'] }, { label: 'A', categories: ['Beta'] }] }, /^Two groups are called "A"; give each its own label\.$/);
+  await refused({ groups: [{ label: 'Delta', categories: ['Alpha'] }] }, /^"Delta" is kept as it is \(no group lists it\), and a group is called "Delta": list it in that group, or call the group otherwise\.$/);
+  await refused({ groups: [{ label: ' A', categories: ['Alpha'] }] }, /starts or ends with a space/);
+  await refused({ groups: [{ label: 'A', categories: ['Acinar'] }] }, /There is no category "Acinar" in "clusters"/);
+  await refused({ groups: lineage, name: 'clusters' }, /clusters/);
+  assert.equal(grouped.length, 2, 'a refused grouping changes nothing');
+  // Joining a group's own label is a grouping too: every other category into Endocrine.
+  await actions.dispatch('field.group', { field, groups: lineage, rest: 'Endocrine', name: 'two' });
+  assert.equal(grouped[2].options.restLabel, 'Endocrine');
+  const definition = getActionCatalog().get('field.group');
+  assert.equal(definition.describe({ field, groups: lineage, rest: null }, { name: 'lineage' }), 'Grouped clusters into Progenitor and Endocrine as lineage');
+  assert.equal(definition.describe({ field, groups: lineage, rest: 'Other' }, null), 'Grouped clusters into Progenitor, Endocrine and Other as clusters (grouped)');
+  // The rest joins a group it names: listed once (L11-3).
+  assert.equal(definition.describe({ field, groups: lineage, rest: 'Endocrine' }, null), 'Grouped clusters into Progenitor and Endocrine as clusters (grouped)');
+  // Past three, the groups are counted as groups (L11-3: was "into 4 categories and non-epithelial").
+  const four = ['airway', 'distal tip', 'stalk', 'alveolar'].map(label => ({ label, categories: [label] }));
+  assert.equal(definition.describe({ field, groups: four, rest: 'non-epithelial', name: 'compartment' }, { name: 'compartment' }), 'Grouped clusters into 4 groups and non-epithelial as compartment');
+  assert.equal(definition.code({ field, groups: lineage, rest: null, name: 'lineage' }),
+    'group_categories("clusters", {"Progenitor": ["Ductal", "Ngn3 low EP"], "Endocrine": ["Alpha", "Beta"]}, name="lineage")');
+});
+
+test('the grouping of categories: codes by group, the others kept or joined, each new category colored as its first and shown while any was', () => {
+  const categories = ['Ductal', 'Ngn3 low EP', 'Alpha', 'Beta', 'Delta'];
+  const groups = [{ label: 'Endocrine', members: [3, 2] }, { label: 'Progenitor', members: [0, 1] }];
+  const kept = buildGroupCategoriesTransform(categories, groups, null);
+  assert.deepEqual(kept.categories, ['Endocrine', 'Progenitor', 'Delta']);
+  assert.deepEqual([...kept.mapping], [1, 1, 0, 0, 2]);
+  assert.deepEqual([...kept.firstOf], [3, 0, 4]);
+  const codes = applyCategoryIndexMapping(Uint8Array.from([0, 1, 2, 3, 4, 255]), kept.mapping, kept.categories.length);
+  assert.deepEqual([...codes], [1, 1, 0, 0, 2, 255]);
+  const rest = buildGroupCategoriesTransform(categories, [{ label: 'Endocrine', members: [2, 3] }], 'Other');
+  assert.deepEqual(rest.categories, ['Endocrine', 'Other']);
+  assert.deepEqual([...rest.mapping], [1, 1, 0, 0, 1]);
+  const intoGroup = buildGroupCategoriesTransform(categories, [{ label: 'Endocrine', members: [2, 3] }], 'Endocrine');
+  assert.deepEqual(intoGroup.categories, ['Endocrine']);
+  assert.deepEqual(intoGroup.membersOf, [[2, 3, 0, 1, 4]]);
+  assert.throws(() => buildGroupCategoriesTransform(categories, [{ label: 'A', members: [0] }, { label: 'B', members: [0] }], null), /in two groups/);
+  assert.throws(() => buildGroupCategoriesTransform(categories, [{ label: 'Delta', members: [0] }], null), /kept under a label a group takes/);
+  // Colors (each told apart from the others, F111): Endocrine as Beta (its first), Progenitor
+  // as Ductal, Delta its own; shown while any of its categories was.
+  const colors = Uint8Array.of(230, 25, 75, 60, 180, 75, 255, 225, 25, 0, 130, 200, 245, 130, 48);
+  const visible = Uint8Array.from([0, 1, 0, 0, 1]);
+  const carried = carryCategoryStateThroughGroup(kept, { colors, visible });
+  assert.deepEqual([...carried.colors], [0, 130, 200, 230, 25, 75, 245, 130, 48]);
+  assert.deepEqual([...carried.visible], [0, 1, 1]);
+});
+
 test('the open cells as the cells domain names them: the subsample asked for, never a step of its growth', () => {
   assert.equal(openCellsValueOf(null), null);
   assert.equal(openCellsValueOf({ nObs: 100, kept: null, spec: null }), null);
@@ -398,4 +483,66 @@ test('the open cells as the cells domain names them: the subsample asked for, ne
   assert.deepEqual(requestOfOpenCellsValue(null), { mode: 'all' });
   assert.deepEqual(requestOfOpenCellsValue({ method: 'blocks', k: 20, seed: 0, blockSize: 64 }),
     { mode: 'subsample', method: 'blocks', k: 20, seed: 0, blockSize: 64, strict: true });
+});
+
+// Bug hunt R9A-8: a rename made "Alpha\nnewline" (an agent's call; the legend's box trims and is one
+// line), which the legend drew on two lines and the community annotation cannot key. One rule for a
+// category label given now, in every action that takes one: rename, merge, group, Create categorical.
+test('a category label given now is one line with no space at its ends, in every action that takes one', async t => {
+  const source = {
+    kind: 'category', key: 'clusters', categories: ['Ductal', 'Alpha', 'Beta'],
+    codes: Uint8Array.from([0, 1, 2, 1]), loaded: true,
+  };
+  const fields = [source];
+  const changed = [];
+  const state = {
+    pointCount: 4,
+    getFields: () => fields,
+    getVarFields: () => [],
+    ensureFieldLoaded: async () => {},
+    renameCategory: (...args) => changed.push(['rename', ...args]),
+    mergeCategoriesToNewField: (...args) => { changed.push(['merge', ...args]); return { newKey: 'clusters', mergedCategoryLabel: 'x', updatedInPlace: false }; },
+    groupCategoriesToNewField: (...args) => { changed.push(['group', ...args]); return { newFieldIndex: 1, newKey: 'g', categories: 2 }; },
+  };
+  const remove = installFieldActions({ state });
+  t.after(remove);
+  const actions = getActions();
+  const field = { source: 'obs', key: 'clusters' };
+  const refusedAs = async (type, params, pattern) => {
+    await assert.rejects(actions.dispatch(type, { field, ...params }), error => {
+      assert.ok(error instanceof ActionRefused, String(error));
+      assert.equal(error.code, 'bad-name');
+      assert.match(error.message, pattern);
+      return true;
+    });
+  };
+  await refusedAs('category.rename', { category: 'Alpha', name: 'Alpha\nnewline' }, /^"Alpha\nnewline" cannot be a category label: it holds the control character U\+000A/);
+  await refusedAs('category.rename', { category: 'Alpha', name: '  padded  ' }, /it starts or ends with a space; give it without\.$/);
+  await refusedAs('category.rename', { category: 'Alpha', name: 'Al​pha' }, /zero-width character U\+200B/);
+  await refusedAs('category.merge', { category: 'Alpha', into: 'Beta', label: 'Alpha\tBeta' }, /control character U\+0009/);
+  await refusedAs('field.group', { groups: [{ label: 'Endo\ncrine', categories: ['Alpha'] }] }, /control character U\+000A/);
+  await refusedAs('field.group', { groups: [{ label: 'Endocrine', categories: ['Alpha'] }], rest: ' Other' }, /starts or ends with a space/);
+  assert.deepEqual(changed, [], 'a refused label changes nothing');
+  // Text of any script, punctuation and emoji is a label.
+  await actions.dispatch('category.rename', { field, category: 'Alpha', name: 'α-Zelle, "core" 🧬' });
+  assert.deepEqual([changed[0][0], changed[0].at(-1)], ['rename', 'α-Zelle, "core" 🧬']);
+  assert.throws(() => StateValidator.validateNewCategoryLabel(''), /non-empty/);
+  assert.equal(StateValidator.validateCategoryLabel('read\nas it is'), true, 'a label a dataset brings is read as it is');
+});
+
+test('a color map step names the palette as the legend does (R9F-5)', () => {
+  const definition = getActionCatalog().get('color.continuous.colormap');
+  const field = { source: 'var', key: 'Ins1' };
+  assert.equal(definition.describe({ field, colormap: 'plasma' }), 'Drew gene Ins1 in Plasma');
+  assert.equal(definition.describe({ field, colormap: 'rdbu' }).endsWith(' in RdBu'), true);
+});
+
+test('a range step writes its bounds as the Filters list does, not as float32 widened to double (R9F-11)', () => {
+  const catalog = getActionCatalog();
+  const field = { source: 'obs', key: 'G2M_score' };
+  const min = Math.fround(-0.4487030208);
+  assert.equal(catalog.get('filter.continuous.range').describe({ field, min, max: -0.072 }), 'Showed G2M_score from -0.448703 to -0.072');
+  assert.equal(catalog.get('color.continuous.range').describe({ field, min, max: 1500 }), 'Spanned the colors of G2M_score over -0.448703 – 1500');
+  // The pseudocode keeps the exact bound.
+  assert.match(catalog.get('filter.continuous.range').code({ field, min, max: -0.072 }), /-0\.44870302081108093/);
 });

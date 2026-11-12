@@ -7,7 +7,7 @@
  * but only once the data controls exist; before that, and anywhere the target
  * does not reach, a dropped file must still go nowhere.
  *
- * So, from the first paint, every drag that carries files is cancelled at the
+ * So, from the first paint, every drag that carries files is canceled at the
  * document: the page never navigates on a drop. Until the dataset drop target
  * marks itself ready on the root element, the drag is offered as `none`, so
  * the pointer says plainly that nothing will happen. Drags that carry no files

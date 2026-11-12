@@ -287,7 +287,7 @@ test('values a log1p cannot have written refute uns[\'log1p\']: the E-ANND-5 sha
   assert.deepEqual(completed.log1pRefuted.map(entry => entry.matrix), ['X']);
   assert.ok(!completed.guessed.includes('log1p'));
 
-  // log1p of counts normalised to 10,000 (scanpy's defaults: values up to ~9.2): kept.
+  // log1p of counts normalized to 10,000 (scanpy's defaults: values up to ~9.2): kept.
   const logged = await openReader(perMillionTree({ values: Float32Array.from([0.69, 1.61, 9.21, 2.3, 0.69, 3.4, 4.1, 2.2]) }));
   assert.equal((await logged.reader.probeMapping()).X.notLog1p, null);
   // The bound is the matrix's own type: 100 can be log1p of a float64 (expm1(100) = 2.7e43) but not of a float32.

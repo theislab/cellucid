@@ -228,7 +228,7 @@ test('the inner chunks of a shard reads need are read as one slice per run of ne
   assert.deepEqual(await root.get('a').read(), values);
   // The index (8 entries of 16 bytes), then all eight inner chunks in one slice.
   assert.deepEqual(sizes, [128, 64 * 4]);
-  // Two runs of neighbours (chunks 0-1 and 6-7) of a fresh store, asked for
+  // Two runs of neighbors (chunks 0-1 and 6-7) of a fresh store, asked for
   // by two reads at once: 128 bytes apart, less than one more read costs on
   // a local file's link, they are one slice; on a link that prices a read
   // below that gap, two.

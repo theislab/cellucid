@@ -26,11 +26,12 @@ const OTHER_MODES = Object.freeze([
  * One analysis UI over a data layer that publishes exactly `genes`. The
  * validators read only the data layer and the subclass's requirements.
  */
-function uiOver(UiClass, genes, listing = { pending: false, failure: null }) {
+function uiOver(UiClass, genes, listing = { pending: false, failure: null }, pointCount = 100) {
   const ui = Object.create(UiClass.prototype);
   ui.dataLayer = {
     // The gene list of a dataset just shown is read after its first view.
     state: {
+      pointCount,
       areGenesPending: () => listing.pending,
       getGeneListFailure: () => listing.failure,
     },
@@ -64,6 +65,19 @@ test('without genes a gene-expression mode refuses before its pages', () => {
   }
 });
 
+test('with no dataset open every mode says so, not that a kind of data is missing', () => {
+  // R9E-8: "Requires gene expression data." with no dataset open (None).
+  for (const UiClass of [...GENE_MODES, ...OTHER_MODES]) {
+    const ui = uiOver(UiClass, [], undefined, 0);
+    ui.dataLayer.getAvailableVariables = () => [];
+    assert.deepEqual(ui.validateDataRequirements(), {
+      valid: false,
+      noDataset: true,
+      error: 'No dataset is open. Open one in Session › Open data to analyze it.',
+    }, UiClass.name);
+  }
+});
+
 test('while the gene names are read after the first view, a gene-expression mode waits for them', () => {
   for (const UiClass of GENE_MODES) {
     const pending = uiOver(UiClass, [], { pending: true, failure: null });
@@ -92,6 +106,7 @@ test('modes not built on gene expression never ask for genes', () => {
   for (const UiClass of OTHER_MODES) {
     const ui = Object.create(UiClass.prototype);
     ui.dataLayer = {
+      state: { pointCount: 100 },
       getAvailableVariables() {
         throw new Error(`${UiClass.name} must not read the gene inventory.`);
       },

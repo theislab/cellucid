@@ -139,44 +139,16 @@
   flex: 1;
 }
 
-/* Modal (shared) */
-.figure-export-modal {
-  position: fixed;
-  inset: 0;
-  z-index: var(--z-modal);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: var(--space-5);
-}
-
-.figure-export-modal-backdrop {
-  position: absolute;
-  inset: 0;
-  background: var(--color-surface-overlay);
-  backdrop-filter: blur(var(--space-0-5));
+/* The figure export's dialog (components/modal.js): an app dialog
+   (components/_modals.css, App dialogs) wider, scrolling as one piece under
+   its header band. */
+.app-dialog.figure-export-modal {
+  width: min(680px, calc(100vw - 2 * var(--space-4)));
+  max-height: min(80dvh, calc(100dvh - 2 * var(--space-4)));
 }
 
 .figure-export-modal-content {
-  position: relative;
-  background: var(--color-surface-elevated);
-  border: var(--border-default);
-  box-shadow: var(--shadow-lg);
-  width: min(680px, 100%);
-  max-height: 80vh;
-  overflow: auto;
   padding: var(--control-dialog-padding);
-}
-
-/* The title is the dialog's header band (shared chrome in _modals.css). The
-   card scrolls as one piece, so the band bleeds over the card's padding and
-   stays at the top while the settings below it scroll. */
-.figure-export-modal-title {
-  position: sticky;
-  top: calc(-1 * var(--control-dialog-padding));
-  z-index: 1;
-  margin: calc(-1 * var(--control-dialog-padding)) calc(-1 * var(--control-dialog-padding))
-    var(--control-block-gap);
 }
 
 .figure-export-modal-actions {
@@ -267,6 +239,19 @@
   margin: 0;
 }
 
+/* A panel far from the shape asked for, and Fit the cells (F119): one line. */
+.figure-export-shape-note {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-wrap: wrap;
+}
+
+.figure-export-shape-note[hidden] {
+  display: none;
+}
+
 /* Framing (crop) */
 .figure-export-crop-aspect {
   font-size: var(--type-hint);
@@ -319,7 +304,7 @@
   min-width: var(--space-20);
 }
 
-/* Custom background colour */
+/* Custom background color */
 .figure-color-picker {
   width: var(--space-7);
   height: var(--space-6);

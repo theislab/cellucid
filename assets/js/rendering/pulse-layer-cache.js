@@ -7,19 +7,19 @@
  * the whole pane again, every point of the dataset included, to change only
  * the rings around the highlighted cells. A pane's frame is two layers in a
  * fixed order: the **base** (backdrop, grid, every point, the vector-field
- * overlay) and what is drawn over it (highlights, neighbour edges, centroids,
+ * overlay) and what is drawn over it (highlights, neighbor edges, centroids,
  * projectiles, the orbit anchor). The pulse changes only the second.
  *
  * So while highlights animate, the base is drawn into a framebuffer of this
  * module (`base`) instead of the canvas, and kept. Every frame then copies the
- * base, colour and depth, into a second framebuffer (`work`), draws the upper
+ * base, color and depth, into a second framebuffer (`work`), draws the upper
  * layer there, against the base's depth exactly as it would have against the
- * canvas, and copies the colour onto the canvas. A frame that only moves the
+ * canvas, and copies the color onto the canvas. A frame that only moves the
  * pulse skips the base: its cost is the highlighted cells, two copies of the
  * pane and the small upper passes, not the dataset.
  *
  * The output is the frame drawn directly, pixel for pixel: both framebuffers
- * have the default framebuffer's colour format (RGBA8) and its depth format
+ * have the default framebuffer's color format (RGBA8) and its depth format
  * (`DEPTH_BITS` of the drawing buffer), so every pass writes and tests the same
  * bits it would there, and a blit between framebuffers of identical formats is
  * an exact copy. A drawing buffer whose depth format this cannot match (no
@@ -132,7 +132,7 @@ export function createPulseLayerCache(gl, { depthBits }) {
     },
 
     /**
-     * Copy a pane's base (colour and depth) into the work framebuffer and bind
+     * Copy a pane's base (color and depth) into the work framebuffer and bind
      * it for the upper layer.
      */
     beginUpperLayer(x, y, w, h) {

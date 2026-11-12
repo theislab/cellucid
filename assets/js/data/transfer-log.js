@@ -19,6 +19,7 @@
 
 import { formatBytes, formatCountOf } from '../utils/format-units.js';
 import { PLACES, placePath } from '../app/ui/place-names.js';
+import { createListenerSet } from '../utils/listener-set.js';
 
 /**
  * @typedef {Object} TransferEntry
@@ -71,7 +72,7 @@ export class TransferLog {
   constructor({ console: output = globalThis.console } = {}) {
     /** @type {Map<string, TransferEntry>} */
     this._entries = new Map();
-    this._listeners = new Set();
+    this._listeners = createListenerSet('the transfers');
     this._console = output;
   }
 
@@ -260,20 +261,12 @@ export class TransferLog {
    * @returns {() => void} unsubscribe
    */
   subscribe(listener) {
-    this._listeners.add(listener);
-    return () => this._listeners.delete(listener);
+    return this._listeners.add(listener);
   }
 
   _publish() {
     if (this._listeners.size === 0) return;
-    const entries = this.entries();
-    for (const listener of this._listeners) {
-      try {
-        listener(entries);
-      } catch (error) {
-        this._console?.error?.('[cellucid:transfer] A Transfers display failed:', error);
-      }
-    }
+    this._listeners.notify(this.entries());
   }
 }
 

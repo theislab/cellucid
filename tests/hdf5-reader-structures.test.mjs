@@ -644,7 +644,7 @@ test('a gene sample\'s first gene is priced with its chunk-index reads: the pric
   // other before its chunks, and the entries only once the pointers say
   // where they lie: four trips, where pricing chunk runs alone said one (on
   // an 11.4M-cell CELLxGENE atlas, 311 of the first gene's 539 requests were
-  // chunk B-tree nodes, and revisits ran 2-6 % past the 20 s target).
+  // chunk B-tree nodes, and revisits ran 2-6% past the 20 s target).
   const latencyMs = 100;
   const recorder = recordingSource(fixture('default-format.h5'), { latencyMs });
   const file = await openHdf5(recorder.reader(), { load: [''] });
@@ -696,7 +696,7 @@ test('a string column read in pieces loads each piece\'s heap collections as its
   // collections, their references a request each, arriving one after
   // another. With room on the link (a multiplexed one), each piece's
   // collection is asked for as its references arrive: one union after
-  // every piece made the link idle meanwhile (100M cells at a 1 % share
+  // every piece made the link idle meanwhile (100M cells at a 1% share
   // over 20 ms HTTP/2: 87.7 s against 71.8 s). With every request queued
   // (six a host over HTTP/1.1, a host's request budget), what arrives
   // meanwhile is gathered into one plan: a request, not one a piece
@@ -884,7 +884,7 @@ test('reads can be aborted; other reads of the same chunks still complete', asyn
   already.abort();
   await assert.rejects(node.read(undefined, { signal: already.signal }), { name: 'AbortError' });
   const controller = new AbortController();
-  // Cancelled while its first request is in flight.
+  // Canceled while its first request is in flight.
   recorder.onRead = () => {
     recorder.onRead = null;
     controller.abort();
@@ -961,21 +961,9 @@ test('a failed chunk read reaches every read waiting on it, is not kept, and the
   root.close();
 });
 
-test('the decoded-chunk cache keeps owned copies, to its budget, least recently used first', async () => {
-  const { ByteCache } = await import('../assets/js/formats/hdf5/lru.js');
-  assert.throws(() => new ByteCache(-1), TypeError);
-  const cache = new ByteCache(64);
-  cache.set('a', 'A', 16);
-  cache.set('b', 'B', 16);
-  cache.set('c', 'C', 16);
-  assert.equal(cache.get('a'), 'A');
-  cache.set('d', 'D', 32);
-  assert.deepEqual([...cache.entries.keys()], ['c', 'a', 'd']);
-  assert.equal(cache.bytes, 64);
-  assert.equal(cache.set('e', 'E', 65), false, 'an entry larger than the budget is not kept');
-  assert.equal(cache.bytes, 64);
-
-  // A chunk read as part of one larger request is kept as its own bytes, not
+test('the decoded-chunk cache keeps owned copies', async () => {
+  // The cache itself (formats/io/byte-cache.js, shared with Zarr) is tested
+  // in zarr-format-efficiency.test.mjs. A chunk read as part of one larger request is kept as its own bytes, not
   // as a view holding the whole request buffer alive.
   const root = await open(fixture('default-format.h5'));
   const chunked = root.get('chunked/le_f4');
@@ -991,7 +979,7 @@ test('the decoded-chunk cache keeps owned copies, to its budget, least recently 
 });
 
 test('the decode gates serve reads someone waits for before background work, which leaves its reserve free', async () => {
-  const { ByteBudget } = await import('../assets/js/formats/hdf5/lru.js');
+  const { ByteBudget } = await import('../assets/js/formats/hdf5/byte-budget.js');
   const slots = new ByteBudget(4, { waves: false, reserve: 1 });
   const background = [];
   for (let i = 0; i < 6; i++) background.push(slots.acquire(1, true));

@@ -1,8 +1,8 @@
 // Volumetric Cloud Shaders (WebGL2 / GLSL ES 3.0)
 // ================================================
 // A single-scattering ray march through the cells' density volume:
-// - the volume carries density and the active field's display colour
-//   (smoke-density.js), so the cloud is coloured like the points it replaces;
+// - the volume carries density and the active field's display color
+//   (smoke-density.js), so the cloud is colored like the points it replaces;
 // - shadowing and sky occlusion are pre-integrated once per density build
 //   into a coarse lighting volume (LIGHT_VOLUME_FS) and read with one fetch;
 // - a Henyey-Greenstein phase lobe and a multiple-scattering approximation
@@ -43,7 +43,7 @@ in vec2 v_ndc;
 // Uniforms
 // ============================================================================
 
-// Density volume: r = density, gba = display colour premultiplied by density.
+// Density volume: r = density, gba = display color premultiplied by density.
 uniform sampler3D u_densityTex3D;
 uniform float u_gridSize;
 // Lighting volume: r = optical depth to the key light, g = sky occlusion.
@@ -122,7 +122,7 @@ vec3 densityTexCoord(vec3 p01) {
   return clamp(p01, 0.0, 1.0) * g_densityTexMap.x + g_densityTexMap.y;
 }
 
-// Density and premultiplied colour at one volume position.
+// Density and premultiplied color at one volume position.
 //
 // textureLod, not texture: every caller runs inside the march loop, which
 // contains break and continue, and GLSL ES 3.00 leaves screen-space derivatives
@@ -170,7 +170,7 @@ float getBlueNoiseJitter(vec2 screenCoord) {
   return fract(noise.r + noise.g * 0.5);
 }
 
-// Shaped density in [0,1] and the field colour, at one march position.
+// Shaped density in [0,1] and the field color, at one march position.
 // Returns density 0 for empty space.
 vec4 sampleCloud(vec3 worldPos, vec3 p01, float time, float lod, float distanceToCamera) {
   vec4 base = sampleVolume(p01);

@@ -5,7 +5,10 @@
 (`installStateDomains`); the state fingerprint (`fingerprint.js`); the shared
 rules every owner follows: cells by original position (`cell-positions.js`),
 fields by name (`fields.js`), views by position (`view-list.js`), value
-equality (`same-value.js`).
+equality (`same-value.js`). Each per-view owner (`filters`, `visibility`,
+`active-field`, `colors`, `camera`, `views`) gives `readPart`
+(`view-list.js` `viewReadPart`): the entry of the view a step acted in, which
+staleness compares (F156).
 
 **Entry points:** `installStateDomains({state, viewer, sidebar, refreshUi,
 cinematicCamera, figureExport, analysis, getDockable, openCells,
@@ -18,6 +21,7 @@ the owners through the registry (`getStateDomains()` in `app/actions/index.js`).
 | --- | --- | --- |
 | `cells` | `cells.js` | `{open: null or the subsample's specification, genes: null or the cells genes were asked to be read for}` |
 | `mapping` | `mapping.js` | the canonical DataMapping, or null with no dataset |
+| `expression` | `expression.js` | `{normalize, log1p}`: the expression values asked (Data mapping › Expression values); both false by default and in a session without it |
 | `field-overlays` | `field-overlays.js` | `{renamedFields, renamedCategories, deletedFields, userFields}`; user fields' codes and values as columns by original position |
 | `gene-sets` | `gene-sets.js` | `{sets: [{name, description, genes}]}` (the notebook's sets) |
 | `views` | `views.js` | `{layout, focus, liveHidden, camerasLinked, views: [{embedding, followsDefault, centroids}]}` |
@@ -83,14 +87,14 @@ Each module's header gives its value in full.
 - A kept view's field objects are shallow copies of its source's
   (`managers/view-context-core.js` `_cloneFieldState`) and share the category
   list and its originals, the centroid tables and their records, category
-  colours and visibility, codes and values. None of these is written in
+  colors and visibility, codes and values. None of these is written in
   place: a change makes a new one (a rename, `renameCategory`; a relabel,
   `_syncCentroidCategoryLabels`), so restoring one view's fields never
   changes another's. A user field's copies share its one definition, which
   an edit replaces in the registry and in every copy at once.
 - A value records only what differs from the dataset's opening state where
-  opening fills defaults in lazily (filters, colours): opening a field changes
-  no value. A colour range is measured against the data, never the filter, so
+  opening fills defaults in lazily (filters, colors): opening a field changes
+  no value. A color range is measured against the data, never the filter, so
   each change belongs to one domain.
 - `restore(value)` puts the value back through the state methods the app's own
   controls use (never by dispatching actions), changes only what differs, and
@@ -99,8 +103,8 @@ Each module's header gives its value in full.
   focus is put back (`view-list.js` `inEachView`).
 - A user field whose categories a `field-overlays` restore changes (a view's
   copy, or the registry's template, which a view may show as itself: a
-  category deleted into "unassigned") drops what belonged to the categories it
-  had and carries its colours and hidden categories by label (`adoptDefinition`).
+  category deleted into "Unassigned") drops what belonged to the categories it
+  had and carries its colors and hidden categories by label (`adoptDefinition`).
 - A restore checks the whole value before it changes anything (`field-overlays`
   prepares every changed user field's arrays and checks its codes first;
   `camera` checks every camera), and owners whose state another owner may
@@ -116,11 +120,31 @@ Each module's header gives its value in full.
   `heldCategoriesOf`, said by `app/session/session-serializer.js`).
 - Restores run in domain order: `cells` first (reading other cells makes the
   dataset's state again, so the history captures every domain again after
-  it), then `mapping` (the arrays everything is read against), `views` before
+  it), then `mapping` (the arrays everything is read against), `expression`
+  (the values its genes are shown in, before any view reads one), `views` before
   every per-view domain (the views a value names exist). A per-view value whose view count does not fit the views shown is
   refused, naming both counts.
 - Async restores load what they need first (a field's values or categories, a
   gene once the gene list is read, the analysis code), as choosing it does.
+
+**Records of before.** A value saved by an earlier version must still read:
+the samples' starting views and every older session hold the records of the
+day they were written. A key added to a domain's record is an *added key*
+(`record-keys.js`): written only when it differs from the value its absence
+means, filled with that value when read, so a record that does not use it is
+the record of before, byte for byte (no hash changes, no step); a key a record
+no longer holds is *dropped* (read and left out). Only a missing required key
+or an unknown one is refused. Every domain's records are declared once in
+`records.js` (required, optional, added and dropped keys, and the shape of
+each nested record), and `installStateDomains` reads every value a domain
+restores or describes through its declaration and writes what it captures as
+before (`index.js` `readingRecords`); a record another module owns (the Camera
+Path's own state, R9R-13; the settings, read one control at a time, F181; the
+data mapping; a camera state's parts; the analyses' windows and modes) is that
+module's to read. Test: `tests/state-record-added-keys.test.mjs` (every
+domain reads every sample's published starting view, saved states written by
+0.9.7 and during 0.9.8, and the history goldens; each starting view restores
+its camera path).
 
 **Tests:** `tests/state-domains-contract.test.mjs` (every domain owned, value
 shapes, cells, equality, describe lines, fingerprint), and

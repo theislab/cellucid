@@ -54,6 +54,8 @@ test('a place the page builds itself is headed with its place name', () => {
   assert.match(legend, /filterHeader\.textContent = PLACES\.visibleRange\.name;/);
   const annotation = readFileSync(path.join(ROOT, 'assets/js/app/ui/modules/community-annotation/controls-panel.js'), 'utf8');
   assert.match(annotation, /createPeerDisclosure\(\s*'manage',\s*PLACES\.annotatedColumns\.name,/);
+  const expression = readFileSync(path.join(ROOT, 'assets/js/app/ui/modules/data-mapping/expression-values.js'), 'utf8');
+  assert.match(expression, /title: PLACES\.expressionValues\.name,/);
 });
 
 test('no message names a place in words of its own', () => {

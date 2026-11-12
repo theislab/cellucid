@@ -6,19 +6,19 @@
  *
  * It is a sibling of Cells to open: a slider and a percent box, one status
  * line under them and one action. The slider snaps to steps
- * (`geneReadSteps`): the share read now, then 1, 5, 10, 25, 50 and 100 % of
+ * (`geneReadSteps`): the share read now, then 1, 5, 10, 25, 50 and 100% of
  * the open cells above it, up to the most whose gene index this device
  * keeps. The status line says the chosen step's cells and, before it is
  * read, what reading it costs (bytes and, over a measured link, time:
  * `DataState.geneSampleCost`), priced again while it is shown so the time
  * follows the link as it changes. Read grows the sample to the chosen step
  * (`DataState.readGenesForMoreCells`): the cells already read are kept and
- * only the cells added are read, in doubling steps; 100 % is what was Read
+ * only the cells added are read, in doubling steps; 100% is what was Read
  * for all cells. While it reads, the line counts the cells read and the time
  * left (priced again after each step) and the action is Stop (what is read
  * stays); its notification says the same, with Cancel.
  *
- * It applies to every gene read: the colouring, analyses and exports. What
+ * It applies to every gene read: the coloring, analyses and exports. What
  * shows a gene's sample elsewhere links here (`createGeneReadLink`: the
  * gene's legend, an analysis's result) through `revealGeneReadControl`;
  * nothing else changes it. Read is the action `cells.read-genes` (a step;
@@ -30,12 +30,13 @@
  */
 
 import { createInfoTip } from '../components/controls.js';
-import { GENES_READ_PLACE, geneSampleCostText, geneSampleText, roughRemaining } from '../../../data/gene-read-plan.js';
+import { setControlAvailability } from '../core/control-availability.js';
+import { GENES_READ_PLACE, geneSampleCostText, geneSampleText } from '../../../data/gene-read-plan.js';
 import { getNotificationCenter } from '../../notification-center.js';
-import { countNoun, formatCount, formatCountOf, parseDecimalText } from '../../../utils/format-units.js';
-import { formatCompactCount } from '../components/display-format.js';
+import { countNoun, formatCount, formatCountOf, formatRemaining, formatShare, parseDecimalText, shareText, formatCompactCount } from '../../../utils/format-units.js';
 import { isCancellation, onAbort } from '../../../utils/abort.js';
-import { revealSidebar } from './sidebar-controls.js';
+import { failureDetails, sayFailure } from '../../../utils/errors.js';
+import { revealInSidebar } from './sidebar-controls.js';
 import { expandSessionSection } from './session-sections.js';
 import { getActions } from '../../actions/index.js';
 
@@ -50,23 +51,6 @@ export const GENE_READ_STEPS = Object.freeze([1, 5, 10, 25, 50, 100]);
 const REPRICE_MS = 5000;
 
 const DOM_KEYS = Object.freeze(['root', 'slider', 'percent', 'status', 'actions', 'action']);
-
-/**
- * `cells` of `of` as the percent box writes it: whole above 10, two
- * significant figures below; never 100 short of every cell, never 0 above
- * none.
- *
- * @param {number} cells
- * @param {number} of
- * @returns {string}
- */
-export function geneReadPercentText(cells, of) {
-  if (!(of > 0) || cells >= of) return '100';
-  const percent = (100 * cells) / of;
-  if (percent >= 10) return String(Math.min(99, Math.round(percent)));
-  if (percent <= 0) return '0';
-  return String(Number(percent.toPrecision(2)));
-}
 
 /**
  * The open cells the slider stops at, ascending: the sample read now
@@ -121,7 +105,7 @@ export function nearestGeneReadStep(steps, percent, of) {
 export function geneReadStatus(sample, { chosen, cost = null, noRoom = null, growth = null, left = null }) {
   const of = sample.of;
   if (growth !== null) {
-    const remaining = left === null || !(left.ms > 0) ? '' : ` · ${roughRemaining(left.ms)} left`;
+    const remaining = left === null || !(left.ms > 0) ? '' : ` · ${formatRemaining(left.ms, { compact: true })} left`;
     return {
       text: `Reading ${formatCompactCount(growth.cells)} of ${formatCompactCount(growth.target)} ${countNoun(growth.target, 'cell')}${remaining}`,
       title: `Reading genes for ${formatCountOf(growth.target, 'open cell')}: ${formatCount(growth.cells)} read so far${left === null ? '' : `, ${geneSampleCostText(left)} to go`}. Every gene shown fills in as its cells are read; what is read stays if you stop.`,
@@ -151,9 +135,13 @@ export function geneReadStatus(sample, { chosen, cost = null, noRoom = null, gro
  * @param {number} target
  * @param {string|null} cost - The cost as said before it ran (`geneSampleCostText`)
  * @param {string} [what]
+ * @param {{heavy?: ((estimate: Object) => Promise<void>)|null, signal?: AbortSignal|null}} [options] - An action's `ctx.heavy`:
+ *   asked before the cells' totals of normalized values are summed (declined: nothing is read, said by the refusal);
+ *   `signal`: what stops the action or the move that asked (its Stop), which stops the reading as Stop on its card
+ *   does (what is read stays)
  * @returns {Promise<{ended: 'read'|'stopped'|'failed', error: Error|null}>} How it ended (said already)
  */
-export async function readGenesForMoreCellsSaid(state, target, cost = null, what = 'every open cell') {
+export async function readGenesForMoreCellsSaid(state, target, cost = null, what = 'every open cell', { heavy = null, signal = null } = {}) {
   const notifications = getNotificationCenter();
   const id = notifications.loading(`Reading genes for ${what}${cost === null ? '' : ` (${cost})`}`, {
     category: 'data',
@@ -165,6 +153,8 @@ export async function readGenesForMoreCellsSaid(state, target, cost = null, what
   };
   try {
     await state.readGenesForMoreCells(target, {
+      heavy,
+      signal,
       onStep: (_sample, cells) => {
         if (notifications.hasNotification(id)) {
           notifications.loading(`Reading genes for ${what}: ${formatCount(cells)} of ${formatCountOf(target, 'cell')} read`, { id, category: 'data' });
@@ -178,7 +168,12 @@ export async function readGenesForMoreCellsSaid(state, target, cost = null, what
       notifications.complete(id, `Stopped. ${said()}`);
       return { ended: 'stopped', error: null };
     }
-    notifications.fail(id, `Reading genes for ${what} failed: ${error?.message ?? String(error)}`);
+    // Declined by the person (heavy work asked about): nothing failed; the refusal says why.
+    if (error?.code === 'declined') {
+      notifications.dismiss(id);
+      return { ended: 'failed', error };
+    }
+    notifications.fail(id, `Reading genes for ${what} failed: ${sayFailure(error)}`, failureDetails(error));
     return { ended: 'failed', error: error instanceof Error ? error : new Error(String(error)) };
   }
 }
@@ -195,10 +190,13 @@ export async function readGenesForMoreCellsSaid(state, target, cost = null, what
 export function revealGeneReadControl(ownerDocument = document) {
   const block = ownerDocument.getElementById('gene-read-block');
   if (block === null || block.hidden) return false;
-  revealSidebar(ownerDocument);
-  expandSessionSection(ownerDocument, 'subsampling');
-  block.scrollIntoView({ block: 'center' });
-  ownerDocument.getElementById('gene-read-slider')?.focus({ preventScroll: true });
+  // The sidebar first, then its Subsampling section and the slider's focus
+  // (while hidden it is inert): the one order of `revealInSidebar` (R9K-2).
+  void revealInSidebar(ownerDocument, () => {
+    expandSessionSection(ownerDocument, 'subsampling');
+    block.scrollIntoView({ block: 'center' });
+    ownerDocument.getElementById('gene-read-slider')?.focus({ preventScroll: true });
+  });
   return true;
 }
 
@@ -340,11 +338,12 @@ export function initGeneReadControl({ dom, state, openCellsKey }) {
     const of = sample?.of ?? state.pointCount;
     const shown = sample ?? { cells: growth.cells, of };
     if (growth !== null) {
-      dom.slider.disabled = true;
-      dom.percent.disabled = true;
+      const growing = 'genes are being read for more cells; Stop that first to choose another share';
+      setControlAvailability(dom.slider, growing);
+      setControlAvailability(dom.percent, growing);
       dom.slider.max = '1';
       dom.slider.value = '1';
-      dom.percent.value = geneReadPercentText(growth.target, of);
+      dom.percent.value = shareText(growth.target, of);
       const status = geneReadStatus(shown, { chosen: growth.target, growth, left });
       dom.status.textContent = status.text;
       dom.status.title = status.title;
@@ -354,14 +353,17 @@ export function initGeneReadControl({ dom, state, openCellsKey }) {
       dom.action.disabled = false;
       return;
     }
-    dom.slider.disabled = steps.length < 2;
-    dom.percent.disabled = steps.length < 2;
+    const noOtherShare = steps.length < 2
+      ? 'genes are read for as many cells as can be read now; there is no other share to choose'
+      : null;
+    setControlAvailability(dom.slider, noOtherShare);
+    setControlAvailability(dom.percent, noOtherShare);
     dom.slider.min = '0';
     dom.slider.max = String(Math.max(0, steps.length - 1));
     const index = Math.max(0, steps.indexOf(chosen));
     dom.slider.value = String(index);
-    if (document.activeElement !== dom.percent) dom.percent.value = geneReadPercentText(chosen, of);
-    dom.slider.setAttribute('aria-valuetext', `${geneReadPercentText(chosen, of)} % of the open cells: ${formatCountOf(chosen, 'cell')}`);
+    if (document.activeElement !== dom.percent) dom.percent.value = shareText(chosen, of);
+    dom.slider.setAttribute('aria-valuetext', `${formatShare(chosen, of)} of the open cells: ${formatCountOf(chosen, 'cell')}`);
     const status = geneReadStatus(sample, { chosen, cost, noRoom });
     dom.status.textContent = status.text;
     dom.status.title = status.title;
@@ -485,7 +487,7 @@ export function initGeneReadControl({ dom, state, openCellsKey }) {
       return;
     }
     choose(nearestGeneReadStep(steps, Math.min(100, Math.max(0, typed)), sample.of));
-    dom.percent.value = geneReadPercentText(chosen, sample.of);
+    dom.percent.value = shareText(chosen, sample.of);
   };
   on(dom.percent, 'change', commitPercent);
   on(dom.percent, 'keydown', event => { if (event.key === 'Enter') commitPercent(); });
@@ -495,7 +497,7 @@ export function initGeneReadControl({ dom, state, openCellsKey }) {
    * runs. Stopped, what was read is the step; a failure that read nothing is
    * refused (it was said).
    */
-  async function readGenesAction({ cells }, { signal }) {
+  async function readGenesAction({ cells }, { signal, heavy = null }) {
     const sample = sampleNow();
     if (sample === null) return null;
     // Priced now, at the link as measured now.
@@ -503,16 +505,10 @@ export function initGeneReadControl({ dom, state, openCellsKey }) {
     const fits = priced?.index?.refusal == null ? Infinity : priced.index.fits;
     const target = Math.min(cells, sample.of, fits);
     if (target <= sample.cells || growthNow() !== null) return null;
-    const what = target >= sample.of ? 'every open cell' : `${geneReadPercentText(target, sample.of)} % of the open cells (${formatCountOf(target, 'cell')})`;
+    const what = target >= sample.of ? 'every open cell' : `${formatShare(target, sample.of)} of the open cells (${formatCountOf(target, 'cell')})`;
     const said = priced === null || target !== cells ? null : geneSampleCostText(priced);
     // Stopping the action stops the reading; what is read stays.
-    const remove = onAbort(signal, () => state.stopReadingGenesForMoreCells());
-    let ended;
-    try {
-      ended = await readGenesForMoreCellsSaid(state, target, said, what);
-    } finally {
-      remove();
-    }
+    const ended = await readGenesForMoreCellsSaid(state, target, said, what, { heavy, signal });
     const now = sampleNow();
     const read = now === null ? sample.of : now.cells;
     if (ended.ended === 'failed' && read <= sample.cells) throw ended.error;

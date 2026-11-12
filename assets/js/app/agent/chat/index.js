@@ -4,7 +4,7 @@
  * dataset shown; the agent reads it and acts in it through the same tools
  * and the same history as everything else.
  *
- * - **One system.** The tools are the catalogue's MCP tools
+ * - **One system.** The tools are the catalog's MCP tools
  *   (`bridge/mcp-tools.js`), a call is run as every agent call is
  *   (`bridge/tool-call.js`), the instructions are `instructionsFor('chat')`.
  *   Each message the person sends is one turn (`turn-<id>`): every step the
@@ -37,10 +37,12 @@
  *   person picks the provider, a model from the provider's own list, the
  *   effort the model takes (none: the model's default); a key is kept for
  *   this tab unless Remember is ticked.
- * - **Attach the selection** (`selection.js`): while cells are highlighted,
- *   a chip above the message field ("Selection: 1,234 cells ×") attaches a
- *   reference to them (the page, its groups, the counts) to each message;
- *   × leaves it out until the selection changes.
+ * - **Attach the selection** (`selection.js`): while cells are highlighted
+ *   that the conversation does not know yet (not attached to an earlier
+ *   message, not highlighted when its last turn ended), a chip above the
+ *   message field ("Selection: 1,234 cells ×") attaches a reference to them
+ *   (the page, its groups, the counts) to the next message; × leaves it out
+ *   until the selection changes.
  * - **Clickable choices** (`ask.js`): a question the model asks with
  *   choices shows them as buttons above the message field; a click sends
  *   the choice as the person's message.
@@ -57,9 +59,11 @@
  */
 
 import {
-  appendMessage, closeInterrupted, conversationFrom, createConversation, latestConversation, sentOf, transcriptOf, usageOf,
+  appendMessage, closeInterrupted, conversationFrom, createConversation, latestConversation, sentOf, transcriptOf,
+  unreadConversationNotice, usageOf,
 } from './conversation.js';
 import { runAgentTurn } from './agent-loop.js';
+import { setControlAvailability } from '../../ui/core/control-availability.js';
 import { createKeyStore } from './keys.js';
 import { effortKey, readChatPreferences, writeChatPreferences } from './preferences.js';
 import { createTranscriptView, sentText, tokensText, workingTextOf } from './transcript-view.js';
@@ -68,24 +72,34 @@ import { readSuggestionFacts, suggestionsFor } from './suggestions.js';
 import { ASK_TOOL, pendingQuestion } from './ask.js';
 import { createSelectionSource, sameSelection, selectionLabel, selectionTitle } from './selection.js';
 import { dataScopeNow } from '../data-scope.js';
-import { permissionsForAgent } from '../presence/permissions.js';
+import { chatFoldsForFilm } from '../dock.js';
 import { providersForPage } from '../providers/index.js';
+import { EFFORT_LABELS } from '../providers/contract.js';
 import { instructionsFor } from '../instructions.js';
-import { mcpToolsOf, notRecordedSentences, toolIndexOf } from '../bridge/mcp-tools.js';
+import { mcpToolsOf, toolIndexOf } from '../bridge/mcp-tools.js';
+import { settingsTold } from '../settings-told.js';
 import { historySettings, offDomainsOf } from '../../history/history-settings.js';
-import { noteTurn, registerTurnLink, revealStep, turnSteps, turnsChanged, undoAgentTurn } from '../history-link.js';
+import {
+  historySeen, historySinceSentence, noteTurn, registerTurnLink, revealStep, turnSteps, turnsChanged, undoAgentTurn,
+} from '../history-link.js';
 import { catalogDocument } from '../../actions/catalog.js';
 import { getCurrentHistory, subscribeCurrentHistory } from '../../history/current.js';
-import { createOpaqueId } from '../../utils/opaque-id.js';
-import { downloadBlob } from '../../utils/download.js';
+import { createOpaqueId } from '../../../utils/opaque-id.js';
+import { downloadBlob, fileTimestamp } from '../../utils/download.js';
+import { sayFailure } from '../../../utils/errors.js';
+import { getNotificationCenter } from '../../notification-center.js';
 import { pageVersion } from '../../utils/page-version.js';
-import { copyWithFeedback } from '../../ui/components/app-dialog.js';
+import { ICONS, createIconButton } from '../../ui/components/controls.js';
 import { cancel } from '../../../utils/abort.js';
 import { formatCount } from '../../../utils/format-units.js';
+import { provideShortcut } from '../../ui/onboarding/keyboard-shortcuts.js';
+import { noteSeenAddressesIn } from '../../ui/modules/seen-addresses.js';
+import { copyText } from '../../utils/clipboard.js';
+import { realmHosts } from '../../../formats/io/hosts.js';
 
 const REQUIRED = [
   'dock', 'toggle', 'toggleLabel', 'panel', 'status', 'newButton', 'exportButton', 'settingsButton', 'collapseButton',
-  'settings', 'provider', 'keyRow', 'keyLabel', 'key', 'remember', 'forget', 'keyLink', 'model', 'effortRow', 'effort',
+  'settings', 'provider', 'keyRow', 'keyLabel', 'key', 'remember', 'forget', 'keyLink', 'model', 'effortRow', 'effort', 'cacheRow', 'cache',
   'permissionsSummary', 'permissionsChange', 'instructions', 'budget', 'settingsStatus', 'usage',
   'log', 'form', 'tray', 'input', 'send', 'stop',
 ];
@@ -103,9 +117,11 @@ const MODEL_DEFAULT = '';
  *   history?: {current: () => object|null, subscribe: (listener: () => void) => () => void},
  *   selection?: ReturnType<typeof createSelectionSource>,
  *   dataScope?: {now: () => {summariesOnly: boolean}},
+ *   opensAsSide?: () => boolean,
  *   win?: Window,
  * }} options - `selection`: the person's highlighted cells (`selection.js`); `dataScope`: what
- *   agents may be sent of the dataset shown (`../data-scope.js`)
+ *   agents may be sent of the dataset shown (`../data-scope.js`); `opensAsSide`: whether the
+ *   open chat is the dock's side panel on this window (`../dock.js`), else the bar over the plot
  */
 export function initAgentChat({
   dom, actions, presence,
@@ -114,6 +130,7 @@ export function initAgentChat({
   history = { current: getCurrentHistory, subscribe: subscribeCurrentHistory },
   selection = createSelectionSource(null),
   dataScope = { now: () => dataScopeNow() },
+  opensAsSide = () => true,
   win = globalThis.window,
 }) {
   for (const name of REQUIRED) {
@@ -129,9 +146,8 @@ export function initAgentChat({
   // tools), and the prompt cache holds only while they stay. So no tool says
   // the person's permissions; the model is told them with the message after
   // they change (`contextFor`).
-  // The chat's own question with choices (`ask.js`) after the catalogue's tools.
-  const tools = Object.freeze([...mcpToolsOf(catalogDoc, { withPermissions: false }), ASK_TOOL]);
-  const titles = new Map([...[...toolIndex].map(([name, definition]) => [name, definition.title]), [ASK_TOOL.name, ASK_TOOL.title]]);
+  // The chat's own question with choices (`ask.js`) after the catalog's tools.
+  const tools = Object.freeze([...mcpToolsOf(catalogDoc), ASK_TOOL]);
   const system = instructionsFor('chat');
   const preferences = readChatPreferences();
 
@@ -140,6 +156,7 @@ export function initAgentChat({
   const chosenEfforts = { ...preferences.efforts };
   let personInstructions = preferences.instructions;
   let budget = preferences.budget;
+  let cacheLength = preferences.cache;
   /** providerId → {key, list, error, loading} */
   const modelLists = new Map();
   let conversation = createConversation();
@@ -148,6 +165,11 @@ export function initAgentChat({
   /** The turn running: {turn, controller, status, streaming, detach, asking}. */
   let running = null;
   let open = preferences.open;
+  /** A camera path plays (`setFilmPlaying`), and whether the person opened the chat during it. */
+  let filmPlaying = false;
+  let keptForFilm = false;
+  /** The chat had the focus when it folded for the film: its message field gets it back. */
+  let refocusAfterFilm = false;
   let settingsOpen = false;
   let watched = null;
   let unwatch = () => {};
@@ -157,6 +179,21 @@ export function initAgentChat({
   let suggestionsKey = null;
   /** The selection the person left out (×), until it changes. */
   let leftOut = null;
+  /**
+   * The selection each conversation already knows: the one attached to its
+   * last message, or the one highlighted when its last turn ended (what its
+   * agent highlighted among it). The chip offers, and a message carries, only
+   * another: an unchanged selection was sent again with every message, and an
+   * agent's own highlight came back to it as "the person attached their
+   * selection".
+   */
+  const knownSelections = new WeakMap();
+  /** The turns of a conversation (its person's messages'): its agent's own steps are of these. */
+  const ownTurnsOf = chat => new Set(chat.messages.filter(message => message.role === 'user').map(message => message.turn));
+  /** The tracker the conversation's turns act in, when it is the one shown. */
+  function boundTree() {
+    return bound !== null && bound.history === history.current() && bound.history.active?.id === bound.trackerId ? bound.history.active : null;
+  }
 
   const view = createTranscriptView({
     log: dom.log,
@@ -172,12 +209,14 @@ export function initAgentChat({
       dom.input.focus({ preventScroll: true });
     },
     onRetry: turn => {
+      // Only a turn of this page's own (a received one offers no Try again: `offersRetry`).
+      if (conversation.received.includes(turn)) return;
       const asked = conversation.messages.find(message => message.role === 'user' && message.turn === turn);
       if (asked === undefined || running !== null) return;
       dom.input.value = asked.text;
       void send();
     },
-    onCopy: (text, button) => void copyWithFeedback(button, text),
+    onCopy: (text, button) => void copyText(text, { what: 'the answer', button, category: 'agent' }),
   });
 
   // ----------------------------------------------------- Above the field
@@ -195,10 +234,8 @@ export function initAgentChat({
     chip.hidden = true;
     const chipText = doc.createElement('span');
     chipText.className = 'agent-chat-chip-text';
-    const remove = doc.createElement('button');
-    remove.type = 'button';
-    remove.className = 'icon-btn agent-chat-chip-remove';
-    remove.textContent = '×';
+    // Named with the selection it leaves out once one is attached (`renderTray`).
+    const remove = createIconButton({ label: 'Leave out the selection', icon: ICONS.close, className: 'agent-chat-chip-remove' });
     remove.addEventListener('click', () => {
       leftOut = selection.current();
       renderTray();
@@ -215,7 +252,8 @@ export function initAgentChat({
   /** The selection attached to the next message, or null (none, or left out). */
   function attachedSelection() {
     const now = selection.current();
-    return now === null || sameSelection(now, leftOut) ? null : now;
+    if (now === null || sameSelection(now, leftOut)) return null;
+    return sameSelection(now, knownSelections.get(conversation) ?? null) ? null : now;
   }
 
   function renderTray() {
@@ -328,20 +366,20 @@ export function initAgentChat({
     const label = `Ask ${chosen.agent}`;
     if (dom.toggleLabel.textContent !== label) dom.toggleLabel.textContent = label;
     dom.toggle.dataset.busy = String(running !== null);
-    dom.toggle.setAttribute('aria-expanded', String(open));
-    dom.dock.dataset.chatOpen = String(open);
+    dom.toggle.setAttribute('aria-expanded', String(shownOpen()));
+    dom.dock.dataset.chatOpen = String(shownOpen());
     if (!ready(chosen)) {
       // Short enough for a phone's header; the settings (open by themselves) name the provider and its key.
       setStatus('Add an API key to start.', 'info');
     } else if (running !== null && running.status !== null) {
       setStatus(workingTextOf(running.status), running.status.phase === 'waiting' ? 'warning' : 'info');
-    } else if (win?.navigator?.onLine === false) {
+    } else if (!realmHosts.online()) {
       setStatus('This browser is offline; a message waits until it is back.', 'warning');
     } else {
       const model = chosenModel(chosen);
       const effort = chosenEffort(chosen, model);
       const name = model.label.startsWith(chosen.agent) ? model.label : `${chosen.agent} · ${model.label}`;
-      setStatus(effort === null ? name : `${name} · ${effort} effort`);
+      setStatus(effort === null ? name : `${name} · ${EFFORT_LABELS[effort].toLowerCase()} effort`);
     }
     dom.send.hidden = running !== null;
     dom.stop.hidden = running === null;
@@ -355,7 +393,8 @@ export function initAgentChat({
       dom.provider.replaceChildren(...providers.map(candidate => new Option(candidate.label, candidate.id)));
     }
     dom.provider.value = chosen.id;
-    dom.provider.disabled = running !== null;
+    const turnRunning = running === null ? null : 'a turn is running; stop it or wait for it to end to change this';
+    setControlAvailability(dom.provider, turnRunning);
     dom.keyRow.hidden = !chosen.needsKey;
     const kept = chosen.needsKey ? keys.get(chosen.id) : null;
     if (chosen.needsKey) {
@@ -363,7 +402,7 @@ export function initAgentChat({
       dom.key.placeholder = kept === null ? chosen.keyPlaceholder : 'Kept · type a new key to replace it';
       dom.keyLink.href = chosen.keyUrl;
       dom.remember.checked = kept?.remembered === true;
-      dom.remember.disabled = kept === null;
+      setControlAvailability(dom.remember, kept === null ? 'no key is kept yet; enter one first' : null);
       dom.forget.disabled = kept === null;
     }
     const entry = modelEntry(chosen);
@@ -371,14 +410,18 @@ export function initAgentChat({
     const listed = entry.list ?? [current];
     dom.model.replaceChildren(...listed.map(model => new Option(model.label === model.id ? model.id : `${model.label} (${model.id})`, model.id)));
     dom.model.value = current.id;
-    dom.model.disabled = running !== null || !ready(chosen);
+    setControlAvailability(dom.model, turnRunning ?? (ready(chosen) ? null : `enter your ${chosen.keyLabel} first to list its models`));
     const efforts = current.efforts ?? [];
     dom.effortRow.hidden = efforts.length === 0;
-    dom.effort.replaceChildren(new Option('Model\'s default', MODEL_DEFAULT), ...efforts.map(effort => new Option(effort[0].toUpperCase() + effort.slice(1), effort)));
+    dom.effort.replaceChildren(new Option('Model\'s default', MODEL_DEFAULT), ...efforts.map(effort => new Option(EFFORT_LABELS[effort], effort)));
     dom.effort.value = chosenEffort(chosen, current) ?? MODEL_DEFAULT;
-    dom.effort.disabled = running !== null;
+    setControlAvailability(dom.effort, turnRunning);
     if (doc.activeElement !== dom.instructions) dom.instructions.value = personInstructions;
     if (doc.activeElement !== dom.budget) dom.budget.value = budget === null ? '' : String(budget);
+    // Only a provider that offers a choice of cache length shows it (Claude's; OpenAI caches by itself).
+    dom.cacheRow.hidden = !(chosen.cacheLengths?.length > 1);
+    dom.cache.value = cacheLength;
+    setControlAvailability(dom.cache, turnRunning);
     let text;
     let tone = 'muted';
     if (chosen.needsKey && kept === null) {
@@ -434,8 +477,8 @@ export function initAgentChat({
       status: running?.status ?? null,
       running: running?.turn ?? null,
       turnSteps: stepsByTurn(),
-      titles,
-      sentOf: turn => sentText(sentOf(conversation, turn), providerLabelOfTurn(turn)),
+      toolIndex,
+      sentOf: turn => sentText(sentOf(conversation, turn), providerLabelOfTurn(turn), { received: conversation.received.includes(turn) }),
       usageOf: turn => tokensText(usageOf(conversation, turn)),
       suggestions,
     });
@@ -447,12 +490,40 @@ export function initAgentChat({
     return providers.find(candidate => candidate.id === id)?.label.replace(/^.*\((.+)\)$/, '$1') ?? id;
   }
 
+  /**
+   * Whether the open chat is folded to its button for a playing camera path
+   * (`chatFoldsForFilm`): the person's choice to keep it open is untouched,
+   * and it comes back when the path stops.
+   */
+  function foldedForFilm() {
+    return open && chatFoldsForFilm({
+      playing: filmPlaying,
+      sidePanel: opensAsSide(),
+      drafting: dom.input.value.trim() !== '',
+      asking: running === null && pendingQuestion(conversation) !== null,
+      kept: keptForFilm,
+    });
+  }
+
+  /** Whether the chat is shown open: open, and not folded for a film. */
+  function shownOpen() {
+    return open && !foldedForFilm();
+  }
+
   function render() {
     if (destroyed) return;
     stepsCache = null;
+    const folding = foldedForFilm();
+    if (folding && dom.panel.contains(doc.activeElement)) refocusAfterFilm = true;
     renderHeader();
     renderSettings();
-    dom.panel.hidden = !open;
+    dom.panel.hidden = !open || folding;
+    if (!folding && refocusAfterFilm) {
+      refocusAfterFilm = false;
+      // Back to the message field, unless the person has put the focus elsewhere since.
+      const idle = doc.activeElement === null || doc.activeElement === doc.body;
+      if (open && idle) dom.input.focus({ preventScroll: true });
+    }
     dom.settings.hidden = !settingsOpen;
     dom.settingsButton.setAttribute('aria-expanded', String(settingsOpen));
     renderLog();
@@ -466,6 +537,12 @@ export function initAgentChat({
     const key = tree === null ? null : `${watched.dataset?.id ?? ''}:${tree.id}`;
     if (key === suggestionsKey) return;
     suggestionsKey = key;
+    // No dataset's history: no dataset is open.
+    if (watched === null) {
+      suggestions = suggestionsFor({ dataset: false });
+      renderLog();
+      return;
+    }
     const steps = tree === null ? 0 : tree.steps.size - 1;
     void readSuggestionFacts(actions, steps).then(facts => {
       if (destroyed || suggestionsKey !== key) return;
@@ -475,6 +552,8 @@ export function initAgentChat({
   }
 
   function setOpen(next, { focus = true } = {}) {
+    // Opened by the person while a path plays: it stays open for this play.
+    if (next && filmPlaying) keptForFilm = true;
     open = next;
     writeChatPreferences({ open });
     render();
@@ -502,9 +581,8 @@ export function initAgentChat({
   function exportChat() {
     if (conversation.messages.length === 0) return;
     const version = pageVersion(doc);
-    const text = conversationMarkdown(conversation, { dataset: watched?.dataset?.name ?? null, version });
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    downloadBlob(new Blob([text], { type: 'text/markdown' }), `cellucid-chat-${stamp}.md`);
+    const text = conversationMarkdown(conversation, { dataset: watched?.dataset?.name ?? null, version, toolIndex });
+    downloadBlob(new Blob([text], { type: 'text/markdown' }), `cellucid-chat-${fileTimestamp()}.md`);
   }
 
   // ---------------------------------------------------------------- Saving
@@ -541,11 +619,14 @@ export function initAgentChat({
     if (!loaded && bound !== null && bound.history === watched && bound.trackerId === tree.id) return;
     const previous = bound;
     bound = { history: watched, trackerId: tree.id };
-    if (running !== null && !loaded && running.openedDataset) {
-      // The agent of this turn opened another dataset: the chat belongs to
-      // the tab, so the turn goes on where the agent now acts, and the
-      // conversation is kept with that dataset's history too (the one it
-      // left keeps it up to here).
+    if (running !== null && (loaded ? running.datasetActions > 0 : running.openedDataset || running.historyActions > 0)) {
+      // The agent of this turn opened another dataset, or one of its history
+      // actions shows another tracker (verifying a branch replays it on a
+      // tracker of its own and comes back; starting, using or replaying one
+      // shows that one), or a saved state was loaded by its own opening of
+      // one (`history.saved.open`, under way): the chat belongs to the tab,
+      // so the turn goes on where the agent now acts, and the conversation
+      // is kept with that tracker too (the one it left keeps it up to here).
       running.home = bound;
       save();
       render();
@@ -556,7 +637,14 @@ export function initAgentChat({
     if (running !== null) {
       stopTurn(loaded ? 'A saved state was loaded, so the turn stopped.' : 'Another dataset or tracker was shown, so the turn stopped.');
     }
-    const saved = latestConversation(watched.chatsOf(tree.id));
+    const keptChats = watched.chatsOf(tree.id);
+    const saved = latestConversation(keptChats);
+    // A kept conversation this version cannot show is said, never dropped silently (F155).
+    const tellUnread = (error = undefined) => {
+      const notice = unreadConversationNotice(keptChats, error);
+      if (notice !== null) getNotificationCenter().warning(notice.message, { category: 'session', details: notice.details });
+    };
+    if (saved === null) tellUnread();
     if (saved !== null) {
       try {
         const kept = conversationFrom(saved);
@@ -569,6 +657,7 @@ export function initAgentChat({
         return;
       } catch (error) {
         console.error('[agent chat] a saved conversation could not be shown', error);
+        tellUnread(error);
       }
     }
     // A conversation begun with nothing to keep it with goes on here.
@@ -577,7 +666,11 @@ export function initAgentChat({
       render();
       return;
     }
-    show(createConversation());
+    // The agent's last turn was in the conversation left behind: the first message of this new
+    // one says which history is shown now and what is in effect there (F270).
+    const fresh = createConversation();
+    fresh.seen = conversation.seen;
+    show(fresh);
   }
 
   function watchHistory() {
@@ -607,12 +700,6 @@ export function initAgentChat({
   }
 
   /** The dataset's switch as the model is told it. */
-  function dataScopeSentence() {
-    return dataScope.now().summariesOnly
-      ? 'This dataset is set to names and summaries only: reads of single cells\' values and pictures of the plot are refused; work from names, counts and summaries.'
-      : 'Reads of this dataset are not limited (values of cells and pictures of the plot included).';
-  }
-
   /**
    * What Cellucid tells the model with this message: the person's
    * permissions, the dataset's switch, what their History settings leave
@@ -620,8 +707,9 @@ export function initAgentChat({
    * changed since the last message that told them (the model plans by them).
    */
   function contextFor() {
-    const told = [`Permissions: ${permissionsForAgent(presence.permissions.get())}`, dataScopeSentence(),
-      ...notRecordedSentences(offDomainsOf(historySettings()))];
+    const told = [settingsTold({
+      permissions: presence.permissions.get(), summariesOnly: dataScope.now().summariesOnly, offDomains: offDomainsOf(historySettings()),
+    })];
     const own = personInstructions.trim();
     if (own !== '') told.push(`The person's own instructions for agents: ${own}`);
     const now = told.join(' ');
@@ -648,12 +736,23 @@ export function initAgentChat({
     if (given === null) {
       dom.input.value = '';
       resizeInput();
+      // What the person typed (not a choice the agent offered): the addresses in it are
+      // ones they have seen, which the agent may open without asking (F121).
+      noteSeenAddressesIn(text);
     }
     const context = contextFor();
+    // What the person did since the agent's last turn (`conversation.seen`, kept with the conversation:
+    // its turn undone, their steps, another history shown), bug hunts L3-15, F270.
+    const since = historySinceSentence(boundTree(), conversation.seen, ownTurnsOf(conversation), { conversation: conversation.id });
+    // Where the tracker stood as the turn began: a step someone else takes while it runs is told next time (L18-4).
+    const startTree = boundTree();
+    const turnStart = startTree === null ? null : { tracker: startTree.id, next: startTree.nextStep ?? 0 };
     const attached = attachedSelection();
+    if (attached !== null) knownSelections.set(conversation, attached);
     appendMessage(conversation, {
       role: 'user', text, turn, at: Date.now(),
       ...(context === null ? {} : { context }),
+      ...(since === null ? {} : { since }),
       ...(attached === null ? {} : { attached: { selection: attached } }),
     });
     if (bound === null && watched?.active) bound = { history: watched, trackerId: watched.active.id };
@@ -663,8 +762,9 @@ export function initAgentChat({
     const turnConversation = conversation;
     running = {
       turn, controller: turnController, status: { phase: 'thinking' }, streaming: null, detach: () => {}, before: null,
-      // Where the turn's conversation is kept, and whether its agent opened another dataset.
-      conversation, home: bound, openedDataset: false, provider: chosen.id,
+      // Where the turn's conversation is kept, whether its agent opened another dataset,
+      // and how many of its history actions run now (each may show another tracker).
+      conversation, home: bound, openedDataset: false, datasetActions: 0, historyActions: 0, provider: chosen.id,
     };
     running.detach = presence.attach({
       agent: chosen.agent,
@@ -683,7 +783,7 @@ export function initAgentChat({
       const model = chosenModel(chosen);
       const effort = chosenEffort(chosen, model);
       result = await runAgentTurn({
-        conversation, provider: chosen, key: keyOf(chosen), model, effort, budget, system, tools, toolIndex, actions, turn,
+        conversation, provider: chosen, key: keyOf(chosen), model, effort, cacheLength, budget, system, tools, toolIndex, actions, turn,
         signal: turnController.signal, lastUsage, win,
         onChange: change => {
           if (running?.turn !== turn) return;
@@ -704,6 +804,20 @@ export function initAgentChat({
       const ended = running;
       running = null;
       ended?.detach();
+      // What is highlighted as the turn ends is known to its conversation (its agent may have made it).
+      knownSelections.set(turnConversation, selection.current());
+      // The history as the turn ends (others' steps taken while it ran left out, L18-4), kept with the
+      // conversation (a reload, a save or a share keeps it): the next message says what changed since.
+      if (turnConversation === conversation) {
+        const endTree = boundTree();
+        if (endTree !== null) {
+          turnConversation.seen = historySeen(endTree, {
+            from: turnStart !== null && turnStart.tracker === endTree.id ? turnStart.next : null,
+            ownTurns: ownTurnsOf(turnConversation),
+            conversation: turnConversation.id,
+          });
+        }
+      }
       if (ended !== null) saveConversation(ended.home, ended.conversation);
       tickCountdown();
     }
@@ -746,7 +860,7 @@ export function initAgentChat({
       // Others acted after it began: the person chooses only its steps or everything since (`history-link.js`).
       await undoAgentTurn(current, turn);
     } catch (error) {
-      appendMessage(conversation, { role: 'note', turn: null, kind: 'error', text: `Undoing the turn failed: ${error?.message ?? String(error)}` });
+      appendMessage(conversation, { role: 'note', turn: null, kind: 'error', text: `Undoing the turn failed: ${sayFailure(error)}` });
     }
     renderLog();
   }
@@ -775,13 +889,14 @@ export function initAgentChat({
     },
     reveal(turn) {
       if (!conversation.messages.some(message => message.role === 'user' && message.turn === turn)) return false;
-      if (!open) setOpen(true, { focus: false });
+      if (!shownOpen()) setOpen(true, { focus: false });
       requestAnimationFrame(() => view.reveal(turn));
       return true;
     },
   });
 
-  dom.toggle.addEventListener('click', () => setOpen(!open), { signal });
+  // The button of a chat folded for a film opens it again for the rest of the play.
+  dom.toggle.addEventListener('click', () => setOpen(!shownOpen()), { signal });
   dom.collapseButton.addEventListener('click', () => setOpen(false), { signal });
   dom.newButton.addEventListener('click', newChat, { signal });
   dom.exportButton.addEventListener('click', exportChat, { signal });
@@ -847,11 +962,18 @@ export function initAgentChat({
   const unsubscribePermissions = presence.permissions.subscribe(() => renderSettings());
   // The person is asked about a call of this chat's turn (`asking`, then
   // `answered`, from the dispatcher): the chat says it waits for them.
-  // An action of this turn that opens another dataset: the turn goes on there (`followTracker`).
+  // An action of this turn that opens another dataset, or a history action
+  // of it while it runs: the turn goes on where it shows (`followTracker`).
   const unsubscribeAsking = actions.subscribe(event => {
     if (running === null || event.meta?.turn !== running.turn || event.meta.connection?.kind !== 'chat') return;
-    if (actions.catalog.get(event.type).effect === 'dataset' && (event.kind === 'start' || event.kind === 'failed')) {
-      running.openedDataset = event.kind === 'start';
+    const effect = actions.catalog.get(event.type).effect;
+    if (effect === 'dataset' && (event.kind === 'start' || event.kind === 'done' || event.kind === 'failed')) {
+      if (event.kind !== 'done') running.openedDataset = event.kind === 'start';
+      running.datasetActions = Math.max(0, running.datasetActions + (event.kind === 'start' ? 1 : -1));
+      return;
+    }
+    if (effect === 'history' && (event.kind === 'start' || event.kind === 'done' || event.kind === 'failed')) {
+      running.historyActions = Math.max(0, running.historyActions + (event.kind === 'start' ? 1 : -1));
       return;
     }
     if (event.kind !== 'asking' && event.kind !== 'answered') return;
@@ -868,6 +990,11 @@ export function initAgentChat({
   dom.instructions.addEventListener('change', () => {
     personInstructions = dom.instructions.value.trim();
     writeChatPreferences({ instructions: personInstructions });
+  }, { signal });
+  dom.cache.addEventListener('change', () => {
+    cacheLength = dom.cache.value;
+    writeChatPreferences({ cache: cacheLength });
+    renderSettings();
   }, { signal });
   dom.budget.addEventListener('change', () => {
     const value = Number(dom.budget.value);
@@ -887,15 +1014,13 @@ export function initAgentChat({
   }, { signal });
   dom.input.addEventListener('input', resizeInput, { signal });
   dom.stop.addEventListener('click', () => stopTurn(), { signal });
-  // `/` anywhere but a field opens the chat at its message field.
-  doc.addEventListener('keydown', event => {
-    if (event.key !== '/' || event.ctrlKey || event.metaKey || event.altKey || event.defaultPrevented) return;
-    const target = event.target;
-    if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input, textarea, select, dialog[open]'))) return;
-    event.preventDefault();
-    if (!open) setOpen(true);
+  // `/` (`shortcut-table.js`) opens the chat at its message field.
+  const withdrawChatKey = provideShortcut('chat.open', () => {
+    if (!shownOpen()) setOpen(true);
     else dom.input.focus({ preventScroll: true });
-  }, { signal });
+  });
+  // A window turned wide or narrow during a film: the chat folds as the bar only.
+  win?.addEventListener?.('resize', () => { if (filmPlaying) render(); }, { signal });
   win?.addEventListener?.('online', () => renderHeader(), { signal });
   win?.addEventListener?.('offline', () => renderHeader(), { signal });
 
@@ -922,6 +1047,19 @@ export function initAgentChat({
     /** Open or collapse the chat. */
     setOpen: next => setOpen(next, { focus: false }),
     get open() { return open; },
+    /**
+     * A camera path started or stopped playing: while it plays, the open chat
+     * as the bar over the plot folds to its button (`chatFoldsForFilm`).
+     */
+    setFilmPlaying(playing) {
+      if (typeof playing !== 'boolean') throw new TypeError('setFilmPlaying takes whether a camera path plays.');
+      if (playing === filmPlaying) return;
+      filmPlaying = playing;
+      if (!playing) keptForFilm = false;
+      render();
+    },
+    /** Whether the open chat is folded for a playing camera path. */
+    get foldedForFilm() { return foldedForFilm(); },
     /** Whether a turn runs now. */
     get busy() { return running !== null; },
     /** The conversation shown (tests). */
@@ -940,6 +1078,7 @@ export function initAgentChat({
       if (selectionFrame !== null) cancelAnimationFrame(selectionFrame);
       unsubscribeCurrent();
       unwatch();
+      withdrawChatKey();
       controller.abort();
       view.destroy();
     },

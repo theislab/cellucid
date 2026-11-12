@@ -70,7 +70,7 @@ test('a recorded source is validated as untrusted input', () => {
 test('a recorded source is named the way the person loading the session knows it', () => {
   assert.equal(
     describeDatasetSourceRecord({ kind: 'sample', dataset: 'suo' }),
-    'the sample dataset "suo"',
+    'the samples',
   );
   assert.equal(
     describeDatasetSourceRecord({ kind: 'link', locator: 'hf:a/b', dataset: 'x' }),
@@ -123,7 +123,7 @@ async function loadSession({ recorded, openIdentity, opens = true }) {
         downloadSession() {},
         async readSessionDataset(blob) {
           assert.equal(blob, file);
-          return { datasetId: 'suo-identity', source: recorded, cells: null };
+          return { datasetId: 'suo-identity', name: 'Developing human immune system (Suo)', source: recorded, cells: null };
         },
         async loadSessionFromFile({ beforeRestore }) {
           const proceed = await beforeRestore(file);
@@ -145,7 +145,8 @@ test('loading a session opens the dataset it records before applying it', async 
   assert.deepEqual(
     await loadSession({ recorded, openIdentity: null }),
     [
-      ['notice', 'the session\'s dataset from the sample dataset "suo"'],
+      // Named as the Dataset box names it, never by its id (found 2026-11-10: "from the sample dataset "suo"").
+      ['notice', 'the session\'s dataset "Developing human immune system (Suo)" from the samples'],
       ['open', recorded],
       ['restore', true],
     ],
@@ -341,5 +342,57 @@ test('a newer session file retires the Reopen offer of the last one, and that of
   } finally {
     notifications.show = show;
     notifications.dismiss = dismiss;
+  }
+});
+
+test('opening a saved state says whether it opened and, when not, why, to whoever asked (F114)', async () => {
+  const notifications = getNotificationCenter();
+  const { show, error } = notifications;
+  const offers = [];
+  const errors = [];
+  notifications.show = options => { offers.push(options); return 'offer'; };
+  notifications.error = message => { errors.push(message); return 'error'; };
+  const header = source => ({ datasetFingerprint: { datasetId: 'h5ad_cells_1a2b3c4d', name: 'cells.h5ad', cellCount: 4 }, source });
+  const controlsWith = ({ source, openIdentity, kept = null, load = async () => {} }) => initSessionControls({
+    dom: {},
+    datasetChanges: { recordAction: () => 1, settled: true, whenSettled: async () => {} },
+    currentDatasetIdentityId: () => openIdentity,
+    localFiles: { kept: async () => kept, reopen: async () => false },
+    currentCellIdentity: () => null,
+    reopenDataset: async () => ({ shown: true, inPlace: true }),
+    openDatasetSource: async () => true,
+    sessionSerializer: null,
+    savedStates: { read: async () => ({ header: header(source) }), load },
+  });
+  try {
+    // Its dataset shown: its history loads.
+    let loaded = 0;
+    let controls = controlsWith({ source: null, openIdentity: 'h5ad_cells_1a2b3c4d', load: async () => { loaded++; } });
+    assert.deepEqual(await controls.openSavedState('state-1'), { opened: true, problem: null, code: null, notRestored: null });
+    assert.equal(loaded, 1);
+    await controls.destroy();
+    // A file of this computer the browser lets only the person read again:
+    // the page offers Reopen, and the asker is told so.
+    controls = controlsWith({
+      source: { kind: 'file', name: 'cells.h5ad', dataset: 'h5ad_cells_1a2b3c4d' }, openIdentity: 'suo',
+      kept: { name: 'cells.h5ad', kind: 'file', granted: false },
+    });
+    assert.deepEqual(await controls.openSavedState('state-1'), {
+      opened: false, code: 'needs-person',
+      problem: 'It was saved on "cells.h5ad", opened from this computer, which the browser lets only the person read again: the page now offers them "Reopen cells.h5ad", after which it opens.',
+    });
+    assert.equal(offers.at(-1).action.label, 'Reopen cells.h5ad');
+    await controls.destroy();
+    // A load that fails is said on the page and to the asker, in the same words.
+    controls = controlsWith({ source: null, openIdentity: 'h5ad_cells_1a2b3c4d', load: async () => { throw new Error('The saved state names a field this dataset lacks: "leiden".'); } });
+    const outcome = await controls.openSavedState('state-1');
+    assert.equal(outcome.opened, false);
+    assert.equal(outcome.code, 'failed');
+    assert.match(outcome.problem, /names a field this dataset lacks: "leiden"/);
+    assert.match(errors.at(-1), /names a field this dataset lacks: "leiden"/);
+    await controls.destroy();
+  } finally {
+    notifications.show = show;
+    notifications.error = error;
   }
 });

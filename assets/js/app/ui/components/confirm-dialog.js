@@ -1,47 +1,16 @@
 /**
- * Confirm dialog (lightweight modal) for destructive actions.
- *
- * The dialog is intentionally dependency-free and uses existing CSS tokens.
+ * The app's one confirmation dialog (a destructive action, a name to type, a
+ * choice of two): a native `<dialog>` opened through `wireAppDialog`
+ * (`app-dialog.js`), which owns the backdrop, Escape, the inert page, the
+ * stacking over any dialog already open and the return of focus.
  */
 
 import { escapeHtml } from '../utils.js';
-import { claimModalDocumentLayer } from './modal-background-owner.js';
+import { wireAppDialog } from './app-dialog.js';
 import { createDomId } from './dom-id.js';
-import { formatCountOf } from '../../../utils/format-units.js';
 
-let activeKeydownHandler = null;
-let activeDialogCancel = null;
-
-function releaseExactModalDocumentLayer(release) {
-  if (typeof release !== 'function') {
-    throw new TypeError(
-      'Confirm dialog document-layer release owner must be a function'
-    );
-  }
-  try {
-    if (release() !== true) {
-      throw new Error(
-        'Confirm dialog lost its exact document-layer owner'
-      );
-    }
-    return true;
-  } catch (primaryError) {
-    try {
-      if (release() !== true) {
-        throw new Error(
-          'Confirm dialog document-layer retry lost ownership'
-        );
-      }
-      return true;
-    } catch (retryError) {
-      throw new AggregateError(
-        [primaryError, retryError],
-        'Confirm dialog document-layer release failed twice'
-      );
-    }
-  }
-}
-
+/** The open question's cancel: a new question replaces it. */
+let activeCancel = null;
 
 /**
  * Ask the user to confirm an action.
@@ -88,24 +57,13 @@ export function showConfirmDialog({
   if (alternativeText !== null && typeof onAlternative !== 'function') {
     throw new TypeError('A confirm dialog with an alternative needs onAlternative');
   }
-  if (activeDialogCancel !== null) {
-    activeDialogCancel();
-  } else if (activeKeydownHandler) {
-    document.removeEventListener('keydown', activeKeydownHandler, true);
-    activeKeydownHandler = null;
-  }
+  activeCancel?.();
 
-  const existing = document.querySelector('.confirm-dialog-overlay');
-  if (existing) existing.remove();
-
-  const overlay = document.createElement('div');
-  overlay.className = 'confirm-dialog-overlay';
-  overlay.setAttribute('role', 'dialog');
-  overlay.setAttribute('aria-modal', 'true');
-  const prevFocus = document.activeElement;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'app-dialog confirm-dialog';
   const titleId = createDomId('confirm-dialog-title');
   const inputId = createDomId('confirm-dialog-input');
-  overlay.setAttribute('aria-labelledby', titleId);
+  dialog.setAttribute('aria-labelledby', titleId);
 
   const wantsInput = Boolean(inputLabel || inputPlaceholder);
   const lengthLimit = inputMaxLength === null ? '' : `maxlength="${escapeHtml(String(inputMaxLength))}"`;
@@ -137,171 +95,51 @@ export function showConfirmDialog({
     `
     : '';
 
-  overlay.innerHTML = `
-    <div class="confirm-dialog" role="document">
-      <div class="confirm-dialog-header">
-        <span class="confirm-dialog-title" id="${escapeHtml(titleId)}">${escapeHtml(title || 'Confirm')}</span>
-      </div>
-      <div class="confirm-dialog-body">
-        <p class="confirm-dialog-message"></p>
-        <ul class="confirm-dialog-list" hidden></ul>
-        ${inputBlock}
-        <p class="confirm-dialog-problem status-line" data-tone="danger" role="alert" hidden></p>
-        ${option === null ? '' : `<label class="checkbox-inline confirm-dialog-option"><input type="checkbox" ${option.checked ? 'checked' : ''} /> ${escapeHtml(option.label)}</label>`}
-      </div>
-      <div class="confirm-dialog-actions">
-        <button type="button" class="btn confirm-dialog-cancel">Cancel</button>
-        ${alternativeText === null ? '' : `<button type="button" class="btn confirm-dialog-alternative">${escapeHtml(alternativeText)}</button>`}
-        <button type="button" class="btn ${tone === 'danger' ? 'btn-danger' : 'btn-primary'} confirm-dialog-confirm">${escapeHtml(confirmText)}</button>
-      </div>
+  dialog.innerHTML = `
+    <div class="confirm-dialog-header">
+      <span class="confirm-dialog-title" id="${escapeHtml(titleId)}">${escapeHtml(title || 'Confirm')}</span>
+    </div>
+    <div class="confirm-dialog-body">
+      <p class="confirm-dialog-message"></p>
+      <ul class="confirm-dialog-list" hidden></ul>
+      ${inputBlock}
+      <p class="confirm-dialog-problem status-line" data-tone="danger" role="alert" hidden></p>
+      ${option === null ? '' : `<label class="checkbox-inline confirm-dialog-option"><input type="checkbox" ${option.checked ? 'checked' : ''} /> ${escapeHtml(option.label)}</label>`}
+    </div>
+    <div class="confirm-dialog-actions">
+      <button type="button" class="btn confirm-dialog-cancel">Cancel</button>
+      ${alternativeText === null ? '' : `<button type="button" class="btn confirm-dialog-alternative">${escapeHtml(alternativeText)}</button>`}
+      <button type="button" class="btn ${tone === 'danger' ? 'btn-danger' : 'btn-primary'} confirm-dialog-confirm">${escapeHtml(confirmText)}</button>
     </div>
   `;
 
-  let closed = false;
-  let releaseModalLayer = null;
-  const releaseDocumentOwnership = () => {
-    if (releaseModalLayer === null) return;
-    const exactRelease = releaseModalLayer;
-    releaseExactModalDocumentLayer(exactRelease);
-    if (releaseModalLayer === exactRelease) {
-      releaseModalLayer = null;
+  // How the question was answered; null until a button answers it, so a
+  // close by Escape, the backdrop or a newer question is a cancel.
+  let answered = false;
+  const owner = wireAppDialog(dialog, {
+    onClose: () => {
+      dialog.remove();
+      if (activeCancel === cancel) activeCancel = null;
+      if (!answered) onCancel?.();
     }
-  };
-  const listFocusable = () => {
-    const root = overlay.querySelector('.confirm-dialog');
-    if (!root) return [];
-    const selectors = [
-      'a[href]',
-      'area[href]',
-      'button:not([disabled])',
-      'input:not([disabled]):not([type="hidden"])',
-      'select:not([disabled])',
-      'textarea:not([disabled])',
-      '[contenteditable="true"]',
-      '[tabindex]:not([tabindex="-1"])'
-    ].join(',');
-    return Array.from(root.querySelectorAll(selectors)).filter((node) => {
-      if (!(node instanceof HTMLElement)) return false;
-      try {
-        const style = window.getComputedStyle?.(node);
-        if (style?.display === 'none' || style?.visibility === 'hidden') return false;
-        return node.getClientRects().length > 0;
-      } catch {
-        return true;
-      }
-    });
+  });
+  const cancel = () => owner.close();
+  /** Close, then hand the answer on (focus is back by then). */
+  const answer = (then) => {
+    answered = true;
+    owner.close();
+    then();
   };
 
-  const onTrapKeyDown = (e) => {
-    if (e.key === 'Escape') {
-      try {
-        e.preventDefault?.();
-        e.stopPropagation?.();
-        e.stopImmediatePropagation?.();
-      } catch {
-        // The dialog still closes when a synthetic event method throws.
-      }
-      cancel();
-      return;
-    }
-    if (e.key !== 'Tab') return;
-    const focusables = listFocusable();
-    if (!focusables.length) {
-      try { e.preventDefault?.(); } catch { /* ignore */ }
-      return;
-    }
-    const first = focusables[0];
-    const last = focusables[focusables.length - 1];
-    const active = document.activeElement;
-    const root = overlay.querySelector('.confirm-dialog');
-    const containsActive = active && root && root.contains(active);
-
-    if (e.shiftKey) {
-      if (!containsActive || active === first) {
-        try {
-          e.preventDefault?.();
-          last.focus?.();
-        } catch {
-          // ignore
-        }
-      }
-      return;
-    }
-
-    if (!containsActive || active === last) {
-      try {
-        e.preventDefault?.();
-        first.focus?.();
-      } catch {
-        // ignore
-      }
-    }
-  };
-
-  overlay.addEventListener('keydown', onTrapKeyDown, true);
-
-  const close = () => {
-    if (closed) {
-      releaseDocumentOwnership();
-      if (
-        releaseModalLayer === null &&
-        activeDialogCancel === cancel
-      ) {
-        activeDialogCancel = null;
-      }
-      return;
-    }
-    closed = true;
-    if (activeKeydownHandler === onKeyDown) {
-      document.removeEventListener('keydown', onKeyDown, true);
-      activeKeydownHandler = null;
-    }
-    const cleanupErrors = [];
-    for (const cleanup of [
-      () => overlay.removeEventListener('keydown', onTrapKeyDown, true),
-      () => overlay.remove(),
-      releaseDocumentOwnership,
-      () => prevFocus?.focus?.()
-    ]) {
-      if (cleanup === null) continue;
-      try {
-        cleanup();
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
-    }
-    if (
-      releaseModalLayer === null &&
-      activeDialogCancel === cancel
-    ) {
-      activeDialogCancel = null;
-    }
-    if (cleanupErrors.length === 1) throw cleanupErrors[0];
-    if (cleanupErrors.length > 1) {
-      throw new AggregateError(
-        cleanupErrors,
-        `Confirm dialog teardown failed in ${formatCountOf(cleanupErrors.length, 'operation')}`
-      );
-    }
-  };
-  const cancel = () => {
-    if (closed) {
-      close();
-      return;
-    }
-    close();
-    onCancel?.();
-  };
-
-  const cancelBtn = overlay.querySelector('.confirm-dialog-cancel');
-  const confirmBtn = overlay.querySelector('.confirm-dialog-confirm');
-  const alternativeBtn = overlay.querySelector('.confirm-dialog-alternative');
-  const textarea = overlay.querySelector('.confirm-dialog-textarea');
-  const charCounter = overlay.querySelector('.confirm-dialog-char-counter');
-  const optionBox = overlay.querySelector('.confirm-dialog-option input');
-  const problem = overlay.querySelector('.confirm-dialog-problem');
-  const messageEl = overlay.querySelector('.confirm-dialog-message');
-  const listEl = overlay.querySelector('.confirm-dialog-list');
+  const cancelBtn = dialog.querySelector('.confirm-dialog-cancel');
+  const confirmBtn = dialog.querySelector('.confirm-dialog-confirm');
+  const alternativeBtn = dialog.querySelector('.confirm-dialog-alternative');
+  const textarea = dialog.querySelector('.confirm-dialog-textarea');
+  const charCounter = dialog.querySelector('.confirm-dialog-char-counter');
+  const optionBox = dialog.querySelector('.confirm-dialog-option input');
+  const problem = dialog.querySelector('.confirm-dialog-problem');
+  const messageEl = dialog.querySelector('.confirm-dialog-message');
+  const listEl = dialog.querySelector('.confirm-dialog-list');
   const checked = () => optionBox?.checked === true;
   // The sentence and the list, as text (never markup), worded again when the option changes.
   const words = () => {
@@ -340,63 +178,26 @@ export function showConfirmDialog({
     updateCounter();
   }
 
-  cancelBtn?.addEventListener('click', () => {
-    cancel();
-  });
-  confirmBtn?.addEventListener('click', () => {
+  cancelBtn.addEventListener('click', cancel);
+  confirmBtn.addEventListener('click', () => {
     if (!accepted()) return;
     const note = wantsInput ? String(textarea?.value || '') : null;
     const option = checked();
-    close();
-    onConfirm?.(note, option);
+    answer(() => onConfirm?.(note, option));
   });
   alternativeBtn?.addEventListener('click', () => {
     const option = checked();
-    close();
-    onAlternative(option);
+    answer(() => onAlternative(option));
   });
 
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) {
-      cancel();
-    }
-  });
-
-  const onKeyDown = (e) => {
-    if (e.key !== 'Escape') return;
-    try {
-      e.preventDefault?.();
-      e.stopPropagation?.();
-      e.stopImmediatePropagation?.();
-    } catch {
-      // The dialog still closes when a synthetic event method throws.
-    }
-    cancel();
-  };
-  activeDialogCancel = cancel;
-  activeKeydownHandler = onKeyDown;
-  document.addEventListener('keydown', onKeyDown, true);
-
+  document.body.append(dialog);
   try {
-    releaseModalLayer = claimModalDocumentLayer(overlay);
-    document.body.appendChild(overlay);
-    if (wantsInput) {
-      textarea?.focus?.();
-      textarea?.select?.();
-    }
-    else confirmBtn?.focus?.();
-  } catch (primaryError) {
-    const rollbackErrors = [primaryError];
-    try {
-      close();
-    } catch (rollbackError) {
-      rollbackErrors.push(rollbackError);
-    }
-    if (rollbackErrors.length === 1) throw primaryError;
-    throw new AggregateError(
-      rollbackErrors,
-      'Confirm dialog creation and rollback failed'
-    );
+    owner.open(null, { focus: wantsInput ? textarea : confirmBtn });
+  } catch (error) {
+    dialog.remove();
+    throw error;
   }
+  if (wantsInput) textarea.select();
+  activeCancel = cancel;
   return cancel;
 }

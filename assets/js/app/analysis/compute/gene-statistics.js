@@ -2,7 +2,7 @@
  * Gene statistics from a gene's non-zero entries.
  *
  * Single-cell expression is mostly zeros: the median gene of a 562,000-cell
- * atlas is non-zero in 0.2 % of its cells. Every statistic the analyses report
+ * atlas is non-zero in 0.2% of its cells. Every statistic the analyses report
  * is a function of the non-zero values and of how many zeros each group holds,
  * so the kernels here walk the non-zero entries only, O(nnz), and account for
  * the zeros in closed form:
@@ -20,7 +20,7 @@
  *   over the dense values, accurate to the last bit or two. Expression is
  *   pivoted at 0, where its zeros are (the Detailed view's tests of obs
  *   fields pivot at their first value: `math-utils.js` `centredMoments`).
- * - A centred sum of squares is `Σ(v − mean)²` over the non-zero entries plus
+ * - A centered sum of squares is `Σ(v − mean)²` over the non-zero entries plus
  *   the zeros' `zeros · mean²` in one product, where adding it cell by cell
  *   was as many roundings as there are zeros: the dense two-pass sum to its
  *   last bits (summation order). A constant sample's is exactly 0 and its
@@ -251,7 +251,7 @@ function nonZeroValues(sample, count) {
 }
 
 /**
- * A sample's centred sum of squares about its mean (see the module header):
+ * A sample's centered sum of squares about its mean (see the module header):
  * over its non-zero entries plus the zeros in one product, O(nnz); exactly 0
  * for a constant sample.
  *
@@ -284,7 +284,7 @@ export function sumOfSquaresAbout(values, zeros, mean) {
 
 /**
  * A gene column's moments over every cell (`shared/gene-moments-cache.js`):
- * the mean and centred sum of squares of its finite values (exactly 0 for a
+ * the mean and centered sum of squares of its finite values (exactly 0 for a
  * constant column, which then has no z-score), its non-zero finite values
  * and its finite values (`n`).
  *
@@ -627,7 +627,7 @@ export function rankSumComparison(rankSum, n, m, tieTerm, convention) {
 }
 
 /**
- * Welch's t of a group against a reference from centred second moments.
+ * Welch's t of a group against a reference from centered second moments.
  * `ttest_overestim_var` divides the reference variance by the group's size
  * instead of its own (scanpy's `t-test_overestim_var`).
  */
@@ -839,7 +839,7 @@ export function groupMarkers(sample, context, { method, minCells, pConvention = 
   const testable = g => tested[g] === 1 && g !== reference && nIn[g] >= minPerSide && nOut[g] >= minPerSide;
 
   if (!wilcox) {
-    // Centred second moments: each group about its mean, over the non-zero
+    // Centered second moments: each group about its mean, over the non-zero
     // entries plus each zero's term in one product. The rest's is merged
     // from the other groups' (`restMoments`), so a dominant group with a
     // wide spread never leaves a tight rest as the residue of a subtraction.
@@ -955,7 +955,7 @@ export function groupMarkers(sample, context, { method, minCells, pConvention = 
 
 /**
  * Each group's rest — every other group's measured cells — as one sample's
- * size, mean and (with `m2`) centred sum of squares, merged from the groups'
+ * size, mean and (with `m2`) centered sum of squares, merged from the groups'
  * own by Chan's pairwise rule (`M2 = M2a + M2b + δ² · na · nb / n`, every
  * term non-negative): the groups before it merged in order, those after it
  * merged in reverse, and the two merged. O(groups) for all of them, and no
@@ -964,7 +964,7 @@ export function groupMarkers(sample, context, { method, minCells, pConvention = 
  *
  * @param {Uint32Array} n - Each group's measured cells
  * @param {Float64Array} mean - Each group's mean (NaN for an empty group)
- * @param {Float64Array|null} m2 - Each group's centred sum of squares
+ * @param {Float64Array|null} m2 - Each group's centered sum of squares
  * @returns {{mean: Float64Array, m2: Float64Array}} NaN for a group with no rest
  */
 function restMoments(n, mean, m2) {

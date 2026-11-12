@@ -106,7 +106,7 @@ const CONNECTIVITY_ROW_LABEL = 'Direct AnnData connectivity row reading';
 const JS_ARRAY_ELEMENT_BYTES = 8n;
 
 /**
- * The refusal of one neighbour graph that fails its load-time check, in the
+ * The refusal of one neighbor graph that fails its load-time check, in the
  * words `cellucid serve` uses for the same graph.
  *
  * @param {string} key
@@ -281,8 +281,8 @@ function requireLaunchKeyOrNull(value, name, what) {
  * - `embedding1d`, `embedding2d`, `embedding3d`: the `obsm` key shown in that
  *   dimension slot (its first columns), or `{key, columns}` naming the
  *   0-based columns (null columns: the first ones); null keeps the automatic
- *   choice (`embedding_keys`).
- * - `knn`: the `obsp` matrix shown as the neighbour graph; null shows none
+ *   choice (`embedding_defaults`).
+ * - `knn`: the `obsp` matrix shown as the neighbor graph; null shows none
  *   (`knn_key`).
  * - `modality`: for a dataset of several modalities, the one gene names and
  *   expression are read from; null keeps the automatic choice.
@@ -290,7 +290,7 @@ function requireLaunchKeyOrNull(value, name, what) {
  *   `'layers/<name>'` (of the modality, for a multimodal dataset); null
  *   keeps the automatic choice (`expression_source`).
  * - `geneIdColumn`: the column of the expression matrix's var axis whose
- *   values name the genes; null names them by the index (`gene_id_column`).
+ *   values name the genes; null names them by the index (`var_gene_id_column`).
  * - `latentKey`: the `obsm` array outlier quantiles are computed in; null
  *   computes none (`latent_key`).
  * - `vectorFieldDefault`: the vector field id selected when several are
@@ -493,7 +493,7 @@ export class BaseAnnDataAdapter {
     this._obsFieldDataCacheBytes = 0n;
 
     /**
-     * The extracted neighbour graph asked for last, by obsp key (null for an
+     * The extracted neighbor graph asked for last, by obsp key (null for an
      * absent key). While a view shows its edges or the k-NN tool uses it,
      * it is counted as drawn (`memory-budget.js` `isDrawn`), never evicted;
      * otherwise it is a cached copy like the others.
@@ -634,7 +634,7 @@ export class BaseAnnDataAdapter {
         for (const [key, graph] of [...this._connectivityCache]) {
           if (graph === null || isDrawn(graph)) continue;
           this._connectivityCache.delete(key);
-          released.push('a cached copy of the neighbour graph');
+          released.push('a cached copy of the neighbor graph');
         }
       }
     }
@@ -682,7 +682,7 @@ export class BaseAnnDataAdapter {
    * The operation receives the shared cancellation signal of its callers so a
    * cancelled request stops its work instead of only stopping its wait. A
    * cancelled entry is never joined by a later caller: that caller starts a
-   * fresh computation, so cancelling one request can never poison the next.
+   * fresh computation, so canceling one request can never poison the next.
    *
    * @param {Map<any, {cancellation: CoalescedCancellationOwner, promise: Promise<any>}>} registry
    * @param {any} key
@@ -1027,15 +1027,18 @@ export class BaseAnnDataAdapter {
    * candidates, and the embedding the first view draws. `firstView: false`
    * leaves that embedding unread: an opening grown or cut in place
    * (`AnnDataFileSource.reopenCells`) keeps the coordinates on screen and
-   * reads only the cells it adds.
+   * reads only the cells it adds. `signal`: the opening's; aborted, the
+   * reads stop where they are (the first view's embedding, the largest).
    *
-   * @param {{firstView?: boolean}} [options]
+   * @param {{firstView?: boolean, signal?: AbortSignal|null}} [options]
    */
-  async initialize({ firstView: readFirstView = true } = {}) {
+  async initialize({ firstView: readFirstView = true, signal = null } = {}) {
     const generation = this._captureLifecycleGeneration();
     try {
+      throwIfAborted(signal);
       const metadata = await this._loader.getDatasetMetadata();
       this._assertLifecycleGeneration(generation);
+      throwIfAborted(signal);
       const sourceType = this.constructor.sourceType ?? 'anndata';
       const fileMetadata = requireCellucidFileMetadata(metadata?.cellucid ?? null, sourceType);
       let fileDefaults;
@@ -1089,16 +1092,19 @@ export class BaseAnnDataAdapter {
       // opening. Candidate sources are adopted only after initialize()
       // resolves, so its payload is validated before then: corrupt bytes
       // cannot replace and close a still-working dataset.
-      const firstView = readFirstView ? this.getEmbeddingForRef(this._slots[openingSlot(this._slots)]) : Promise.resolve(null);
+      // The opening's signal reaches this read: stopped, the read stops (no other caller waits).
+      const firstView = readFirstView ? this.getEmbeddingForRef(this._slots[openingSlot(this._slots)], { signal }) : Promise.resolve(null);
       firstView.catch(() => {});
 
       await this._computeObsFieldsMetadata(generation);
       this._assertLifecycleGeneration(generation);
+      throwIfAborted(signal);
       this._candidates = this._assembleCandidates(described, resolution);
       this._mappingResolution = resolution;
       this._candidatesCompleted = null;
       await this._computeVectorFieldsMetadata(generation);
       this._assertLifecycleGeneration(generation);
+      throwIfAborted(signal);
       await firstView;
       this._assertLifecycleGeneration(generation);
     } catch (error) {
@@ -1125,7 +1131,7 @@ export class BaseAnnDataAdapter {
 
   /**
    * The candidate catalog, its defaults seeded by the launch defaults: the
-   * neighbour graph, expression matrix, gene names and latent space a launch
+   * neighbor graph, expression matrix, gene names and latent space a launch
    * named, each checked against the file, become the catalog's initial
    * choices, which the data-mapping panel can still change.
    *
@@ -1310,12 +1316,13 @@ export class BaseAnnDataAdapter {
     };
     const entries = obsmEntries(described.obsm);
     // Slots a launch named are shown as named; the others follow the default
-    // rule, and only when neither fills a slot is the best guess made.
+    // rule, and every slot neither fills is guessed (each width alike).
     const requested = this._requestedEmbeddingSlots(entries);
     const modality = described.defaultModality ?? null;
-    const resolution = requested === null
-      ? await resolveEmbeddingSlotsAsync(entries, loadCheck, { modality })
-      : { slots: this._withDefaultRuleSlots(entries, requested, modality), guessed: [], rejected: [] };
+    const resolution = await resolveEmbeddingSlotsAsync(entries, loadCheck, {
+      modality,
+      filled: requested === null ? null : this._withDefaultRuleSlots(entries, requested, modality),
+    });
     this._assertLifecycleGeneration(generation);
     if (DIMENSION_SLOTS.every(slot => resolution.slots[slot] === null)) {
       const rejected = new Map(resolution.rejected);
@@ -1488,7 +1495,7 @@ export class BaseAnnDataAdapter {
         // A text or boolean column's categories, or integer labels' (a Loom
         // clustering), are found by reading it (the reader worker codes it,
         // `discovered-categories.js`): its labels in label order, each in
-        // the colour its label names.
+        // the color its label names.
         return { key, kind: 'category', categories: null, categorySlots: null, palette: null, _needsCodeComputation: true };
       }
       throw new Error(`Observation field '${key}' has unsupported dtype '${fieldInfo.dtype}'`);
@@ -1540,13 +1547,39 @@ export class BaseAnnDataAdapter {
   /**
    * Adopt the categories a text or boolean column was coded under in the
    * reader worker (`codeDiscoveredColumn`): the first ones, or more of them
-   * (every earlier one kept, in label order), each with the colour its label
-   * names (`categoryNameSlots`: a label shown keeps its colour). @private
+   * (every earlier one kept, in label order), each with the color its label
+   * names (`categoryNameSlots`: a label shown keeps its color). @private
    *
    * @param {Object} meta - The field's metadata
    * @param {ReadonlyArray<string|boolean>} categories
    * @param {string} key
    */
+  /**
+   * Make the continuous field `meta` a text column: an integer column whose
+   * first load found identifiers past 2^53 (`readExactIntegers`), coded from
+   * now on as a text column is, with `note` saying why. The dataset's field
+   * counts follow. @private
+   */
+  _adoptTextColumn(meta, note) {
+    meta.kind = 'category';
+    delete meta.min;
+    delete meta.max;
+    meta.categories = null;
+    meta.categorySlots = null;
+    meta.palette = null;
+    meta._needsCodeComputation = true;
+    meta.asText = note;
+    const listed = this._metadata?.obs_fields?.find(field => field.key === meta.key);
+    if (listed !== undefined) {
+      listed.kind = 'category';
+      listed.n_categories = null;
+    }
+    if (this._metadata?.stats) {
+      this._metadata.stats.n_categorical_fields = this._obsFieldsMetadata.filter(field => field.kind === 'category').length;
+      this._metadata.stats.n_continuous_fields = this._obsFieldsMetadata.filter(field => field.kind === 'continuous').length;
+    }
+  }
+
   _adoptDiscoveredCategories(meta, categories, key) {
     validateCellucidCategories(categories, key);
     const known = meta.categories;
@@ -1571,7 +1604,7 @@ export class BaseAnnDataAdapter {
    * Adopt the categories a categorical with more categories than open cells
    * was coded by in the reader (`AnnDataReader._readPresentCategorical`):
    * the ones its open cells hold, in stored order, every one found before
-   * kept, each in the colour it has with every category open
+   * kept, each in the color it has with every category open
    * (`presentCategoryPalette`). Its stored dictionary's size stays
    * `categoryCount`. @private
    *
@@ -1742,9 +1775,17 @@ export class BaseAnnDataAdapter {
       signal,
       // A text or boolean column is coded under the categories already found.
       ...(meta._needsCodeComputation ? { categories: meta.categories } : {}),
+      // Identifiers past 2^53 found once are text on every later read.
+      ...(typeof meta.asText === 'string' ? { integers: 'text' } : {}),
     });
     try {
       this._assertLifecycleGeneration(generation);
+      // An integer column listed as numbers whose values are identifiers
+      // past 2^53 (`readExactIntegers`) arrives as text: it is a text column
+      // from now on.
+      if (meta.kind === 'continuous' && field.dtype === 'categorical' && typeof field.asText === 'string') {
+        this._adoptTextColumn(meta, field.asText);
+      }
       let result;
 
       if (meta.kind === 'continuous') {
@@ -1837,6 +1878,7 @@ export class BaseAnnDataAdapter {
           kind: 'category',
           categories,
           codes,
+          ...(typeof meta.asText === 'string' ? { asText: meta.asText } : {}),
           ...(meta._presentCategories === true ? { storedCategoryCount: meta.categoryCount } : {}),
           ...(typeof field.ordered === 'boolean'
             ? { ordered: field.ordered }
@@ -2413,15 +2455,17 @@ export class BaseAnnDataAdapter {
   /**
    * What a copy of the whole dataset is planned against
    * (`AnnDataReaderClient.readCopyTarget`): the stored obs columns, the
-   * values of those `names` lists over every cell by original position, and
-   * `uns['cellucid']`. A dataset replaced meanwhile fails it.
+   * values of those `names` lists over every cell by original position, the
+   * root `uns` keys, the colors of the columns `colors` lists
+   * (`uns['<column>_colors']`), and `uns['cellucid']`. A dataset replaced
+   * meanwhile fails it.
    *
    * @param {string[]} names
-   * @param {{signal?: AbortSignal|null, owner?: string|null, varModality?: string|null}} [options]
+   * @param {{signal?: AbortSignal|null, owner?: string|null, varModality?: string|null, colors?: string[]}} [options]
    */
-  async readCopyTarget(names, { signal = null, owner = null, varModality = null } = {}) {
+  async readCopyTarget(names, { signal = null, owner = null, varModality = null, colors = [] } = {}) {
     const generation = this._captureLifecycleGeneration();
-    const target = await this._loader.readCopyTarget(names, { signal, owner, varModality });
+    const target = await this._loader.readCopyTarget(names, { signal, owner, varModality, colors });
     this._assertLifecycleGeneration(generation);
     return target;
   }
@@ -2690,7 +2734,7 @@ export class BaseAnnDataAdapter {
           data: codes.buffer,
           kind: 'category',
           categories: fieldData.categories,
-          // The file's colours for them, for a field whose categories its
+          // The file's colors for them, for a field whose categories its
           // first load found (null for a text column's).
           palette: this._obsFieldsMetadata?.find(field => field.key === key)?.palette ?? null,
           // Coded by the categories its open cells hold: how many its file
@@ -2700,6 +2744,12 @@ export class BaseAnnDataAdapter {
           missingValue,
           ...(typeof fieldData.ordered === 'boolean'
             ? { ordered: fieldData.ordered }
+            : {}),
+          // An integer column read as text (identifiers past 2^53): why,
+          // and the field as a text column is listed before its first load
+          // (its categories are the ones above).
+          ...(typeof fieldData.asText === 'string'
+            ? { asText: fieldData.asText, descriptor: { ...this.getObsFields().fields.find(field => field.key === key), categories: null, codesDtype: null, codesMissingValue: null, palette: null } }
             : {}),
         };
       },
@@ -2791,7 +2841,7 @@ export class BaseAnnDataAdapter {
    * categories the field was loaded with (the shown field's), in their
    * storage (`getCellucidCategoryStorage`). A text or boolean column whose
    * rows hold a label outside `categories` answers its grown categories
-   * (every earlier one kept, in label order) and their colours, the rows
+   * (every earlier one kept, in label order) and their colors, the rows
    * coded under them: the caller recodes the cells it holds by label.
    *
    * @param {string} key
@@ -2811,6 +2861,9 @@ export class BaseAnnDataAdapter {
       signal,
       rows: [start, end],
       ...(meta._needsCodeComputation ? { categories } : {}),
+      // Added rows of a 64-bit integer column read as the column was first
+      // found: text (identifiers past 2^53) or numbers.
+      integers: typeof meta.asText === 'string' ? 'text' : (meta.kind === 'continuous' ? 'numbers' : 'decide'),
     });
     this._assertLifecycleGeneration(generation);
     const count = end - start;
@@ -2843,7 +2896,7 @@ export class BaseAnnDataAdapter {
     if (field.categories.length === categories.length) return { kind: 'category', codes: field.codes };
     // A text or boolean column whose added cells hold labels it had not
     // shown: its categories grow (every earlier one kept, in label order,
-    // its colour too), and these rows are coded under them. A categorical
+    // its color too), and these rows are coded under them. A categorical
     // coded by the categories its open cells hold grows the same way, in
     // stored order (adopted above).
     if (field.present === undefined) this._adoptDiscoveredCategories(meta, field.categories, key);
@@ -3282,7 +3335,7 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Get the edges of one neighbour graph, `obsp[key]`.
+   * Get the edges of one neighbor graph, `obsp[key]`.
    *
    * Edge extraction is the most expensive read this adapter performs, so it
    * observes its caller's cancellation at every asynchronous boundary: a
@@ -3308,7 +3361,7 @@ export class BaseAnnDataAdapter {
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
       throw new TypeError('Connectivity edge options must be an object.');
     }
-    const { key = this._defaultGraphKey(), ...rest } = options;
+    const { key = this._defaultGraphKey(), readKey = null, ...rest } = options;
     const signal = getMetadataLoadSignal(
       rest,
       'Direct AnnData connectivity edges'
@@ -3347,7 +3400,7 @@ export class BaseAnnDataAdapter {
           // millions of stored values never holds the page.
           let edges;
           try {
-            edges = await this._loader.getConnectivityEdges(key, { signal: workSignal });
+            edges = await this._loader.getConnectivityEdges(key, { signal: workSignal, readKey });
           } catch (error) {
             this._assertLifecycleGeneration(generation);
             if (isDefault) throw error;
@@ -3383,9 +3436,9 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * Some open cells' neighbours in one neighbour graph, read from the file
+   * Some open cells' neighbors in one neighbor graph, read from the file
    * by row in the reader (`getConnectivityRows`): what the k-NN tool expands
-   * through, so the page never holds every cell's neighbour list. Nothing is
+   * through, so the page never holds every cell's neighbor list. Nothing is
    * cached here: the reader's decoded chunks serve a row read again.
    *
    * @param {{key?: string, cells: Uint32Array, signal?: AbortSignal|null}} options -
@@ -3399,7 +3452,7 @@ export class BaseAnnDataAdapter {
     const { key = this._defaultGraphKey(), cells, ...rest } = options;
     const signal = getMetadataLoadSignal(rest, 'Direct AnnData connectivity rows');
     throwIfAborted(signal);
-    if (key === null) throw new Error('This file opens with no neighbour graph to read rows of.');
+    if (key === null) throw new Error('This file opens with no neighbor graph to read rows of.');
     requireObspKey(key);
     if (!(cells instanceof Uint32Array)) throw new TypeError('Connectivity rows are asked for by a Uint32Array of cells.');
     if (typeof this._loader.getConnectivityRows !== 'function') {
@@ -3414,7 +3467,7 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * The neighbour graph the file opens with: the one a launch named
+   * The neighbor graph the file opens with: the one a launch named
    * (`defaults.knn`, null for none), else the default rule's
    * (`defaultGraph`: `connectivities`, else Seurat's `<modality>_snn`).
    *
@@ -3441,7 +3494,7 @@ export class BaseAnnDataAdapter {
   }
 
   /**
-   * The summary of one neighbour graph the candidate catalog lists, by its
+   * The summary of one neighbor graph the candidate catalog lists, by its
    * position in `candidates.obsp` (its route `obsp/{p}`). The graph is
    * read and checked to count its edges; a graph that is unusable, absent or
    * fails its check is a `MappingLoadError` naming the key.

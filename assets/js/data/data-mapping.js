@@ -4,7 +4,7 @@
  * A *data mapping* names, for one dataset, the embeddings it can be shown with
  * (any number, of any mix of 1D, 2D and 3D: the *enabled* representations),
  * the default representation of each dimension, the vector fields bound to
- * those embeddings, the neighbour graph, the gene-name set, the expression
+ * those embeddings, the neighbor graph, the gene-name set, the expression
  * matrix, how each expression matrix is transformed (log1p), the highly
  * variable genes and the latent space, each named by its key in one AnnData
  * object.
@@ -86,7 +86,7 @@ export const DIMENSIONAL_UMAP_KEYS = Object.freeze([
  * The conventional names of one UMAP, in the order the default rule takes
  * them: Scanpy's (`sc.tl.umap()` writes `X_umap`, as does a Seurat object's
  * `umap` reduction), a SingleCellExperiment's (scater's `runUMAP()` names
- * its reducedDim `UMAP`), then a Seurat object's weighted-nearest-neighbour
+ * its reducedDim `UMAP`), then a Seurat object's weighted-nearest-neighbor
  * and Azimuth reference UMAPs (`wnn.umap`, `ref.umap`). An R object's
  * reductions and reducedDims are `obsm['X_<name>']` with the name's case
  * kept (`anndata/transcode/`, `cellucid_prepare()`).
@@ -1100,14 +1100,16 @@ export function bestGuessOrder(keys, { modality = null } = {}) {
  */
 
 /**
- * Fill embedding slots when the default rule filled none.
+ * Fill the embedding slots the default rule (or a launch) left empty.
  *
  * Candidates are the usable entries, minus vector-field keys
- * (`parseVectorFieldKey`) and the latent key. For each of 3D, 2D and 1D the
- * slot takes the best-ranked *narrow* candidate (width 1-3) whose width is
- * exactly that dimension. When no narrow candidate fills any slot, only the
- * 2D slot is filled, from the best-ranked *wide* candidate (width > 3) read
- * at columns `[0, 1]`.
+ * (`parseVectorFieldKey`), the latent key and the keys already in a slot.
+ * For each of 3D, 2D and 1D whose slot `filled` leaves null, the slot takes
+ * the best-ranked *narrow* candidate (width 1-3) whose width is exactly that
+ * dimension: every width is treated alike, so `X_umap` beside a 3-column
+ * `X_phate` names both. When no slot is filled at all, only the 2D slot is
+ * filled, from the best-ranked *wide* candidate (width > 3) read at columns
+ * `[0, 1]`. `guessed` names the slots this guess filled.
  *
  * `loadCheck(key, columns)` returns null when the array loads, or the reason
  * it does not. A candidate that fails is recorded in `rejected` and the next
@@ -1115,11 +1117,12 @@ export function bestGuessOrder(keys, { modality = null } = {}) {
  * deterministic and bounded by the candidate count.
  *
  * @param {Iterable<ObsmEntry>} entries
- * @param {{latentKey: string|null, loadCheck?: LoadCheck|null, modality?: string|null}} options
- *   `modality`: the modality a dataset of several opens with (`bestGuessOrder`)
+ * @param {{latentKey: string|null, loadCheck?: LoadCheck|null, modality?: string|null, filled?: EmbeddingSlots|null}} options
+ *   `modality`: the modality a dataset of several opens with (`bestGuessOrder`);
+ *   `filled`: the slots already chosen (the default rule's, a launch's), kept
  * @returns {EmbeddingGuess}
  */
-export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck = null, modality = null } = {}) {
+export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck = null, modality = null, filled = null } = {}) {
   const list = Array.from(entries);
   const vectorKeys = vectorFieldKeys(list.map(entry => entry.key));
   const widthByKey = new Map();
@@ -1138,6 +1141,13 @@ export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck =
   const rejected = [];
   const failed = new Set();
   const slots = emptySlots();
+  for (const slot of DIMENSION_SLOTS) {
+    const ref = filled?.[slot] ?? null;
+    if (ref === null) continue;
+    slots[slot] = { key: ref.key, columns: [...ref.columns] };
+    widthByKey.delete(ref.key);
+  }
+  const given = new Set(DIMENSION_SLOTS.filter(slot => slots[slot] !== null));
 
   const tryCandidate = (key, columns) => {
     if (failed.has(key)) return false;
@@ -1151,6 +1161,7 @@ export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck =
     [...widthByKey].filter(([, width]) => predicate(width)).map(([key]) => key);
 
   for (const dimension of [3, 2, 1]) {
+    if (slots[dimensionSlot(dimension)] !== null) continue;
     for (const key of bestGuessOrder(keysWhere(width => width === dimension), { modality })) {
       const columns = defaultColumns(dimension);
       if (tryCandidate(key, columns)) {
@@ -1171,18 +1182,34 @@ export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck =
   }
 
   const guessed = DIMENSION_SLOTS
-    .filter(slot => slots[slot] !== null)
+    .filter(slot => slots[slot] !== null && !given.has(slot))
     .map(slot => `embeddings.${slot}`);
   return Object.freeze({ slots, guessed, rejected });
 }
 
 /**
- * Resolve the initial embedding slots: the default rule, else the best guess.
+ * Whether a file opens on a best guess: some slot is filled and every filled
+ * slot was guessed (`resolveEmbeddingSlots`), so the file names no default
+ * of its own. A file whose UMAP fills one slot and whose other widths are
+ * guessed opens on its own default, the guessed slots marked as such.
  *
- * When the default rule fills any slot, its slots are the answer and nothing
- * is guessed, so an object carrying `X_umap_<d>d` or a key of `UMAP_KEYS` resolves
- * exactly as it did before the best guess existed. Only when it fills none
- * does `bestGuessEmbeddingSlots` run.
+ * @param {Partial<EmbeddingSlots>} slots
+ * @param {ReadonlyArray<string>} guessed - Groups such as `embeddings.2d`
+ * @returns {boolean}
+ */
+export function opensOnBestGuess(slots, guessed) {
+  const filled = DIMENSION_SLOTS.filter(slot => (slots[slot] ?? null) !== null);
+  return filled.length > 0 && filled.every(slot => guessed.includes(`embeddings.${slot}`));
+}
+
+/**
+ * Resolve the initial embedding slots: the default rule's, then the best
+ * guess for every slot it left empty.
+ *
+ * Every width is treated alike (one ranked order, `bestGuessOrder`): the
+ * default rule names the UMAP its conventional keys hold, and each other
+ * width takes its best-ranked array, marked guessed. `X_umap` beside
+ * `X_umap_3d` names both 2D and 3D; a file with no UMAP is guessed whole.
  *
  * @param {Iterable<ObsmEntry>} entries
  * @param {{latentKey: string|null, loadCheck?: LoadCheck|null, modality?: string|null}} options
@@ -1191,10 +1218,7 @@ export function bestGuessEmbeddingSlots(entries, { latentKey = null, loadCheck =
 export function resolveEmbeddingSlots(entries, { latentKey = null, loadCheck = null, modality = null } = {}) {
   const list = Array.from(entries);
   const slots = defaultEmbeddingSlots(list, { modality });
-  if (DIMENSION_SLOTS.some(slot => slots[slot] !== null)) {
-    return Object.freeze({ slots, guessed: [], rejected: [] });
-  }
-  return bestGuessEmbeddingSlots(list, { latentKey, loadCheck, modality });
+  return bestGuessEmbeddingSlots(list, { latentKey, loadCheck, modality, filled: slots });
 }
 
 /**
@@ -1277,25 +1301,27 @@ export function defaultVectorBindings(entries, enabled) {
   return sortVectorBindings(bindings);
 }
 
-/** The neighbour graph AnnData's `sc.pp.neighbors` writes, the default first. */
+/** The neighbor graph AnnData's `sc.pp.neighbors` writes, the default first. */
 export const DEFAULT_GRAPH_KEY = 'connectivities';
 
-/** The suffix Seurat's `FindNeighbors` gives its shared-nearest-neighbour graph (`<assay>_snn`). */
+/** The suffix Seurat's `FindNeighbors` gives its shared-nearest-neighbor graph (`<assay>_snn`). */
 const SNN_GRAPH_SUFFIX = '_snn';
 
-/** Whether a graph key names a shared-nearest-neighbour graph: `snn`, or `<assay>_snn`, in any case. */
+/** Whether a graph key names a shared-nearest-neighbor graph: `snn`, or `<assay>_snn`, in any case. */
 function isSharedNeighbourGraph(key) {
   const lowered = key.toLowerCase();
   return lowered === 'snn' || (lowered.endsWith(SNN_GRAPH_SUFFIX) && key.length > SNN_GRAPH_SUFFIX.length);
 }
 
 /**
- * The neighbour graph a dataset opens with, of its `obsp` keys: Scanpy's
- * `connectivities`; else Seurat's shared-nearest-neighbour graph of the
+ * The neighbor graph a dataset opens with, of its `obsp` keys: Scanpy's
+ * `connectivities`; else the connectivities of the MuData modality it opens
+ * with (`<modality>:connectivities`, `obsmNamespace`: the graph scanpy and
+ * `prepare()` write into that modality); else Seurat's shared-nearest-neighbor graph of the
  * modality (assay) it opens with (`<modality>_snn`), else the first other
- * shared-nearest-neighbour graph (`<assay>_snn`, or `SNN`, in any case) in
+ * shared-nearest-neighbor graph (`<assay>_snn`, or `SNN`, in any case) in
  * code-point order; else none. Seurat's other graph (`<assay>_nn`,
- * directed) and Scanpy's `distances` are no undirected neighbour graph and
+ * directed) and Scanpy's `distances` are no undirected neighbor graph and
  * are never the default. `prepare()` and `cellucid_prepare()` choose the
  * graph they write by the same rule.
  *
@@ -1306,6 +1332,7 @@ function isSharedNeighbourGraph(key) {
 export function defaultGraph(keys, { modality = null } = {}) {
   const list = [...keys];
   if (list.includes(DEFAULT_GRAPH_KEY)) return DEFAULT_GRAPH_KEY;
+  if (modality !== null && list.includes(`${modality}:${DEFAULT_GRAPH_KEY}`)) return `${modality}:${DEFAULT_GRAPH_KEY}`;
   if (modality !== null && list.includes(`${modality}${SNN_GRAPH_SUFFIX}`)) return `${modality}${SNN_GRAPH_SUFFIX}`;
   const shared = list.filter(isSharedNeighbourGraph).sort(compareCodePoints);
   return shared[0] ?? null;
@@ -1376,9 +1403,9 @@ export function requireMappingModality(mapping, modalities) {
  *
  * `xScaled` is read only when there is a `raw` to choose (else false): `X`
  * is a dense float matrix and its first chunk (stored in one piece: its
- * first row) holds a negative value -- `sc.pp.scale` centres every gene, so
+ * first row) holds a negative value -- `sc.pp.scale` centers every gene, so
  * about half of any cell's values are negative, while counts and
- * normalised values never are, and a sparse matrix is not scaled. One small
+ * normalized values never are, and a sparse matrix is not scaled. One small
  * read, through `read`.
  *
  * @param {Object} options
@@ -1412,12 +1439,12 @@ export async function expressionRuleInputs({ X, rawX, read }) {
  *
  * Scanpy reads genes from `raw` when it is present (`use_raw=None`), for
  * the files that convention is for: `adata.raw = adata` saved the
- * log-normalised matrix of every gene before `X` was cut to the highly
+ * log-normalized matrix of every gene before `X` was cut to the highly
  * variable genes or scaled. So `raw` is the default when it is present and
  * either holds more genes than `X` (`rawHasMoreGenes`) or `X` holds scaled
  * values (`xScaled`: a dense float `X` with negative values in its first
  * chunk); otherwise `X`. A CELLxGENE file keeps raw counts in `raw` over
- * the same genes as its normalised `X`, and opens on `X`. `X` is one choice
+ * the same genes as its normalized `X`, and opens on `X`. `X` is one choice
  * away in Data mapping either way. Without `X`: `raw` (guessed); otherwise
  * the only layer; otherwise the first layer whose name contains `norm` or
  * `log`, then the remaining layers in code-point order, with `counts` and
@@ -1636,4 +1663,18 @@ export function nothingPlottableMessage({ nObs, descriptions }) {
     `cell (${formatCount(nObs)}) and at least one numeric column. obsm holds: ${holds}.` +
     ' Add a 2-D embedding to obsm (for example with sc.tl.umap in Scanpy), then open the data again.'
   );
+}
+
+/**
+ * The name of an expression matrix, as Data mapping's Expression menu writes
+ * it and every message, analysis, CSV and provenance names it: `X`, `raw.X`,
+ * `layers['counts']`.
+ *
+ * @param {string|null|undefined} expression - `X`, `raw` or `layer:<name>` (null: X)
+ * @returns {string}
+ */
+export function expressionMatrixName(expression) {
+  if (expression === 'raw') return 'raw.X';
+  if (typeof expression === 'string' && expression.startsWith('layer:')) return `layers['${expression.slice('layer:'.length)}']`;
+  return String(expression ?? 'X');
 }

@@ -33,12 +33,12 @@
  *    (`DimensionManager.resizeCells`, `DataState.resizeOpenCells`), the
  *    runtime stage takes the new count, the viewer the new points with the
  *    camera where it was (`resizeLiveCells`), and the field shown, its
- *    filters, colours, centroids and highlights are made again from them.
+ *    filters, colors, centroids and highlights are made again from them.
  *    An embedding the added cells make unusable (a value that cannot be
  *    drawn) is let go, as an opening of those cells would refuse it; when it
  *    is the one shown, Apply shows the new cells as a new reading (a
  *    progressive opening stops at the cells open, and says why).
- * 3. **After**: the neighbour graph is read again on the new cells if it is
+ * 3. **After**: the neighbor graph is read again on the new cells if it is
  *    shown, the vector field overlay likewise, outlier filters in use get
  *    their quantiles, the field shown is loaded again if it had to be
  *    released, analyses mark their results stale (their inputs changed),
@@ -58,7 +58,7 @@
  *
  * Every reading names its own cells (a cell subset request,
  * `cell-subset-policy.js`): a step, an Apply and the earlier cells read back
- * after a cancelled one never take each other's.
+ * after a canceled one never take each other's.
  *
  * @module open-cells-resize
  */
@@ -68,8 +68,8 @@ import { cellPriorityOf, requireCellPriority } from '../data/cell-priority.js';
 import { EmbeddingLoadError } from '../data/data-mapping-candidates.js';
 import { beginCellsChangeOnceSettled } from '../data/open-cells-work.js';
 import { formatCount, formatCountOf } from '../utils/format-units.js';
-import { isCancellation, cancel } from '../utils/abort.js';
-import { failureText } from '../utils/errors.js';
+import { cancel, isCancellation, throwIfAborted } from '../utils/abort.js';
+import { failureDetails, joinFailure, sayFailure } from '../utils/errors.js';
 import { isChangedOnHost } from '../data/data-source.js';
 
 /**
@@ -127,14 +127,14 @@ function requireAddedRows(read, added, dimensionOf) {
  *     retireKeptViews: () => void,
  *     retireSelections: () => void,
  *     keptViews: {capture: () => object, restore: (record: object) => Promise<string[]>}|null,
- *     connectivity: {getConnectivityGraph: () => {summary: Object|null, url: string|null}, replaceConnectivityGraph: (graph: Object) => void, loadSummary: (url: string, signal: AbortSignal|null) => Promise<Object>},
+ *     connectivity: {getConnectivityGraph: () => {summary: Object|null, url: string|null}, replaceConnectivityGraph: (graph: Object) => void, retireGraphKeepingChoices: () => void, loadSummary: (url: string, signal: AbortSignal|null) => Promise<Object>},
  *     invalidateAnalysisData: () => void,
  *     loadMappingCandidates: (signal: AbortSignal|null) => Promise<Object>,
  *     completeMappingCandidates: () => void,
  *     adoptMetadata: (metadata: Object) => void,
  *     afterResize: () => Promise<void>,
  *   },
- *   notify?: (text: string, options?: {level?: 'info'|'warning', action?: {label: string, run: () => void}}) => void,
+ *   notify?: (text: string, options?: {level?: 'info'|'warning', action?: {label: string, run: () => void}, details?: string}) => void,
  *   onProgress?: (progress: {cells: number, target: number, chunked: boolean}|null) => void,
  * }} options
  */
@@ -271,7 +271,7 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
         runtime.loadGeneration({ expectedIdentityId: stage.generation.identity.id, signal }),
         runtime.loadMappingCandidates(signal),
       ]);
-      if (signal?.aborted) throw signal.reason;
+      throwIfAborted(signal);
       // Everything the commit needs, checked before it changes anything.
       identity = annData.getCellIdentity();
       if (identity?.n !== to) throw new Error(`The reader opened ${formatCountOf(identity?.n ?? 0, 'cell')}, not the ${formatCount(to)} it grew to.`);
@@ -304,6 +304,10 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
     // every one of them open, cutting may not.
     if (to < from) runtime.retireSelections();
     const graph = runtime.connectivity.getConnectivityGraph();
+    // The graph is of the earlier cells: the viewer drops it with them, and
+    // so does the page, here, before anything of the commit asks for edges
+    // (the person's choices stay; the graph is read again in step 3, R9R-11).
+    runtime.connectivity.retireGraphKeepingChoices();
     viewer.resetVectorFieldOverlay?.();
     const layouts = dimensionManager.resizeCells(to, read.positions);
     const positions = layouts.get(liveLayout);
@@ -340,7 +344,7 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
     const commitMs = performance.now() - committing;
     // Not a measure of what showing a cell costs on an opening
     // (`data/opening-cost.js`): the GPU keeps the cells kept and takes only
-    // those added, while their colours and filters are made again for every
+    // those added, while their colors and filters are made again for every
     // open cell.
     console.log(`[OpenCellsResize] ${formatCount(from)} → ${formatCountOf(to, 'cell')} in place: read ${readMs.toFixed(0)} ms, shown ${commitMs.toFixed(0)} ms`);
     return { inPlace: true, from, to, readMs, commitMs, outcome, graph, keptViews, unusable: read.unusable };
@@ -367,7 +371,7 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
         runtime.loadGeneration({ expectedIdentityId: stage.generation.identity.id, signal }),
         runtime.loadMappingCandidates(signal),
       ]);
-      if (signal?.aborted) throw signal.reason;
+      throwIfAborted(signal);
       identity = annData.getCellIdentity();
       if (identity?.n !== n || before?.n !== n) throw new Error(`The reader reopened ${formatCountOf(identity?.n ?? 0, 'cell')}, and ${formatCount(n)} are shown.`);
       priority = requireCellPriority(cellPriorityOf(annData.getCellSubset()), n);
@@ -386,6 +390,8 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
     // A selection under way names cells at their earlier positions.
     runtime.retireSelections();
     const graph = runtime.connectivity.getConnectivityGraph();
+    // As in a resize: the graph goes with the cells' earlier order (R9R-11).
+    runtime.connectivity.retireGraphKeepingChoices();
     viewer.resetVectorFieldOverlay?.();
     const positions = dimensionManager.reorderCells(order).get(liveLayout);
     const outcome = state.reorderOpenCells({ identity, priority, positions, order });
@@ -406,7 +412,7 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
     if (graph.url !== null) {
       followUps.push(runtime.connectivity.loadSummary(graph.url, signal).then(
         summary => runtime.connectivity.replaceConnectivityGraph({ summary, url: graph.url }),
-        error => { if (!isCancellation(error)) notify(`The neighbour graph could not be read on the new cells: ${failureText(error)}`, { level: 'warning' }); }
+        error => { if (!isCancellation(error)) notify(`${joinFailure(`The neighbor graph could not be read on the new cells`, sayFailure(error))}`, { level: 'warning', ...failureDetails(error) }); }
       ));
     }
     if (outcome.resumeActive !== null) followUps.push(resumeActiveField(outcome.resumeActive));
@@ -440,7 +446,7 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
         if (state.activeFieldSource === null) state.setActiveField(index);
       }
     } catch (error) {
-      if (!isCancellation(error)) notify(`The field shown could not be read on the new cells: ${failureText(error)}`, { level: 'warning' });
+      if (!isCancellation(error)) notify(`${joinFailure(`The field shown could not be read on the new cells`, sayFailure(error))}`, { level: 'warning', ...failureDetails(error) });
     }
   }
 
@@ -521,8 +527,9 @@ export function createOpenCellsResize({ state, viewer, runtime, notify = () => {
           console.error('[OpenCellsResize] Progressive opening stopped:', error);
           // The view is left incomplete: a warning, with the way to go on.
           // A store changed on its host gives the same answer however often it is asked.
-          notify(`Reading the rest of the cells stopped: ${failureText(error)}. ${formatCountOf(state.pointCount, 'cell')} are open.`, {
+          notify(`Reading the rest of the cells stopped: ${sayFailure(error).replace(/\.$/, '')}. ${formatCountOf(state.pointCount, 'cell')} are open.`, {
             level: 'warning',
+            ...failureDetails(error),
             ...(isChangedOnHost(error) ? {} : { action: { label: 'Read the rest', run: () => void grow(annData, signal) } }),
           });
         }
@@ -571,7 +578,7 @@ export function describeOutcome({ droppedGroups, resetRanges, resetFilters = [],
     parts.push(`The filter of ${resetFilters.map(key => `"${key}"`).join(', ')} could not be kept on the cells added and shows every category again.`);
   }
   if (extended.length > 0) {
-    parts.push(`The cells added hold categories ${extended.map(key => `"${key}"`).join(', ')} had not shown: shown beside the others, which keep their colours.`);
+    parts.push(`The cells added hold categories ${extended.map(key => `"${key}"`).join(', ')} had not shown: shown beside the others, which keep their colors.`);
   }
   return parts.join(' ');
 }

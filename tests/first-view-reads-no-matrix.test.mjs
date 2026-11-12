@@ -1,7 +1,7 @@
 /**
  * The first view reads no matrix value, whatever the source: opening a
  * dataset (`BaseAnnDataAdapter.initialize`, the reader's `getDatasetMetadata`)
- * reads the positions, the colouring field and what describes the file, never
+ * reads the positions, the coloring field and what describes the file, never
  * a value of `X`, a layer or `raw.X`. Whether a matrix holds counts
  * (`holdsCounts`: its first stored values) is read after it, once
  * (`completeMappingCandidates`), and the catalog completed then names it.

@@ -3,7 +3,7 @@
  *
  * Every way a gene is chosen goes through here: the sidebar's Gene expression
  * search (typing, a pasted name, then Enter), and the exact name an analysis
- * result colours by. A choice that finds no gene is never dropped in silence:
+ * result colors by. A choice that finds no gene is never dropped in silence:
  * `describeUnavailableGene` says why in words the person can act on.
  *
  * Matching (`rankGeneMatches`) ignores letter case and ranks the gene named

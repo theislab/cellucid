@@ -82,7 +82,9 @@ import { ANNOTATION_MERGES_PATH } from './file-cache.js';
 import { OPERATION_ID_HEADER, OPERATION_OUTCOME_HEADER } from './worker-contract.js';
 import { isLimitAnswer } from '../../formats/io/byte-source.js';
 import { requireExactObjectKeys } from '../../utils/exact-record.js';
-import { cancelled } from '../../utils/abort.js';
+import { cancelled, requireSignalOrNull } from '../../utils/abort.js';
+import { base64OfBytes, bytesOfBase64 } from '../../utils/byte-text.js';
+import { fnv1a32 } from '../../utils/fnv1a.js';
 
 const GIT_OID = /^[0-9a-f]{40}$/;
 const USER_FILE_NAME = /^ghid_([1-9][0-9]*)\.json$/;
@@ -171,21 +173,6 @@ function assertOptionalToken(value) {
   return assertExactNonblankString(value, 'GitHub token');
 }
 
-function assertAbortSignalOrNull(value, label = 'GitHub request signal') {
-  if (
-    value !== null &&
-    (
-      typeof value !== 'object' ||
-      typeof value.aborted !== 'boolean' ||
-      typeof value.addEventListener !== 'function' ||
-      typeof value.removeEventListener !== 'function'
-    )
-  ) {
-    throw new TypeError(`${label} must be an AbortSignal or exact null`);
-  }
-  return value;
-}
-
 function assertSafeCount(value, label) {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(`${label} must be a nonnegative safe integer`);
@@ -195,7 +182,7 @@ function assertSafeCount(value, label) {
 
 /** The caller stopped a GitHub request: a cancellation naming what it was. */
 function ownedRequestCancelled(label, cause = undefined) {
-  return cancelled('user', `${label} was cancelled.`, cause);
+  return cancelled('user', `${label} was canceled.`, cause);
 }
 
 function assertPublicationMode(value) {
@@ -464,16 +451,6 @@ function stableStringifyJson(value) {
 
 // ------------------------------------------------------------------- base64
 
-function encodeBase64Bytes(bytes) {
-  if (!(bytes instanceof Uint8Array)) throw new Error('Base64 input must be a Uint8Array');
-  const chunks = [];
-  const chunkSize = 32_768;
-  for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
-    chunks.push(String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.byteLength, offset + chunkSize))));
-  }
-  return btoa(chunks.join(''));
-}
-
 function base64AlphabetValue(code) {
   if (code >= 65 && code <= 90) return code - 65;
   if (code >= 97 && code <= 122) return code - 97 + 26;
@@ -552,11 +529,8 @@ function base64PayloadEqualsCanonical(value, canonical, path) {
 function decodeBase64Utf8(b64, path) {
   const { decodedByteLength, hasFolding } = scanFoldedBase64Payload(b64, { path });
   const base64 = hasFolding ? b64.replaceAll('\r\n', '').replaceAll('\n', '') : b64;
-  const bin = atob(base64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return {
-    decoded: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes),
+    decoded: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytesOfBase64(base64)),
     decodedByteLength,
   };
 }
@@ -639,7 +613,7 @@ async function callWorker(ctx, {
     throw new Error('GitHub request method must equal GET, POST, PUT, or PATCH');
   }
   const url = workerUrl(ctx.workerOrigin, scope, path, query);
-  const ownerSignal = assertAbortSignalOrNull(signal);
+  const ownerSignal = requireSignalOrNull(signal, 'GitHub request signal');
   const where = scope === 'api' ? { github: { path, method } } : { worker: { path, method } };
   const decorate = (error) => {
     if (error && typeof error === 'object' && !error.github && !error.worker) Object.assign(error, where);
@@ -678,7 +652,7 @@ async function callWorker(ctx, {
       const stop = ownedRequestCancelled(label, ownerSignal.reason ?? error);
       if (operation !== null && dispatched) {
         throw decorate(createUnknownMutationOutcomeError(
-          'GitHub mutation outcome is unknown after request cancellation',
+          'Stopped while GitHub was writing, so whether the write was made is not known.',
           operation,
           stop
         ));
@@ -687,7 +661,7 @@ async function callWorker(ctx, {
     }
     if (operation !== null && dispatched) {
       throw decorate(createUnknownMutationOutcomeError(
-        'GitHub mutation outcome is unknown after a transport failure',
+        'The connection dropped while GitHub was writing, so whether the write was made is not known.',
         operation,
         error
       ));
@@ -1436,16 +1410,6 @@ async function assertForkCopied(ctx, { owner, repo, baseBranch, defaultBranch, s
   throw error;
 }
 
-function fnv1aHash32(input) {
-  const str = assertExactNonblankString(input, 'Hash input');
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++) {
-    hash ^= str.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return hash >>> 0;
-}
-
 /**
  * The one head branch of a contributor's pull requests against one base
  * branch: `cellucid-annotations/ghid_<id>/<fnv(base)>`. One user file holds
@@ -1457,7 +1421,7 @@ export function toAnnotationHeadBranch({ baseBranch, fileUser }) {
   if (typeof fileUser !== 'string' || !/^ghid_[1-9][0-9]*$/.test(fileUser) || !Number.isSafeInteger(Number(fileUser.slice(5)))) {
     throw new Error('Pull-request file user must be an exact ghid identity');
   }
-  return `cellucid-annotations/${fileUser}/${fnv1aHash32(base).toString(36)}`;
+  return `cellucid-annotations/${fileUser}/${fnv1a32(base).toString(36)}`;
 }
 
 function assertPullRequestRecord(value, label) {
@@ -1651,7 +1615,7 @@ async function publishUserFileViaFork(ctx, {
   // A composed change goes on top of the file the pull request already
   // proposes (its other unmerged changes stay in it), else on top of upstream.
   const view = viewOver(prior);
-  const contentBase64 = encodeBase64Bytes(
+  const contentBase64 = base64OfBytes(
     toAnnotationPublicationBytes(composeUserFile(prior, datasetId, view, { path, filename }), { path })
   );
   if (base !== null && base64PayloadEqualsCanonical(base.contentBase64, contentBase64, path)) {
@@ -1772,7 +1736,7 @@ export class CommunityAnnotationGitHubSync {
    * @returns {Promise<RepositorySnapshot>}
    */
   async openSnapshot({ signal = null } = {}) {
-    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation snapshot signal');
+    const requestSignal = requireSignalOrNull(signal, 'Annotation snapshot signal');
     const repoInfo = await this._repositoryMetadata(requestSignal);
     const branch = this.branch === null
       ? assertGitHubBranch(repoInfo.default_branch, 'GitHub repository default_branch')
@@ -1816,7 +1780,7 @@ export class CommunityAnnotationGitHubSync {
    * config's blob id, which is the SHA the Contents API names it by.
    */
   async validateAndLoadConfig({ datasetId, signal = null } = {}) {
-    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation config request signal');
+    const requestSignal = requireSignalOrNull(signal, 'Annotation config request signal');
     const snapshot = await this.openSnapshot({ signal: requestSignal });
     const config = await this._readConfig(snapshot, requestSignal);
     const targetDatasetId = datasetId === undefined
@@ -1848,7 +1812,7 @@ export class CommunityAnnotationGitHubSync {
    *   signal?: AbortSignal|null, onProgress?: ((progress: {done: number, total: number}) => void)|null}} options
    */
   async pullFiles({ snapshot, fileCache, cacheScope, ownUserKey = null, signal = null, onProgress = null } = {}) {
-    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation files pull signal');
+    const requestSignal = requireSignalOrNull(signal, 'Annotation files pull signal');
     if (snapshot === null || typeof snapshot !== 'object' || !GIT_OID.test(snapshot.annotationsOid ?? '')) {
       throw new TypeError('Annotation files pull requires a repository snapshot');
     }
@@ -1994,7 +1958,7 @@ export class CommunityAnnotationGitHubSync {
     publicationMode,
     signal = null,
   } = {}) {
-    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation config publication signal');
+    const requestSignal = requireSignalOrNull(signal, 'Annotation config publication signal');
     const mode = assertPublicationMode(publicationMode);
     const ctx = this._ctx();
     const { repoInfo, branch, source } = await this._resolved(requestSignal);
@@ -2017,7 +1981,7 @@ export class CommunityAnnotationGitHubSync {
       annotatableSettings,
       closedFields,
     });
-    const contentBase64 = encodeBase64Bytes(toAnnotationPublicationBytes(nextConfig, { path: ANNOTATION_CONFIG_PATH }));
+    const contentBase64 = base64OfBytes(toAnnotationPublicationBytes(nextConfig, { path: ANNOTATION_CONFIG_PATH }));
     const unchanged = { mode: 'none', branch, path: ANNOTATION_CONFIG_PATH, sha: current.sha, ...replacement, changed: false };
     if (base64PayloadEqualsCanonical(current.contentBase64, contentBase64, ANNOTATION_CONFIG_PATH)) return unchanged;
     if (expectedSha === null) {
@@ -2066,7 +2030,7 @@ export class CommunityAnnotationGitHubSync {
     publicationMode,
     signal = null,
   } = {}) {
-    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation moderation publication signal');
+    const requestSignal = requireSignalOrNull(signal, 'Annotation moderation publication signal');
     const mode = assertPublicationMode(publicationMode);
     const ctx = this._ctx();
     const { repoInfo, branch, source } = await this._resolved(requestSignal);
@@ -2082,7 +2046,7 @@ export class CommunityAnnotationGitHubSync {
     // The open dataset's merges replace that dataset's part of the file;
     // every other dataset's merges stay as published.
     const incoming = composeMergesFile(current?.json ?? null, this.datasetId, mergesDoc, { path: ANNOTATION_MERGES_PATH });
-    const contentBase64 = encodeBase64Bytes(toAnnotationPublicationBytes(incoming, { path: ANNOTATION_MERGES_PATH }));
+    const contentBase64 = base64OfBytes(toAnnotationPublicationBytes(incoming, { path: ANNOTATION_MERGES_PATH }));
     const unchanged = { mode: 'none', branch, path: ANNOTATION_MERGES_PATH, sha: current?.sha ?? null, changed: false };
     if (current !== null && base64PayloadEqualsCanonical(current.contentBase64, contentBase64, ANNOTATION_MERGES_PATH)) {
       return unchanged;
@@ -2130,7 +2094,7 @@ export class CommunityAnnotationGitHubSync {
 
   /** The caller's own user file at the branch (a profile load, not a Pull): `{doc, sha, path}` or null. */
   async pullUserFile({ userKey = null, signal = null } = {}) {
-    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation user-file pull signal');
+    const requestSignal = requireSignalOrNull(signal, 'Annotation user-file pull signal');
     if (typeof userKey !== 'string' || !/^ghid_[1-9][0-9]*$/.test(userKey)) throw new Error('userKey required');
     const { branch, source } = await this._resolved(requestSignal);
     const path = `annotations/users/${userKey}.json`;
@@ -2156,7 +2120,7 @@ export class CommunityAnnotationGitHubSync {
     publicationMode,
     signal = null,
   } = {}) {
-    const requestSignal = assertAbortSignalOrNull(signal, 'Annotation user-file publication signal');
+    const requestSignal = requireSignalOrNull(signal, 'Annotation user-file publication signal');
     const mode = assertPublicationMode(publicationMode);
     const ctx = this._ctx();
     const composeView = typeof userDoc === 'function' ? userDoc : null;
@@ -2194,7 +2158,7 @@ export class CommunityAnnotationGitHubSync {
     // file; the contributor's other datasets stay as published.
     const view = mode === 'direct' ? viewOver(published) : null;
     const content = mode === 'direct'
-      ? encodeBase64Bytes(
+      ? base64OfBytes(
         toAnnotationPublicationBytes(composeUserFile(published, this.datasetId, view, { path, filename }), { path })
       )
       : null;
@@ -2334,7 +2298,7 @@ export function setDatasetAnnotationRepoFromUrlParam({ datasetId, urlParamValue,
 }
 
 export async function resolveAnnotationRepositoryFromUrlParam({ urlParamValue, tokenOverride = null, signal = null } = {}) {
-  const requestSignal = assertAbortSignalOrNull(signal, 'Annotation repository resolution signal');
+  const requestSignal = requireSignalOrNull(signal, 'Annotation repository resolution signal');
   const parsed = parseOwnerRepo(urlParamValue);
   if (!parsed) return null;
   // Default-branch ownership is resolved once, before the repository reference

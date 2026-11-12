@@ -2,7 +2,7 @@
  * One embedding, one set of displayed coordinates, whichever way it is opened.
  *
  * The format defines the payload: every writer normalizes an embedding on its
- * own (centred per axis, one `2 / max(axis ranges)` scale) at the input's
+ * own (centered per axis, one `2 / max(axis ranges)` scale) at the input's
  * precision and rounds to float32 once. The reader worker makes that payload
  * (`embedding-payload.js`) and the DimensionManager publishes it as it is,
  * with the identity display transform; the vectors are scaled exactly once,

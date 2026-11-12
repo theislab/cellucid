@@ -6,7 +6,7 @@ import { loadSyntheticDataset } from './helpers/synthetic-dataset.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 /**
- * K-03: a 3D embedding that does not place 30 % of 1M cells (NaN positions in
+ * K-03: a 3D embedding that does not place 30% of 1M cells (NaN positions in
  * every axis, `rendering/unplaced-positions.js`). The view draws exactly what
  * it draws with those cells hidden, picking never finds one, a tree holds
  * only the placed cells, levels of detail and culling draw, and no WebGL
@@ -124,13 +124,13 @@ async function attachFrameDifference(page) {
   }
 }
 
-test('a 3D embedding that does not place 30 % of 1M cells draws, picks and builds its tree over the placed cells only', async ({ page }) => {
+test('a 3D embedding that does not place 30% of 1M cells draws, picks and builds its tree over the placed cells only', async ({ page }) => {
   test.setTimeout(600_000);
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   await open(page);
   await page.evaluate(() => {
-    // 30 % of the cells, spread over the cloud.
+    // 30% of the cells, spread over the cloud.
     const unplacedOf = cell => (Math.imul(cell, 2654435761) >>> 0) % 10 < 3;
     const viewer = window._cellucidViewer;
     viewer.setAntialiasing(false);

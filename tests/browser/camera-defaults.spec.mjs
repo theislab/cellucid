@@ -502,7 +502,7 @@ test('Orbit and Planar targets follow the sidebar-aware visual center', async ({
     const sidebarRight = sidebar.offsetLeft + sidebar.offsetWidth;
     const centerY = (canvasRect.top + canvasRect.bottom) / 2;
     // Both grid cells lie in the canvas area right of the sidebar, each
-    // half of it wide; a camera target sits at the centre of its cell.
+    // half of it wide; a camera target sits at the center of its cell.
     const paneWidth = (canvasRect.right - Math.max(canvasRect.left, sidebarRight)) / 2;
     const leftPaneLeft = Math.max(canvasRect.left, sidebarRight);
     const leftX = leftPaneLeft + paneWidth / 2;

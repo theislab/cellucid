@@ -3,7 +3,7 @@
  * every continuous field takes, or float64 for an integer column that
  * float32 cannot hold exactly (an integer dtype wider than 16 bits: cell or
  * donor ids, deep cells' counts; `anndata/values.js` `readContinuous`).
- * Colours, filters, legends, highlights, analysis pages and exports read
+ * Colors, filters, legends, highlights, analysis pages and exports read
  * either; a value is never rounded on its way to them.
  *
  * @module data/continuous-values

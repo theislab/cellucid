@@ -106,6 +106,10 @@ class FakeElement {
     for (const child of this.children) child.setConnected(value);
   }
 
+  append(...children) {
+    for (const child of children) this.appendChild(child);
+  }
+
   appendChild(child) {
     if (child.parentNode !== null) child.remove();
     this._textContent = '';
@@ -154,6 +158,10 @@ class FakeElement {
 
   getAttribute(name) {
     return this.attributes.get(String(name)) ?? null;
+  }
+
+  removeAttribute(name) {
+    this.attributes.delete(String(name));
   }
 
   addEventListener(type, listener) {
@@ -217,7 +225,7 @@ class FakeElement {
   }
 
   getBoundingClientRect() {
-    if (this.classList.contains('page-combine-menu')) {
+    if (this.classList.contains('popup-menu')) {
       return {
         bottom: 1080,
         height: 120,
@@ -267,6 +275,7 @@ class FakeDocument {
       clientHeight: 1000,
       clientWidth: 1440
     };
+    this.defaultView = { innerHeight: 1000, innerWidth: 1440 };
     this.body.setConnected(true);
     this.activeElement = this.body;
   }
@@ -480,37 +489,48 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
     let combineButton = tabs.querySelectorAll(
       '.highlight-page-tab-combine'
     )[1];
+    // The page's Combine is a menu button of the shared menu
+    // (`ui/components/menu.js`): its look, its keys, its state.
     combineButton.dispatch('click');
-    let combineMenu = document.getElementById('page-combine-menu');
+    let combineMenu = document.body.querySelector('.popup-menu');
     assert.notEqual(combineMenu, null);
     assert.equal(combineMenu.getAttribute('role'), 'menu');
+    assert.equal(combineMenu.getAttribute('aria-label'), 'Combine Activated cells');
     assert.equal(combineButton.getAttribute('aria-haspopup'), 'menu');
     assert.equal(combineButton.getAttribute('aria-expanded'), 'true');
-    assert.equal(
-      combineButton.getAttribute('aria-controls'),
-      'page-combine-menu'
+    assert.equal(combineButton.getAttribute('aria-controls'), combineMenu.id);
+    const menuOptions = combineMenu.querySelectorAll('.open-menu-item');
+    assert.deepEqual(
+      menuOptions.map(option => option.textContent),
+      ['∩ Intersection with Page 1', '∪ Union with Page 1']
     );
-    assert.equal(combineMenu.style.top, '8px');
-    assert.equal(combineMenu.style.maxHeight, '984px');
-    assert.equal(
-      document.activeElement,
-      combineMenu.querySelector('.page-combine-option')
-    );
-    const menuOptions = combineMenu.querySelectorAll(
-      '.page-combine-option'
-    );
-    document.dispatch('keydown', { key: 'ArrowDown' });
-    assert.equal(document.activeElement, menuOptions[1]);
-    document.dispatch('keydown', { key: 'Home' });
     assert.equal(document.activeElement, menuOptions[0]);
-    document.dispatch('keydown', { key: 'Escape' });
-    assert.equal(document.getElementById('page-combine-menu'), null);
+    const press = key => combineMenu.dispatch('keydown', {
+      key,
+      target: document.activeElement
+    });
+    press('ArrowDown');
+    assert.equal(document.activeElement, menuOptions[1]);
+    press('Home');
+    assert.equal(document.activeElement, menuOptions[0]);
+    press('Escape');
+    assert.equal(document.body.querySelector('.popup-menu'), null);
     assert.equal(document.activeElement, combineButton);
     assert.equal(combineButton.getAttribute('aria-expanded'), 'false');
+    assert.equal(combineButton.getAttribute('aria-controls'), null);
+
+    // Tab closes the menu and hands focus back to its button first, so the
+    // browser's Tab moves on from there (the menu sits at the end of the
+    // page: a Tab from an item went to the page's first stop, LF-5).
+    combineButton.dispatch('click');
+    combineMenu = document.body.querySelector('.popup-menu');
+    press('Tab');
+    assert.equal(document.body.querySelector('.popup-menu'), null);
+    assert.equal(document.activeElement, combineButton);
 
     combineButton.dispatch('click');
-    combineMenu = document.getElementById('page-combine-menu');
-    combineMenu.querySelector('.page-combine-option').dispatch('click');
+    combineMenu = document.body.querySelector('.popup-menu');
+    combineMenu.querySelector('.open-menu-item').dispatch('click');
     await settleActions();
     assert.equal(state.pages.length, 3);
     assert.equal(state.activePageId, 'page_3');
@@ -560,7 +580,7 @@ test('highlight pages expose roving tabs and complete keyboard operations with f
   });
 });
 
-test('a page colour drag publishes once per frame, and its final colour on change', { concurrency: false }, async () => {
+test('a page color drag publishes once per frame, and its final color on change', { concurrency: false }, async () => {
   const frames = [];
   const previous = {
     requestAnimationFrame: globalThis.requestAnimationFrame,
@@ -595,7 +615,7 @@ test('a page colour drag publishes once per frame, and its final colour on chang
       assert.deepEqual(
         operations.filter(([kind]) => kind === 'color').at(-1),
         ['color', 'page_1', '#444444'],
-        'the final colour is published at once on change'
+        'the final color is published at once on change'
       );
       pagesUi.destroy?.();
       removeActions();

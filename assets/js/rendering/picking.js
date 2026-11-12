@@ -1,19 +1,20 @@
 import { BENEATH_ALPHA_BYTE, POINT_VISIBILITY_THRESHOLD, UNREAD_ALPHA_BYTE } from './alpha-visibility.js';
 import { requireLodMembership } from './high-perf/renderer-contracts.js';
+import { pointScaleFor, pointSpriteSize } from './point-sprite.js';
 
 /**
  * Screen-space cell picking: the cell is the dot drawn under the pointer.
  *
  * Every point is projected with the pane's own matrices and given the size the
- * vertex shader draws it at (shaders/high-perf-shaders.js: the same point size,
- * perspective attenuation and clamp). A cell is under the pointer when its
- * drawn disc covers it; of those, the front-most wins, which is the dot the
- * depth test leaves on top. When no disc covers the pointer, the nearest dot
- * within PICK_TOLERANCE_CSS_PX of its edge is taken, so a near miss on a small
- * dot still lands. Hidden cells and cells the current level of detail does not
- * draw are never picked.
+ * vertex shader draws it at (`pointSpriteSize`, rendering/point-sprite.js: the
+ * same point size, perspective attenuation and cap). A cell is under the
+ * pointer when its drawn disc covers it; of those, the front-most wins, which
+ * is the dot the depth test leaves on top. When no disc covers the pointer,
+ * the nearest dot within PICK_TOLERANCE_CSS_PX of its edge is taken, so a
+ * near miss on a small dot still lands. Hidden cells and cells the current
+ * level of detail does not draw are never picked.
  *
- * A field's colours layer the cells (`alpha-visibility.js`, `pointLayers`):
+ * A field's colors layer the cells (`alpha-visibility.js`, `pointLayers`):
  * a cell drawn in an upper layer wins over one beneath it, as drawn -- in a
  * flat layout by layer, in 3-D by depth among the cells read, every cell not
  * read lying under them (drawn without depth writes). The cells read are
@@ -23,15 +24,11 @@ import { requireLodMembership } from './high-perf/renderer-contracts.js';
  *
  * This replaced a ray search with a fixed world-space radius, which ignored
  * drawn size and preferred the cell nearest the camera: zoomed in it picked a
- * neighbour of the dot under the pointer, zoomed out it missed dots entirely.
+ * neighbor of the dot under the pointer, zoomed out it missed dots entirely.
  */
 
 /** How far outside a dot's drawn edge a click still selects it, in CSS px. */
 export const PICK_TOLERANCE_CSS_PX = 3;
-
-/** The vertex shader's clamp on gl_PointSize, in device pixels. */
-const MIN_DRAWN_POINT_SIZE_PX = 0.5;
-const MAX_DRAWN_POINT_SIZE_PX = 128;
 
 function requireFinite(value, label, { positive = false } = {}) {
   if (!Number.isFinite(value) || (positive && value <= 0)) {
@@ -61,6 +58,7 @@ function requireScreenPickInput(input) {
     pointSize,
     sizeAttenuation,
     fov,
+    pointSizeMax,
     pointLayers = null,
   } = input;
   if (dimension !== 1 && dimension !== 2 && dimension !== 3) {
@@ -91,6 +89,7 @@ function requireScreenPickInput(input) {
   requireFinite(pointSize, 'Picking pointSize', { positive: true });
   requireFinite(sizeAttenuation, 'Picking sizeAttenuation');
   requireFinite(fov, 'Picking fov', { positive: true });
+  requireFinite(pointSizeMax, 'Picking pointSizeMax', { positive: true });
   if (pointLayers !== null) {
     if (
       typeof pointLayers !== 'object'
@@ -132,21 +131,23 @@ function requireScreenPickInput(input) {
     pointSize,
     sizeAttenuation,
     fov,
+    pointSizeMax,
     pointLayers,
   };
 }
 
 /**
- * The drawn radius of a point at clip-space w, in CSS pixels. Mirrors the
- * vertex shader: mix(pointSize, perspectiveSize, attenuation), clamped, in
- * device pixels; halved for a radius and divided by the device pixel ratio.
+ * The drawn radius of a point at clip-space w (its eye depth), in CSS pixels:
+ * the vertex shader's sprite (`pointSpriteSize`) in device pixels, halved
+ * for a radius and divided by the device pixel ratio.
  */
-export function drawnPointRadiusCss({ w, pointSize, sizeAttenuation, fov, framebufferHeight, devicePixelRatio }) {
-  const projectionFactor = framebufferHeight / (2 * Math.tan(fov * 0.5));
-  const perspectiveSize = (pointSize * 0.01 * projectionFactor) / Math.max(w, 0.001);
-  const size = pointSize + (perspectiveSize - pointSize) * sizeAttenuation;
-  const clamped = Math.min(MAX_DRAWN_POINT_SIZE_PX, Math.max(MIN_DRAWN_POINT_SIZE_PX, size));
-  return clamped / 2 / devicePixelRatio;
+export function drawnPointRadiusCss({
+  w, pointSize, sizeAttenuation, fov, framebufferHeight, devicePixelRatio, pointSizeMax,
+}) {
+  const size = pointSpriteSize(w, {
+    pointSize, pointScale: pointScaleFor(framebufferHeight, fov), sizeAttenuation, pointSizeMax,
+  });
+  return size / 2 / devicePixelRatio;
 }
 
 /**
@@ -164,12 +165,13 @@ export function drawnPointRadiusCss({ w, pointSize, sizeAttenuation, fov, frameb
  * @param {number} input.pointSize - u_pointSize.
  * @param {number} input.sizeAttenuation - u_sizeAttenuation.
  * @param {number} input.fov - u_fov, radians.
+ * @param {number} input.pointSizeMax - u_pointSizeMax: the cap the pane drew with.
  * @param {import('./high-perf/spatial-index.js').SpatialIndex|null} [input.spatialIndex]
  * @param {import('./high-perf/renderer-contracts.js').LodMembership|null} [input.lodMembership] -
  *   The cells the pane's level of detail draws, or null at full detail.
  * @param {{colors: Uint8Array, readEveryLevel: boolean, readPointSize: number}|null} [input.pointLayers] -
  *   The layers the pane was drawn with (`HighPerfRenderer#getCurrentPointLayers`):
- *   the colours (alpha byte = layer), whether the cells read were drawn at
+ *   the colors (alpha byte = layer), whether the cells read were drawn at
  *   every level, and their u_pointSize; null: every cell on top at `pointSize`.
  * @returns {{ cellIndex: number, examinedPointCount: number, screenDistance: number, depth: number }}
  */
@@ -187,6 +189,7 @@ export function findScreenSpacePick(input) {
     pointSize,
     sizeAttenuation,
     fov,
+    pointSizeMax,
     pointLayers,
   } = requireScreenPickInput(input);
   // The level's cells (`LodMembership`): by admission level, or the first
@@ -196,7 +199,7 @@ export function findScreenSpacePick(input) {
   const lodPrefix = lodMembership === null || lodAdmissionLevels !== null ? pointCount : lodMembership.count;
   const { cssWidth, cssHeight, framebufferHeight } = pane;
   const devicePixelRatio = framebufferHeight / cssHeight;
-  const sizeInput = { w: 1, pointSize, sizeAttenuation, fov, framebufferHeight, devicePixelRatio };
+  const sizeInput = { w: 1, pointSize, sizeAttenuation, fov, framebufferHeight, devicePixelRatio, pointSizeMax };
   const layerColors = pointLayers === null ? null : pointLayers.colors;
   const readEveryLevel = pointLayers !== null && pointLayers.readEveryLevel;
   const readPointSize = pointLayers === null ? pointSize : pointLayers.readPointSize;
@@ -217,7 +220,7 @@ export function findScreenSpacePick(input) {
 
   const evaluatePoint = cellIndex => {
     examinedPointCount++;
-    // The layer its colour names: 0 on top, 1 the grey beneath, 2 not read.
+    // The layer its color names: 0 on top, 1 the gray beneath, 2 not read.
     const layerByte = layerColors === null ? 255 : layerColors[cellIndex * 4 + 3];
     const layer = layerByte === UNREAD_ALPHA_BYTE ? 2 : layerByte === BENEATH_ALPHA_BYTE ? 1 : 0;
     const read = layer !== 2;
@@ -243,7 +246,7 @@ export function findScreenSpacePick(input) {
     if (distance <= radius) {
       // The upper layer first, as drawn; then front-most: what the depth
       // test leaves on top. In a flat layout every dot has the same depth,
-      // so the nearer centre decides.
+      // so the nearer center decides.
       const rank = flat ? layer : (read ? 0 : 1);
       const tieRank = flat ? 0 : layer;
       if (
@@ -296,7 +299,7 @@ export function findScreenSpacePick(input) {
   } else {
     // Every dot that can reach the pointer lies in a screen rectangle as wide
     // as the largest drawable radius plus the tolerance.
-    const reachCss = MAX_DRAWN_POINT_SIZE_PX / 2 / devicePixelRatio + PICK_TOLERANCE_CSS_PX;
+    const reachCss = pointSizeMax / 2 / devicePixelRatio + PICK_TOLERANCE_CSS_PX;
     const centreX = (cursor.x / cssWidth) * 2 - 1;
     const centreY = 1 - (cursor.y / cssHeight) * 2;
     const halfX = (reachCss / cssWidth) * 2;

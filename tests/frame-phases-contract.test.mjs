@@ -128,8 +128,8 @@ test('a gesture in another pane moves the camera focus at once and the sidebar w
   assert.match(focus, /transferViewFocus\(clickedViewId, \{ saveOutgoing: true \}\);[\s\S]*deferSidebarFocus\(commit\);/);
   assert.doesNotMatch(focus.slice(0, focus.indexOf('let sidebarFocusPending')), /viewFocusHandler\(/);
   // Ends: the release of a press or of the last finger, or a resting wheel.
-  assert.match(viewer, /const handleMouseUp = \(e\) => \{\n[^\n]*\n\s*if \(sidebarFocusPending && sidebarFocusTimer === null\) commitSidebarFocus\(\);/);
-  assert.match(viewer, /touchGesture = 'idle';\n\s*if \(sidebarFocusPending && sidebarFocusTimer === null\) commitSidebarFocus\(\);/);
+  assert.match(viewer, /const handleMouseUp = \(e\) => \{\n[^\n]*\n\s*if \(sidebarFocusPending && !commitAtWheelRest\.pending\) commitSidebarFocus\(\);/);
+  assert.match(viewer, /touchGesture = 'idle';\n\s*if \(sidebarFocusPending && !commitAtWheelRest\.pending\) commitSidebarFocus\(\);/);
   assert.match(viewer, /focusViewAtScreenPosition\(e\.clientX, e\.clientY, 'wheel'\)/);
   // A wheel that moves nothing draws nothing.
   assert.match(viewer, /if \(targetRadius === oldRadius\) return;\n\s*invalidateCameraFrame\(\);/);
@@ -152,7 +152,7 @@ test('a grid pane whose scene and camera did not change keeps its pixels', () =>
   // Every time-driven effect bumps the scene generation; all but the
   // highlight pulse bump the base layer's too (pulse-layer-cache.js).
   assert.match(viewer, /if \(baseLayerAnimationActive\(\)\) \{\n\s*sceneGeneration \+= 1;\n\s*baseGeneration \+= 1;\n\s*\} else if \(highlightTools !== null && highlightTools\.isHighlightAnimating\(\)\) \{\n\s*sceneGeneration \+= 1;/);
-  // A retained pane is skipped; a redrawn one clears its own colour.
+  // A retained pane is skipped; a redrawn one clears its own color.
   assert.match(viewer, /if \(retainPanes && paneIsUnchanged\(paneDrawRecords\.get\(view\.id\), mvpMatrix, pane, paneNavigationMode\)\) \{\n\s*continue;/);
   // (A pane drawn over its kept samples, pulse-sample-mask.js, is not
   // cleared: its marked samples are reset by the pass itself.)
@@ -208,7 +208,7 @@ test('the frame loop stops once the scene has settled and starts again on demand
   for (const site of [
     /function invalidateFrame\(\) \{\n\s*frameInvalidated = true;\n\s*sceneGeneration \+= 1;\n\s*baseGeneration \+= 1;\n\s*ensureFrameScheduled\(\);/,
     /function invalidateCameraFrame\(\) \{\n\s*frameInvalidated = true;\n\s*ensureFrameScheduled\(\);/,
-    /activeKeys\.add\(code\);\n(\s*\/\/.*\n)*\s*ensureFrameScheduled\(\);/,
+    /activeKeys\.press\(code, e\.timeStamp\);\n(\s*\/\/.*\n)*\s*ensureFrameScheduled\(\);/,
     /createCanvasResizeObserver\(canvas, \(\) => ensureFrameScheduled\(\)\)/,
     /requestFrame: \(\) => ensureFrameScheduled\(\)/,
   ]) {

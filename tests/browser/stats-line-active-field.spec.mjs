@@ -9,7 +9,7 @@
 // `activeFieldIndex` — so switching between them is an active-field change, and
 // the switch path published the legend without publishing the line beside it.
 //
-// This walks the real path: colour a view, keep it, colour the live view with a
+// This walks the real path: color a view, keep it, color the live view with a
 // different field, and switch back. The line must name the field of the view
 // being looked at, every time.
 
@@ -46,15 +46,14 @@ test('the statistics line names the active field of the view being shown', async
   );
 
   const stats = page.locator('#stats');
-  await expect(stats).toHaveText('120 cells • Field: None');
-
-  await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+  // The fixture opens colored by its cell types (`first-coloring.js`).
+  await expect(page.locator('#categorical-field option:checked')).toHaveText('cell_type');
   await expect(page.locator('.legend-item')).toHaveCount(3);
   await expect(stats).toHaveText(
     '120 cells • Field: cell_type (category) • Centroids: 3',
   );
 
-  // Keep the coloured view. The kept view becomes active and carries the field
+  // Keep the colored view. The kept view becomes active and carries the field
   // it was kept with.
   await openCollapsedPanels(page);
   await page.locator('#split-keep-view-btn').click();
@@ -64,7 +63,7 @@ test('the statistics line names the active field of the view being shown', async
     '120 cells • Field: cell_type (category) • Centroids: 3',
   );
 
-  // Back to the live view and colour it with a different field, so the two
+  // Back to the live view and color it with a different field, so the two
   // views disagree about what is being shown.
   await page.locator('.split-badge').first().click();
   await expect.poll(() => activeViewId(page)).toBe('live');
@@ -73,7 +72,7 @@ test('the statistics line names the active field of the view being shown', async
 
   // Switching back must re-announce the kept view's own field. Publishing the
   // legend without the line beside it is what left this reading "score" over a
-  // plot coloured by cell type.
+  // plot colored by cell type.
   await page.locator('.split-badge').nth(1).click();
   await expect.poll(() => activeViewId(page)).toBe('snap_1');
   await expect(page.locator('.legend-item')).toHaveCount(3);

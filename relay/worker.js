@@ -30,6 +30,7 @@ import {
   authorizationServerMetadata,
   handleAuthorize,
   handleAuthorizeWait,
+  handleClaim,
   handleRegister,
   handleToken,
   protectedResourceMetadata,
@@ -172,6 +173,8 @@ export default {
           return await handleAuthorize(request, site, keys, env, (input, init) => globalThis.fetch(input, init));
         case '/oauth/authorize/wait':
           return await handleAuthorizeWait(request, site, env);
+        case '/oauth/claim':
+          return await handleClaim(request, keys, env, allowedOrigins);
         case '/oauth/assets/authorize.js':
         case '/oauth/assets/authorize.css': {
           requireGet(request);

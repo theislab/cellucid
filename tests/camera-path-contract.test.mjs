@@ -6,9 +6,10 @@ import { infoTipText } from './helpers/info-tip-text.mjs';
 const keyframeModule = await import(
   '../assets/js/app/ui/modules/cinematic-camera/keyframe-store.js'
 );
-const { createPlaybackController, prefersReducedMotion } = await import(
+const { createPlaybackController } = await import(
   '../assets/js/app/ui/modules/cinematic-camera/playback-controller.js'
 );
+const { prefersReducedMotion } = await import('../assets/js/utils/reduced-motion.js');
 const { interpolateCameraState } = await import(
   '../assets/js/app/ui/modules/cinematic-camera/interpolation-engine.js'
 );
@@ -165,6 +166,7 @@ test('Camera Path state accepts only the exact current fields', async () => {
   );
   const state = {
     autoplay: false,
+    captions: true,
     keyframes: [keyframe('one'), keyframe('two')],
     nextIndex: 3,
     loopBackKeyframeId: null,
@@ -175,7 +177,7 @@ test('Camera Path state accepts only the exact current fields', async () => {
     defaultSpeed: '30'
   };
 
-  assert.equal(assertCameraPathState(state), state);
+  assert.deepEqual(assertCameraPathState(state), state);
   assert.throws(
     () => assertCameraPathState({ ...state, legacyPlayback: false }),
     /exactly/i
@@ -193,6 +195,12 @@ test('Camera Path state accepts only the exact current fields', async () => {
     () => assertCameraPathState({ ...state, autoplay: 1 }),
     /autoplay/i
   );
+  // Captions are a playback setting of the path (F110), a key added after
+  // records were first written: a record saved before it reads as captions
+  // on (R9R-13), a wrong value is refused.
+  assert.throws(() => assertCameraPathState({ ...state, captions: 'on' }), /captions/i);
+  const { captions: _captions, ...savedBeforeCaptions } = state;
+  assert.deepEqual(assertCameraPathState(savedBeforeCaptions), { ...savedBeforeCaptions, captions: true });
   // The navigation mode is the camera's and the navigation settings are
   // settings: neither is part of a path.
   assert.throws(
@@ -445,7 +453,9 @@ test('a reduced-motion preference completes the path instead of animating it', (
     );
     assert.equal(controller.getState(), 'STOPPED');
     assert.deepEqual(stateChanges, ['STOPPED']);
-    assert.deepEqual(progress, [1, 0]);
+    // The transport stays at the end, where the camera is (R9R-7: it went back to 0).
+    assert.deepEqual(progress, [1]);
+    assert.equal(controller.getProgress(), 1);
     assert.equal(
       appliedStates.length,
       1,
@@ -921,4 +931,80 @@ test('a keyframe records the representation it was captured on', () => {
   const restored = keyframeModule.createKeyframeStore();
   assert.equal(restored.importAll(exportedState), true);
   assert.deepEqual(restored.getAll().map(({ representation }) => representation), [umap, { key: 'X_umap_3d', columns: null }, null]);
+});
+
+test('a stop keeps where the film is: the transport shows it and Play goes on from it; the bar\'s Stop and a new path go back to 0 (R9R-7)', () => {
+  const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+  const originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
+  const originalNow = performance.now;
+  const scheduledFrames = new Map();
+  let nextFrameId = 1;
+  let clock = 10_000;
+  globalThis.requestAnimationFrame = callback => {
+    const id = nextFrameId++;
+    scheduledFrames.set(id, callback);
+    return id;
+  };
+  globalThis.cancelAnimationFrame = id => { scheduledFrames.delete(id); };
+  performance.now = () => clock;
+  const drain = () => {
+    const frames = [...scheduledFrames.values()];
+    scheduledFrames.clear();
+    for (const frame of frames) frame(clock);
+  };
+  try {
+    const store = keyframeModule.createKeyframeStore();
+    assert.equal(store.importAll({ keyframes: [keyframe('one'), keyframe('two', 1)], nextIndex: 3 }), true);
+    store.setDuration(0, 4);
+    const times = [];
+    const controller = createPlaybackController({
+      viewer: { setCameraState: () => {} },
+      keyframeStore: store,
+      getInterpolationOptions: () => ({ positionMethod: 'linear', rotationMethod: 'linear', easing: 'linear', loop: false, autoPaceSpeed: 1 }),
+    });
+    controller.on('timeUpdate', update => times.push(update.elapsed));
+
+    controller.play();
+    clock += 1000;
+    drain();
+    // An agent's stop, a turn's Stop: the camera stays, and so does the transport.
+    controller.stop({ resetCamera: false });
+    assert.equal(controller.getState(), 'STOPPED');
+    assert.equal(controller.getProgress(), 0.25);
+    assert.equal(times.at(-1), 1, 'the readout says 0:01, where the camera is');
+
+    // Play goes on from where the transport shows.
+    controller.play();
+    clock += 1000;
+    drain();
+    assert.equal(controller.getProgress(), 0.5);
+
+    // The bar's Stop goes back to the first keyframe, and the transport with it.
+    controller.stop({ resetCamera: true });
+    assert.equal(controller.getProgress(), 0);
+    assert.equal(times.at(-1), 0);
+
+    // Played to its end: the transport stays at the end; Play starts again.
+    controller.play();
+    clock += 5000;
+    drain();
+    assert.equal(controller.getState(), 'STOPPED');
+    assert.equal(controller.getProgress(), 1);
+    controller.play();
+    clock += 1000;
+    drain();
+    assert.equal(controller.getProgress(), 0.25, 'from the end, Play starts again');
+
+    // A change of the path: the position meant the old one.
+    controller.stop({ resetCamera: false });
+    store.setDuration(0, 8);
+    assert.equal(controller.getProgress(), 0);
+    controller.destroy();
+  } finally {
+    performance.now = originalNow;
+    if (originalRequestAnimationFrame === undefined) delete globalThis.requestAnimationFrame;
+    else globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+    if (originalCancelAnimationFrame === undefined) delete globalThis.cancelAnimationFrame;
+    else globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+  }
 });

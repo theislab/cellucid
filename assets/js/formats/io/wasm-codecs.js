@@ -2,7 +2,7 @@
  * The WebAssembly decoders: Zstandard, LZ4 and Blosc as their own libraries
  * decode them (zstd 1.5.6, lz4 1.10.0, c-blosc 1.21.6 with its blosclz and
  * bitshuffle), in one module, `assets/wasm/codecs.wasm`, built from the
- * pinned release tarballs by `scripts/build-wasm-codecs.mjs` (its licences
+ * pinned release tarballs by `scripts/build-wasm-codecs.mjs` (its licenses
  * in `assets/wasm/LICENSES/`).
  *
  * - **Loading**: on first need in each thread (a decode worker, the reader

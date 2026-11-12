@@ -16,7 +16,7 @@
  *
  * 1. open: from navigation to a ready view of the dataset (and, within it,
  *    `firstPictureSeconds`: until the first cells are drawn);
- * 2. colour by a categorical field (the second one the field menu lists);
+ * 2. color by a categorical field (the second one the field menu lists);
  * 3. show a gene (the first of the gene list).
  *
  * 4. show another gene, and with `--genes N` the next ones, up to N genes.
@@ -462,7 +462,7 @@ async function runLinkIn(context, port, { id, share, data }, { listSent = false 
       return options[1] ?? options[0] ?? null;
     });
     if (field !== null) {
-      await measure(page, 'colour by a field', async () => {
+      await measure(page, 'color by a field', async () => {
         await page.locator('#categorical-field').selectOption(field);
         await page.waitForFunction(value => {
           const state = window._cellucidState;

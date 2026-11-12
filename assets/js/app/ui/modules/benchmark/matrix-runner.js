@@ -10,7 +10,7 @@
  *
  * Measuring the viewer the user actually runs is the point: a matrix swept
  * against a renderer built for the benchmark would report LOD and culling
- * behaviour for a configuration nobody ever sees.
+ * behavior for a configuration nobody ever sees.
  *
  * The view-count axis respects the viewer's own mechanics rather than fighting
  * them. Setting the layout to `grid` alone changes nothing: the viewer stays on

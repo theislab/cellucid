@@ -10,6 +10,7 @@ import { PlotFactory, PlotRegistry, PlotHelpers, BasePlot, COMMON_HOVER_STYLE } 
 import { getHeatmapTraceType } from '../plotly-loader.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
+import { formatPercent } from '../../../../utils/format-units.js';
 
 /**
  * Category counts summed over pages, categories in first-occurrence order
@@ -84,9 +85,9 @@ const heatmapDefinition = {
         const count = pageCounts[j].get(cat) || 0;
         let value = count, text = count.toString();
 
-        if (normalize === 'row' && rowTotals[i] > 0) { value = (count / rowTotals[i]) * 100; text = `${value.toFixed(1)}%`; }
-        else if (normalize === 'column' && colTotals[j] > 0) { value = (count / colTotals[j]) * 100; text = `${value.toFixed(1)}%`; }
-        else if (normalize === 'total' && grandTotal > 0) { value = (count / grandTotal) * 100; text = `${value.toFixed(1)}%`; }
+        if (normalize === 'row' && rowTotals[i] > 0) { value = (count / rowTotals[i]) * 100; text = formatPercent(value, 1); }
+        else if (normalize === 'column' && colTotals[j] > 0) { value = (count / colTotals[j]) * 100; text = formatPercent(value, 1); }
+        else if (normalize === 'total' && grandTotal > 0) { value = (count / grandTotal) * 100; text = formatPercent(value, 1); }
         else if (normalize === 'none') { text = PlotHelpers.formatNumber(count, 0); }
 
         row.push(value);

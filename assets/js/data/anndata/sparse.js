@@ -1,7 +1,7 @@
 /**
  * AnnData sparse matrices (`csr_matrix` / `csc_matrix` 0.1.0 groups of
  * `data`, `indices` and `indptr`): their contract and pointers. Expression
- * matrices are read a column at a time (`matrix-access.js`), neighbour
+ * matrices are read a column at a time (`matrix-access.js`), neighbor
  * graphs line by line (`graph-lines.js`).
  *
  * @module data/anndata/sparse
@@ -10,6 +10,7 @@
 import { isAnnDataMatrixDataKind } from '../anndata-value-kinds.js';
 import { isGroup } from '../../formats/store.js';
 import {
+  AnnDataFormatError,
   attributeValue,
   encodingType,
   requireEncoding,
@@ -25,16 +26,16 @@ import {
  *   format: 'csr'|'csc', indicesArray: Object, indptrArray: Object, shape: number[]}}
  */
 export function sparseContract(group, format, label = 'Sparse matrix') {
-  if (!isGroup(group)) throw new Error(`${label} must be a ${format.storage} group`);
+  if (!isGroup(group)) throw new AnnDataFormatError(`${label} must be a ${format.storage} group`);
   const declared = encodingType(group);
   if (declared !== 'csr_matrix' && declared !== 'csc_matrix') {
-    throw new Error(`${label} encoding-type is required and must be 'csr_matrix' or 'csc_matrix'`);
+    throw new AnnDataFormatError(`${label} encoding-type is required and must be 'csr_matrix' or 'csc_matrix'`);
   }
   requireEncoding(group, declared, '0.1.0', label);
   const shape = shapeFromAttribute(attributeValue(group, 'shape'), label);
-  if (shape.length !== 2) throw new Error(`${label} shape must contain exactly two dimensions`);
+  if (shape.length !== 2) throw new AnnDataFormatError(`${label} shape must contain exactly two dimensions`);
   for (const key of ['data', 'indices', 'indptr']) {
-    if (!group.has(key)) throw new Error(`${label} is missing required '${key}' dataset`);
+    if (!group.has(key)) throw new AnnDataFormatError(`${label} is missing required '${key}' dataset`);
   }
   const dataArray = group.get('data');
   const indicesArray = group.get('indices');
@@ -45,14 +46,14 @@ export function sparseContract(group, format, label = 'Sparse matrix') {
   const pointerAxis = sparseFormat === 'csr' ? shape[0] : shape[1];
   validateOneDimensional(indptrArray, format, `${label} indptr`, pointerAxis + 1);
   if (dataLength !== indicesLength) {
-    throw new Error(`${label} data and indices lengths differ (${dataLength} versus ${indicesLength})`);
+    throw new AnnDataFormatError(`${label} data and indices lengths differ (${dataLength} versus ${indicesLength})`);
   }
   const dataKind = valueKind(dataArray);
-  if (!isAnnDataMatrixDataKind(dataKind)) throw new Error(`${label} data must use a numeric dtype`);
+  if (!isAnnDataMatrixDataKind(dataKind)) throw new AnnDataFormatError(`${label} data must use a numeric dtype`);
   const indicesKind = valueKind(indicesArray);
   const indptrKind = valueKind(indptrArray);
   if (!['int', 'uint'].includes(indicesKind) || !['int', 'uint'].includes(indptrKind)) {
-    throw new Error(`${label} indices and indptr must use integer dtypes`);
+    throw new AnnDataFormatError(`${label} indices and indptr must use integer dtypes`);
   }
   return {
     dataArray,
@@ -71,12 +72,12 @@ export function sparseContract(group, format, label = 'Sparse matrix') {
  * the non-zero count.
  */
 export function checkPointers(pointers, nnz, label) {
-  if (pointers[0] !== 0) throw new Error(`${label} indptr must start at zero`);
+  if (pointers[0] !== 0) throw new AnnDataFormatError(`${label} indptr must start at zero`);
   for (let i = 1; i < pointers.length; i++) {
-    if (!(pointers[i] >= pointers[i - 1])) throw new Error(`${label} indptr must be monotonic`);
+    if (!(pointers[i] >= pointers[i - 1])) throw new AnnDataFormatError(`${label} indptr must be monotonic`);
   }
   if (pointers[pointers.length - 1] !== nnz) {
-    throw new Error(`${label} indptr last value must equal the non-zero count (${nnz})`);
+    throw new AnnDataFormatError(`${label} indptr last value must equal the non-zero count (${nnz})`);
   }
   return pointers;
 }

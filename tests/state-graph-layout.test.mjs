@@ -23,7 +23,7 @@ import { bannerOf } from '../assets/js/app/ui/modules/state/workflow-banner.js';
 import { journalEntries } from '../assets/js/app/ui/modules/state/recently-deleted.js';
 
 const EFFECTS = { 'camera.set': 'view', 'view.keep': 'view', 'layout.section.open': 'layout', 'color.by': 'state' };
-const OPTIONS = { effectOf: type => EFFECTS[type] ?? 'state', categoryOf: step => step.touches[0] === 'camera' ? 'Camera' : step.touches[0] === 'layout' ? 'Layout' : 'Step' };
+const OPTIONS = { effectOf: type => EFFECTS[type] ?? 'state' };
 const camera = { type: 'camera.set', touches: ['camera'] };
 const section = { type: 'layout.section.open', touches: ['layout'] };
 
@@ -113,10 +113,10 @@ test('an archived branch is not drawn; a turn is one header with its steps under
   b.jump('s2');
   b.as({ origin: 'agent', agent: 'Claude', model: 'claude-sonnet-4-6', turn: 't1' }, 'Markers');
   b.step('Ran DE', { type: 'analysis.run', touches: ['analysis'] });
-  b.step('Coloured by CD3E');
+  b.step('Colored by CD3E');
   const view = createTrackerView(b.build());
   const layout = rowsOf(view);
-  assert.deepEqual(brief(layout), ['step:Opened@past', 'step:A@past', 'step:B@past', 'turn:t1@head▾', '  step:Ran DE@past', '  step:Coloured by CD3E@head']);
+  assert.deepEqual(brief(layout), ['step:Opened@past', 'step:A@past', 'step:B@past', 'turn:t1@head▾', '  step:Ran DE@past', '  step:Colored by CD3E@head']);
   const turn = layout.rows[3];
   assert.equal(turn.count, 2);
   assert.equal(turn.turn.label, 'Markers');
@@ -127,7 +127,7 @@ test('an archived branch is not drawn; a turn is one header with its steps under
 
 test('runs: consecutive view and layout steps (camera moves, open sections) fold into one row; undo is unchanged', () => {
   const b = trackerBuilder();
-  b.step('Coloured');
+  b.step('Colored');
   b.step('Opened Filters', section);
   b.steps(3, 'Moved the camera', camera);
   b.step('Opened Analysis', section);
@@ -136,9 +136,10 @@ test('runs: consecutive view and layout steps (camera moves, open sections) fold
   b.undo(4);
   const view = createTrackerView(b.build());
   const layout = rowsOf(view);
-  assert.deepEqual(brief(layout), ['step:Opened@past', 'step:Coloured@past', 'run:s2,s3,s4,s5,s6@head▸', 'step:Hid alpha@undone', 'step:Moved once@undone']);
+  assert.deepEqual(brief(layout), ['step:Opened@past', 'step:Colored@past', 'run:s2,s3,s4,s5,s6@head▸', 'step:Hid alpha@undone', 'step:Moved once@undone']);
   const run = layout.rows[2];
-  assert.deepEqual(run.categories, [{ name: 'Layout', count: 2 }, { name: 'Camera', count: 3 }]);
+  // What its steps did, by their labels (R9F: "Colors ×2" said nothing of which switches).
+  assert.deepEqual(run.changes, ['Opened Filters', 'Moved the camera 1', 'Moved the camera 2', 'Moved the camera 3', 'Opened Analysis'].map(label => ({ label, count: 1 })));
   assert.deepEqual(run.headAt, { index: 3, count: 5 }, 'the step shown is the 3rd of the run');
   const open = rowsOf(view, { expandedRuns: new Set([run.key]) });
   assert.equal(open.rows.filter(row => row.parent === run.key).length, 5);
@@ -232,8 +233,8 @@ test('search filters: who acted, the kind, notes, bookmarks, flags', () => {
   assert.deepEqual(match({ day: dayOf(day - 1) }), []);
   assert.deepEqual(searchCriteria({ text: '', day, domain: 'camera', hasNote: false }), { domain: 'camera', from: day, to: dayOf(day + 36 * 3_600_000) - 1 });
   // What the two filters offer: the parts some step changed, the days some step was taken (the opening left out).
-  const choices = filterChoices(view.steps(), id => ({ camera: 'Camera', 'active-field': 'Colouring' })[id] ?? id, view.step(py).at);
-  assert.deepEqual(choices.domains, [{ id: 'camera', label: 'Camera', count: 1 }, { id: 'active-field', label: 'Colouring', count: 2 }]);
+  const choices = filterChoices(view.steps(), id => ({ camera: 'Camera', 'active-field': 'Coloring' })[id] ?? id, view.step(py).at);
+  assert.deepEqual(choices.domains, [{ id: 'camera', label: 'Camera', count: 1 }, { id: 'active-field', label: 'Coloring', count: 2 }]);
   assert.deepEqual(choices.days, [{ day, label: 'Today', count: 3 }]);
 });
 
@@ -285,7 +286,7 @@ test('reveal: the stubs and groups to open for a step of a branch of a branch', 
 test('revert, group and squash say why not before anything is dispatched', () => {
   const b = trackerBuilder();
   const a = b.step('Hid alpha', { touches: ['filters'] });
-  b.step('Coloured');
+  b.step('Colored');
   const c = b.step('Hid beta', { touches: ['filters'] });
   b.as({ origin: 'agent', agent: 'Claude', turn: 't1' }, 'Two steps');
   const t1 = b.step('Agent 1');
@@ -359,9 +360,9 @@ test('appends: a layout from the one before (new steps at the tip shown) equals 
   // Each append joins or ends a different last row: a run, a step, an agent's turn, a group, a folded step alone.
   const appends = [
     () => b.step('Moved again', camera),
-    () => b.step('Coloured'),
+    () => b.step('Colored'),
     () => { b.as({ origin: 'agent', agent: 'Claude', model: 'claude-sonnet-4-6', turn: 'turn-1' }, 'Markers'); return b.step('Ran DE', { type: 'analysis.run', touches: ['analysis'] }); },
-    () => b.step('Coloured by CD3E'),
+    () => b.step('Colored by CD3E'),
     () => { b.as({ origin: 'user' }); return b.step('Moved', camera); },
     () => b.step('Kept a view', { type: 'view.keep', touches: ['views'] }),
     () => { b.step('Hid', { touches: ['filters'] }); return b.step('Hid more', { touches: ['filters'] }); },

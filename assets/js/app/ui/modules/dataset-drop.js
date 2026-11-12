@@ -11,9 +11,9 @@
  * item's handle (Chromium) it travels with the drop, to be kept for a
  * one-click reopen (`app/library/local-file-handles.js`). A library file of
  * My datasets (`.cellucid-library`, `CELLUCID_FILES`) goes to its Import; a
- * session file is refused with the sentence saying what it is and where it
- * goes. Anything else is refused with a message that says what can be
- * dropped.
+ * session file (`.cellucid-session`) loads as Load… › Open a session file…
+ * loads one, its dataset opened with it (bug hunt L25-8). Anything else is
+ * refused with a message that says what can be dropped.
  *
  * The browser's own reaction to a dropped file is to navigate to it, which
  * would leave the application. `ui/core/file-drop-guard.js`, a classic script
@@ -106,7 +106,7 @@ function droppedHandleOf(item) {
  *   {kind: 'file'|'zip'|'folder', label: string,
  *     readFiles: (options?: {signal?: AbortSignal|null}) => Promise<ArrayLike<File>>,
  *     handle: Promise<FileSystemHandle|null>|null} |
- *   {kind: 'library', label: string, file: File} |
+ *   {kind: 'library'|'session', label: string, file: File} |
  *   {kind: 'refused', message: string}
  * >} `library`: a library file of My datasets, to import
  */
@@ -155,10 +155,9 @@ export function describeDatasetDrop(dataTransfer) {
   if (file === null || file === undefined) {
     return refusal(`The dropped item could not be read. ${WHAT_CAN_BE_DROPPED}`);
   }
-  // Cellucid's own files are no dataset: a library file is imported, a session file says where it goes.
+  // Cellucid's own files are no dataset: a library file is imported, a session file loaded (its dataset with it).
   const own = cellucidFileOfName(file.name);
-  if (own?.id === 'library') return Object.freeze({ kind: 'library', label: file.name, file });
-  if (own !== null) return refusal(own.said);
+  if (own !== null) return Object.freeze({ kind: own.id, label: file.name, file });
   const readFiles = async () => [file];
   const layout = localFileLayout(file);
   if (layout !== null) return Object.freeze({ kind: layout, label: file.name, readFiles, handle });
@@ -175,10 +174,11 @@ export function describeDatasetDrop(dataTransfer) {
  *   readFiles: (options?: {signal?: AbortSignal|null}) => Promise<ArrayLike<File>>,
  *   handle: Promise<FileSystemHandle|null>|null}) => void} options.openDataset
  * @param {(file: File) => void} options.importLibrary A library file of My datasets dropped: its import.
+ * @param {(file: File) => void} options.openSession A session file dropped: loaded as Load…'s, its dataset with it.
  * @param {(message: string) => void} options.refuse
  * @returns {() => void} Retires the drop target.
  */
-export function initDatasetDrop({ documentOwner, overlay, openDataset, importLibrary, refuse }) {
+export function initDatasetDrop({ documentOwner, overlay, openDataset, importLibrary, openSession, refuse }) {
   if (
     documentOwner === null ||
     typeof documentOwner?.addEventListener !== 'function' ||
@@ -189,8 +189,8 @@ export function initDatasetDrop({ documentOwner, overlay, openDataset, importLib
   if (overlay === null || typeof overlay !== 'object' || !('hidden' in overlay)) {
     throw new TypeError('Dataset drop requires its overlay element.');
   }
-  if (typeof openDataset !== 'function' || typeof importLibrary !== 'function' || typeof refuse !== 'function') {
-    throw new TypeError('Dataset drop requires openDataset, importLibrary and refuse.');
+  if (typeof openDataset !== 'function' || typeof importLibrary !== 'function' || typeof openSession !== 'function' || typeof refuse !== 'function') {
+    throw new TypeError('Dataset drop requires openDataset, importLibrary, openSession and refuse.');
   }
   const view = documentOwner.defaultView;
   const lifecycle = new AbortController();
@@ -229,6 +229,10 @@ export function initDatasetDrop({ documentOwner, overlay, openDataset, importLib
     }
     if (drop.kind === 'library') {
       importLibrary(drop.file);
+      return;
+    }
+    if (drop.kind === 'session') {
+      openSession(drop.file);
       return;
     }
     openDataset(drop);

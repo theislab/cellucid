@@ -10,9 +10,16 @@ const mainSource = fs.readFileSync(
 test('KNN absence uses the exact current warning notification API', () => {
   assert.match(
     mainSource,
-    /setKnnEdgeLoadCallback\(\(\) => \{[\s\S]*?connectivitySummary === null[\s\S]*?notifications\.warning\([\s\S]*?No neighbor graph available for this dataset/
+    /setKnnEdgeLoadCallback\(\(\) => \{[\s\S]*?connectivitySummary === null[\s\S]*?notifications\.warning\([\s\S]*?This dataset has no neighbor graph, so KNN drag cannot select by neighbors; use Proximity drag or Lasso\./
   );
   assert.doesNotMatch(mainSource, /notifications\.warn\(/);
+});
+
+test('KNN with no dataset says so before any graph question (R9E-8)', () => {
+  assert.match(
+    mainSource,
+    /setKnnEdgeLoadCallback\(\(\) => \{\s*\/\/[^\n]*\n\s*if \(!\(state\.pointCount > 0\)\) \{\s*notifications\.info\(noDatasetOpenTo\('select cells by their neighbors'\)/
+  );
 });
 
 test('KNN absence is announced once per dataset and graph generation', () => {
@@ -20,10 +27,10 @@ test('KNN absence is announced once per dataset and graph generation', () => {
   // absent-capability announcement must be latched, and the latch must be
   // keyed to the publication and graph generations, so the next dataset, or a
   // data mapping that changes the graph, arms it again.
-  // Behaviour is covered by tests/browser/knn-missing-connectivity-warning
+  // Behavior is covered by tests/browser/knn-missing-connectivity-warning
   // .spec.mjs; this keeps the fast suite from losing the structure silently.
   const guarded = mainSource.match(
-    /setKnnEdgeLoadCallback\(\(\) => \{\s*if \(connectivitySummary === null\) \{([\s\S]*?)\n {10}return;/
+    /setKnnEdgeLoadCallback\(\(\) => \{[\s\S]*?\n\s*if \(connectivitySummary === null\) \{([\s\S]*?)\n {10}return;/
   );
   assert.notEqual(guarded, null, 'KNN absence guard was not found in main.js');
   const branch = guarded[1];

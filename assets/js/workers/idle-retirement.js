@@ -16,6 +16,8 @@
  * @module workers/idle-retirement
  */
 
+import { debounce } from '../utils/debounce.js';
+
 /**
  * How long idle workers are kept (a scheduling choice): the work of one
  * action (a gene's chunks, an analysis's runs, a plot's boxes, an export's
@@ -38,27 +40,21 @@ const pools = new Set();
  */
 export function registerIdleWorkers(retire) {
   if (typeof retire !== 'function') throw new TypeError('A pool retires its idle workers with a function.');
-  let timer = null;
+  // Its workers end once it has had nothing to do for `WORKER_IDLE_MS`.
+  const retireWhenIdle = debounce(retire, WORKER_IDLE_MS, { unref: true });
   const pool = {
     retire() {
-      if (timer !== null) clearTimeout(timer);
-      timer = null;
+      retireWhenIdle.cancel();
       retire();
     },
   };
   pools.add(pool);
   return {
     idle() {
-      if (timer !== null) clearTimeout(timer);
-      timer = setTimeout(() => {
-        timer = null;
-        retire();
-      }, WORKER_IDLE_MS);
-      timer.unref?.();
+      retireWhenIdle();
     },
     dispose() {
-      if (timer !== null) clearTimeout(timer);
-      timer = null;
+      retireWhenIdle.cancel();
       pools.delete(pool);
     },
   };

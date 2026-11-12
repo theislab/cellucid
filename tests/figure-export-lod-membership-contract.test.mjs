@@ -3,8 +3,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
-  computeVisibleCameraBounds,
-  computeVisibleRealBounds,
+  sourceHasDrawnCells,
 } from '../assets/js/app/ui/modules/figure-export/utils/coordinate-mapper.js';
 import {
   reducePointsByDensity,
@@ -132,6 +131,7 @@ function renderState() {
     fov: 1,
     pointSize: 4,
     sizeAttenuation: 1,
+    pointSizeMax: 160,
     lightingStrength: 1,
     fogDensity: 0,
     fogColor: Float32Array.from([0, 0, 0]),
@@ -264,6 +264,7 @@ test('projection admits source points at or below the active LOD level', () => {
       colorAlpha: 'layer',
       lodMembership: membership,
       drawOrder: null,
+      pointDiameterViewportPx: 3,
       renderState: renderState(),
       plotRect: { x: 0, y: 0, width: 100, height: 100 },
       sortByDepth,
@@ -284,6 +285,7 @@ test('projection admits source points at or below the active LOD level', () => {
     colorAlpha: 'layer',
     lodMembership: null,
     drawOrder: null,
+    pointDiameterViewportPx: 3,
     renderState: renderState(),
     plotRect: { x: 0, y: 0, width: 100, height: 100 },
     onPoint(_x, _y, _r, _g, _b, _a, _radius, index) {
@@ -309,8 +311,9 @@ test('depth-sorted projection packs only in-crop points before assigning bins', 
     dimension: 3,
     colors,
     colorAlpha: 'layer',
+    pointDiameterViewportPx: 3,
     renderState: renderState(),
-    plotRect: { x: 0, y: 0, width: 100, height: 100 },
+    plotRect: { x: 0, y: 0, width: 50, height: 100 },
     crop: {
       enabled: true,
       x: 0.5,
@@ -334,7 +337,7 @@ test('depth-sorted projection packs only in-crop points before assigning bins', 
   );
 });
 
-test('density reduction and coordinate bounds share exact LOD admission semantics', () => {
+test('density reduction and the drawn-cells pass share exact LOD admission semantics', () => {
   const membership = createMembership();
   const reduced = reducePointsByDensity({
     positions: POSITIONS,
@@ -349,34 +352,25 @@ test('density reduction and coordinate bounds share exact LOD admission semantic
   });
   assert.deepEqual(Array.from(reduced.index).sort((a, b) => a - b), [0, 1]);
 
-  const realBounds = computeVisibleRealBounds({
+  // "No visible cells" asks the admitted cells only.
+  assert.equal(sourceHasDrawnCells({
     positions: POSITIONS,
     dimension: 3,
     lodMembership: membership,
-    drawOrder: null,
     mvpMatrix: IDENTITY_MATRIX,
     viewportWidth: 100,
     viewportHeight: 100,
-    normTransform: { center: [0, 0, 0], scale: 1 },
-  });
-  assert.deepEqual(realBounds, {
-    minX: POSITIONS[0],
-    maxX: POSITIONS[3],
-    minY: POSITIONS[1],
-    maxY: POSITIONS[4],
-  });
-
-  const cameraBounds = computeVisibleCameraBounds({
+  }), true);
+  assert.equal(sourceHasDrawnCells({
     positions: POSITIONS,
     dimension: 3,
     lodMembership: membership,
-    drawOrder: null,
     mvpMatrix: IDENTITY_MATRIX,
-    viewMatrix: IDENTITY_MATRIX,
     viewportWidth: 100,
     viewportHeight: 100,
-  });
-  assert.deepEqual(cameraBounds, realBounds);
+    // Only cell 3, which the level does not admit, lies in this crop.
+    crop: { enabled: true, x: 0.8, y: 0.1, width: 0.15, height: 0.15 },
+  }), false);
 
   const fullDetail = reducePointsByDensity({
     positions: POSITIONS,
@@ -395,7 +389,7 @@ test('density reduction and coordinate bounds share exact LOD admission semantic
   );
 });
 
-test('optimized reduction and coordinate bounds reject the full depth clip volume', () => {
+test('optimized reduction and the drawn-cells pass reject the full depth clip volume', () => {
   const positions = Float32Array.from([
     -0.8, -0.4, -1.01,
     0.1, 0.2, 0,
@@ -417,6 +411,7 @@ test('optimized reduction and coordinate bounds reject the full depth clip volum
       colorAlpha: 'layer',
       lodMembership: membership,
       drawOrder: null,
+      pointDiameterViewportPx: 3,
       renderState: renderState(),
       plotRect: { x: 0, y: 0, width: 100, height: 100 },
       sortByDepth,
@@ -440,38 +435,17 @@ test('optimized reduction and coordinate bounds reject the full depth clip volum
   });
   assert.deepEqual(Array.from(reduced.index), [1]);
 
-  const expectedBounds = {
-    minX: positions[3],
-    maxX: positions[3],
-    minY: positions[4],
-    maxY: positions[4],
-  };
-  assert.deepEqual(
-    computeVisibleRealBounds({
-      positions,
-      dimension: 3,
-      lodMembership: membership,
-      drawOrder: null,
-      mvpMatrix: IDENTITY_MATRIX,
-      viewportWidth: 100,
-      viewportHeight: 100,
-      normTransform: { center: [0, 0, 0], scale: 1 },
-    }),
-    expectedBounds
-  );
-  assert.deepEqual(
-    computeVisibleCameraBounds({
-      positions,
-      dimension: 3,
-      lodMembership: membership,
-      drawOrder: null,
-      mvpMatrix: IDENTITY_MATRIX,
-      viewMatrix: IDENTITY_MATRIX,
-      viewportWidth: 100,
-      viewportHeight: 100,
-    }),
-    expectedBounds
-  );
+  // Only the cell inside the depth range is drawn: without it, none is.
+  const drawn = (cells) => sourceHasDrawnCells({
+    positions: cells,
+    dimension: 3,
+    lodMembership: null,
+    mvpMatrix: IDENTITY_MATRIX,
+    viewportWidth: 100,
+    viewportHeight: 100,
+  });
+  assert.equal(drawn(positions), true);
+  assert.equal(drawn(Float32Array.from([...positions.subarray(0, 3), ...positions.subarray(6, 9)])), false);
 });
 
 test('density reduction apportions an exact deterministic 1000-point grid target', () => {
@@ -767,6 +741,7 @@ test('reduced figure export consumes only the exact K-point prefix for large N',
     colorAlpha: 'layer',
     lodMembership: membership,
     drawOrder: null,
+    pointDiameterViewportPx: 3,
     renderState: renderState(),
     plotRect: { x: 0, y: 0, width: 100, height: 100 },
     onPoint(_x, _y, _r, _g, _b, _a, _radius, index) {
@@ -941,6 +916,7 @@ test('WebGL export rejects a descriptor from a different point generation', () =
       renderState: renderState(),
       outputWidthPx: 16,
       outputHeightPx: 16,
+      viewRect01: { x: 0, y: 0, width: 1, height: 1 },
       pointSizePx: 2,
     }),
     /describes 2 cells/
@@ -964,8 +940,8 @@ test('figure-export source has no dense LOD mask API or hot-loop conversion', as
   for (const file of ['utils/webgl-point-rasterizer.js', 'utils/point-projector.js']) {
     const source = await readFile(new URL(file, figureExportRoot), 'utf8');
     assert.doesNotMatch(source, /lodMembership\?\.indices/, file);
-    // With the cells' colours: the layers come bottom first (UX-8, cells not
-    // read); a marker's colours (an alpha byte of opacity) are not layered.
+    // With the cells' colors: the layers come bottom first (UX-8, cells not
+    // read); a marker's colors (an alpha byte of opacity) are not layered.
     assert.match(source, /drawnSequence\(lodMembership, drawOrder, (alphaIsLayer \? colors : null|alphaIsOpacity \? null : colors)(, [^)]*)?\)/, file);
   }
   assert.doesNotMatch(
@@ -1112,11 +1088,11 @@ test('full detail packs points in the pane draw order, and a reduced level in it
 test('a figure draws cells beneath the others (a field\'s no-value grey) first, each group in the pane\'s order (UX-8)', () => {
   const colors = new Uint8Array(6 * 4).fill(255);
   assert.equal(drawnSequence(null, null, colors), null, 'every cell opaque: the sequence as it is');
-  // Cells 1 and 4 are grey, beneath.
+  // Cells 1 and 4 are gray, beneath.
   colors[1 * 4 + 3] = BENEATH_ALPHA_BYTE;
   colors[4 * 4 + 3] = BENEATH_ALPHA_BYTE;
   assert.equal(colorLayersOf(colors).layered, true);
-  assert.equal(colorLayersOf(new Uint8Array(new ArrayBuffer(25), 1, 24).fill(255)).layered, false, 'unaligned colours read bytewise');
+  assert.equal(colorLayersOf(new Uint8Array(new ArrayBuffer(25), 1, 24).fill(255)).layered, false, 'unaligned colors read bytewise');
   assert.deepEqual(Array.from(drawnSequence(null, null, colors)), [1, 4, 0, 2, 3, 5]);
   const drawOrder = Uint32Array.of(5, 4, 3, 2, 1, 0);
   assert.deepEqual(Array.from(drawnSequence(null, drawOrder, colors)), [4, 1, 5, 3, 2, 0]);
@@ -1135,6 +1111,7 @@ test('a centroid\'s alpha byte is its opacity, a cell\'s its layer: each consume
       dimension: 3,
       colors,
       colorAlpha,
+      pointDiameterViewportPx: 3,
       renderState: renderState(),
       plotRect: { x: 0, y: 0, width: 100, height: 100 },
       onPoint: (x, y, r, g, b, a, radius, index) => seen.push([index, Number(a.toFixed(4))]),

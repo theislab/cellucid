@@ -4,7 +4,9 @@
  * A connection is adopted only after the health response, server information
  * and dataset catalog have all satisfied the current contract. Remote failures
  * are terminal; this source never retries, fabricates dataset metadata, or
- * rewrites caller-supplied URLs.
+ * rewrites caller-supplied URLs. Its requests go through the one transport
+ * (`fetchAnswer`: the host's budget, a stall ends a request, a request
+ * without an answer is said as one).
  *
  * A Cellucid server (`cellucid serve`, `serve_anndata()`) serves one dataset
  * file or folder in any input format (`data/input-formats.js`) and declares
@@ -20,6 +22,7 @@ import {
   DataSourceError,
   DataSourceErrorCode,
   explainedFailure,
+  fetchAnswer,
   readBoundedJson
 } from './data-source.js';
 import {
@@ -32,7 +35,7 @@ import {
   servedStoreKey
 } from './served-anndata.js';
 import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
-import { abortReason, isCancellation, cancel, cancelled, throwIfAborted } from '../utils/abort.js';
+import { abortReason, isCancellation, cancel, cancelled, throwIfAborted, requireSignal } from '../utils/abort.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -251,7 +254,7 @@ function requireDatasetCatalogPayload(payload) {
  */
 export async function probeRemoteServer(url, { signal }) {
   validateRemoteServerUrl(url);
-  if (!(signal instanceof AbortSignal)) throw new TypeError('A server probe runs under its opening\'s signal.');
+  requireSignal(signal, 'A server probe\'s signal (its opening\'s)');
   try {
     requireRemoteHealthPayload(
       await requestJson(`${url}/_cellucid/health`, signal, 'Remote health')
@@ -296,26 +299,24 @@ async function requestHealth(url, signal) {
 async function requestJson(url, signal, label) {
   let response;
   try {
-    response = await fetch(url, {
+    // Asked once (a server's failures are terminal; the person's Try again
+    // asks again), through the one transport: within its host's budget,
+    // never left hanging by a server that stopped answering (a stall), and
+    // a request without an answer failed as one, with its host.
+    response = await fetchAnswer(url, {
       signal,
       cache: 'no-store',
       redirect: 'error'
     });
   } catch (error) {
-    if (signal.aborted) throw error;
+    if (signal.aborted || isCancellation(error)) throw error;
+    const said = error instanceof Error ? error.message : String(error);
     throw new DataSourceError(
-      `${label} request failed: ${error instanceof Error ? error.message : String(error)}`,
+      error?.details?.phase === 'body' ? `${label} response body transfer failed: ${said}` : `${label} request failed: ${said}`,
       DataSourceErrorCode.NETWORK_ERROR,
       'remote',
-      { url }
-    );
-  }
-  if (!(response instanceof Response)) {
-    throw new DataSourceError(
-      `${label} fetch must return a Response`,
-      DataSourceErrorCode.VALIDATION_ERROR,
-      'remote',
-      { url }
+      // The transport's own failure, so a caller can say who is at fault.
+      { url, cause: error }
     );
   }
   if (response.status !== 200) {
@@ -334,16 +335,15 @@ async function requestJson(url, signal, label) {
       { url, contentType: response.headers.get('Content-Type') }
     );
   }
-  // The body read owns four distinguishable outcomes and they are not
+  // The body has four distinguishable outcomes and they are not
   // interchangeable: the caller's own cancellation, a payload that exceeded the
-  // metadata byte ceiling, a transfer that broke mid-body, and genuinely
-  // malformed JSON. Reporting all four as "must contain valid JSON" accuses the
-  // server of sending bad data when the user cancelled, when the response was
-  // refused for its size, or when the connection dropped — three lies a user
-  // cannot tell from the truth. The signal is threaded in so a cancelled listing
-  // stops reading rather than draining a body nobody will use.
+  // metadata byte ceiling, a transfer that broke mid-body (the transport's,
+  // said above), and genuinely malformed JSON. Reporting all four as "must
+  // contain valid JSON" accuses the server of sending bad data when the user
+  // cancelled, when the response was refused for its size, or when the
+  // connection dropped — three lies a user cannot tell from the truth.
   //
-  // The size refusal is not re-labelled here: `readBoundedBody()` owns the
+  // The size refusal is not re-labeled here: `readBoundedBody()` owns the
   // ceiling and already publishes TOO_LARGE, so it arrives as a DataSourceError
   // and passes straight through. Naming it a second time here is how it came to
   // be reported as a failed contract validation, which reaches the user as
@@ -352,13 +352,8 @@ async function requestJson(url, signal, label) {
   try {
     return await readBoundedJson(response, { label, signal });
   } catch (error) {
-    if (signal.aborted || isCancellation(error)) {
-      throw error;
-    }
-    if (error instanceof DataSourceError) {
-      throw error;
-    }
-    if (error instanceof SyntaxError) {
+    // A cancellation and the size refusal pass as they are.
+    if (error instanceof SyntaxError && !signal.aborted) {
       throw new DataSourceError(
         `${label} response must contain valid JSON`,
         DataSourceErrorCode.INVALID_FORMAT,
@@ -366,15 +361,7 @@ async function requestJson(url, signal, label) {
         { url, cause: error.message }
       );
     }
-    throw new DataSourceError(
-      `${label} response body transfer failed: ${error instanceof Error ? error.message : String(error)}`,
-      DataSourceErrorCode.NETWORK_ERROR,
-      'remote',
-      {
-        url,
-        cause: error instanceof Error ? error.message : String(error)
-      }
-    );
+    throw error;
   }
 }
 
@@ -569,7 +556,7 @@ export class RemoteDataSource {
       );
 
       if (operationId !== this._operationId || controller.signal.aborted) {
-        throw cancelled('superseded', 'Remote connection was cancelled before adoption.');
+        throw cancelled('superseded', 'Remote connection was canceled before adoption.');
       }
 
       this._releaseAnnData();
@@ -593,7 +580,7 @@ export class RemoteDataSource {
       if (controller.signal.aborted) throw abortReason(controller.signal);
       // A cancellation that did not come from this connection's own controller
       // — a body stream cancelled by the transport, for instance — is still a
-      // cancellation. Relabelling it as a contract validation failure blames the
+      // cancellation. Relabeling it as a contract validation failure blames the
       // server for a request that was never allowed to finish.
       if (isCancellation(error)) throw error;
       if (error instanceof DataSourceError) throw error;

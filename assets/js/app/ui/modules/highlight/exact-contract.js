@@ -379,24 +379,24 @@ function requireCancelledStep(event, tool, includeCandidates, pointCount) {
   const keys = includeCandidates
     ? ['cancelled', 'step', 'candidateCount', 'candidates']
     : ['cancelled', 'step', 'candidateCount'];
-  requireExactKeys(event, keys, `${tool} cancelled step event`);
+  requireExactKeys(event, keys, `${tool} canceled step event`);
   if (
     event.cancelled !== true
     || event.step !== 0
     || event.candidateCount !== 0
   ) {
     throw new TypeError(
-      `${tool} cancelled step must publish cancelled true with zero counts.`
+      `${tool} canceled step must publish canceled true with zero counts.`
     );
   }
   if (includeCandidates) {
     requireCellIndices(
       event.candidates,
-      `${tool} cancelled step candidates`,
+      `${tool} canceled step candidates`,
       { allowEmpty: true, pointCount }
     );
     if (event.candidates.length !== 0) {
-      throw new TypeError(`${tool} cancelled step candidates must be empty.`);
+      throw new TypeError(`${tool} canceled step candidates must be empty.`);
     }
   }
   return event;
@@ -763,7 +763,7 @@ export function requireViewerHostSource(viewerHostSource) {
   requireMethods(
     viewerHostSource,
     'Highlight viewer host source',
-    ['notifySelection']
+    ['notifySelection', 'getHostRuntime']
   );
   return viewerHostSource;
 }

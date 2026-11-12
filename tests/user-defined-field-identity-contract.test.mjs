@@ -40,6 +40,7 @@ import {
 } from '../assets/js/data/categorical-storage-contract.js';
 import { getCategoryColor } from '../assets/js/data/palettes.js';
 import { viewContextCoreMethods } from '../assets/js/app/state/managers/view-context-core.js';
+import { highlightStateMethods } from '../assets/js/app/state/managers/highlight-manager.js';
 
 const POINTS = 24;
 
@@ -105,6 +106,7 @@ function makeState({ pointCount = POINTS, obsFields = [] } = {}) {
   state._deleteRegistry = new DeleteRegistry();
   state._userDefinedFields = new UserDefinedFieldsRegistry();
   state.getDatasetGeneration = () => 0;
+  state.getHighlightPageColor = highlightStateMethods.getHighlightPageColor;
 
   state._syncActiveContext = () => {};
   state.getActiveViewId = viewContextCoreMethods.getActiveViewId;
@@ -485,4 +487,60 @@ test('a categorical update that changes the inventory still validates every code
     () => registry.updateField(id, { categories: ['a', 'b'] }),
     /outside the category inventory/
   );
+});
+
+test('a field made from pages opens in its pages\' colors, and keeps them by label through an edit in place (F124)', () => {
+  const pages = Array.from({ length: 3 }, (_v, index) => ({
+    id: `p${index}`,
+    name: `P${index}`,
+    color: ['#dc2626', '#16a34a', '#9333ea'][index],
+    highlightedGroups: [{ enabled: true, cellIndices: [index] }]
+  }));
+  const state = makeState({ pointCount: WIDE_POINTS, obsFields: [] });
+  state.highlightPages = pages;
+  const { field } = state.createCategoricalFromPages({
+    key: 'pages',
+    pages: pages.map(page => ({ pageId: page.id, label: page.name })),
+    uncoveredLabel: 'Unassigned',
+    overlapStrategy: 'first',
+    overlapLabel: 'Overlap',
+    intersectionLabels: {}
+  });
+  const hex = rgb => `#${rgb.map(channel => Math.round(channel * 255).toString(16).padStart(2, '0')).join('')}`;
+  const rest = hex(getCategoryColor(3));
+  assert.deepEqual(field.palette.map(hex), ['#dc2626', '#16a34a', '#9333ea', rest]);
+  // P1's cells join Unassigned, in place: every other category keeps its color.
+  const fieldIndex = state.obsData.fields.indexOf(field);
+  state.deleteCategoryToUnassigned(fieldIndex, 1, { editInPlace: true, unassignedLabel: 'Unassigned' });
+  const edited = state.obsData.fields[fieldIndex];
+  assert.deepEqual(edited.categories, ['P0', 'P2', 'Unassigned']);
+  assert.deepEqual(edited.palette.map(hex), ['#dc2626', '#9333ea', rest]);
+});
+
+test('a field the person made has no original name: renamed, it shows no `*` and offers no "Put name back", before and after a session round trip (R9F-8)', async () => {
+  const { createCellIdentity } = await import('../assets/js/data/cell-identity.js');
+  const everyCell = () => createCellIdentity({ nObs: POINTS, kept: null, openOrder: null });
+  const source = makeState({ obsFields: [categoricalField('ct', ['a', 'b'], POINTS)] });
+  source.cellIdentity = everyCell();
+  const { newFieldIndex } = await source.duplicateField('obs', 0, { newKey: 'ct (copy)' });
+  source.renameField('obs', newFieldIndex, 'S score');
+  const made = source.obsData.fields[newFieldIndex];
+  assert.equal(made.key, 'S score');
+  assert.equal(Object.hasOwn(made, '_originalKey'), false, 'no original name in the page (it showed "S score *")');
+  // A dataset field renamed keeps its original name: the `*` and Put name back are for it.
+  source.renameField('obs', 0, 'cell type');
+  assert.equal(source.obsData.fields[0]._originalKey, 'ct');
+  // Put name back has nothing to do for the made field.
+  assert.equal(source.revertFieldRename('obs', newFieldIndex), true);
+  assert.equal(made.key, 'S score');
+  // The session's round trip says the same.
+  const restored = makeState({ obsFields: [categoricalField('ct', ['a', 'b'], POINTS)] });
+  restored.cellIdentity = everyCell();
+  await carryFieldOverlays(source, restored);
+  const again = restored.obsData.fields.find(field => field.key === 'S score');
+  assert.ok(again, 'the made field comes back under its name');
+  assert.equal(Object.hasOwn(again, '_originalKey'), false);
+  // Renamed back to the name it was made with, it is simply renamed (no original name to "restore").
+  source.renameField('obs', newFieldIndex, 'ct (copy)');
+  assert.equal(Object.hasOwn(made, '_originalKey'), false);
 });

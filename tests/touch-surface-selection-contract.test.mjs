@@ -9,7 +9,7 @@ import test from 'node:test';
  *
  * iOS Safari starts a text selection on a long press wherever the element
  * under the finger is selectable; on the plot there is no text, so the
- * selection grew to the whole page. Safari honours only `-webkit-user-select`,
+ * selection grew to the whole page. Safari honors only `-webkit-user-select`,
  * so an unprefixed `user-select: none` is ignored there: every declaration is
  * paired with its prefixed twin, and the plot's touch surfaces also refuse
  * the long-press callout menu.

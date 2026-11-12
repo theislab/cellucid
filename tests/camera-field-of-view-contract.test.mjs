@@ -36,9 +36,35 @@ test('an area with no shape is refused', () => {
   }
 });
 
-test('the viewer takes its field of view from the presented area, nowhere else', async () => {
+test('the viewer takes its field of view from the presented area, and each pane from its own shape', async () => {
   const source = await readFile(new URL('../assets/js/rendering/viewer.js', import.meta.url), 'utf8');
   assert.match(source, /let fov = BASE_FIELD_OF_VIEW;/);
   assert.match(source, /fieldOfViewFor\(area\.cssWidth \/ area\.cssHeight\)/);
   assert.doesNotMatch(source, /45 \* Math\.PI/);
+  // A pane is projected, drawn, picked and zoomed with its own field of view.
+  assert.match(source, /function configurePaneProjection\(output, pane\) \{\s*mat4\.perspective\(\s*output,\s*pane\.fov,/);
+  assert.match(source, /fov = pane\.fov;/);
+  assert.match(source, /Math\.tan\(vpInfo\.fov \/ 2\)/);
+  assert.match(source, /fov: viewport\.fov,/);
+});
+
+test('two views side by side make portrait panes that see 45° across: a kept view no longer crops a wide 2-D map', async () => {
+  const { resolvePresentedLayout } = await import('../assets/js/rendering/viewer/presented-view-layout.js');
+  // 1440 × 900 with the sidebar over 290 px: one landscape area, or two 575 × 900 portrait panes.
+  const options = { canvasHeight: 1800, canvasWidth: 2880, cssHeight: 900, cssWidth: 1440, focusedViewId: 'live', leftOcclusionRatio: 290 / 1440 };
+  const single = resolvePresentedLayout({ ...options, mode: 'single', viewIds: ['live'] });
+  assert.equal(single.panes[0].fov, BASE_FIELD_OF_VIEW);
+  const grid = resolvePresentedLayout({ ...options, mode: 'grid', viewIds: ['live', 'snap_1'] });
+  for (const pane of grid.panes) {
+    const aspect = pane.cssWidth / pane.cssHeight;
+    assert.ok(aspect < 1, 'a portrait pane');
+    assert.equal(pane.fov, fieldOfViewFor(aspect));
+    // The camera that frames the data's height in the single view frames its width here:
+    // 45° across, where the presented area's 45° down saw only 2·atan(tan 22.5° · aspect).
+    assert.ok(Math.abs(horizontalOf(pane.fov, aspect) - BASE_FIELD_OF_VIEW) < 1e-12);
+    assert.ok(horizontalOf(BASE_FIELD_OF_VIEW, aspect) < 0.7 * BASE_FIELD_OF_VIEW, 'what the shared field of view showed');
+  }
+  // Two panes stacked on a wide window stay landscape, at 45° down.
+  const wide = resolvePresentedLayout({ ...options, cssWidth: 2880, canvasWidth: 5760, leftOcclusionRatio: 0, mode: 'grid', viewIds: ['live', 'snap_1'] });
+  for (const pane of wide.panes) assert.equal(pane.fov, BASE_FIELD_OF_VIEW);
 });

@@ -19,7 +19,7 @@ embeddings it plots (`tests/browser/data-mapping.spec.mjs`):
   10-column ``X_pca`` and ``velocity_umap_2d`` bound to ``X_umap_2d``
   (``tests/browser/multi-representation.spec.mjs``).
 - ``data-mapping-full.h5ad`` (and ``data-mapping-full.zarr.zip``): every other
-  mapping group. Three neighbour graphs -- ``connectivities``,
+  mapping group. Three neighbor graphs -- ``connectivities``,
   ``scvi_connectivities`` and an asymmetric ``distances`` that must be
   refused. An Ensembl var index with a ``gene_symbols`` column holding a
   duplicate and an empty value, a categorical ``feature_type`` and two columns
@@ -34,7 +34,7 @@ embeddings it plots (`tests/browser/data-mapping.spec.mjs`):
   them, with no default UMAP: three 2-column ``X_umap_scale*_latents`` (the
   guess turns them on), two 3-column arrays (``X_tsne_scale0_latents`` and
   ``spatial``), an integer 4-column ``coordinates`` and six wide latent and
-  PCA arrays, plus a layer and a neighbour graph, and the colours Scanpy
+  PCA arrays, plus a layer and a neighbor graph, and the colors Scanpy
   keeps for ``cell_type`` (``uns['cell_type_colors']``). The sidebar layout,
   the dimension choice of a narrow array and the sidebar's scroll position are
   tested on it (``tests/browser/data-mapping-layout.spec.mjs``); so are the
@@ -105,7 +105,7 @@ ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
 def clustered(rng: np.random.Generator, labels: np.ndarray, width: int, spread: float) -> np.ndarray:
-    """Points around one centre per cluster, ``width`` columns wide."""
+    """Points around one center per cluster, ``width`` columns wide."""
     centres = rng.normal(0.0, 6.0, size=(len(CLUSTERS), width))
     return (centres[labels] + rng.normal(0.0, spread, size=(len(labels), width))).astype(np.float32)
 
@@ -195,7 +195,7 @@ def crowded_fixture() -> anndata.AnnData:
     for scale in range(3):
         adata.obsm[f"X_umap_scale{scale}_latents"] = clustered(rng, labels, 2, 0.8)
     adata.obsp["connectivities"] = symmetric_graph(rng, labels, 6)
-    # As ``sc.pl.umap(adata, color="cell_type")`` leaves it: one colour per
+    # As ``sc.pl.umap(adata, color="cell_type")`` leaves it: one color per
     # category, none of them one Cellucid would pick.
     adata.uns["cell_type_colors"] = np.array(["#8c564b", "#17becf", "#bcbd22"], dtype=object)
     return adata

@@ -276,14 +276,25 @@ test('an expanded view follows a newer result and draws only the committed snaps
     const { closeModal } = await import(
       '/assets/js/app/analysis/ui/components/modal.js'
     );
+    const { getActions } = await import('/assets/js/app/actions/index.js');
     const ui = new DetailedAnalysisUI({ comparisonModule: {}, dataLayer: {} });
+    // The committed snapshot holds page data as the data layer reads it (its
+    // `variableInfo` names the values the heading and the axes say), never a
+    // hand-made shape that drifts from it.
+    await getActions().dispatch('highlight.category', {
+      field: { source: 'obs', key: 'cell_type' }, categories: ['alpha'], page: 'Expanded',
+    });
+    const layer = window._comparisonModule.dataLayer;
+    const pageId = layer.getPages().find(entry => entry.name === 'Expanded').id;
     const committedConfig = {
       dataSource: { type: 'categorical_obs', variable: 'cell_type' },
-      pages: ['page-1'],
+      pages: [pageId],
       plotType: 'barplot',
       plotOptions: {},
     };
-    const committedData = [{ pageId: 'page-1', values: ['A'] }];
+    const committedData = await layer.getDataForPages({
+      type: 'categorical_obs', variableKey: 'cell_type', pageIds: [pageId],
+    });
     ui._committedView = Object.freeze({
       config: committedConfig,
       pageData: committedData,

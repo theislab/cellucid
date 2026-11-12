@@ -24,8 +24,9 @@ import {
   reportDocument, reportPictureDefaults, reportEntries,
 } from '../assets/js/app/history/exports/report.js';
 import {
-  branchPath, groupRuns, inSentence, originOf, originPhrase, parameterFacts, parameterValue, runHeadings, squashPhrase,
+  branchPath, groupRuns, originOf, originPhrase, parameterFacts, parameterValue, runHeadings, squashPhrase,
 } from '../assets/js/app/history/exports/step-text.js';
+import { lowerFirst } from '../assets/js/utils/text-case.js';
 
 const OBJECT = (properties, required = Object.keys(properties)) => ({
   type: 'object', additionalProperties: false, required, properties,
@@ -211,8 +212,8 @@ test('step text: who acted, parameter facts, domain names, squash phrases', () =
   });
   assert.equal(parameterValue(0.123456789).value, '0.123457');
   assert.equal(parameterValue(1500).value, '1,500');
-  assert.equal(inSentence('Colored by cell_type'), 'colored by cell_type');
-  assert.equal(inSentence('PCA computed on 2,000 genes'), 'PCA computed on 2,000 genes');
+  assert.equal(lowerFirst('Colored by cell_type'), 'colored by cell_type');
+  assert.equal(lowerFirst('PCA computed on 2,000 genes'), 'PCA computed on 2,000 genes');
   assert.equal(numberRanges([5, 1, 2, 3, 8, 9]), '1–3, 5 and 8–9');
   assert.equal(numberRanges([4]), '4');
 });
@@ -295,7 +296,7 @@ test('methods: the abstract opens it, groups are sections, squashed steps said p
     'Annotation of the fetal immune atlas: *T cells* first.',
     'Single-cell data were explored interactively in Cellucid (version 0.9.7) [Inecik K. et al. (2026). Cellucid].'
       + ' The dataset “Suo fetal immune” (841,922 cells and 33,538 genes; Suo et al. 2022, Science) was opened on 84,192 of'
-      + ' its 841,922 cells (10%), chosen in blocks of neighbouring cells with seed 0. The 7 steps applied are listed below, in order.'
+      + ' its 841,922 cells (10%), chosen in blocks of neighboring cells with seed 0. The 7 steps applied are listed below, in order.'
       + ' For steps 5–6, only the states they reached were kept, not the operations that led to them.'
       + ' 1 further step only changed the camera, the panel layout, colors or display settings and is not listed.'
       + ' 1 recorded step no longer applied after an earlier step was removed and is not included.'
@@ -401,5 +402,5 @@ test('report: abstract, notes, groups as headings, bookmarks, flags, picked pict
   assert.match(upTo, /No steps were taken\./);
   assert.match(upTo, /<dt>Branch<\/dt><dd>Main, up to step 0<\/dd>/);
   assert.doesNotMatch(upTo, /<h2>Abstract<\/h2>/);
-  assert.throws(() => reportEntries({ tracker, catalog: null }), /action catalogue/);
+  assert.throws(() => reportEntries({ tracker, catalog: null }), /action catalog/);
 });

@@ -290,6 +290,8 @@ test('scatter plot escapes axis titles, trace names, and category legend entries
       pageName: HOSTILE_PAGE,
       xVariable: HOSTILE_FIELD,
       yVariable: HOSTILE_GENE,
+      xLabel: HOSTILE_FIELD,
+      yLabel: HOSTILE_GENE,
       colorVariable: HOSTILE_FIELD,
       xValues: [1, 2, 3, 4],
       yValues: [2, 3, 4, 5],
@@ -313,7 +315,7 @@ test('scatter plot escapes axis titles, trace names, and category legend entries
   assertEscaped(layout.annotations[0].text, HOSTILE_PAGE_ESCAPED, HOSTILE_PAGE);
 
   const categoryTrace = traces.find(trace => trace.legendgroup === HOSTILE_CATEGORY);
-  assert.ok(categoryTrace, 'expected one trace per colour category');
+  assert.ok(categoryTrace, 'expected one trace per color category');
   assertEscaped(categoryTrace.name, HOSTILE_CATEGORY_ESCAPED, HOSTILE_CATEGORY);
 
   const trendTrace = traces.find(trace => typeof trace.name === 'string' && trace.name.startsWith('Trend ('));
@@ -334,6 +336,8 @@ test('scatter plot escapes the page name on the density and plain marker traces'
       pageName: HOSTILE_PAGE,
       xVariable: HOSTILE_FIELD,
       yVariable: HOSTILE_FIELD,
+      xLabel: HOSTILE_FIELD,
+      yLabel: HOSTILE_FIELD,
       xValues,
       yValues
     }],

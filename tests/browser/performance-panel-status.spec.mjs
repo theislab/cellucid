@@ -29,7 +29,7 @@ function installProbe() {
     context.fillStyle = '#ff00ff';
     context.fillStyle = color;
     if (context.fillStyle === '#ff00ff') {
-      throw new Error(`Canvas could not resolve the CSS colour "${color}"`);
+      throw new Error(`Canvas could not resolve the CSS color "${color}"`);
     }
     context.fillRect(0, 0, 1, 1);
   };
@@ -114,7 +114,7 @@ for (const theme of ['light', 'dark']) {
     await page.locator('#theme-select').selectOption(theme);
     await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
     // themes/_base.css transitions every element during a theme change, so
-    // computed colours are in flight until that class is gone.
+    // computed colors are in flight until that class is gone.
     await expect(page.locator('html')).not.toHaveClass(/theme-transition/);
     await settleStyleTransitions(page);
 
@@ -130,7 +130,7 @@ for (const theme of ['light', 'dark']) {
       await settleStyleTransitions(page);
 
       // Exactly one status glyph is shown, and it strokes with the verdict
-      // colour rather than an emoji's fixed rendering.
+      // color rather than an emoji's fixed rendering.
       const shown = await page.locator('.bn-verdict-glyph:visible').evaluateAll(
         glyphs => glyphs.map(glyph => glyph.dataset.status)
       );
@@ -170,7 +170,7 @@ for (const theme of ['light', 'dark']) {
     expect(failures, failures.join('\n')).toEqual([]);
 
     // No emoji anywhere in the panel: a screen reader announces them by name
-    // and they ignore the theme's colour.
+    // and they ignore the theme's color.
     const emoji = await page.locator('#bottleneck-results').evaluate(
       root => (root.textContent || '').match(
         /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}]/gu

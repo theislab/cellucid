@@ -32,6 +32,7 @@ import {
   createViewerHostPointerDelivery,
 } from '../assets/js/app/viewer-host/pointer-delivery.js';
 import {
+  VIEWER_ACTION_UNRECORDED,
   VIEWER_BINARY_EVENT_HEADER_FIELDS,
   VIEWER_EVENT_FIELDS,
   VIEWER_HOST_RUNTIMES,
@@ -43,6 +44,7 @@ import {
 import { viewerChannelUrl } from '../assets/js/data/viewer-channel.js';
 import { FakeHostSocket, decodeFrames, host, lastSocket } from './helpers/fake-host-socket.mjs';
 import { cancellationKind, cancelled } from '../assets/js/utils/abort.js';
+import { until } from './helpers/settles.mjs';
 
 const CURRENT_PROTOCOL = Object.freeze(viewerProtocolDocument());
 const protocolFixture = { passthrough: false, document: CURRENT_PROTOCOL, lastHealth: null };
@@ -693,7 +695,7 @@ test('Viewer host pointer hooks use per-view pick records without changing wire 
     /viewerHostPointerDelivery\?\.freeze\(\)/,
   );
   // The channel's end is the stop signal: nothing polls the host.
-  assert.match(mainSource, /viewerHostSource\.onChannelEnd\(end => \{[\s\S]*freezeViewerHostView\(\)/);
+  assert.match(mainSource, /viewerHostSource\.onChannelEnd\(end => \{[\s\S]*endViewerHostView\(end\)/);
   assert.doesNotMatch(mainSource, /setInterval\([\s\S]{0,200}checkHealth/);
   assert.doesNotMatch(
     mainSource,
@@ -726,48 +728,76 @@ test('Viewer host pointer hooks use per-view pick records without changing wire 
       freezeSource.indexOf('viewer.pause()'),
   );
 
-  // The channel's end freezes the view before it tells the person.
-  const endStart = mainSource.indexOf('viewerHostSource.onChannelEnd(end => {', freezeEnd);
-  const endSource = mainSource.slice(endStart, mainSource.indexOf('\n      });', endStart));
+  // The channel's end freezes the view before it tells the person, once.
+  const endStart = mainSource.indexOf('const endViewerHostView = end => {', freezeEnd);
+  const endSource = mainSource.slice(endStart, mainSource.indexOf('\n      };', endStart));
   assert.ok(endStart > 0);
   assert.ok(endSource.indexOf('freezeViewerHostView();') < endSource.indexOf('notifications['));
+  assert.ok(endSource.indexOf('if (viewerHostEndSaid) return;') < endSource.indexOf('notifications['));
+  // Offers shown before cannot be answered on the frozen page: they go first.
+  assert.ok(endSource.indexOf('notifications.dismissAll();') < endSource.indexOf('notifications['));
+  // The end is said on the frozen picture, which covers the notifications.
+  assert.ok(endSource.indexOf("caption.id = 'cellucid-viewer-host-freeze-caption';") > endSource.indexOf('freezeViewerHostView();'));
+  // A host's own stop (`freeze`, then a normal close) is said as a stop
+  // (R9S-7: it froze the page in silence).
+  assert.match(
+    mainSource,
+    /if \(message\.type === 'freeze'\) \{\s*endViewerHostView\(\{ kind: 'stopped', message: viewerStoppedMessage\(viewerHostSource\.getHostRuntime\(\)\) \}\);/,
+  );
 });
 
-test('Viewer host command failure names the command for the person watching', () => {
+test('Viewer host command failure names the command and its host for the person watching', () => {
+  const FIX = 'The viewer is unchanged; correct the call in the notebook and run it again.';
   assert.deepEqual(
     describeViewerHostCommandFailure(
       'action',
       new Error('There is no field "CD8A" in obs; did you mean CD8B?'),
       'color.by',
+      'jupyter',
     ),
     {
-      title: 'Notebook command failed',
+      title: 'Jupyter command failed',
       message:
         'The notebook\'s "color.by" action did not run: There is no field "CD8A" in obs; ' +
-        'did you mean CD8B?. The viewer is unchanged; correct the notebook cell and run it again.',
+        `did you mean CD8B? ${FIX}`,
     },
+  );
+  // Every host is named by its own words (`VIEWER_HOST_RUNTIMES`), and one
+  // that has not said what it is by the neutral ones.
+  for (const [runtime, { name, label }] of Object.entries(VIEWER_HOST_RUNTIMES)) {
+    const failure = describeViewerHostCommandFailure('freeze', new Error('boom'), null, runtime);
+    assert.equal(failure.title, `${label} command failed`);
+    assert.ok(failure.message.includes(`correct the call in ${name} and run it again.`), runtime);
+  }
+  assert.deepEqual(describeViewerHostCommandFailure(null, new Error('boom'), null, null), {
+    title: 'Host command failed',
+    message: 'A command from the program serving this viewer did not run: boom. The viewer is unchanged; ' +
+      'correct the call in the program serving this viewer and run it again.',
+  });
+  assert.throws(() => describeViewerHostCommandFailure(null, new Error('boom'), null, 'perl'), /runtime is one of/);
+  // A reason ending its own sentence is not ended twice (R9S-6: the field
+  // refusal read '… "sample".. The viewer is unchanged').
+  assert.equal(
+    describeViewerHostCommandFailure('action', new Error('There is no field "x"; the fields are "a" and "b".'), 'color.by', 'jupyter').message,
+    `The notebook's "color.by" action did not run: There is no field "x"; the fields are "a" and "b". ${FIX}`,
   );
   // An action named by text that is not a dotted type is not echoed.
   assert.equal(
-    describeViewerHostCommandFailure('action', new Error('boom'), '<img src=x>').message,
-    'The notebook "action" command did not run: boom. The viewer is unchanged; ' +
-    'correct the notebook cell and run it again.',
+    describeViewerHostCommandFailure('action', new Error('boom'), '<img src=x>', 'jupyter').message,
+    `The notebook's "action" command did not run: boom. ${FIX}`,
   );
 
   assert.equal(
-    describeViewerHostCommandFailure(null, new Error('boom')).message,
-    'A notebook command did not run: boom. The viewer is unchanged; ' +
-    'correct the notebook cell and run it again.',
+    describeViewerHostCommandFailure(null, new Error('boom'), null, 'jupyter').message,
+    `A command from the notebook did not run: boom. ${FIX}`,
   );
 
   // A thrown non-Error, or an Error with no message, still produces text a
   // reader can act on rather than an empty or "undefined" notification.
   for (const thrown of [new Error(''), 'plain string', null, undefined, { a: 1 }]) {
     assert.equal(
-      describeViewerHostCommandFailure('freeze', thrown).message,
-      'The notebook "freeze" command did not run: the viewer reported no ' +
-      'reason. The viewer is unchanged; correct the notebook cell and run it ' +
-      'again.',
+      describeViewerHostCommandFailure('freeze', thrown, null, 'jupyter').message,
+      `The notebook's "freeze" command did not run: the viewer reported no reason. ${FIX}`,
     );
   }
 
@@ -777,22 +807,26 @@ test('Viewer host command failure names the command for the person watching', ()
     describeViewerHostCommandFailure(
       'freeze',
       new Error('first line\n  second line\tthird'),
+      null,
+      'jupyter',
     ).message.startsWith(
-      'The notebook "freeze" command did not run: first line second line third.',
+      'The notebook\'s "freeze" command did not run: first line second line third.',
     ),
     true,
   );
   const truncated = describeViewerHostCommandFailure(
     'freeze',
     new Error('x'.repeat(4000)),
+    null,
+    'jupyter',
   ).message;
   assert.equal(truncated.includes(`${'x'.repeat(999)}…`), true);
   assert.equal(truncated.includes('x'.repeat(1001)), false);
 
-  // Only recognised command types may be named.
+  // Only recognized command types may be named.
   assert.throws(
-    () => describeViewerHostCommandFailure('notACommand', new Error('boom')),
-    /one recognised command or null/,
+    () => describeViewerHostCommandFailure('notACommand', new Error('boom'), null, 'jupyter'),
+    /one recognized command or null/,
   );
 });
 
@@ -877,7 +911,7 @@ test('a host whose credentials check fails is a clear initialization error', asy
   installWindow('?viewer=true&viewerId=viewer-1&viewerToken=wrong-token');
   globalThis.fetch = async () => viewerHostHealthResponse();
   const source = new ViewerHostDataSource(getViewerHostConfig());
-  await assert.rejects(source.initialize(), /no longer knows this viewer.*Run the cell/);
+  await assert.rejects(source.initialize(), /The Python session no longer knows this viewer.*Open it again from Python\./);
   assert.equal(source.isConnected(), false);
 });
 
@@ -972,7 +1006,7 @@ test('commands that arrive before the app is ready run, in order, once it accept
   source.onMessage(message => seen.push(message.type));
   source.onAction(async ({ action, params }) => {
     seen.push(params.cells instanceof Uint32Array ? `${action}:${params.cells.join(',')}` : action);
-    return { outcome: null, step: null };
+    return { outcome: null, step: null, unrecorded: null };
   });
   assert.deepEqual(seen, []);
   source.acceptCommands();
@@ -991,7 +1025,7 @@ test('host commands are checked against their exact keys before any handler', as
   const actions = [];
   source.onAction(async action => {
     actions.push(action);
-    return { outcome: null, step: null };
+    return { outcome: null, step: null, unrecorded: null };
   });
   // A frame of the right shape whose values are wrong reaches no handler,
   // and the host is told; the channel stays open.
@@ -1074,7 +1108,7 @@ test('a binary command is checked as exactly as the hosts check events', async t
     source.onChannelEnd(end => ends.push(end));
     source.onAction(async () => {
       handled += 1;
-      return { outcome: null, step: null };
+      return { outcome: null, step: null, unrecorded: null };
     });
     source.onMessage(() => {
       handled += 1;
@@ -1112,7 +1146,7 @@ test('a session file a host pushes is loaded by the app\'s handler and answered 
     { name: 'shared.cellucid-session', text: 'CELLUCID_SESSION/4\n' },
     { name: 'other.cellucid-session', text: 'CELLUCID_SESSION/4\n' },
   ]);
-  assert.match(raised[0].message, /^The notebook "load_session" command did not run/);
+  assert.match(raised[0].message, /^The Python session's "load_session" command did not run/);
   assert.throws(() => source.onLoadSession(null), /handler must be a function/);
   assert.throws(() => source.onLoadSession(async () => null), /already have a handler/);
   source.disconnect();
@@ -1143,9 +1177,9 @@ test('an action is answered with its outcome and step, or with the command error
   const { source, socket } = await connectedSource();
   source.acceptCommands();
   source.onAction(async ({ action, params }) => {
-    if (action === 'color.by') return { outcome: null, step: { id: 's3', label: `Coloured by ${params.field.key}` } };
-    if (action === 'history.get') return { outcome: { head: 's3', note: 'Ünïcode' }, step: null };
-    if (action === 'view.picture') return { outcome: { png: new Uint8Array(1) }, step: null };
+    if (action === 'color.by') return { outcome: null, step: { id: 's3', label: `Colored by ${params.field.key}` }, unrecorded: null };
+    if (action === 'history.get') return { outcome: { head: 's3', note: 'Ünïcode' }, step: null, unrecorded: null };
+    if (action === 'view.picture') return { outcome: { png: new Uint8Array(1) }, step: null, unrecorded: null };
     throw new RangeError(`There is no action "${action}"`);
   });
   sendAction(socket, 'r1', 'color.by', { field: { source: 'obs', key: 'leiden' } });
@@ -1156,8 +1190,8 @@ test('an action is answered with its outcome and step, or with the command error
   const frames = await decodeFrames(socket.frames);
   const results = frames.filter(frame => frame.header?.type === 'action_result');
   assert.deepEqual(results.map(frame => frame.header), [
-    { type: 'action_result', requestId: 'r1', step: { id: 's3', label: 'Coloured by leiden' } },
-    { type: 'action_result', requestId: 'r2', step: null },
+    { type: 'action_result', requestId: 'r1', step: { id: 's3', label: 'Colored by leiden' }, unrecorded: null },
+    { type: 'action_result', requestId: 'r2', step: null, unrecorded: null },
   ]);
   assert.deepEqual(results.map(frame => JSON.parse(new TextDecoder().decode(frame.body))), [
     null, { head: 's3', note: 'Ünïcode' },
@@ -1166,7 +1200,36 @@ test('an action is answered with its outcome and step, or with the command error
   assert.deepEqual(errors.map(error => [error.command, error.requestId]), [['action', 'r3'], ['action', 'r4']]);
   assert.match(errors[0].reason, /There is no action "nothing.here"/);
   assert.match(errors[1].reason, /outcome/);
-  assert.match(raised[0].message, /^The notebook's "nothing.here" action did not run/);
+  assert.match(raised[0].message, /^The Python session's "nothing.here" action did not run/);
+  source.disconnect();
+});
+
+test('a change that made no step is answered with why (unrecorded), one of the closed set, never beside a step', async t => {
+  const raised = silenceNotifications(t);
+  const { source, socket } = await connectedSource();
+  source.acceptCommands();
+  const answers = new Map([
+    ...Object.keys(VIEWER_ACTION_UNRECORDED).map((reason, at) => [`r${at}`, { outcome: null, step: null, unrecorded: reason }]),
+    // Refused before it is sent: a reason the protocol does not know, a reason beside a step, the key left out.
+    ['bad-reason', { outcome: null, step: null, unrecorded: 'forgotten' }],
+    ['reason-and-step', { outcome: null, step: { id: 's3', label: 'Colored by leiden' }, unrecorded: 'unchanged' }],
+    ['no-key', { outcome: null, step: null }],
+  ]);
+  const ids = [...answers.keys()];
+  source.onAction(async ({ params }) => answers.get(params.id));
+  for (const id of ids) sendAction(socket, id, 'color.by', { id });
+  await waitFor(() => socket.frames.length >= ids.length, 'every answer');
+  const frames = await decodeFrames(socket.frames);
+  assert.deepEqual(
+    frames.filter(frame => frame.header?.type === 'action_result').map(frame => frame.header),
+    Object.keys(VIEWER_ACTION_UNRECORDED).map((reason, at) => ({ type: 'action_result', requestId: `r${at}`, step: null, unrecorded: reason })),
+  );
+  const errors = frames.filter(frame => frame.type === 'command_error');
+  assert.deepEqual(errors.map(error => error.requestId), ['bad-reason', 'reason-and-step', 'no-key']);
+  assert.match(errors[0].reason, /unrecorded/);
+  assert.match(errors[1].reason, /unrecorded/);
+  assert.match(errors[2].reason, /exactly/);
+  assert.equal(raised.length, 3);
   source.disconnect();
 });
 
@@ -1178,11 +1241,11 @@ test('an agent app\'s commands through the host run through the agent handler an
   source.onAgent({
     list: connection => {
       seen.push(['list', connection]);
-      return [{ name: 'color_by', title: 'Colour by a field', description: 'Colour.', inputSchema: { type: 'object' }, annotations: {} }];
+      return [{ name: 'color_by', title: 'Color by a field', description: 'Color.', inputSchema: { type: 'object' }, annotations: {} }];
     },
     call: call => {
       seen.push(['call', call]);
-      source.sendAgentAsking(call.id, { message: 'Claude Code (local) asks to colour by a field.', detail: null });
+      source.sendAgentAsking(call.id, { message: 'Claude Code (local) asks to color by a field.', detail: null });
       source.sendAgentAnswered(call.id, true);
       source.sendAgentResult(call.id, { content: [{ type: 'text', text: 'Ünïcode done' }], isError: false });
     },
@@ -1198,8 +1261,7 @@ test('an agent app\'s commands through the host run through the agent handler an
   socket.hostSend({ type: 'agent_list', requestId: 'a4', connection: { id: 'has space', client: null } });
   socket.hostSend({ type: 'agent_call', requestId: 'a5', tool: 'color_by', args: [], agent: 'Claude Code', connection });
   socket.hostSend({ type: 'agent_cancel', requestId: 'a6', extra: true });
-  source.notifyAgentToolsChanged();
-  await waitFor(() => socket.frames.length >= 8, 'the agent events and three command errors');
+  await waitFor(() => socket.frames.length >= 7, 'the agent events and three command errors');
   assert.deepEqual(seen, [
     ['list', connection],
     ['call', { id: 'a2', tool: 'color_by', args: { field: { source: 'obs', key: 'leiden' } }, agent: 'Claude Code', connection }],
@@ -1213,9 +1275,8 @@ test('an agent app\'s commands through the host run through the agent handler an
   assert.deepEqual(JSON.parse(new TextDecoder().decode(binary[1].body)), { content: [{ type: 'text', text: 'Ünïcode done' }], isError: false });
   const text = frames.filter(frame => frame.header === undefined);
   assert.deepEqual(text.filter(frame => frame.type.startsWith('agent_')), [
-    { type: 'agent_asking', requestId: 'a2', message: 'Claude Code (local) asks to colour by a field.', detail: null },
+    { type: 'agent_asking', requestId: 'a2', message: 'Claude Code (local) asks to color by a field.', detail: null },
     { type: 'agent_answered', requestId: 'a2', allowed: true },
-    { type: 'agent_tools_changed' },
   ]);
   const errors = text.filter(frame => frame.type === 'command_error');
   assert.deepEqual(errors.map(error => [error.command, error.requestId]), [['agent_list', 'a4'], ['agent_call', 'a5'], ['agent_cancel', 'a6']]);
@@ -1248,12 +1309,28 @@ test('a host that does not take action results is answered with nothing', async 
   let applied = 0;
   source.onAction(async () => {
     applied += 1;
-    return { outcome: null, step: null };
+    return { outcome: null, step: null, unrecorded: null };
   });
   sendAction(socket, 'r1', 'highlight.clear-all', {});
   await nextTask();
   assert.equal(applied, 1);
   assert.deepEqual(socket.frames, []);
+  source.disconnect();
+});
+
+test('a disconnect lets go of what ran when the channel reopened, as of what ran at its end (RCD-3)', async () => {
+  const { source } = await connectedSource();
+  const before = [];
+  source.onChannelReopen(() => before.push('reopened'));
+  source.disconnect();
+  // Connected again: only what was registered on this connection runs.
+  assert.equal(await source.initialize(), true);
+  const after = [];
+  source.onChannelReopen(() => after.push('reopened'));
+  lastSocket().hostClose(1006, '');
+  await until(() => after.length > 0, 'the channel to open again');
+  assert.deepEqual(after, ['reopened'], 'the channel opened again');
+  assert.deepEqual(before, [], 'the disconnected connection\'s callback is gone');
   source.disconnect();
 });
 
@@ -1410,7 +1487,7 @@ test('the viewer sends only event types the protocol declares, each as a literal
 
 test('main wires the channel: session bundles on it, commands accepted after every handler', () => {
   const mainSource = readFileSync(new URL('../assets/js/app/main.js', import.meta.url), 'utf8');
-  assert.match(mainSource, /const viewerHostConfig = getViewerHostConfig\(\);/);
+  assert.match(mainSource, /viewerHostConfig = getViewerHostConfig\(\);/);
   assert.match(mainSource, /createViewerHostBridgeDataSource\(viewerHostConfig\)/);
   assert.match(mainSource, /viewerHostSource\.sendSessionBundle\(message\.requestId, bundle\)/);
   assert.match(mainSource, /viewerHostSource\.onChannelEnd\(/);
@@ -1534,16 +1611,17 @@ test('a failed notebook command is announced in the viewer and reported to the h
   assert.equal(raised.length, 1);
   assert.equal(
     raised[0].message,
-    'The notebook\'s "color.by" action did not run: There is no field "CD8A" in obs. ' +
-    'The viewer is unchanged; correct the notebook cell and run it again.',
+    // The host is named as its info's runtime (`python`) names it.
+    'The Python session\'s "color.by" action did not run: There is no field "CD8A" in obs. ' +
+    'The viewer is unchanged; correct the call in the Python session and run it again.',
   );
   assert.deepEqual(raised[0].options, {
     category: 'connectivity',
-    title: 'Notebook command failed',
+    title: 'Python command failed',
     duration: 0,
   });
   assert.equal(logged.length, 1);
-  assert.match(logged[0][0], /^\[ViewerHost\] The notebook's "color.by" action/);
+  assert.match(logged[0][0], /^\[ViewerHost\] The Python session's "color.by" action/);
   assert.deepEqual(await decodeFrames(socket.frames), [{
     type: 'command_error',
     command: 'action',
@@ -1558,7 +1636,7 @@ test('a failed notebook command is announced in the viewer and reported to the h
   });
   socket.hostSend({ type: 'freeze' });
   assert.equal(raised.length, 1);
-  assert.match(raised[0].message, /^The notebook "freeze" command did not run: freeze failed\./);
+  assert.match(raised[0].message, /^The Python session's "freeze" command did not run: freeze failed\./);
 
   // An unknown command type is never echoed into the notification, and the
   // host is not told of a command it cannot have sent.
@@ -1569,7 +1647,7 @@ test('a failed notebook command is announced in the viewer and reported to the h
   }
   assert.equal(raised.length, 2);
   for (const { message } of raised) {
-    assert.match(message, /^A notebook command did not run:/);
+    assert.match(message, /^A command from the Python session did not run:/);
     assert.equal(message.includes('alert'), false);
   }
   assert.equal(socket.frames.length, framesBefore);
@@ -1582,7 +1660,7 @@ test('a failed notebook command is announced in the viewer and reported to the h
   };
   socket.hostSend({ type: 'freeze' });
   assert.equal(logged.length, 2);
-  assert.match(logged[1][0], /^\[ViewerHost\] Notebook command failure notice failed:/);
+  assert.match(logged[1][0], /^\[ViewerHost\] Host command failure notice failed:/);
 });
 
 function protocolServer(protocolResponse, runtime = 'python') {
@@ -1705,22 +1783,22 @@ test('the host is named from its server info, and an unknown runtime is refused'
     protocolFixture.passthrough = false;
   });
   const protocol = () => new Response(JSON.stringify(CURRENT_PROTOCOL), { status: 200 });
-  // Its steps are labelled with its language: Jupyter is Python's notebook viewer.
-  const named = [['r', 'R', 'r'], ['jupyter', 'Jupyter', 'python'], ['python', 'Python', 'python']];
-  assert.deepEqual(named.map(([runtime]) => runtime).sort(), Object.keys(VIEWER_HOST_RUNTIMES).sort(), 'every runtime has a language');
-  for (const [runtime, label, language] of named) {
+  for (const runtime of Object.keys(VIEWER_HOST_RUNTIMES)) {
     globalThis.fetch = protocolServer(protocol, runtime);
     const source = new ViewerHostDataSource(getViewerHostConfig());
+    assert.equal(source.getHostRuntime(), null);
     assert.equal(source.getHostLabel(), null);
-    assert.equal(source.getHostLanguage(), null);
     assert.equal(await source.initialize(), true);
-    assert.equal(source.getHostLabel(), label);
-    assert.equal(source.getHostLanguage(), language);
+    assert.equal(source.getHostRuntime(), runtime);
+    assert.equal(source.getHostLabel(), VIEWER_HOST_RUNTIMES[runtime].label);
     source.disconnect();
   }
   globalThis.fetch = protocolServer(protocol, 'perl');
   const source = new ViewerHostDataSource(getViewerHostConfig());
-  await assert.rejects(source.initialize(), /runtime must be one of python, jupyter, r/);
+  await assert.rejects(
+    source.initialize(),
+    /runtime must be one of jupyter, python, cellucid-serve, cellucid-mcp, r, r-mcp/,
+  );
   const health = { status: 'ok', type: 'anndata', version: '1.0.0', format: 'h5ad', n_cells: 3, n_genes: 2 };
   assert.throws(
     () => requireViewerHostInfoPayload({ ...hostInfo(health, 'r'), n_cells: 4 }, health),

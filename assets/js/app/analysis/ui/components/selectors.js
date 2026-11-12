@@ -8,6 +8,7 @@
  */
 
 import { createIntentPrefetcher } from '../../../utils/intent-prefetch.js';
+import { setControlAvailability } from '../../../ui/core/control-availability.js';
 import { NONE_VALUE } from '../../shared/dom-utils.js';
 import { createField } from '../../../ui/components/controls.js';
 import { createWindowedListbox } from '../../../ui/components/windowed-listbox.js';
@@ -359,7 +360,7 @@ export function createPlotTypeSelector(options = {}) {
     noneOption.value = '';
     noneOption.textContent = 'No plots available';
     select.appendChild(noneOption);
-    select.disabled = true;
+    setControlAvailability(select, 'no plot shows this kind of data');
   } else {
     plotTypes.forEach(pt => {
       const option = document.createElement('option');

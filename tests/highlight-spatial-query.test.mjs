@@ -321,6 +321,7 @@ test('picking rejects a same-size spatial index from another position owner', ()
       pointSize: 4,
       sizeAttenuation: 0,
       fov: Math.PI / 4,
+      pointSizeMax: 160,
       spatialIndex: wrongIndex,
     }),
     /exact matching spatial owner/,

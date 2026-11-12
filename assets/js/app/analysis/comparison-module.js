@@ -45,7 +45,8 @@ import './plots/types/scatterplot.js';
 import './plots/types/gene-heatmap.js';
 import { formatCountOf } from '../../utils/format-units.js';
 import { isLeftOutResult } from './shared/analysis-result-session.js';
-import { failureText } from '../../utils/errors.js';
+import { failureDetails, sayFailure } from '../../utils/errors.js';
+import { isCancellation } from '../../utils/abort.js';
 import { GeneUnavailableError, describeUnavailableGene } from '../utils/gene-lookup.js';
 
 /**
@@ -295,7 +296,8 @@ export class ComparisonModule {
       ['page:changed', () => this.onPagesChanged()],
       ['highlight:changed', () => this.onHighlightChanged()],
       ['visibility:changed', () => this.onCellVisibilityChanged()],
-      ['genes:listed', () => this.onGenesListed()]
+      ['genes:listed', () => this.onGenesListed()],
+      ['field:changed', () => this.onFieldsChanged()]
     ];
     try {
       for (const [eventName, handler] of subscriptions) {
@@ -482,8 +484,8 @@ export class ComparisonModule {
             error
           );
           this._notifications.error(
-            `Could not create the analysis window: ${failureText(error)}`,
-            { category: 'analysis', title: 'Analysis window error' }
+            `Could not create the analysis window: ${sayFailure(error)}`,
+            { ...failureDetails(error), category: 'analysis', title: 'Analysis window error' }
           );
         });
       }
@@ -493,8 +495,8 @@ export class ComparisonModule {
         error
       );
       this._notifications.error(
-        `Could not create the analysis window: ${failureText(error)}`,
-        { category: 'analysis', title: 'Analysis window error' }
+        `Could not create the analysis window: ${sayFailure(error)}`,
+        { ...failureDetails(error), category: 'analysis', title: 'Analysis window error' }
       );
     }
   }
@@ -715,6 +717,17 @@ export class ComparisonModule {
   onGenesListed() {
     this._uiManager.onGenesListed();
     this._analysisWindowManager.onGenesListed();
+  }
+
+  /**
+   * A field was created, renamed, deleted or had its categories edited: every
+   * analysis offers the fields there are now, with their categories read
+   * again, in the panel and in every window (an agent's new field was "no
+   * choice" of Differential expression until another change, L25-6).
+   */
+  onFieldsChanged() {
+    this._uiManager.onFieldsChanged();
+    this._analysisWindowManager.onFieldsChanged();
   }
 
   // ===========================================================================
@@ -1266,7 +1279,7 @@ export class ComparisonModule {
   }
 
   /**
-   * Colour the cells by one gene of a result (a marker or a DE gene), through
+   * Color the cells by one gene of a result (a marker or a DE gene), through
    * the sidebar's gene selector, so its search box names the gene shown. A
    * gene the gene list cannot choose -- still being read, or not in it (a
    * result read from another matrix) -- is said as the selector's lookup
@@ -1279,11 +1292,13 @@ export class ComparisonModule {
     try {
       await this._colorByGene(geneKey);
     } catch (error) {
+      // A newer choice took its place (or it was stopped): nothing to say.
+      if (isCancellation(error)) return;
       if (error instanceof GeneUnavailableError) {
         this._notifications.info(describeUnavailableGene(error.gene, { kind: error.reason }, error.failure), { category: 'analysis' });
         return;
       }
-      this._notifications.error(`Colouring by ${geneKey} failed: ${failureText(error)}`, { category: 'analysis' });
+      this._notifications.error(`Coloring by ${geneKey} failed: ${sayFailure(error)}`, { ...failureDetails(error), category: 'analysis' });
     }
   }
 
@@ -1312,14 +1327,18 @@ export class ComparisonModule {
     if (typeof ui?.applyPreset !== 'function') {
       throw new Error(`Analysis "${modeId}" does not accept presets`);
     }
+    const before = ui.getOptions();
     await ui.applyPreset(preset);
     // One person's click ("Score as signature", "Dot plot"): one step that
     // opens the analysis with the options it was sent
     // (`analysis.<name>.set` with `show`), the whole record, as the preset
-    // sets every option. Pages a preset names are their own step.
+    // sets every option; the step is named by those it changed. Pages a
+    // preset names are their own step.
     await ui.whenSettled();
     if (preset.selectedPages !== undefined) this.recordAnalysisChange(ui, 'pages', { pageIds: [...ui.getSelectedPages()] });
-    this.recordAnalysisChange(ui, 'set', { options: ui.getOptions(), show: true });
+    const options = ui.getOptions();
+    const changed = Object.keys(options).filter(key => JSON.stringify(before[key]) !== JSON.stringify(options[key]));
+    this.recordAnalysisChange(ui, 'set', { options, show: true, changed });
     this._modeToggleContainer
       ?.querySelector(`.analysis-mode[data-mode="${modeId}"]`)
       ?.scrollIntoView?.({ block: 'nearest' });

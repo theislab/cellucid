@@ -1,53 +1,15 @@
 /* =========================================================================
-   License Modal
+   License (license-dialog.js): an app dialog (App dialogs, below), wider,
+   its header standing while the text scrolls under it.
    ========================================================================= */
 
-.license-modal {
-  position: fixed;
-  inset: 0;
-  z-index: var(--z-modal);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: var(--space-5);
-}
-
-.license-modal.hidden {
-  display: none;
-}
-
-.license-backdrop {
-  position: absolute;
-  inset: 0;
-  background: var(--color-surface-overlay);
-  backdrop-filter: blur(10px) saturate(1.15);
-}
-
-.license-content {
-  position: relative;
-  overflow: hidden;
-  /* The card every other dialog uses (welcome, confirm, figure export,
-     community annotation): square, a strong 2px rule, a flat surface. */
-  border-radius: var(--radius-none);
-  background: var(--color-surface-elevated);
-  border: var(--border-default);
-  box-shadow: var(--shadow-lg);
-  max-width: 600px;
-  width: 100%;
-  max-height: 80vh;
-  display: flex;
-  flex-direction: column;
-}
-
-.license-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+.app-dialog.license-dialog {
+  width: min(600px, calc(100vw - 2 * var(--space-4)));
+  max-height: min(80dvh, calc(100dvh - 2 * var(--space-4)));
 }
 
 .license-body {
   padding: var(--control-dialog-padding);
-  overflow-y: auto;
   font-family: var(--font-sans);
   font-size: var(--type-body);
   line-height: var(--leading-relaxed);
@@ -82,8 +44,8 @@
 }
 
 @media (max-width: 640px) {
-  .license-content {
-    max-height: 90vh;
+  .app-dialog.license-dialog {
+    max-height: calc(100dvh - 2 * var(--space-4));
   }
 }
 
@@ -95,22 +57,18 @@
    the one exception: its header is the logo.
    ========================================================================= */
 
-.license-header,
 .app-dialog-header,
 .confirm-dialog-header,
 .community-annotation-modal-header,
-.analysis-modal-header,
-.figure-export-modal-title {
+.analysis-modal-header {
   padding: var(--control-dialog-header-padding-y) var(--control-dialog-header-padding-x);
   background: var(--color-surface-secondary);
   border-bottom: var(--border-width-1) solid var(--color-border-light);
 }
 
-.license-header h2,
 .app-dialog-header h2,
 .confirm-dialog-title,
 .community-annotation-modal-title,
-.figure-export-modal-title,
 .analysis-modal-title {
   margin: 0;
   font-size: var(--type-title);
@@ -119,7 +77,6 @@
   color: var(--color-text-primary);
 }
 
-.license-close,
 .app-dialog-close,
 .analysis-modal-close {
   position: relative;
@@ -140,7 +97,6 @@
   transition: var(--transition-colors);
 }
 
-.license-close:hover,
 .app-dialog-close:hover,
 .analysis-modal-close:hover {
   background: var(--color-interactive-secondary-hover);
@@ -206,10 +162,22 @@
    Analysis Modal / Popup
    ========================================================================= */
 
+/* A <dialog> opened modally (wireAppDialog): it fills the screen, its own
+   backdrop element blurs the page, the browser's ::backdrop draws nothing. */
 .analysis-modal {
   position: fixed;
   inset: 0;
   z-index: var(--z-modal);
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  overflow: visible;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -221,6 +189,16 @@
 .analysis-modal.open {
   opacity: 1;
   pointer-events: auto;
+}
+
+/* Closed (`closeModal`): out of the top layer at once, the page usable
+   again; the view, inert, fades where it was until it is detached. */
+.analysis-modal:not([open]):not(.closing) {
+  display: none;
+}
+
+.analysis-modal::backdrop {
+  background: transparent;
 }
 
 .analysis-modal-backdrop {
@@ -294,7 +272,8 @@
   min-width: 250px;
   padding: var(--space-3);
   background: var(--color-surface-elevated);
-  overflow: hidden;
+  /* A plot that needs more room than the window gives (every name of a dot plot) scrolls. */
+  overflow: auto;
 }
 
 .analysis-modal-plot {
@@ -686,8 +665,8 @@
     height: 100% !important;
     min-width: 0;
     min-height: 0;
-    max-width: none;
-    max-height: none;
+    max-width: none !important;
+    max-height: none !important;
     border: none;
   }
 
@@ -764,10 +743,12 @@
 }
 
 /* =========================================================================
-   App dialogs: native <dialog> opened with showModal(), which owns the
-   backdrop, the focus trap, Escape and the return of focus. Cite Cellucid and
-   Share this dataset use it. The header band and close glyph are the shared
-   dialog chrome above.
+   App dialogs: every modal dialog is a native <dialog> opened with
+   showModal() through wireAppDialog (ui/components/app-dialog.js); the
+   browser owns the backdrop, the inert page, the top layer and Escape. Most
+   are a card (`.app-dialog`): Cite Cellucid, Share, the license, the
+   confirmation, the figure export's warnings, the history's dialogs. The
+   header band and close glyph are the shared dialog chrome above.
    ========================================================================= */
 
 .app-dialog {
@@ -784,6 +765,36 @@
 }
 
 .app-dialog::backdrop {
+  background: var(--color-surface-overlay);
+}
+
+/* A dialog drawn as a layer over the whole screen with its own card centered
+   in it (the welcome card, the community annotation dialogs): a press on the
+   layer around the card is a press on the backdrop, and what is kept above
+   dialogs (the notification cards) sits beside the card, where a short
+   screen can put it under the card. */
+.dialog-layer {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100dvh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: var(--space-5);
+  border: 0;
+  background: transparent;
+  color: inherit;
+  overflow: hidden;
+}
+
+.dialog-layer[open] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dialog-layer::backdrop {
   background: var(--color-surface-overlay);
 }
 
@@ -955,4 +966,57 @@
 
 .share-badge-preview {
   display: block;
+}
+
+/* Group categories (group-categories-dialog.js): one row per category, a group box each. */
+.group-categories-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--control-row-gap);
+  max-height: min(50dvh, 360px);
+  overflow-y: auto;
+}
+
+.group-categories-row,
+.group-categories-setting {
+  display: flex;
+  align-items: center;
+  gap: var(--control-row-gap);
+}
+
+.group-categories-swatch {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border: var(--border-default);
+}
+
+.group-categories-category {
+  flex: 1 1 45%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A category with no name, shown as (empty) or (blank): quiet, as in the legend. */
+.group-categories-category.is-unnamed {
+  color: var(--color-text-tertiary);
+  font-style: italic;
+}
+
+.group-categories-row > .obs-select,
+.group-categories-setting > .obs-select {
+  flex: 1 1 55%;
+  min-width: 0;
+}
+
+.group-categories-setting > label {
+  flex: none;
+}
+
+.group-categories-source,
+.group-categories-status {
+  color: var(--color-text-secondary);
+  font-size: var(--type-readout);
 }

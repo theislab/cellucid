@@ -648,6 +648,16 @@ const REVISIONS = [
   { revision: 12, digest: '41a3728f589d43152158fd09b89f7a18a925a4bcb81455043f2197b5edfed8fa' },
   // The rates a plan weighs are read through `utils/machine.js` (the link the reader plans on, the decoding rate, the cores); nothing a transcoder writes changed.
   { revision: 13, digest: 'a1dc761510f5d62359b15d945f846249d1aa9be2d9e2370a1dd53cb3daebc89c' },
+  // One test of "this machine" (`utils/loopback.js`, kept parts' `sameMachine`); nothing a transcoder writes changed.
+  { revision: 14, digest: '73cebcfddf900d5eba30164347adf2adac3afb0d101429d4cc84cbe9ee45db9d' },
+  // A request no answer arrived for names its host fault (`byte-source.js` `unansweredFault`, the `silent` fault); nothing a transcoder writes changed.
+  { revision: 15, digest: '38a6643f0929ab3fa340f149f0ec9d5e19bf236842c4ec7d75350d6853b679e1' },
+  // Round 8–9 (2026-11-11; one raise for the day): what a converted store holds changed — an R `integer64` column is
+  // kept as 64-bit integers, a text table's whole number past 2^53 makes its column text, a column whose name a store
+  // cannot hold (`CD4/CD8`, one a table repeats) is written under its portable name and said; with web pages in place
+  // of data told apart, AnnData layout refusals (`AnnDataFormatError`), messages in US spelling and one formatter,
+  // listener set and digest helper per concept.
+  { revision: 16, digest: 'cd5a32d88d88b64634be5e246e4f201627d5fa35aef8bb44c54a3a0fd232d358' },
 ];
 
 test('the kept-store revision is raised whenever the transcoders change', () => {
@@ -762,6 +772,37 @@ const OUTPUT_REVISIONS = [
   {
     // Raised for the rates a plan weighs read through `utils/machine.js`: the same stores.
     revision: 13,
+    digests: {
+      'rds/seurat5_gzip.rds': '62052a45721e4f911254d389702351adac6b723b366b659e8049cf1d2dbf2fb7',
+      'rds/sce.rds': '54b58f99d91edf2b8da89ef8275be7621af43b647207de307658eed16d8b5b8f',
+      'rds/SeuratObject_5.4.0_pbmc_small.rda': 'a07f8f125cebf4a505a78e62809ed0a9a7e8de4f5ed82a38a11f2a023adea578',
+      'mtx/cellranger3': '99d99f23a675244c3c30c024f26fea47eab31e24f3a51a5b218d8fda3d92d302',
+    },
+  },
+  {
+    // Raised for the one test of "this machine" (`utils/loopback.js`): the same stores.
+    revision: 14,
+    digests: {
+      'rds/seurat5_gzip.rds': '62052a45721e4f911254d389702351adac6b723b366b659e8049cf1d2dbf2fb7',
+      'rds/sce.rds': '54b58f99d91edf2b8da89ef8275be7621af43b647207de307658eed16d8b5b8f',
+      'rds/SeuratObject_5.4.0_pbmc_small.rda': 'a07f8f125cebf4a505a78e62809ed0a9a7e8de4f5ed82a38a11f2a023adea578',
+      'mtx/cellranger3': '99d99f23a675244c3c30c024f26fea47eab31e24f3a51a5b218d8fda3d92d302',
+    },
+  },
+  {
+    // Raised for the host fault of a request no answer arrived for alone: the same stores.
+    revision: 15,
+    digests: {
+      'rds/seurat5_gzip.rds': '62052a45721e4f911254d389702351adac6b723b366b659e8049cf1d2dbf2fb7',
+      'rds/sce.rds': '54b58f99d91edf2b8da89ef8275be7621af43b647207de307658eed16d8b5b8f',
+      'rds/SeuratObject_5.4.0_pbmc_small.rda': 'a07f8f125cebf4a505a78e62809ed0a9a7e8de4f5ed82a38a11f2a023adea578',
+      'mtx/cellranger3': '99d99f23a675244c3c30c024f26fea47eab31e24f3a51a5b218d8fda3d92d302',
+    },
+  },
+  {
+    // Raised for the day's changes (integer64, text-table identifiers, portable column names, with messages and
+    // helpers): the corpus holds none of the changed kinds, so the same stores.
+    revision: 16,
     digests: {
       'rds/seurat5_gzip.rds': '62052a45721e4f911254d389702351adac6b723b366b659e8049cf1d2dbf2fb7',
       'rds/sce.rds': '54b58f99d91edf2b8da89ef8275be7621af43b647207de307658eed16d8b5b8f',

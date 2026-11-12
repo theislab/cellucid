@@ -8,7 +8,7 @@
  *   `style` in markup, outside a short list of geometry owners;
  * - every number the interface prints goes through display-format.js;
  * - the replaced classes are gone from markup, code and CSS;
- * - component CSS names colours through tokens and does not fight the
+ * - component CSS names colors through tokens and does not fight the
  *   cascade with `!important` outside the listed third-party overrides.
  */
 import assert from 'node:assert/strict';
@@ -202,7 +202,7 @@ test('the replaced control classes are gone from markup, code and CSS', () => {
   assert.deepEqual(offenders, []);
 });
 
-test('component CSS names colours through tokens', () => {
+test('component CSS names colors through tokens', () => {
   const offenders = [];
   for (const [file, source] of CSS) {
     for (const [declaration] of source.matchAll(/[a-z-]+\s*:[^;{}]*;/g)) {

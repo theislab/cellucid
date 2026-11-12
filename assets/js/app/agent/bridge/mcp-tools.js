@@ -1,5 +1,5 @@
 /**
- * @fileoverview The action catalogue as MCP tools: what Claude and ChatGPT
+ * @fileoverview The action catalog as MCP tools: what Claude and ChatGPT
  * see when they list Cellucid's tools.
  *
  * Every action is one tool, named by `toolNameOf` (`history.get` →
@@ -10,7 +10,9 @@
  * - `readOnlyHint` for a read (`effect: 'read'`): it changes nothing; a move
  *   of the history (`effect: 'history'`: undo, redo, a jump) changes what is
  *   shown, so it is not read-only, and loses nothing, so it is not
- *   destructive; nor is opening another dataset (`effect: 'dataset'`): the
+ *   destructive; nor is a stop of work under way (`effect: 'control'`:
+ *   a playing camera path, a running analysis); nor is opening another
+ *   dataset (`effect: 'dataset'`): the
  *   open one's history stays kept in this browser; nor an act outside the
  *   state (`effect: 'outside'`: a file written, a publication, what this
  *   browser keeps), whose `confirm` says how it is destructive;
@@ -18,14 +20,24 @@
  *   writes a file, deletes what was saved, downloads a lot or publishes,
  *   which the history cannot take back; every other change is an undoable
  *   step, so it is not destructive;
- * - `openWorldHint` when it reaches beyond the open dataset (a download or a
- *   publication);
+ * - `openWorldHint` when it reaches beyond the open dataset (a download, a
+ *   publication, or an address its parameters name: `opensLinks`);
  * - `idempotentHint` for reads.
  *
- * A description also says what the person's History settings make of the
- * action: one that changes only a detail they leave out of the history
- * (camera moves; panels, windows and theme) says it is not recorded
- * (History v2 §3.15.5: "camera moves are not recorded in this history").
+ * A change that is one undoable step says nothing of it: that is the rule,
+ * said once in the instructions (`instructions.js`), and every description
+ * says only its exception (a read, a move of the history, opening a dataset,
+ * an act outside the dataset's state).
+ *
+ * **The list never changes with the person's settings**, for every way in
+ * alike (the chat bar, the connector, a local agent): a model's reasoning is
+ * bound to the exact tools it was given, and a changed list rewrites a
+ * client's cached prompt (L26-9: a permission changed mid-session cost a
+ * connector's next turn about four times its cached price and dropped its
+ * earlier reasoning). What the person's permissions, the dataset's data
+ * switch and their History settings make of the tools is told to the agent
+ * apart: the chat bar's with the person's message, an outside agent's after
+ * a tool result (`../settings-told.js`).
  *
  * The tab answers the relay's tool list with this (`relay-client.js`), and
  * the relay's bundled copy for when no tab is connected is made by the same
@@ -37,24 +49,11 @@
 import { toolNameOf } from '../../actions/catalog.js';
 import { RELAY_STATUS_TOOL, VIEW_APP } from './relay-protocol.js';
 
-const CONFIRM_SENTENCES = Object.freeze({
-  'writes-file': 'Cellucid asks the person before it writes the file.',
-  'deletes-saved': 'Cellucid asks the person before it deletes what was saved.',
-  'large-download': 'Cellucid asks the person before a large download starts.',
-  publishes: 'Cellucid asks the person before it publishes.',
-  'pauses-recording': 'Cellucid asks the person before it pauses the history.',
-});
-/** What the person's settings make of a kind of action for one connection (`permissionOf`). */
-export const AGENT_PERMISSIONS = Object.freeze(['ask', 'allow', 'deny']);
-const CHANGE_ASKED = 'The person\'s settings ask them before each change: Cellucid asks, and you wait for the answer.';
-const PERMISSION_SENTENCES = Object.freeze({
-  allow: 'The person\'s settings let this run without asking.',
-  deny: 'The person\'s settings refuse this for you: do not call it; tell the person, who can change it in Cellucid.',
-});
 const OPEN_WORLD_CONFIRMS = new Set(['large-download', 'publishes']);
 /**
  * A detail the person's History settings leave out of the history (History
- * v2 §3.15.5: `offDomainsOf`), said of an action that changes nothing else.
+ * v2 §3.15.5: `offDomainsOf`), in the words an agent is told
+ * (`notRecordedSentences`).
  */
 const NOT_RECORDED = Object.freeze({
   camera: 'Camera moves are not recorded in this history (the person\'s History settings)',
@@ -86,8 +85,8 @@ function toolSchemaOf(schema) {
 
 /**
  * What the person's History settings leave out of the history, in the words
- * the tool list uses (the chat bar's model is told it with the person's
- * message, `chat/index.js`); empty while everything is recorded.
+ * an agent is told (`../settings-told.js`); empty while everything is
+ * recorded.
  * @param {string[]} offDomains - `history-settings.js` `offDomainsOf`
  * @returns {string[]}
  */
@@ -95,71 +94,36 @@ export function notRecordedSentences(offDomains) {
   return offDomains.map(domain => `${NOT_RECORDED[domain]}: such a change makes no step, and Undo does not take it back.`);
 }
 
-function descriptionOf(action, permission, offDomains) {
+function descriptionOf(action) {
   const sentences = [action.summary];
-  const notRecorded = action.touches.length > 0 && action.touches.every(domain => offDomains.includes(domain));
   if (action.effect === 'read') sentences.push('Reads only; changes nothing.');
+  else if (action.effect === 'control') sentences.push('Stops work under way at once (it never waits behind it); that work\'s own step records what it changed, so this records no step.');
   else if (action.effect === 'history') sentences.push('Moves the history; records no step.');
   else if (action.effect === 'dataset') sentences.push('Replaces the open dataset, whose history stays kept in this browser (Undo does not bring it back); records no step.');
   else if (action.effect === 'outside') sentences.push('Acts outside the dataset\'s state (a file, a publication, what this browser keeps); Undo does not take it back, and it records no step.');
-  else if (action.confirm === null && notRecorded) sentences.push(...new Set(action.touches.map(domain => `${NOT_RECORDED[domain]}: this change makes no step, and Undo does not take it back.`)));
-  else if (action.confirm === null) sentences.push('Recorded as one step of the person\'s history; it can be undone.');
-  if (action.effect === 'read' || permission === null) return sentences.join(' ');
-  if (action.confirm !== null) {
-    sentences.push(permission === 'ask' ? CONFIRM_SENTENCES[action.confirm] : PERMISSION_SENTENCES[permission]);
-  } else if (permission === 'ask') {
-    sentences.push(CHANGE_ASKED);
-  } else if (permission === 'deny') {
-    sentences.push(PERMISSION_SENTENCES.deny);
-  }
+  // Any other change is one undoable step: the instructions say so once
+  // (`instructions.js` CORE), so no description repeats it (~1,800 tokens a
+  // call over the ~95 changes, measured 2026-11-11).
   return sentences.join(' ');
 }
 
 /**
- * The kind of permission an action is listed under (`app/agent/presence/permissions.js`):
- * its `confirm` (what the history cannot undo), `change` for any other change,
- * null for a read.
- */
-export function permissionKindOf(action) {
-  if (action.effect === 'read') return null;
-  return action.confirm ?? 'change';
-}
-
-/** What a connection is told of an action when no settings say otherwise: a change runs, what cannot be undone is asked. */
-function defaultPermissionOf(action) {
-  return permissionKindOf(action) === 'change' ? 'allow' : 'ask';
-}
-
-/**
- * One catalogue entry (`catalogDocument(...).actions[i]`) as an MCP tool.
- * `permission`: what the person's settings make of its kind
- * (`permissionKindOf`) for the connection listing it: `ask`, `allow` or
- * `deny` (by default a change runs and what cannot be undone is asked; a
- * read is never asked); null: its description says none (the agent is told
- * the permissions apart, the chat bar's model with the person's message).
- * `offDomains`: the details the person's History settings leave out of the
- * history (`history-settings.js` `offDomainsOf`): an action that changes
- * only those says it makes no step.
+ * One catalog entry (`catalogDocument(...).actions[i]`) as an MCP tool.
  * @param {object} action
- * @param {'ask'|'allow'|'deny'|null} [permission]
- * @param {{offDomains?: string[]}} [options]
  */
-export function mcpToolOf(action, permission = defaultPermissionOf(action), { offDomains = [] } = {}) {
-  if (permission !== null && !AGENT_PERMISSIONS.includes(permission)) throw new TypeError(`A permission is one of ${AGENT_PERMISSIONS.join(', ')}, or null`);
-  const unknown = offDomains.filter(domain => !Object.hasOwn(NOT_RECORDED, domain));
-  if (unknown.length > 0) throw new TypeError(`Only ${Object.keys(NOT_RECORDED).join(' and ')} can be left out of the history, not ${unknown.join(', ')}`);
+export function mcpToolOf(action) {
   const read = action.effect === 'read';
   const tool = {
     name: action.tool,
     title: action.title,
-    description: descriptionOf(action, permission, offDomains),
+    description: descriptionOf(action),
     inputSchema: toolSchemaOf(action.params),
     annotations: {
       title: action.title,
       readOnlyHint: read,
       destructiveHint: !read && action.confirm !== null,
       idempotentHint: read,
-      openWorldHint: !read && OPEN_WORLD_CONFIRMS.has(action.confirm),
+      openWorldHint: !read && (OPEN_WORLD_CONFIRMS.has(action.confirm) || action.opensLinks === true),
     },
   };
   // A host that shows MCP Apps draws the result in the view card; the flat
@@ -172,24 +136,14 @@ export function mcpToolOf(action, permission = defaultPermissionOf(action), { of
 }
 
 /**
- * Every action of a catalogue document as MCP tools, in the catalogue's
- * order (sorted by type, so a client's cached list and the model's prompt
- * cache stay valid while nothing changes).
- *
+ * Every action of a catalog document as MCP tools, in the catalog's order
+ * (sorted by type), the same list whatever the person's settings (see the
+ * module), so a client's cached list and the model's prompt cache stay valid.
  * @param {{schema: number, actions: object[]}} document `catalogDocument(catalog)`
- * @param {{permissionOf?: (kind: string) => ('ask'|'allow'|'deny'|null), withPermissions?: boolean}} [options] -
- *   `permissionOf`: what the person's settings make of each kind of action
- *   (`change`, or a `confirm` kind) for the connection the list is for (null
- *   or left out: the default, `defaultPermissionOf`); `withPermissions`
- *   false: no description says a permission (a list that must stay the same
- *   while the settings change: the chat bar's, whose model's reasoning is
- *   bound to the exact tools it was given; its model is told the
- *   permissions with the person's message); `offDomains`: the details
- *   the person's History settings leave out (`mcpToolOf`)
  */
-export function mcpToolsOf(document, { permissionOf = () => null, withPermissions = true, offDomains = [] } = {}) {
+export function mcpToolsOf(document) {
   if (document?.schema !== 1 || !Array.isArray(document.actions)) {
-    throw new TypeError('mcpToolsOf takes a catalogue document of schema 1');
+    throw new TypeError('mcpToolsOf takes a catalog document of schema 1');
   }
   const names = new Set([RELAY_STATUS_TOOL.name]);
   return document.actions.map(action => {
@@ -197,14 +151,12 @@ export function mcpToolsOf(document, { permissionOf = () => null, withPermission
       throw new TypeError(`Tool name "${action.tool}" is taken (rename the action "${action.type}")`);
     }
     names.add(action.tool);
-    if (!withPermissions) return mcpToolOf(action, null, { offDomains });
-    const kind = permissionKindOf(action);
-    return mcpToolOf(action, (kind === null ? null : permissionOf(kind)) ?? defaultPermissionOf(action), { offDomains });
+    return mcpToolOf(action);
   });
 }
 
 /**
- * Each tool name of a catalogue with its action definition, for running a
+ * Each tool name of a catalog with its action definition, for running a
  * call by the name an agent used.
  * @param {{list: () => readonly object[]}} catalog
  * @returns {Map<string, object>}

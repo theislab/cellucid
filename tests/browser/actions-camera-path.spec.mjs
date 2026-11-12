@@ -92,6 +92,7 @@ function readPath(page) {
     return {
       labels: saved.keyframes.map(kf => kf.label),
       durations: saved.keyframes.map(kf => kf.transitionDuration),
+      holds: saved.keyframes.map(kf => kf.hold ?? 0),
       loopBack: saved.loopBackKeyframeId === null
         ? null
         : saved.keyframes.find(kf => kf.id === saved.loopBackKeyframeId)?.label ?? 'missing',
@@ -102,6 +103,7 @@ function readPath(page) {
         speed: saved.defaultSpeed,
         loop: saved.loopPlayback,
         autoplay: saved.autoplay,
+        captions: saved.captions,
       },
     };
   });
@@ -177,7 +179,7 @@ test('every Camera path control dispatches one action with exact parameters and 
   await rename.press('Enter');
   expect(await takeDispatched(page)).toEqual([]);
   expect(await rename.evaluate(input => input.validationMessage)).toBe(
-    'A keyframe is labelled "KF 2" already; choose another label.'
+    'A keyframe is labeled "KF 2" already; choose another label.'
   );
   await rename.fill('Close-up');
   await rename.press('Enter');
@@ -201,6 +203,27 @@ test('every Camera path control dispatches one action with exact parameters and 
     { type: 'camera-path.duration.set', params: { seconds: 1.5 } },
   ]);
   expect((await readPath(page)).durations).toEqual([1.5, 1.5, 1.5]);
+
+  // A hold, typed in the row under its keyframe: one step; the playback bar
+  // shows the span the camera rests there after the keyframe's mark.
+  const firstHold = page.locator('.cinematic-hold-input[data-hold-index="0"]');
+  await firstHold.fill('2');
+  await firstHold.press('Tab');
+  expect(await takeDispatched(page)).toEqual([
+    { type: 'camera-path.hold.set', params: { keyframe: 'KF 3', seconds: 2 } },
+  ]);
+  expect((await readPath(page)).holds).toEqual([2, 0, 0]);
+  await expect(firstHold).toHaveValue('2');
+  await expect(page.locator('.cinematic-timeline-hold')).toHaveCount(1);
+  // 2 s of a 2 + 1.5 + 1.5 s path, from its start.
+  expect(await page.locator('.cinematic-timeline-hold').evaluate(el => [el.style.left, Number.parseFloat(el.style.width).toFixed(1)]))
+    .toEqual(['0%', '40.0']);
+  await firstHold.fill('');
+  await firstHold.press('Tab');
+  expect(await takeDispatched(page)).toEqual([
+    { type: 'camera-path.hold.set', params: { keyframe: 'KF 3', seconds: 0 } },
+  ]);
+  await expect(page.locator('.cinematic-timeline-hold')).toHaveCount(0);
 
   // The return to start.
   await page.locator('.cinematic-loopback-list-toggle').check();
@@ -240,15 +263,17 @@ test('every Camera path control dispatches one action with exact parameters and 
   await page.locator('#cinematic-rotation-interp').selectOption('linear');
   await page.locator('#cinematic-easing').selectOption('ease-in');
   await page.locator('#cinematic-loop').check();
+  await page.locator('#cinematic-captions').uncheck();
   expect(await takeDispatched(page)).toEqual([
     { type: 'camera-path.playback.set', params: { position_interpolation: 'bezier' }, observed: true },
     { type: 'camera-path.playback.set', params: { rotation_interpolation: 'linear' }, observed: true },
     { type: 'camera-path.playback.set', params: { easing: 'ease-in' }, observed: true },
     { type: 'camera-path.playback.set', params: { loop: true }, observed: true },
+    { type: 'camera-path.playback.set', params: { captions: false }, observed: true },
   ]);
   expect(await outsideSteps(page)).toBe(outsideBefore);
   expect((await readPath(page)).playback).toEqual({
-    position: 'bezier', rotation: 'linear', easing: 'ease-in', speed: '70', loop: true, autoplay: false,
+    position: 'bezier', rotation: 'linear', easing: 'ease-in', speed: '70', loop: true, autoplay: false, captions: false,
   });
 
   // Autoplay on: the ready path starts playing at once.
@@ -277,7 +302,7 @@ test('each camera path action dispatched directly leaves the exact path, and an 
   expect(await dispatch(page, 'camera-path.keyframe.add', { camera: pose(0.4) }))
     .toEqual({ outcome: { keyframe: 'KF 1' } });
   expect(await dispatch(page, 'camera-path.keyframe.add', { camera: pose(0.7), label: 'Wide' }))
-    .toEqual({ refused: true, message: 'A keyframe is labelled "Wide" already; choose another label.' });
+    .toEqual({ refused: true, message: 'A keyframe is labeled "Wide" already; choose another label.' });
   await expect(page.locator('.cinematic-keyframe-item')).toHaveCount(2);
   expect(await page.evaluate(() => window._cellucidUi.cinematicCamera.getKeyframeStore().getAll()[0].orbit.theta)).toBe(0.1);
 
@@ -291,10 +316,13 @@ test('each camera path action dispatched directly leaves the exact path, and an 
     .toEqual({ outcome: { keyframe: 'Close' } });
   expect(await dispatch(page, 'camera-path.duration.set', { keyframe: 'Wide', seconds: 3 }))
     .toEqual({ refused: true, message: 'No transition starts at "Wide": it is the last keyframe.' });
+  expect(await dispatch(page, 'camera-path.hold.set', { keyframe: 'Close', seconds: 1.5 }))
+    .toEqual({ outcome: { keyframe: 'Close' } });
   expect(await dispatch(page, 'camera-path.loop-back.set', { enabled: true })).toEqual({ outcome: null });
   expect(await readPath(page)).toMatchObject({
-    labels: ['Close', 'Wide', LOOP_BACK], durations: [3, null, null], loopBack: LOOP_BACK,
+    labels: ['Close', 'Wide', LOOP_BACK], durations: [3, null, null], holds: [1.5, 0, 0], loopBack: LOOP_BACK,
   });
+  await expect(page.locator('.cinematic-hold-input[data-hold-index="0"]')).toHaveValue('1.5');
   await expect(page.locator('.cinematic-keyframe-label').first()).toHaveText('Close');
   await expect(page.locator('.cinematic-loopback-list-toggle')).toBeChecked();
 
@@ -324,6 +352,9 @@ test('undoing each camera path action gives back the whole state, on the page\'s
     ['camera-path.keyframe.rename', { keyframe: 'A', label: 'Start' }],
     ['camera-path.duration.set', { keyframe: 'Start', seconds: 2 }],
     ['camera-path.duration.set', { seconds: 1.25 }],
+    ['camera-path.hold.set', { keyframe: 'Start', seconds: 2 }],
+    ['camera-path.keyframe.add', { camera: pose(1.4), label: 'E', hold: 1 }],
+    ['camera-path.hold.set', { seconds: 0.5 }],
     ['camera-path.loop-back.set', { enabled: true }],
     ['camera-path.playback.set', { position_interpolation: 'linear', speed: 90, loop: true }],
     ['camera-path.clear', {}],
@@ -335,4 +366,194 @@ test('undoing each camera path action gives back the whole state, on the page\'s
     expect(outcome.differs, `${outcome.type} undone gives back every domain`).toEqual([]);
     expect(outcome.redone, `${outcome.type} redone gives it again`).toEqual([]);
   }
+});
+
+/**
+ * The share of a group's shown cells inside the view's frame, the half-range
+ * (2.5th to 97.5th percentile) it spans across and up in fractions of the
+ * half frame, and where that range's middle is: measured through the
+ * viewer's own projection of the view (`getViewRenderState`).
+ */
+async function measureFraming(page, fieldKey, labels) {
+  return page.evaluate(({ fieldKey, labels }) => {
+    const viewer = window._cellucidViewer;
+    const pane = viewer.getPresentedLayout().panes.find(each => each.viewId === 'live');
+    const m = viewer.getViewRenderState('live', {
+      viewportWidth: Math.round(pane.visibleCssWidth), viewportHeight: Math.round(pane.visibleCssHeight),
+    }).mvpMatrix;
+    const field = window._cellucidState.obsData.fields.find(each => each.key === fieldKey);
+    const wanted = new Set(labels.map(label => field.categories.map(String).indexOf(label)));
+    const xs = [];
+    const ys = [];
+    viewer.withBorrowedViewData('live', data => {
+      for (let i = 0; i < data.pointCount; i++) {
+        if (data.transparency && !(data.transparency[i] > 0)) continue;
+        if (!wanted.has(field.codes[i])) continue;
+        const stride = data.positions.length / data.pointCount;
+        const [x, y, z] = [0, 1, 2].map(axis => (axis < stride ? data.positions[i * stride + axis] : 0));
+        const w = m[3] * x + m[7] * y + m[11] * z + m[15];
+        xs.push((m[0] * x + m[4] * y + m[8] * z + m[12]) / w);
+        ys.push((m[1] * x + m[5] * y + m[9] * z + m[13]) / w);
+      }
+    });
+    const quantile = (values, p) => [...values].sort((a, b) => a - b)[Math.floor(p * (values.length - 1))];
+    const range = values => [quantile(values, 0.025), quantile(values, 0.975)];
+    const [x0, x1] = range(xs);
+    const [y0, y1] = range(ys);
+    return {
+      inside: xs.filter((x, i) => Math.abs(x) <= 1 && Math.abs(ys[i]) <= 1).length / xs.length,
+      fill: Math.max((x1 - x0) / 2, (y1 - y0) / 2),
+      center: [(x0 + x1) / 2, (y0 + y1) / 2],
+    };
+  }, { fieldKey, labels });
+}
+
+test('camera.framing gives cameras that frame each category, and camera-path.play plays a path built from them to its end', async ({ page }) => {
+  const productErrors = observeProductErrors(page);
+  await openCameraPath(page);
+  const field = await page.evaluate(() => window._cellucidState.obsData.fields
+    .find(each => each.kind === 'category' && each.categories.length >= 2 && each._isDeleted !== true).key);
+  const read = await dispatch(page, 'camera.framing', { field: { source: 'obs', key: field }, fill: 0.8 });
+  expect(read.message, 'camera.framing answers').toBeUndefined();
+  const { outcome } = read;
+  expect(outcome.groups.length).toBeGreaterThanOrEqual(2);
+  expect(outcome.frame.fill).toBe(0.8);
+
+  // Each category's camera, applied, frames it: nearly all of it inside, centered, filling much of the frame.
+  for (const group of outcome.groups.slice(0, 4)) {
+    expect(await dispatch(page, 'camera.set', { view: 'View 1', camera: group.camera })).toEqual({ outcome: { view: 'View 1' } });
+    const measured = await measureFraming(page, field, [group.label]);
+    expect(measured.inside, `${group.label}: share of its cells in the frame`).toBeGreaterThanOrEqual(0.9);
+    expect(measured.fill, `${group.label}: how much of the frame it fills`).toBeGreaterThan(0.35);
+    expect(measured.fill, `${group.label}: how much of the frame it fills`).toBeLessThanOrEqual(1);
+    expect(Math.hypot(...measured.center), `${group.label}: off center`).toBeLessThan(0.35);
+  }
+
+  // A path from the framing read: whole, two categories, a hold on the first; played to its end in one step.
+  const [first, second] = outcome.groups;
+  const add = (label, camera, hold) => dispatch(page, 'camera-path.keyframe.add', { label, camera, ...(hold === undefined ? {} : { hold }) });
+  await add('Establishing', outcome.whole.camera);
+  await add(first.label, first.camera, 0.3);
+  await add(second.label, second.camera);
+  expect(await dispatch(page, 'camera-path.duration.set', { seconds: 0.3 })).toEqual({ outcome: { keyframes: 3 } });
+  const path = (await dispatch(page, 'camera-path.get', {})).outcome;
+  expect(path.keyframes.map(kf => [kf.at, kf.hold])).toEqual([[0, 0], [0.3, 0.3], [0.9, 0]]);
+  expect(path.seconds).toBe(0.9);
+  const played = await dispatch(page, 'camera-path.play', {});
+  expect(played.outcome).toEqual({ seconds: 0.9, keyframes: 3, ended: 'end' });
+  const end = await page.evaluate(() => window._cellucidViewer.getCameraState().orbit);
+  expect(end.radius).toBeCloseTo(second.camera.orbit.radius, 4);
+  expect(end.target[0]).toBeCloseTo(second.camera.orbit.target[0], 4);
+  expect(await dispatch(page, 'camera-path.stop', {})).toEqual({ outcome: { stopped: false } });
+
+  // A stop sent while the play still waits for the path's end runs at once
+  // (a stepless control, never queued behind the play on the camera; F96):
+  // the play answers ended "stopped" well before the path's length.
+  expect(await dispatch(page, 'camera-path.duration.set', { seconds: 20 })).toEqual({ outcome: { keyframes: 3 } });
+  const timing = await page.evaluate(async () => {
+    const { getActions } = await import('/assets/js/app/actions/index.js');
+    const actions = getActions();
+    const started = performance.now();
+    const play = actions.dispatch('camera-path.play', {}, { origin: 'user' });
+    // The path is playing (a read, which never waits behind the play).
+    while ((await actions.dispatch('camera-path.get', {}, { origin: 'user' })).outcome.playing !== 'playing') {
+      await new Promise(resolve => requestAnimationFrame(resolve));
+    }
+    const stop = await actions.dispatch('camera-path.stop', {}, { origin: 'user' });
+    const stopAt = performance.now() - started;
+    const ended = await play;
+    return { stop: stop.outcome, stopStep: stop.step, stopAt, ended: ended.outcome.ended, playStep: ended.step !== null };
+  });
+  expect(timing.stop).toEqual({ stopped: true });
+  expect(timing.stopStep).toBeNull();
+  expect(timing.ended).toBe('stopped');
+  expect(timing.playStep, 'the play is the one step, ended where the path stopped').toBe(true);
+  expect(timing.stopAt, 'the stop did not wait for the 40-second path').toBeLessThan(10000);
+  expect(productErrors).toEqual([]);
+});
+
+for (const actor of [{ origin: 'user' }, { origin: 'agent', agent: 'Claude', turn: 'turn-loop' }]) test(`a looping path is one step at its start; while it plays, history moves record no camera move of the person; it is recorded once where it stops, by who stopped it (${actor.origin})`, async ({ page }) => {
+  // Live (L11-6): an agent's looping play was answered "it was so already" (no step), and each
+  // history move or turn during the loop recorded the moving camera as the person's
+  // "Moved the camera of View 1" (an undo then undid that step and branched the history).
+  const productErrors = observeProductErrors(page);
+  await openCameraPath(page);
+  const field = await page.evaluate(() => window._cellucidState.obsData.fields
+    .find(each => each.kind === 'category' && each.categories.length >= 2 && each._isDeleted !== true).key);
+  const { outcome } = await dispatch(page, 'camera.framing', { field: { source: 'obs', key: field }, fill: 0.8 });
+  const [first, second] = outcome.groups;
+  await dispatch(page, 'camera-path.keyframe.add', { label: 'Wide', camera: outcome.whole.camera });
+  await dispatch(page, 'camera-path.keyframe.add', { label: first.label, camera: first.camera, hold: 0.5 });
+  await dispatch(page, 'camera-path.keyframe.add', { label: second.label, camera: second.camera });
+  await dispatch(page, 'camera-path.duration.set', { seconds: 1.5 });
+  await dispatch(page, 'camera-path.playback.set', { loop: true });
+  // The camera elsewhere first, so the loop's start is a change.
+  await dispatch(page, 'camera.set', { view: 'View 1', camera: second.camera });
+
+  // An agent's Stop of its own loop: the camera's rest is a step of its turn, not the person's (L11-6).
+  const run = await page.evaluate(async actor => {
+    const { getActions } = await import('/assets/js/app/actions/index.js');
+    const actions = getActions();
+    const history = window._cellucidHistories.current();
+    const steps = () => [...history.active.steps.values()];
+    const before = steps().length;
+    const played = await actions.dispatch('camera-path.play', {}, actor);
+    // The camera the loop's step holds: the first keyframe's. (The live
+    // camera, read once the play has answered, may already be a frame or
+    // more along the path on a slow machine: Firefox on CI, run 43106620008.)
+    await history.idle();
+    const playStep = steps().slice(before).find(step => step.label === 'Played the camera path on a loop');
+    const atStart = playStep === undefined ? null : history.pool.get(playStep.after.camera).views[0].orbit;
+    const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
+    // While the loop plays: the history's settle (run before every move of
+    // the history) on frame after frame for over one pass of the loop, across
+    // its hold and its transitions (the playback's own clock).
+    const playback = window._cellucidUi.cinematicCamera.getPlaybackController();
+    let previous = 0;
+    let wrapped = false;
+    const onTime = ({ globalT }) => {
+      if (globalT < previous - 0.5) wrapped = true;
+      previous = globalT;
+    };
+    playback.on('timeUpdate', onTime);
+    // Past the wrap and on its way again: stopped in the frame of the wrap,
+    // the camera is exactly at the first keyframe, where the loop's step
+    // already holds it, so its rest is rightly no step and the wait below
+    // for one would never end (L20-1).
+    while (!(wrapped && previous >= 0.1)) {
+      await actions.settle();
+      await frame();
+    }
+    playback.off('timeUpdate', onTime);
+    await history.idle();
+    const whilePlaying = steps().slice(before).map(step => step.label);
+    const stopped = await actions.dispatch('camera-path.stop', {}, actor);
+    // Its rest is recorded by observation, from the stop's own state change
+    // (synchronously): once the history is idle it holds it, or the
+    // assertion below says which step is missing (an open wait hung 90 s).
+    await history.idle();
+    const after = steps().slice(before);
+    const head = history.active.steps.get(history.active.headId);
+    return {
+      ended: played.outcome.ended, playStep: played.step?.label ?? null, atStart,
+      whilePlaying, stopped: stopped.outcome,
+      after: after.map(step => `${step.by.origin}: ${step.label}`),
+      turns: after.map(step => step.by.turn),
+      headCamera: head.type === 'camera.set' ? head.params.camera.orbit : null,
+      camera: window._cellucidViewer.getCameraState().orbit,
+    };
+  }, actor);
+  expect(run.ended).toBe('looping');
+  expect(run.playStep, 'the loop is a step: it put the camera at the first keyframe').toBe('Played the camera path on a loop');
+  expect(run.atStart.radius, 'the loop\'s step holds the first keyframe\'s camera').toBeCloseTo(outcome.whole.camera.orbit.radius, 4);
+  expect(run.whilePlaying, 'nothing but the play while the loop plays').toEqual(['Played the camera path on a loop']);
+  expect(run.stopped).toEqual({ stopped: true });
+  expect(run.after, 'the stop is recorded once, where the camera rests, by who stopped it').toEqual([
+    `${actor.origin}: Played the camera path on a loop`,
+    `${actor.origin}: Moved the camera of View 1`,
+  ]);
+  expect(run.turns).toEqual([actor.turn ?? null, actor.turn ?? null]);
+  expect(run.headCamera.radius).toBeCloseTo(run.camera.radius, 6);
+  expect(run.headCamera.target).toEqual(run.camera.target);
+  expect(productErrors).toEqual([]);
 });

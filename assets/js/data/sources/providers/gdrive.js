@@ -151,6 +151,7 @@ const HELD_BACK =
  */
 async function oneByteFails(media, headers, signal) {
   try {
+    // Raw fetch: waits as long as Google takes (~7 s, past a stall's patience), its failure being the answer.
     const response = await globalThis.fetch(media, { headers: { ...headers, Range: 'bytes=0-0' }, cache: 'no-store', signal });
     await response.body?.cancel().catch(() => {});
     return false;
@@ -303,7 +304,7 @@ export function createDriveProvider({ google = null } = {}) {
   }
 
   /** The file's entry from a Drive item that answered. */
-  async function describe(id, resourceKey, item, headRead, access, signal, onStep) {
+  async function describe(id, resourceKey, item, headRead, accessOf, signal, onStep) {
     if (item.mimeType === `${GOOGLE_APPS}folder`) {
       throw refusal(FOLDER_REFUSAL, DataSourceErrorCode.UNSUPPORTED, { id });
     }
@@ -347,7 +348,9 @@ export function createDriveProvider({ google = null } = {}) {
       signal,
       onStep,
     });
-    return { ...file, resource: Object.freeze({ ...file.resource, access }) };
+    // Registered once the file is described: a refused file holds none
+    // (`sources/access.js`).
+    return { ...file, resource: Object.freeze({ ...file.resource, access: accessOf() }) };
   }
 
   /**
@@ -480,7 +483,7 @@ export function createDriveProvider({ google = null } = {}) {
         const request = ask(id, resourceKey, token, signal);
         const answer = await request.answer;
         if (answer.ok) {
-          return describe(id, resourceKey, answer.body ?? {}, request.head, signedAccess(id, resourceKey, answer.body ?? {}), signal, onStep);
+          return describe(id, resourceKey, answer.body ?? {}, request.head, () => signedAccess(id, resourceKey, answer.body ?? {}), signal, onStep);
         }
         request.stop(cancelled('superseded', 'The file is not readable yet.'));
         if (answer.status === 401) {
@@ -604,7 +607,7 @@ export function createDriveProvider({ google = null } = {}) {
         // A sign-in that fails here is asked for again below, when it is needed.
         const signedAnswer = await signed.answer.catch(() => null);
         if (signedAnswer?.ok === true) {
-          return opened(await describe(id, resourceKey, signedAnswer.body ?? {}, signed.head, signedAccess(id, resourceKey, signedAnswer.body ?? {}), signal, onStep));
+          return opened(await describe(id, resourceKey, signedAnswer.body ?? {}, signed.head, () => signedAccess(id, resourceKey, signedAnswer.body ?? {}), signal, onStep));
         }
         signed.stop(cancelled('superseded', 'The file is not granted yet.'));
         if (signedAnswer?.status === 401) google.refused(token);
@@ -615,7 +618,7 @@ export function createDriveProvider({ google = null } = {}) {
         // Its head was read beside the item only when nobody was signed in.
         const head = open.head ?? readHead(id, resourceKey, null, signal);
         if (await heldBack(head, urls(id, false).media, keyHeaders(id, resourceKey), signal)) return null;
-        return describe(id, resourceKey, answer.body ?? {}, head, publicAccess(id, resourceKey, answer.body ?? {}), signal, onStep);
+        return describe(id, resourceKey, answer.body ?? {}, head, () => publicAccess(id, resourceKey, answer.body ?? {}), signal, onStep);
       };
       if (readPublic !== null && google.validToken() === null) {
         const file = await readPublic();

@@ -121,7 +121,7 @@ test('a production page sends environment classes, then only declared events', (
   const click = listeners.find(entry => entry.type === 'click').handler;
   const change = listeners.find(entry => entry.type === 'change').handler;
 
-  // A legend button labelled with a patient category: only its declared id
+  // A legend button labeled with a patient category: only its declared id
   // counts, and its label is never read.
   const legendButton = element({
     dataset: { analyticsId: 'legend:highlight-category' },

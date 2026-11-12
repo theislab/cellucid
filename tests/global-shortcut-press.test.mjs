@@ -29,4 +29,14 @@ test('a chord, a held key repeating, and typing into a field are not', () => {
     assert.equal(isShortcutPress(press({ target: { tagName } })), false, tagName);
   }
   assert.equal(isShortcutPress(press({ target: { tagName: 'DIV', isContentEditable: true } })), false);
+  assert.equal(isShortcutPress(press({ defaultPrevented: true })), false, 'taken by the focused control');
+});
+
+test('a slider, a checkbox or a button focused leaves the shortcuts working (R9K-1)', () => {
+  const input = type => ({ tagName: 'INPUT', getAttribute: name => (name === 'type' ? type : null), closest: () => null });
+  for (const type of ['range', 'checkbox', 'radio', 'color']) {
+    assert.equal(isShortcutPress(press({ target: input(type) })), true, `${type} input`);
+  }
+  assert.equal(isShortcutPress(press({ target: { tagName: 'BUTTON', closest: () => null } })), true);
+  assert.equal(isShortcutPress(press({ target: { tagName: 'BUTTON', closest: () => ({}) } })), false, 'in a dialog or a menu');
 });

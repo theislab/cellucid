@@ -26,7 +26,7 @@
  *   behind other work for its turn (below).
  * - **Coalescing to the link.** When more requests wait than slots are free
  *   and their round trips would take longer than their bytes, a request
- *   about to start takes its waiting neighbours with it, nearest gap first,
+ *   about to start takes its waiting neighbors with it, nearest gap first,
  *   while a gap is no wider than the queue's plan would fetch
  *   (`planMergeGap` over what waits) and the queue's round trips still
  *   outweigh its bytes: many small reads scattered over a region (the rows
@@ -50,7 +50,7 @@
  *   until that read ends.
  * - **Metadata cache.** Reads marked `cache: true` (headers, B-tree nodes,
  *   heaps) are served from aligned blocks kept in a least-recently-used cache
- *   of `cacheBytes`, so neighbouring metadata is fetched once. Bulk data is
+ *   of `cacheBytes`, so neighboring metadata is fetched once. Bulk data is
  *   read exactly and never cached here. A read whose start is held already
  *   (the file's head, read beside its provider's details) fetches only the
  *   rest: a file read whole from its start (an R object) does not fetch its
@@ -99,15 +99,12 @@ import { LinkMeter, performanceNow } from './link.js';
 import { SharedWork, onAbort, abortReason, cancelled } from '../../utils/abort.js';
 import { formatCountOf } from '../../utils/format-units.js';
 import { allocateTypedArray, copyTypedArray } from '../../data/sparse-column-index.js';
+import { onNextMacrotask } from '../../utils/yield-macrotask.js';
 
-/**
- * Run `callback` on a later macrotask: after the current task and all of its
- * promise continuations, so a burst of reads lands in one plan.
- */
 /**
  * How long the byte reader holds the surplus of its requests (gap bytes no
  * read asked for yet) once nothing is fetched or waits: the reads that may
- * ask for them next (a wave's neighbour, a heap read after the references
+ * ask for them next (a wave's neighbor, a heap read after the references
  * that name it, a value read after its index) follow the requests that
  * fetched them by a decode, milliseconds; a second with nothing in flight
  * means they are done, and the bytes (up to `cacheBytes`) are let go
@@ -115,20 +112,6 @@ import { allocateTypedArray, copyTypedArray } from '../../data/sparse-column-ind
  * size: what the surplus holds is still bounded by `cacheBytes`.
  */
 export const SURPLUS_IDLE_MS = 1000;
-
-const scheduleMacrotask = (() => {
-  if (typeof setImmediate === 'function') return callback => setImmediate(callback);
-  if (typeof MessageChannel === 'function') {
-    const channel = new MessageChannel();
-    const queue = [];
-    channel.port1.onmessage = () => queue.shift()();
-    return callback => {
-      queue.push(callback);
-      channel.port2.postMessage(0);
-    };
-  }
-  return callback => setTimeout(callback, 0);
-})();
 
 /**
  * How long each request of a plan is at most: the link's `maxRequestBytes`,
@@ -265,7 +248,7 @@ export function planMergeGap(spans, link, maxRequestBytes) {
  * @property {() => void} clear - Drop the metadata cache
  * @property {number} blockBytes - The aligned block metadata is read and
  *   cached in (`cache: true`): a read shorter than one costs the same round
- *   trip, and its block's neighbours come with it
+ *   trip, and its block's neighbors come with it
  * @property {(offset: number) => number} cachedEnd - Where the cached bytes
  *   that hold `offset` end (`offset` when its block is not cached): a read
  *   within them costs nothing
@@ -391,7 +374,7 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
    * decoded (a heap collection after the references that name it, read in
    * 17-40 MB merged requests of reference chunks: dropped from a 64 MiB
    * surplus 1.4-2.6 s before their references were decoded, 86 MB of a
-   * 10M-cell file's names were fetched twice, and a 1 % share of a 1.2M
+   * 10M-cell file's names were fetched twice, and a 1% share of a 1.2M
    * category column read 126.3 MB against every cell's 124.5 MB). What is
    * held so is the running reads' own requests, counted (`heldBytes`) and
    * let go as each read ends (`ReadActivity.finished`), and bounded with
@@ -496,7 +479,7 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
    * The waiting requests worth fetching together with `job`, which is about
    * to start: none while every waiting request has a free slot, or while the
    * queue's bytes take longer than its round trips; otherwise its nearest
-   * waiting neighbours, smallest gap first, while a gap transfers faster
+   * waiting neighbors, smallest gap first, while a gap transfers faster
    * than the share of a round trip one request costs and the whole stays
    * within the link's request size.
    */
@@ -679,7 +662,7 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
    * Whether a request asked now would start at once: a slot is free and
    * nothing waits for one. What a reader gathering its own small reads
    * waits for before it asks (`whenRoom`): while requests queue, a later
-   * plan of more of them joins neighbours a request at a time cannot.
+   * plan of more of them joins neighbors a request at a time cannot.
    */
   function room() {
     return slotFree() && !queue.some(job => !job.cancelled);
@@ -1105,7 +1088,7 @@ export function createByteReader(source, { policy: overrides = null, onTransfer 
       asked.push(entry);
       if (!planScheduled) {
         planScheduled = true;
-        scheduleMacrotask(plan);
+        onNextMacrotask(plan);
       }
     });
   }

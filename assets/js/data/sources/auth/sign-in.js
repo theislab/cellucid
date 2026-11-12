@@ -19,6 +19,7 @@
 
 import { whileWaitingOnPerson } from '../../../utils/person-wait.js';
 import { abortReason, cancel, cancelled, onAbort } from '../../../utils/abort.js';
+import { createListenerSet } from '../../../utils/listener-set.js';
 
 /**
  * @typedef {Object} SignInStep
@@ -58,7 +59,7 @@ export class SignInSteps {
     /** @type {Map<number, Object>} */
     this._steps = new Map();
     this._nextId = 1;
-    this._listeners = new Set();
+    this._listeners = createListenerSet('the sign-in steps');
   }
 
   /**
@@ -218,8 +219,7 @@ export class SignInSteps {
    * @returns {() => void}
    */
   subscribe(listener) {
-    this._listeners.add(listener);
-    return () => this._listeners.delete(listener);
+    return this._listeners.add(listener);
   }
 
   /** @private The step goes; whatever its attempts still listen for stops. */
@@ -242,14 +242,7 @@ export class SignInSteps {
 
   /** @private */
   _publish() {
-    const steps = this.list();
-    for (const listener of this._listeners) {
-      try {
-        listener(steps);
-      } catch (error) {
-        console.error('[cellucid:sign-in] A sign-in display failed:', error);
-      }
-    }
+    this._listeners.notify(this.list());
   }
 }
 
@@ -263,7 +256,7 @@ function validHelp(help) {
 
 /**
  * A failure of a step's action that ends the step (the person cannot fix it
- * by trying again: an organisation's policy, a site that is not configured).
+ * by trying again: an organization's policy, a site that is not configured).
  *
  * @param {Error} error
  * @returns {Error}

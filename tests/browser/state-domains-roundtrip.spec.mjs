@@ -6,7 +6,7 @@
  * are restored in domain order, as the history does when it shows a step
  * (`app/history/history.js` `restoreTo`). Then the fingerprint (one digest of
  * every domain) is the captured one, what the person sees is what was shown
- * (legend, counts, selects, views, highlights, panels, theme, the colours and
+ * (legend, counts, selects, views, highlights, panels, theme, the colors and
  * visibility of every view), and restoring again changes nothing.
  *
  * Covered across the live view and a kept view, after a data-mapping change
@@ -163,7 +163,7 @@ async function roundTrip(page, { name, domain, first, second }) {
   // are captured and restored directly below, outside the dispatcher's
   // order, so a restore made while the second change was still being applied
   // was overtaken by it (WebKit, 1 run in 14: the state named `cell_type`,
-  // and the select, the legend and the colours showed none).
+  // and the select, the legend and the colors showed none).
   await first(page);
   await whenActionsDone(page);
   await waitForPageAtRest(page);
@@ -460,7 +460,7 @@ test('per-view state comes back for the live view and a kept view alike', async 
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await page.locator('#split-keep-view-btn').click();
   await expect(page.locator('.split-badge')).toHaveCount(2);
-  // The kept view is focused: its own filter, colour, field and hidden cells.
+  // The kept view is focused: its own filter, color, field and hidden cells.
   await legendRow(page, 'alpha').locator('.legend-checkbox').uncheck();
   await legendRow(page, 'beta').locator('.legend-color-input').fill('#123456');
   await page.evaluate(() => window._cellucidState.setCellVisibility(Uint32Array.of(3), false));

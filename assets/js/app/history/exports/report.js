@@ -13,7 +13,7 @@
  * (`pictures`); `reportPictureDefaults` names the default picks (the
  * bookmarks and the last step of each group).
  *
- * The document is styled for paper as much as for the screen: system colours
+ * The document is styled for paper as much as for the screen: system colors
  * (black on white unless the reader's browser says otherwise), page breaks
  * kept out of a step, and every text escaped (notes are shown as their text,
  * never as HTML).
@@ -28,12 +28,8 @@ import { methodsParts } from './methods.js';
 import { historyPseudocode } from './pseudocode.js';
 import { idNumber } from '../model.js';
 import { formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { escapeHtml } from '../../utils/dom-utils.js';
 
-const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-
-function esc(value) {
-  return String(value ?? '').replace(/[&<>"']/g, ch => ESCAPES[ch]);
-}
 
 /** A date and time as the person's locale writes it (the report is read by people). */
 export function formatWhen(ms, locale = undefined) {
@@ -88,7 +84,7 @@ function stepFlag(step) {
  */
 export function reportEntries({ tracker, branch = null, to = null, catalog }) {
   if (typeof catalog?.has !== 'function' || typeof catalog?.get !== 'function') {
-    throw new TypeError('A report needs the action catalogue');
+    throw new TypeError('A report needs the action catalog');
   }
   const taken = branchPath(tracker, { branch, to }).steps.filter(step => step.kind !== 'root');
   const numberOf = new Map(taken.map((step, index) => [step.id, index + 1]));
@@ -161,27 +157,27 @@ footer { margin-top: 8mm; font-size: 8.5pt; color: GrayText; }
 `;
 
 function factRows(rows) {
-  return rows.map(row => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join('');
+  return rows.map(row => `<dt>${escapeHtml(row.label)}</dt><dd>${escapeHtml(row.value)}</dd>`).join('');
 }
 
 function noteList(notes, locale) {
   if (notes.length === 0) return '';
-  const items = notes.map(note => `<li>${esc(note.text)} <span class="meta">· ${esc(note.by)}${note.carried ? ', on a merged step' : ''}`
-    + `${Number.isFinite(note.at) ? `, ${esc(formatWhen(note.at, locale))}` : ''}</span></li>`);
+  const items = notes.map(note => `<li>${escapeHtml(note.text)} <span class="meta">· ${escapeHtml(note.by)}${note.carried ? ', on a merged step' : ''}`
+    + `${Number.isFinite(note.at) ? `, ${escapeHtml(formatWhen(note.at, locale))}` : ''}</span></li>`);
   return `<ul class="notes">${items.join('')}</ul>`;
 }
 
 function stepItem(entry, picture, locale) {
   return `<li>
-<div class="step-head"><span class="step-n">${entry.number}</span><span class="step-label">${esc(entry.label)}</span>`
+<div class="step-head"><span class="step-n">${entry.number}</span><span class="step-label">${escapeHtml(entry.label)}</span>`
     + entry.bookmarks.map(({ name, carried }) => `<span class="step-bookmark"${carried ? ' title="On a step merged into this one"' : ''}>`
-      + `★ ${esc(name)}${carried ? ' (merged)' : ''}</span>`).join('')
-    + `<span class="step-by">${esc(entry.by.join(', '))}</span><span class="step-at">${esc(formatWhen(entry.at, locale))}</span></div>
-<div class="step-body">${entry.flag === null ? '' : `<p class="step-flag">${esc(entry.flag)}</p>`}`
+      + `★ ${escapeHtml(name)}${carried ? ' (merged)' : ''}</span>`).join('')
+    + `<span class="step-by">${escapeHtml(entry.by.join(', '))}</span><span class="step-at">${escapeHtml(formatWhen(entry.at, locale))}</span></div>
+<div class="step-body">${entry.flag === null ? '' : `<p class="step-flag">${escapeHtml(entry.flag)}</p>`}`
     + `${entry.facts.length > 0 ? `<dl>${factRows(entry.facts)}</dl>` : ''}`
-    + `${entry.changed.length > 0 ? `<p class="step-changed">Changed: ${esc(entry.changed.join(', '))}</p>` : ''}`
+    + `${entry.changed.length > 0 ? `<p class="step-changed">Changed: ${escapeHtml(entry.changed.join(', '))}</p>` : ''}`
     + noteList(entry.notes, locale)
-    + `${picture === null ? '' : `<figure><img src="${esc(picture.src)}" alt="${esc(picture.alt)}"><figcaption>After step ${entry.number}</figcaption></figure>`}</div>
+    + `${picture === null ? '' : `<figure><img src="${escapeHtml(picture.src)}" alt="${escapeHtml(picture.alt)}"><figcaption>After step ${entry.number}</figcaption></figure>`}</div>
 </li>`;
 }
 
@@ -237,34 +233,34 @@ export function reportDocument({
     ...path.branch.notes.map(note => ({ text: note.text, by: originOf(note.by).name, at: note.at })),
   ];
   const methodsHtml = methods.paragraphs
-    .map(({ heading, text }) => `${heading === null ? '' : `<h3>${esc(heading)}</h3>`}<p>${esc(text)}</p>`).join('\n');
+    .map(({ heading, text }) => `${heading === null ? '' : `<h3>${escapeHtml(heading)}</h3>`}<p>${escapeHtml(text)}</p>`).join('\n');
   const stepsHtml = sections.map(section => {
     const list = `<ol class="steps">\n${section.entries.map(entry => stepItem(entry, pictures.get(entry.id) ?? null, locale)).join('\n')}\n</ol>`;
     if (section.heading === null) return list;
     const groupNotes = section.group === null ? [] : section.group.notes.map(note => ({ text: note.text, by: originOf(note.by).name, at: note.at }));
-    return `<h3>${esc(section.heading)} <span class="meta">· ${esc(formatCountOf(section.entries.length, 'step'))}</span></h3>`
+    return `<h3>${escapeHtml(section.heading)} <span class="meta">· ${escapeHtml(formatCountOf(section.entries.length, 'step'))}</span></h3>`
       + `${noteList(groupNotes, locale)}\n${list}`;
   }).join('\n');
 
   const subtitle = [dataset?.name, version ? `Cellucid ${version}` : 'Cellucid', formatWhen(generatedAt, locale)]
-    .filter(Boolean).map(esc).join(' · ');
+    .filter(Boolean).map(text => escapeHtml(text)).join(' · ');
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)}${dataset?.name ? ` · ${esc(dataset.name)}` : ''}</title>
+<title>${escapeHtml(title)}${dataset?.name ? ` · ${escapeHtml(dataset.name)}` : ''}</title>
 <style>${STYLE}</style>
 </head>
 <body>
-<header><h1>${esc(title)}</h1><p class="meta">${subtitle}</p></header>
-${methods.abstract === null ? '' : `<section><h2>Abstract</h2><p>${esc(methods.abstract)}</p></section>\n`}`
+<header><h1>${escapeHtml(title)}</h1><p class="meta">${subtitle}</p></header>
+${methods.abstract === null ? '' : `<section><h2>Abstract</h2><p>${escapeHtml(methods.abstract)}</p></section>\n`}`
     + `${otherNotes.length === 0 ? '' : `<section><h2>Notes</h2>${noteList(otherNotes, locale)}</section>\n`}`
     + `<section><h2>Dataset</h2><dl>${factRows(datasetRows)}</dl></section>
 <section><h2>Methods</h2>${methodsHtml}</section>
-<section><h2>Steps</h2>${picturesNote ? `<p class="note">${esc(picturesNote)}</p>` : ''}
+<section><h2>Steps</h2>${picturesNote ? `<p class="note">${escapeHtml(picturesNote)}</p>` : ''}
 ${count > 0 ? stepsHtml : '<p class="note">No steps were taken.</p>'}</section>
-<section><h2>Pseudocode</h2><pre>${esc(pseudocode)}</pre></section>
+<section><h2>Pseudocode</h2><pre>${escapeHtml(pseudocode)}</pre></section>
 <footer>Made with Cellucid. The session file holds this history with every parameter and reopens it.</footer>
 </body>
 </html>

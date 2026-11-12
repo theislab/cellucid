@@ -421,7 +421,7 @@ test('every data mapping group is named the way the person loading the session k
   const cases = [
     [
       anndataMapping({ knn: null }),
-      "This session was saved with obsp['connectivities'] as its neighbour graph, "
+      "This session was saved with obsp['connectivities'] as its neighbor graph, "
         + 'and this dataset is shown with none. The session was not opened.'
       + ' Open the dataset version the session was saved on, then load the session again.',
     ],
@@ -491,7 +491,7 @@ test('every data mapping group is named the way the person loading the session k
       anndataMapping({ knn: null }),
       changeable(() => 'this dataset does not have'),
     ),
-    "This session uses obsp['connectivities'] as its neighbour graph, which this dataset "
+    "This session uses obsp['connectivities'] as its neighbor graph, which this dataset "
       + 'does not have. The session was not opened.'
       + ' Open the dataset version the session was saved on, then load the session again.',
   );
@@ -501,7 +501,7 @@ test('every data mapping group is named the way the person loading the session k
       base,
       changeable(() => 'this dataset cannot use (not symmetric — choose a connectivities matrix)'),
     ),
-    "This session uses obsp['distances'] as its neighbour graph, which this dataset cannot "
+    "This session uses obsp['distances'] as its neighbor graph, which this dataset cannot "
       + 'use (not symmetric — choose a connectivities matrix). The session was not opened.'
       + ' Open the dataset version the session was saved on, then load the session again.',
   );

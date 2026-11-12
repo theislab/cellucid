@@ -23,8 +23,8 @@ function joinedPageData(pageData, variableName) {
   return rows.join('\n');
 }
 
-function joinedScores(pageData) {
-  const rows = ['page,set,cell_index,score'];
+function joinedScores(pageData, column = 'page') {
+  const rows = [`${column},set,cell_index,score`];
   for (const pd of pageData) {
     pd.values.forEach((value, i) => {
       if (Number.isFinite(value)) {
@@ -71,8 +71,10 @@ test('per-cell CSV bytes equal the joined rows however the rows are split', asyn
     { pageName: 'C', setName: 'B, cells', values: Float32Array.of(NaN), cellIndices: Uint32Array.of(1) },
   ];
   for (const parts of [1, 3, 8]) {
-    assert.equal(await written('signature-scores', scores, undefined, parts), joinedScores(scores), `${parts} parts`);
+    assert.equal(await written('signature-scores', scores, 'page', parts), joinedScores(scores), `${parts} parts`);
   }
+  // Scored per category of a Group by field, the first column says group, as the result's table does (L11-5).
+  assert.equal(await written('signature-scores', scores, 'group', 3), joinedScores(scores, 'group'));
   assert.equal(await written('page-data', [], 'v', 8), 'page,cell_index,v');
 });
 
@@ -90,6 +92,7 @@ test('the CSV export operation writes the lines of its rows, and refuses unknown
     /Unknown CSV export layout/
   );
   assert.throws(() => perCellCSVHeader('page-data'), /variable name/);
+  assert.throws(() => perCellCSVHeader('signature-scores'), /per page or per group/);
 });
 
 test('cell_index names a cell by its original position, rows ascending, whatever cells are open and in what order', async () => {

@@ -29,9 +29,30 @@
     "mode": "viewer"
   },
   "runtimes": {
-    "python": "Python",
-    "jupyter": "Jupyter",
-    "r": "R"
+    "jupyter": {
+      "label": "Jupyter",
+      "language": "python"
+    },
+    "python": {
+      "label": "Python",
+      "language": "python"
+    },
+    "cellucid-serve": {
+      "label": "cellucid serve",
+      "language": "python"
+    },
+    "cellucid-mcp": {
+      "label": "cellucid mcp",
+      "language": "python"
+    },
+    "r": {
+      "label": "R",
+      "language": "r"
+    },
+    "r-mcp": {
+      "label": "cellucid_mcp()",
+      "language": "r"
+    }
   },
   "protocolDocument": {
     "channel": "_cellucid/ws",
@@ -57,7 +78,6 @@
       "agent_asking",
       "agent_result",
       "agent_tools",
-      "agent_tools_changed",
       "click",
       "color_by",
       "command_error",
@@ -149,6 +169,14 @@
       "id",
       "label"
     ],
+    "unrecorded": {
+      "unchanged": "it changed nothing (it was so already), so no step was recorded.",
+      "retracted": "it put back what the step just before it changed, so that step was taken out and no step was recorded.",
+      "off": "done, but the History settings do not record this kind of change, so no step was recorded and Undo does not take it back.",
+      "paused": "done, but the history's recording is paused, so no step was recorded and Undo does not take it back.",
+      "elsewhere": "done, but another tracker of the history was shown meanwhile, so no step was recorded.",
+      "no-history": "done, but the dataset's history has not started yet, so no step was recorded."
+    },
     "body": "binary action: each of header.arrays in order, length elements of its type, little-endian, placed in params at its path (keys and list indices ending in a key params does not hold); action_result: the outcome as UTF-8 JSON",
     "turn": "turn and turnLabel: both exact text (the turn's id; what it was asked to do), or both null"
   },
@@ -265,9 +293,6 @@
       "type",
       "requestId",
       "allowed"
-    ],
-    "agent_tools_changed": [
-      "type"
     ]
   },
   "binaryEvents": {
@@ -293,7 +318,8 @@
     "action_result": [
       "type",
       "requestId",
-      "step"
+      "step",
+      "unrecorded"
     ],
     "agent_tools": [
       "type",
@@ -317,6 +343,7 @@
       "categorical": [
         "key",
         "categories",
+        "colors",
         "origin"
       ],
       "continuous": [
@@ -1027,9 +1054,6 @@
         "type": "agent_answered",
         "requestId": "a4",
         "allowed": false
-      },
-      {
-        "type": "agent_tools_changed"
       }
     ],
     "binaryEvents": [
@@ -1059,11 +1083,12 @@
           "requestId": "r4",
           "step": {
             "id": "s3",
-            "label": "Coloured by cell_type"
-          }
+            "label": "Colored by cell_type"
+          },
+          "unrecorded": null
         },
         "outcome": null,
-        "hex": "5c0000007b2274797065223a22616374696f6e5f726573756c74222c22726571756573744964223a227234222c2273746570223a7b226964223a227333222c226c6162656c223a22436f6c6f757265642062792063656c6c5f74797065227d7d6e756c6c"
+        "hex": "6d0000007b2274797065223a22616374696f6e5f726573756c74222c22726571756573744964223a227234222c2273746570223a7b226964223a227333222c226c6162656c223a22436f6c6f7265642062792063656c6c5f74797065227d2c22756e7265636f72646564223a6e756c6c7d6e756c6c"
       },
       {
         "header": {
@@ -1072,20 +1097,22 @@
           "step": {
             "id": "s4",
             "label": "Added the categorical column leiden"
-          }
+          },
+          "unrecorded": null
         },
         "outcome": {
           "name": "leiden",
           "kind": "categorical",
           "id": "user_cat_1"
         },
-        "hex": "6b0000007b2274797065223a22616374696f6e5f726573756c74222c22726571756573744964223a22723131222c2273746570223a7b226964223a227334222c226c6162656c223a224164646564207468652063617465676f726963616c20636f6c756d6e206c656964656e227d7d7b226e616d65223a226c656964656e222c226b696e64223a2263617465676f726963616c222c226964223a22757365725f6361745f31227d"
+        "hex": "7d0000007b2274797065223a22616374696f6e5f726573756c74222c22726571756573744964223a22723131222c2273746570223a7b226964223a227334222c226c6162656c223a224164646564207468652063617465676f726963616c20636f6c756d6e206c656964656e227d2c22756e7265636f72646564223a6e756c6c7d7b226e616d65223a226c656964656e222c226b696e64223a2263617465676f726963616c222c226964223a22757365725f6361745f31227d"
       },
       {
         "header": {
           "type": "action_result",
           "requestId": "r5",
-          "step": null
+          "step": null,
+          "unrecorded": null
         },
         "outcome": {
           "head": "s4",
@@ -1097,7 +1124,19 @@
           ],
           "note": "Ünïcode — kept as UTF-8"
         },
-        "hex": "350000007b2274797065223a22616374696f6e5f726573756c74222c22726571756573744964223a227235222c2273746570223a6e756c6c7d7b2268656164223a227334222c227374657073223a5b7b226964223a227330222c226c6162656c223a224f70656e6564204578616d706c65227d5d2c226e6f7465223a22c39c6ec3af636f646520e28094206b657074206173205554462d38227d"
+        "hex": "470000007b2274797065223a22616374696f6e5f726573756c74222c22726571756573744964223a227235222c2273746570223a6e756c6c2c22756e7265636f72646564223a6e756c6c7d7b2268656164223a227334222c227374657073223a5b7b226964223a227330222c226c6162656c223a224f70656e6564204578616d706c65227d5d2c226e6f7465223a22c39c6ec3af636f646520e28094206b657074206173205554462d38227d"
+      },
+      {
+        "header": {
+          "type": "action_result",
+          "requestId": "r16",
+          "step": null,
+          "unrecorded": "unchanged"
+        },
+        "outcome": {
+          "field": "cell_type"
+        },
+        "hex": "4f0000007b2274797065223a22616374696f6e5f726573756c74222c22726571756573744964223a22723136222c2273746570223a6e756c6c2c22756e7265636f72646564223a22756e6368616e676564227d7b226669656c64223a2263656c6c5f74797065227d"
       },
       {
         "header": {
@@ -1107,14 +1146,14 @@
         "body": [
           {
             "name": "color_by",
-            "title": "Colour by a field",
-            "description": "Colour the cells by a field.",
+            "title": "Color by a field",
+            "description": "Color the cells by a field.",
             "inputSchema": {
               "type": "object",
               "properties": {}
             },
             "annotations": {
-              "title": "Colour by a field",
+              "title": "Color by a field",
               "readOnlyHint": false,
               "destructiveHint": false,
               "idempotentHint": false,
@@ -1122,7 +1161,7 @@
             }
           }
         ],
-        "hex": "270000007b2274797065223a226167656e745f746f6f6c73222c22726571756573744964223a226131227d5b7b226e616d65223a22636f6c6f725f6279222c227469746c65223a22436f6c6f75722062792061206669656c64222c226465736372697074696f6e223a22436f6c6f7572207468652063656c6c732062792061206669656c642e222c22696e707574536368656d61223a7b2274797065223a226f626a656374222c2270726f70657274696573223a7b7d7d2c22616e6e6f746174696f6e73223a7b227469746c65223a22436f6c6f75722062792061206669656c64222c22726561644f6e6c7948696e74223a66616c73652c22646573747275637469766548696e74223a66616c73652c226964656d706f74656e7448696e74223a66616c73652c226f70656e576f726c6448696e74223a66616c73657d7d5d"
+        "hex": "270000007b2274797065223a226167656e745f746f6f6c73222c22726571756573744964223a226131227d5b7b226e616d65223a22636f6c6f725f6279222c227469746c65223a22436f6c6f722062792061206669656c64222c226465736372697074696f6e223a22436f6c6f72207468652063656c6c732062792061206669656c642e222c22696e707574536368656d61223a7b2274797065223a226f626a656374222c2270726f70657274696573223a7b7d7d2c22616e6e6f746174696f6e73223a7b227469746c65223a22436f6c6f722062792061206669656c64222c22726561644f6e6c7948696e74223a66616c73652c22646573747275637469766548696e74223a66616c73652c226964656d706f74656e7448696e74223a66616c73652c226f70656e576f726c6448696e74223a66616c73657d7d5d"
       },
       {
         "header": {
@@ -1133,12 +1172,12 @@
           "content": [
             {
               "type": "text",
-              "text": "{\"step\":{\"id\":\"s5\",\"label\":\"Coloured by cell_type\"}}"
+              "text": "{\"step\":{\"id\":\"s5\",\"label\":\"Colored by cell_type\"}}"
             }
           ],
           "isError": false
         },
-        "hex": "280000007b2274797065223a226167656e745f726573756c74222c22726571756573744964223a226132227d7b22636f6e74656e74223a5b7b2274797065223a2274657874222c2274657874223a227b5c22737465705c223a7b5c2269645c223a5c2273355c222c5c226c6162656c5c223a5c22436f6c6f757265642062792063656c6c5f747970655c227d7d227d5d2c2269734572726f72223a66616c73657d"
+        "hex": "280000007b2274797065223a226167656e745f726573756c74222c22726571756573744964223a226132227d7b22636f6e74656e74223a5b7b2274797065223a2274657874222c2274657874223a227b5c22737465705c223a7b5c2269645c223a5c2273355c222c5c226c6162656c5c223a5c22436f6c6f7265642062792063656c6c5f747970655c227d7d227d5d2c2269734572726f72223a66616c73657d"
       },
       {
         "header": {
@@ -1197,6 +1236,10 @@
               "B cell",
               "T cell"
             ],
+            "colors": [
+              "#ff9900",
+              "#0077c8"
+            ],
             "origin": "user"
           },
           "cells": 4,
@@ -1214,7 +1257,7 @@
           255,
           1
         ],
-        "hex": "d20000007b2274797065223a22726573756c74222c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a322c226b696e64223a2263617465676f726963616c222c226964223a22757365725f6361745f31222c226e4f6273223a31302c226d657461223a7b226b6579223a22616e6e6f746174696f6e222c2263617465676f72696573223a5b22422063656c6c222c22542063656c6c225d2c226f726967696e223a2275736572227d2c2263656c6c73223a342c2276616c756573223a2275696e7438227d000000000300000004000000090000000100ff01"
+        "hex": "f10000007b2274797065223a22726573756c74222c2265706f6368223a2230313233343536373839616263646566222c227265766973696f6e223a322c226b696e64223a2263617465676f726963616c222c226964223a22757365725f6361745f31222c226e4f6273223a31302c226d657461223a7b226b6579223a22616e6e6f746174696f6e222c2263617465676f72696573223a5b22422063656c6c222c22542063656c6c225d2c22636f6c6f7273223a5b2223666639393030222c2223303037376338225d2c226f726967696e223a2275736572227d2c2263656c6c73223a342c2276616c756573223a2275696e7438227d000000000300000004000000090000000100ff01"
       },
       {
         "header": {

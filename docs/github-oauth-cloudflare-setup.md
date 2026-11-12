@@ -96,7 +96,7 @@ working at GitHub, and forgets it.
 
 Request bodies are JSON objects of exactly the documented fields, parsed
 natively; a repeated key keeps its last value, and what reaches GitHub is
-re-serialised from the checked values, never the bytes received. Unknown
+re-serialized from the checked values, never the bytes received. Unknown
 fields, wrong JSON types, malformed GitHub responses, disallowed origins,
 unsupported routes and unsupported methods fail visibly. A GitHub error answer
 keeps GitHub's status, with GitHub's `message` (or, for a page that is not
@@ -365,7 +365,7 @@ npm run test:worker-bundle
 The Worker suites (`tests/community-annotation-worker*.test.mjs`) cover route
 inventory, methods, CORS and preflight caching, OAuth state, PKCE, callback
 cookies and every sign-in outcome, exact request bodies and their
-re-serialisation, page-by-page collections, the GraphQL queries, relayed reads
+re-serialization, page-by-page collections, the GraphQL queries, relayed reads
 without a byte cut, relayed GitHub headers and conditional requests, the ref
 force update and the caller binding of writes, read-only schema enforcement,
 fixed CAP persisted queries and item projection, caller cancellation, the

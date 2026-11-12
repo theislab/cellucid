@@ -7,14 +7,29 @@
  * @module ui/modules/figure-export/figure-export-ui
  */
 
+import { figureAutoTitle, gridPanelsDifferInField } from './utils/figure-title.js';
+import { setControlAvailability } from '../../core/control-availability.js';
 import { createElement, clearElement } from '../../../utils/dom-utils.js';
-import { createDecimalInput, createDisclosure, createGroup, createInfoTip, readDecimalInput, writeDecimalInput } from '../../components/controls.js';
+import { createButton, createDecimalInput, createDisclosure, createGroup, createInfoTip, createStatusLine, readDecimalInput, writeDecimalInput } from '../../components/controls.js';
 import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { createVisibilityGatedRender } from '../../core/visibility-gate.js';
 import { clamp } from '../../../utils/number-utils.js';
 import { confirmExportFidelityWarnings } from './components/fidelity-warning-dialog.js';
 import { reportFigureExportFailure } from './figure-export-engine.js';
-import { computeSingleViewLayout } from './utils/layout.js';
+import { fillSingleViewWidth } from './utils/layout.js';
+import {
+  FIGURE_DEFAULT_WIDTH_PRESET,
+  FIGURE_STANDARD_TEXT_PT,
+  FIGURE_WIDTH_PRESETS,
+  FIGURE_WIDTH_PRESET_LABELS,
+  figurePxOfPt,
+  devicePxOf,
+  figureSizeText,
+  figureWidthPxOf,
+  formatMm,
+} from './utils/figure-size.js';
+import { highlightLegendEntry } from './utils/highlight-legend.js';
+import { buildSelectionBadge, drawCanvasSelectionBadge } from './utils/selection-badge.js';
 import { buildRenderModeFidelityWarnings } from './utils/render-mode.js';
 import { reducePointsByDensity } from './utils/density-reducer.js';
 import {
@@ -23,9 +38,12 @@ import {
   POINT_VISIBILITY_THRESHOLD,
 } from './utils/lod-membership.js';
 import { drawCanvasLegend } from './components/legend-builder.js';
-import { drawCanvasAxes } from './components/axes-builder.js';
+import { computeSourceAxisBounds, drawCanvasAxes, figureViewHasAxes } from './components/axes-builder.js';
 import { drawCanvasCentroidOverlay } from './components/centroid-overlay.js';
-import { denormalizeXY } from './utils/coordinate-mapper.js';
+import { drawCanvasVectorFieldOf, vectorFieldLegendKey } from './components/vector-field-figure.js';
+import { readShownVectorFieldOverlay } from './utils/overlay-fidelity.js';
+import { createPlotPlacement, figureSourceAspect } from './utils/plot-fit.js';
+import { createViewportPointDiameter } from './utils/point-size.js';
 import { drawCanvasOrientationIndicator } from './components/orientation-indicator.js';
 import {
   buildReferenceGridModel,
@@ -38,18 +56,22 @@ import {
 } from './components/backdrop-look-export.js';
 import { applyColorblindSimulationToImageData } from './utils/colorblindness.js';
 import { assertCropRect01 } from './utils/crop.js';
+import { panelShapeAgainstCells } from './utils/cells-frame.js';
 import {
   assertFigureExportSessionSettings,
   changedFigureExportSettings,
   figureExportParamsOf,
   figureExportSettingsOf,
+  FIGURE_EXPORT_DEFAULT_SVG_STRATEGY,
+  FIGURE_EXPORT_FRAME_CELLS,
   FIGURE_EXPORT_SESSION_SETTINGS_VERSION,
   FIGURE_EXPORT_SETTING_RANGES,
+  FIGURE_EXPORT_SIZE_PRESETS,
   trackCommittedNumber,
 } from './utils/session-settings.js';
 import { getActions } from '../../../actions/index.js';
 import { ActionRefused } from '../../../actions/dispatcher.js';
-import { rgb01ToHex } from './utils/color-utils.js';
+import { hexOfRgb01, isHexColor } from '../../../../utils/hex-color.js';
 import { resolveFigureInk } from './utils/figure-ink.js';
 import {
   buildViewerBackgroundFidelityWarnings,
@@ -59,13 +81,11 @@ import {
 import {
   buildOverlayFidelityWarnings,
 } from './utils/overlay-fidelity.js';
-import {
-  assertCameraState,
-  assertNavigationMode
-} from '../../../../rendering/camera-state-contract.js';
+import { assertCameraState } from '../../../../rendering/camera-state-contract.js';
 import { cancel, onAbort } from '../../../../utils/abort.js';
+import { openADatasetTo } from '../../no-dataset.js';
+import { debounce } from '../../../../utils/debounce.js';
 
-const DEFAULT_SIZE = { width: 1600, height: 1200 };
 const PREVIEW_PRESENTATION_SETTLE_MS = 120;
 
 function previewValuesEqual(left, right) {
@@ -195,7 +215,7 @@ export function mapFigurePreviewPointToPlot({
  * @param {import('../../../state/core/data-state.js').DataState} options.state
  * @param {object} options.viewer
  * @param {HTMLElement} options.container
- * @param {{ exportFigure: (opts: any) => Promise<any> }} options.engine
+ * @param {ReturnType<typeof import('./figure-export-engine.js').createFigureExportEngine>} options.engine
  */
 export function initFigureExportUI({ state, viewer, container, engine }) {
   if (!(container instanceof HTMLElement)) {
@@ -205,10 +225,12 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     engine === null ||
     typeof engine !== 'object' ||
     typeof engine.exportFigure !== 'function' ||
-    typeof engine.exportFigures !== 'function'
+    typeof engine.exportFigures !== 'function' ||
+    typeof engine.cellsFrame !== 'function' ||
+    typeof engine.figureViewIds !== 'function'
   ) {
     throw new TypeError(
-      'Figure export engine must publish exportFigure() and exportFigures().'
+      'Figure export engine must publish exportFigure(), exportFigures(), cellsFrame() and figureViewIds().'
     );
   }
   if (
@@ -292,13 +314,14 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   };
   container.__cellucidCleanup = destroy;
 
-  const presets = [
-    { label: 'Screen (half)', value: 'screen-half' },
-    { label: 'Screen (current)', value: 'screen' },
-    { label: '1200 × 900', value: '1200x900' },
-    { label: '1600 × 1200', value: '1600x1200' },
-    { label: '1920 × 1080', value: '1920x1080' },
-  ];
+  // The figure's width as a journal prints it (`utils/figure-size.js`): the
+  // figure fills it at its own height, and its text keeps its point sizes.
+  const presets = FIGURE_EXPORT_SIZE_PRESETS.map(value => ({
+    value,
+    label: value === 'custom'
+      ? FIGURE_WIDTH_PRESET_LABELS.custom
+      : `${FIGURE_WIDTH_PRESET_LABELS[value]} · ${FIGURE_WIDTH_PRESETS[value]} mm`,
+  }));
 
   const headerInfo = createInfoTip({ tip: 'figure-export', label: 'About figure export' });
   const headerGroup = createGroup({ title: 'Export', info: headerInfo.button });
@@ -309,35 +332,20 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   // Plot size + framing
   // ─────────────────────────────────────────────────────────────────────────
   const sizeRow = createElement('div', { className: 'control-block' });
-  sizeRow.appendChild(createElement('span', { className: 'field-label' }, ['Plot size']));
+  sizeRow.appendChild(createElement('span', { className: 'field-label' }, ['Figure width']));
 
-  const presetSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Export size preset' });
+  const presetSelect = createElement('select', { className: 'obs-select', ariaLabel: 'Figure width preset' });
   presets.forEach((p) => {
     presetSelect.appendChild(createElement('option', { value: p.value }, [p.label]));
   });
-  presetSelect.value = 'screen-half';
+  presetSelect.value = FIGURE_DEFAULT_WIDTH_PRESET;
 
-  const widthInput = createElement('input', {
+  const widthInput = createDecimalInput({
     id: 'figure-export-width',
-    type: 'number',
     className: 'obs-select figure-input-sm',
-    value: String(DEFAULT_SIZE.width),
-    min: '100',
-    max: '20000',
-    step: '10',
-    inputMode: 'numeric',
-    ariaLabel: 'Export width (px)'
-  });
-  const heightInput = createElement('input', {
-    id: 'figure-export-height',
-    type: 'number',
-    className: 'obs-select figure-input-sm',
-    value: String(DEFAULT_SIZE.height),
-    min: '100',
-    max: '20000',
-    step: '10',
-    inputMode: 'numeric',
-    ariaLabel: 'Export height (px)'
+    value: FIGURE_WIDTH_PRESETS[FIGURE_DEFAULT_WIDTH_PRESET],
+    ariaLabel: 'Figure width (mm)',
+    title: 'The figure is exactly this wide, at every resolution; its height follows from its plots\' shapes.',
   });
 
   const sizeGrid = createElement('div', { className: 'figure-export-size-row' }, [
@@ -346,21 +354,28 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       createElement('div', { className: 'figure-export-dim-field' }, [
         createElement('label', { className: 'figure-export-inline-label', htmlFor: widthInput.id }, ['W']),
         widthInput,
-      ]),
-      createElement('div', { className: 'figure-export-dim-field' }, [
-        createElement('label', { className: 'figure-export-inline-label', htmlFor: heightInput.id }, ['H']),
-        heightInput,
+        createElement('span', { className: 'figure-export-inline-label' }, ['mm']),
       ]),
     ])
   ]);
   sizeRow.appendChild(sizeGrid);
+  // The figure's printed size, and the PNG's pixels at the chosen DPI (`figureSizeText`).
+  const sizeReadout = createStatusLine({ tone: 'muted', text: '' });
+  sizeReadout.root.classList.add('figure-export-size-readout');
+  sizeRow.appendChild(sizeReadout.root);
 
   const cropEnabledCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-crop-enabled' });
   const cropLockCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-crop-lock' });
   const cropResetBtn = createElement('button', { type: 'button', className: 'btn btn-compact figure-export-framing-btn' }, ['Reset']);
   const cropConfirmBtn = createElement('button', { type: 'button', className: 'btn btn-compact figure-export-framing-btn', ariaPressed: 'false' }, ['Confirm']);
-  const cropFitPlotBtn = createElement('button', { type: 'button', className: 'btn btn-compact figure-export-framing-btn' }, ['Fit plot']);
   const cropAspectHint = createElement('span', { className: 'figure-export-crop-aspect' }, ['Aspect: —']);
+  // One click frames every cell drawn (F161): the plot takes the cells' shape,
+  // not the pane's, and nobody rearranges the screen for a figure.
+  const fitCellsBtn = createElement('button', {
+    type: 'button',
+    className: 'btn btn-compact figure-export-framing-btn',
+    title: 'Frame every cell drawn, with a small margin: the plot takes the cells\' shape instead of the pane\'s',
+  }, ['Fit the cells']);
 
   const frameExportToggleLabel = createElement('label', { className: 'checkbox-inline', htmlFor: cropEnabledCheckbox.id }, [
     cropEnabledCheckbox,
@@ -374,7 +389,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   const framingActionGrid = createElement('div', { className: 'figure-export-framing-grid' }, [
     cropResetBtn,
     cropConfirmBtn,
-    cropFitPlotBtn,
     lockAspectBtn,
   ]);
 
@@ -389,10 +403,10 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   const backgroundSelect = createElement('select', { id: 'figure-export-background', className: 'obs-select' });
   backgroundSelect.appendChild(createElement('option', { value: 'viewer' }, ['Match viewer']));
-  backgroundSelect.appendChild(createElement('option', { value: 'white' }, ['White BG']));
+  backgroundSelect.appendChild(createElement('option', { value: 'white' }, ['White']));
   backgroundSelect.appendChild(createElement('option', { value: 'transparent' }, ['Transparent']));
   backgroundSelect.appendChild(createElement('option', { value: 'custom' }, ['Custom…']));
-  const initialViewerBg = rgb01ToHex(viewer.getRenderState().bgColor);
+  const initialViewerBg = hexOfRgb01(viewer.getRenderState().bgColor);
   const backgroundColorInput = createElement('input', { type: 'color', className: 'figure-color-picker', value: initialViewerBg || '#ffffff', ariaLabel: 'Custom background color' });
   backgroundSelect.value = 'viewer';
 
@@ -403,82 +417,61 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     { label: 'Times', value: '"Times New Roman", Times, serif' },
   ].forEach((f) => fontSelect.appendChild(createElement('option', { value: f.value }, [f.label])));
 
-  const fontSizeInput = createElement('input', {
+  // Every text size is in points and has one range, the settings' (`FIGURE_EXPORT_SETTING_RANGES.fontSize`,
+  // whole or half points): the control's, the reader's and `figure-export.set`'s. The controls once allowed
+  // 6–24 (axis and centroid 36, title 48) while the reader and an agent's set allowed 1–500, so a size an
+  // agent set drew in the picture and left its control invalid, and Export blamed it for another refusal (L24-7).
+  // Points keep their printed size at any width and resolution (F271): no one converts pixels to points.
+  const fontSizeInput = createDecimalInput({
     id: 'figure-export-font-size',
-    type: 'number',
     className: 'obs-select figure-input-sm',
-    value: '12',
-    min: '6',
-    max: '24',
-    step: '1',
-    inputMode: 'numeric',
-    ariaLabel: 'Base font size (px)'
+    value: FIGURE_STANDARD_TEXT_PT.base,
+    ariaLabel: 'Base text size (pt)',
   });
 
   const autoTextSizingCheckbox = createElement('input', { type: 'checkbox', id: 'figure-export-text-auto', checked: true });
 
-  const legendFontSizeInput = createElement('input', {
+  const legendFontSizeInput = createDecimalInput({
     id: 'figure-export-legend-font-size',
-    type: 'number',
     className: 'obs-select figure-input-sm',
-    value: '12',
-    min: '6',
-    max: '24',
-    step: '1',
-    inputMode: 'numeric',
-    ariaLabel: 'Legend font size (px)'
+    value: FIGURE_STANDARD_TEXT_PT.legend,
+    ariaLabel: 'Legend text size (pt)',
   });
-  const tickFontSizeInput = createElement('input', {
+  const tickFontSizeInput = createDecimalInput({
     id: 'figure-export-tick-font-size',
-    type: 'number',
     className: 'obs-select figure-input-sm',
-    value: '12',
-    min: '6',
-    max: '24',
-    step: '1',
-    inputMode: 'numeric',
-    ariaLabel: 'Tick font size (px)'
+    value: FIGURE_STANDARD_TEXT_PT.ticks,
+    ariaLabel: 'Tick label size (pt)',
   });
-  const axisLabelFontSizeInput = createElement('input', {
+  const axisLabelFontSizeInput = createDecimalInput({
     id: 'figure-export-axis-font-size',
-    type: 'number',
     className: 'obs-select figure-input-sm',
-    value: '12',
-    min: '6',
-    max: '36',
-    step: '1',
-    inputMode: 'numeric',
-    ariaLabel: 'Axis label font size (px)'
+    value: FIGURE_STANDARD_TEXT_PT.axisLabel,
+    ariaLabel: 'Axis label size (pt)',
   });
-  const titleFontSizeInput = createElement('input', {
+  const titleFontSizeInput = createDecimalInput({
     id: 'figure-export-title-font-size',
-    type: 'number',
     className: 'obs-select figure-input-sm',
-    value: '15',
-    min: '8',
-    max: '48',
-    step: '1',
-    inputMode: 'numeric',
-    ariaLabel: 'Title font size (px)'
+    value: FIGURE_STANDARD_TEXT_PT.title,
+    ariaLabel: 'Title size (pt)',
   });
-  const centroidLabelFontSizeInput = createElement('input', {
+  const centroidLabelFontSizeInput = createDecimalInput({
     id: 'figure-export-centroid-font-size',
-    type: 'number',
     className: 'obs-select figure-input-sm',
-    value: '12',
-    min: '6',
-    max: '36',
-    step: '1',
-    inputMode: 'numeric',
-    ariaLabel: 'Centroid label font size (px)'
+    value: FIGURE_STANDARD_TEXT_PT.centroidLabel,
+    ariaLabel: 'Centroid label size (pt)',
   });
 
   // Point radius removed - export now uses viewer's pointSize directly (WYSIWYG)
 
   const autoTextToggleRow = createElement('div', { className: 'figure-export-style-row figure-export-auto-text-toggle' }, [
-    createElement('label', { className: 'checkbox-inline', htmlFor: autoTextSizingCheckbox.id }, [
+    createElement('label', {
+      className: 'checkbox-inline',
+      htmlFor: autoTextSizingCheckbox.id,
+      title: 'The sizes journals print figure text at: 7 pt, ticks and centroid labels 6 pt, the title 8 pt, at any width. Off: your own sizes, in points.',
+    }, [
       autoTextSizingCheckbox,
-      ' Auto text'
+      ' Auto text (pt)'
     ]),
   ]);
 
@@ -575,7 +568,12 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   );
 
   const annotationChecks = createElement('div', { className: 'figure-export-checks' }, [
-    createElement('label', { className: 'checkbox-inline', htmlFor: includeAxesCheckbox.id }, [includeAxesCheckbox, ' Axes']),
+    createElement('label', {
+      className: 'checkbox-inline',
+      htmlFor: includeAxesCheckbox.id,
+      // An axis is drawn only where it is a ruler (`figureViewHasAxes`).
+      title: 'Embedding coordinates on a 1-D or 2-D view seen flat (planar). A 3-D view has none: its picture has no single scale; 3D orientation shows its directions.',
+    }, [includeAxesCheckbox, ' Axes']),
     createElement('label', { className: 'checkbox-inline', htmlFor: includeLegendCheckbox.id }, [includeLegendCheckbox, ' Legend']),
     referenceGridLabel,
     createElement('label', { className: 'checkbox-inline', htmlFor: showOrientationCheckbox.id }, [showOrientationCheckbox, ' 3D orientation']),
@@ -633,7 +631,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     legendSettingsRow.hidden = !includeLegendCheckbox.checked;
     const appearance = readViewerReferenceGridAppearance();
     const available = appearance !== null;
-    referenceGridCheckbox.disabled = !available;
+    setControlAvailability(referenceGridCheckbox, available
+      ? null
+      : 'the viewer background draws no reference grid; choose a grid or studio background to include one');
     referenceGridLabel.title = !available
       ? 'The viewer background draws no reference grid.'
       : appearance.kind === 'studio'
@@ -700,9 +700,26 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ariaLabel: 'Figure export preview',
     tabIndex: -1,
   });
+  // Said when a panel is far from the shape asked for (F119): a narrow pane
+  // (the chat open, a grid) gives a narrow plot of a wide embedding.
+  const shapeNoteText = createElement('span', {}, ['']);
+  const shapeNoteFitBtn = createButton({
+    label: 'Fit the cells',
+    variant: 'quiet',
+    className: 'btn-compact figure-export-shape-fit',
+    title: 'Frame every cell drawn: the plot takes the cells\' shape instead of the pane\'s',
+  });
+  const shapeNote = createElement('p', {
+    className: 'status-line figure-export-shape-note',
+    'data-tone': 'muted',
+    role: 'status',
+    ariaLive: 'polite',
+  }, [shapeNoteText, ' ', shapeNoteFitBtn]);
+  shapeNote.hidden = true;
   const previewBox = createElement('div', { className: 'figure-export-preview-box' }, [
     previewCanvas,
     previewStatus,
+    shapeNote,
   ]);
 
   const previewSettingsBox = createElement('div', { className: 'control-box figure-export-preview-settings' }, [
@@ -712,6 +729,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ]),
     createElement('div', { className: 'figure-export-preview-settings-row figure-export-preview-settings-row--toggles' }, [
       frameExportToggleLabel,
+      fitCellsBtn,
     ]),
     framingActionGrid,
     cropAspectHint,
@@ -738,15 +756,14 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   });
   dpiSelect.value = '300';
 
+  // Full vector by default (every point, editable), as a person and an agent
+  // chose every time when the panel asked first (F160); never changed for
+  // them afterwards.
   const strategySelect = createElement('select', { className: 'obs-select', ariaLabel: 'SVG point strategy' });
-  strategySelect.appendChild(createElement('option', {
-    value: '',
-    disabled: true,
-    selected: true,
-  }, ['Choose SVG strategy…']));
   strategySelect.appendChild(createElement('option', { value: 'full-vector' }, ['Full vector']));
   strategySelect.appendChild(createElement('option', { value: 'optimized-vector' }, ['Optimized vector']));
   strategySelect.appendChild(createElement('option', { value: 'hybrid' }, ['Hybrid']));
+  strategySelect.value = FIGURE_EXPORT_DEFAULT_SVG_STRATEGY;
 
   const optimizedTargetCountInput = createElement('input', {
     id: 'figure-export-target-count',
@@ -805,6 +822,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     previewSettingsBox.hidden = !previewOn;
     if (!previewOn) {
       previewStatus.textContent = 'Preview is off.';
+      shapeNote.hidden = true;
     }
   }
 
@@ -830,6 +848,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   listen(emphasizeSelectionCheckbox, 'change', syncFormatDependentUi);
   listen(downloadSelect, 'change', syncFormatDependentUi);
   listen(dpiSelect, 'change', syncFormatDependentUi);
+  // The PNG's pixels follow its DPI; the printed size does not.
+  for (const control of [dpiSelect, downloadSelect]) listen(control, 'change', () => syncSizeReadout(lastPreviewFigure));
+  listen(exportAllViewsCheckbox, 'change', () => syncSizeReadout(null));
   listen(strategySelect, 'change', syncFormatDependentUi);
   listen(previewEnabledCheckbox, 'change', () => {
     void runPreviewUiAction('Preview toggle', async () => {
@@ -890,7 +911,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   // Redraw preview on option changes (no sample rebuild).
   const previewInputs = [
     widthInput,
-    heightInput,
     titleInput,
     xLabelInput,
     yLabelInput,
@@ -949,6 +969,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   listen(lockAspectBtn, 'click', () => {
     if (!cropEnabled) return;
     cropLockCheckbox.checked = !cropLockCheckbox.checked;
+    // Locked, the frame keeps the shape it has now when it is resized.
+    lockedFrameAspect = cropLockCheckbox.checked ? frameAspectNow() : null;
     lockAspectBtn.setAttribute('aria-pressed', cropLockCheckbox.checked ? 'true' : 'false');
     previewFramingMode = 'edit';
     previewSampleCrop = null;
@@ -1007,85 +1029,81 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     });
   });
 
-  listen(cropFitPlotBtn, 'click', () => {
-    if (!cropEnabled) return;
-    const viewId = getActiveViewIdForPreview();
-    const rs = getPreviewRenderStateForView(viewId);
-    const vw = Math.max(1, Number(rs?.viewportWidth) || 1);
-    const vh = Math.max(1, Number(rs?.viewportHeight) || 1);
-    const c = assertCropRect01({ enabled: true, ...cropRect01 });
-    if (!c || !Number.isFinite(c.width) || !Number.isFinite(c.height) || c.width <= 0 || c.height <= 0) return;
-
-    const cropAspect = (c.width * vw) / Math.max(1e-6, c.height * vh);
-    if (!Number.isFinite(cropAspect) || cropAspect <= 0) return;
-
-    const w = Math.max(100, parseInt(widthInput.value, 10) || DEFAULT_SIZE.width);
-    const nextH = clamp(Math.round(w / cropAspect), 100, 20000);
-    heightInput.value = String(nextH);
-    onPlotSizeAspectChange();
-  });
-
-  // ---------------------------------------------------------------------------
-  // Text sizing (auto by default; scales with plot size)
-  // ---------------------------------------------------------------------------
-
-  function getPlotSizePx() {
-    const w = Math.max(100, parseInt(widthInput.value, 10) || DEFAULT_SIZE.width);
-    const h = Math.max(100, parseInt(heightInput.value, 10) || DEFAULT_SIZE.height);
-    return { w, h };
-  }
-
-  function computeAutoTextSizes() {
-    const { w, h } = getPlotSizePx();
-    const area = Math.sqrt(w * h);
-    const base = clamp(Math.round(area / 70), 14, 30);
-    const title = Math.max(18, Math.round(base * 1.35));
-    const axis = Math.max(14, Math.round(base * 1.15));
-    const ticks = base;
-    const legend = base;
-    return { base, title, axis, ticks, legend };
-  }
-
-  function estimateCentroidLabelSizePx({ plotW, plotH }) {
-    const viewId = getActiveViewIdForPreview();
-    const rs = getPreviewRenderStateForView(viewId);
-    if (!rs) return null;
-    const vw = Math.max(1, Math.round(rs?.viewportWidth || 1));
-    const vh = Math.max(1, Math.round(rs?.viewportHeight || 1));
-    const scale = Math.min(plotW / vw, plotH / vh);
-
-    let cssPx = NaN;
-    if (typeof document !== 'undefined') {
-      const labelLayer = document.getElementById('label-layer');
-      cssPx = labelLayer ? parseFloat(getComputedStyle(labelLayer).fontSize || '') : NaN;
+  /**
+   * Frame every cell the figure draws (`engine.cellsFrame`): Frame export
+   * on, the frame the cells' extent, its shape free. The preview is turned
+   * on, as a frame is drawn on it. False when no cell is drawn.
+   *
+   * @returns {boolean}
+   */
+  function fitFrameToCells() {
+    const rect = engine.cellsFrame({ exportAllViews: exportAllViewsCheckbox.checked });
+    if (rect === null) {
+      previewStatus.textContent = 'No cell is drawn to fit.';
+      return false;
     }
-    if (!Number.isFinite(cssPx) || cssPx <= 0) return null;
-    return clamp(Math.round(cssPx * scale), 6, 36);
+    if (!previewEnabledCheckbox.checked) {
+      previewEnabledCheckbox.checked = true;
+      previewEnabledCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    cropEnabled = true;
+    cropEnabledCheckbox.checked = true;
+    cropLockCheckbox.checked = false;
+    lockedFrameAspect = null;
+    previewFramingMode = 'edit';
+    previewSampleCrop = null;
+    cropRect01 = { ...rect };
+    cellsFrameRect = { ...rect };
+    syncCropUi();
+    schedulePreviewDraw();
+    return true;
+  }
+  listen(fitCellsBtn, 'click', fitFrameToCells);
+  listen(shapeNoteFitBtn, 'click', fitFrameToCells);
+
+  // ---------------------------------------------------------------------------
+  // The figure's width (millimetres) and its text (points): `utils/figure-size.js`
+  // ---------------------------------------------------------------------------
+
+  /** The width box's millimetres, or null while it holds no width (said on Export). */
+  function widthMmNow() {
+    const value = readDecimalInput(widthInput);
+    return Number.isFinite(value) && value >= FIGURE_EXPORT_SETTING_RANGES.widthMm[0] ? value : null;
+  }
+
+  // The last valid width and text sizes while a box holds a value being typed
+  // (`committedNumbers`, set up with the panel below).
+  const committedWidthMm = () => committedNumbers.width.read();
+  const committedTextPt = key => committedNumbers[key].read();
+
+  /** The width the figure fills, in figure pixels (the last valid width while one is typed). */
+  function figureWidthPx() {
+    return figureWidthPxOf(widthMmNow() ?? committedWidthMm());
+  }
+
+  /** A text box's points as figure pixels (its last valid size while one is typed). */
+  function textPx(input, key) {
+    const value = readDecimalInput(input);
+    const pt = Number.isFinite(value) && value > 0 ? value : committedTextPt(key);
+    return figurePxOfPt(pt);
   }
 
   function syncTextSizingUi() {
     const auto = autoTextSizingCheckbox.checked;
-    const inputs = [
-      fontSizeInput,
-      legendFontSizeInput,
-      tickFontSizeInput,
-      axisLabelFontSizeInput,
-      titleFontSizeInput,
-      centroidLabelFontSizeInput,
-    ];
-    for (const el of inputs) el.disabled = auto;
+    const inputs = {
+      base: fontSizeInput,
+      legend: legendFontSizeInput,
+      ticks: tickFontSizeInput,
+      axisLabel: axisLabelFontSizeInput,
+      title: titleFontSizeInput,
+      centroidLabel: centroidLabelFontSizeInput,
+    };
+    for (const el of Object.values(inputs)) {
+      setControlAvailability(el, auto ? 'Auto text sets the sizes journals print figure text at; turn Auto text off to set your own' : null);
+    }
     if (!auto) return;
-
-    const sizes = computeAutoTextSizes();
-    fontSizeInput.value = String(sizes.base);
-    legendFontSizeInput.value = String(sizes.legend);
-    tickFontSizeInput.value = String(sizes.ticks);
-    axisLabelFontSizeInput.value = String(sizes.axis);
-    titleFontSizeInput.value = String(sizes.title);
-
-    const { w, h } = getPlotSizePx();
-    const centroidPx = estimateCentroidLabelSizePx({ plotW: w, plotH: h });
-    if (centroidPx != null) centroidLabelFontSizeInput.value = String(centroidPx);
+    // The same printed sizes at any width: text in points does not grow with the figure.
+    for (const [key, input] of Object.entries(inputs)) writeDecimalInput(input, FIGURE_STANDARD_TEXT_PT[key]);
   }
 
   listen(autoTextSizingCheckbox, 'change', () => {
@@ -1093,48 +1111,56 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     schedulePreviewDraw();
   });
 
-  // Keep the crop frame aspect synced to the export plot aspect.
-  const aspectInputs = [widthInput, heightInput];
-  const onPlotSizeAspectChange = () => {
-    if (cropEnabled) enforceCropAspect();
+  /**
+   * The figure's printed size under the width, and a PNG's pixels at the
+   * chosen DPI: the whole size once the preview has laid the figure out (one
+   * view), else its width (several panels make their own height; the export
+   * picture and Export say it).
+   *
+   * @param {{width: number, height: number}|null} [figure] - figure pixels
+   */
+  let lastPreviewFigure = null;
+  function syncSizeReadout(figure = null) {
+    const dpi = dpiSelect.hidden ? null : Number(dpiSelect.value);
+    const grid = engine.figureViewIds({ exportAllViews: exportAllViewsCheckbox.checked }).length > 1;
+    // One short line (it never wraps); what it means is its title.
+    if (figure !== null && !grid) {
+      const pixels = dpi === null ? '' : ` · ${devicePxOf(figure.width, dpi)} × ${devicePxOf(figure.height, dpi)} px`;
+      sizeReadout.set(`${figureSizeText(figure)}${pixels}`);
+      sizeReadout.root.title = `The figure as printed${dpi === null ? '' : `, and the PNG's pixels at ${dpi} dpi`}.`;
+      return;
+    }
+    const mm = widthMmNow();
+    sizeReadout.set(mm === null ? 'Give a width in mm.' : `${formatMm(mm)} mm wide · height from its ${grid ? 'panels' : 'plot'}`);
+    sizeReadout.root.title = grid
+      ? 'Several panels make their own height; the export picture and Export say it.'
+      : 'The preview lays the figure out and says its height.';
+  }
+
+  const onFigureWidthChange = () => {
+    lastPreviewFigure = null;
+    syncSizeReadout();
     syncCropUi();
-    syncTextSizingUi();
     invalidatePreviewSamples();
     schedulePreviewDraw();
   };
-  for (const el of aspectInputs) {
-    listen(el, 'input', onPlotSizeAspectChange);
-    listen(el, 'change', onPlotSizeAspectChange);
-  }
-
-  function readSizePreset() {
-    const preset = presetSelect.value;
-    if (preset !== 'screen' && preset !== 'screen-half') return;
-    const rs = viewer.getRenderState();
-    if (!rs) return;
-    const scale = preset === 'screen-half' ? 0.5 : 1;
-    const nextW = Math.max(100, Math.round((rs.viewportWidth || DEFAULT_SIZE.width) * scale));
-    const nextH = Math.max(100, Math.round((rs.viewportHeight || DEFAULT_SIZE.height) * scale));
-    widthInput.value = String(nextW);
-    heightInput.value = String(nextH);
-  }
+  // A width typed is a preset's when it is one, else the person's own.
+  const onWidthTyped = () => {
+    const mm = widthMmNow();
+    if (mm !== null) {
+      presetSelect.value = Object.keys(FIGURE_WIDTH_PRESETS).find(key => FIGURE_WIDTH_PRESETS[key] === mm) ?? 'custom';
+    }
+    onFigureWidthChange();
+  };
+  listen(widthInput, 'input', onWidthTyped);
+  listen(widthInput, 'change', onWidthTyped);
 
   listen(presetSelect, 'change', () => {
     const value = presetSelect.value;
-    if (value === 'screen' || value === 'screen-half') {
-      readSizePreset();
-      onPlotSizeAspectChange();
-      return;
-    }
-    const match = value.match(/^(\d+)x(\d+)$/);
-    if (!match) return;
-    widthInput.value = match[1];
-    heightInput.value = match[2];
-    onPlotSizeAspectChange();
+    if (Object.hasOwn(FIGURE_WIDTH_PRESETS, value)) writeDecimalInput(widthInput, FIGURE_WIDTH_PRESETS[value]);
+    onFigureWidthChange();
   });
 
-  // Seed the screen preset once after init.
-  readSizePreset();
   syncTextSizingUi();
 
   // Dynamic title: keep in sync with dataset + shown categories until the user edits.
@@ -1151,36 +1177,32 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const legendField = typeof state?.getFieldForView === 'function'
       ? state.getFieldForView(viewId)
       : (typeof state?.getActiveField === 'function' ? state.getActiveField() : null);
+    // A grid of panels colored by different fields is titled by the dataset alone: each panel
+    // names its own field ("A. cell_type", "B. organ"), so one view's must not stand for all.
+    if (panelsDifferInField()) return figureAutoTitle({ datasetName: safeDataset, fieldLabel: '', legendModel: null });
+    // One view (not a grid of panels, each titled by its own view's name): the name it was given.
+    const viewName = exportAllViewsCheckbox.checked && viewer.getViewLayout().mode === 'grid' ? null : viewer.getViewName(viewId);
     const fieldLabel = String(legendField?.label || legendField?.name || legendField?.key || '').trim();
 
     const legendModel = legendField && typeof state?.getLegendModel === 'function' ? state.getLegendModel(legendField) : null;
-    let categorySummary = '';
-    if (legendModel?.kind === 'category' && Array.isArray(legendModel.categories) && legendModel.categories.length) {
-      const visible = legendModel.visible ?? null;
-      const visibleCounts = Array.isArray(legendModel?.counts?.visible) ? legendModel.counts.visible : null;
-      const shown = legendModel.categories
-        .map((name, i) => {
-          if (visible !== null && visible[i] === 0) return null;
-          if (visibleCounts && (Number(visibleCounts[i]) || 0) <= 0) return null;
-          const s = String(name ?? '').trim();
-          return s ? s : null;
-        })
-        .filter((name) => Boolean(name));
+    // One view: the filters on other fields, which its legend no longer lists categories for (a grid's
+    // panels each name theirs in their label).
+    const otherFilters = exportAllViewsCheckbox.checked || typeof state?.getActiveFiltersStructured !== 'function'
+      ? []
+      : state.getActiveFiltersStructured()
+        .filter(filter => filter.enabled && filter.fieldKey !== legendField?.key)
+        .map(filter => filter.text);
+    return figureAutoTitle({ datasetName: safeDataset, fieldLabel, legendModel, otherFilters, viewName });
+  }
 
-      if (shown.length === 1) {
-        categorySummary = shown[0];
-      } else if (shown.length === 2 || shown.length === 3) {
-        categorySummary = shown.join(', ');
-      } else if (shown.length > 3) {
-        categorySummary = `${shown.slice(0, 2).join(', ')} +${shown.length - 2}`;
-      }
-    }
-
-    if (safeDataset && fieldLabel && categorySummary) return `${safeDataset} • ${fieldLabel}: ${categorySummary}`;
-    if (safeDataset && fieldLabel) return `${safeDataset} • ${fieldLabel}`;
-    if (safeDataset && categorySummary) return `${safeDataset} • ${categorySummary}`;
-    if (fieldLabel && categorySummary) return `${fieldLabel}: ${categorySummary}`;
-    return safeDataset || fieldLabel || categorySummary || '';
+  /** Whether Export all views draws a grid whose panels are colored by different fields. */
+  function panelsDifferInField() {
+    if (!exportAllViewsCheckbox.checked) return false;
+    return gridPanelsDifferInField({
+      viewLayout: viewer.getViewLayout(),
+      snapshotViewIds: viewer.getSnapshotViews().map(view => view.id),
+      fieldKeyOf: viewId => state.getFieldForView(viewId)?.key ?? null
+    });
   }
 
   function syncAutoTitle() {
@@ -1214,13 +1236,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
     if (!value) {
       titleAutofillEnabled = true;
-      if (previewTitleTimer !== null) {
-        clearTimeout(previewTitleTimer);
-      }
-      previewTitleTimer = setTimeout(() => {
-        previewTitleTimer = null;
-        if (!cleanupComplete && !previewDisposed) syncAutoTitle();
-      }, 0);
+      syncAutoTitleSoon();
       return;
     }
     const auto = buildAutoTitle();
@@ -1246,6 +1262,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
     cleanupFns.push(unsubscribe);
   };
+  // Export all views decides whether one field titles the figure (`panelsDifferInField`).
+  listen(exportAllViewsCheckbox, 'change', () => syncAutoTitle());
   subscribePreviewInvalidation('field:changed', {
     title: true,
   });
@@ -1296,6 +1314,11 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         invalidatePreviewSamples({ rebuild: false });
         return;
       }
+      // A view named (`view.rename`): a named view titles the figure.
+      if (event?.reason === 'names') syncAutoTitle();
+      // The panes' shapes may have changed (a resized window, a view kept or
+      // removed): the shape note follows them at once, not at the next picture.
+      if (!cleanupComplete) syncShapeNote();
       // Discrete layout/style publications can arrive in short bursts.
       invalidatePreviewSamples({
         rebuildDelayMs: PREVIEW_PRESENTATION_SETTLE_MS,
@@ -1327,7 +1350,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   function syncExportAvailability() {
     // While an export runs the button stops it: there is always a way out.
     exportBtn.disabled = !exportBusy && !cellsPresent;
-    exportBtn.title = cellsPresent ? '' : 'Load a dataset to export a figure';
+    exportBtn.title = cellsPresent ? '' : openADatasetTo('export a figure');
   }
 
   function setBusy(busy) {
@@ -1398,15 +1421,47 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   let previewSampleCrop = null;
   /** @type {'edit'|'applied'} */
   let previewFramingMode = 'edit';
-  let previewDrawTimer = /** @type {ReturnType<typeof setTimeout> | null} */ (null);
-  let previewRebuildTimer = /** @type {ReturnType<typeof setTimeout> | null} */ (null);
-  let previewTitleTimer = /** @type {ReturnType<typeof setTimeout> | null} */ (null);
+  // The preview is drawn, rebuilt and titled once its controls settle.
+  const drawPreviewSoon = debounce(() => {
+    if (cleanupComplete || previewDisposed) return;
+    // The viewer background can change while this panel is open, so the
+    // reference-grid control's availability is re-resolved every draw.
+    syncAnnotationUi();
+    drawPreview();
+  }, 80);
+  const rebuildPreviewSoon = debounce(() => {
+    if (
+      cleanupComplete ||
+      previewDisposed ||
+      !previewEnabledCheckbox.checked
+    ) {
+      return;
+    }
+    const mode =
+      cropEnabled && previewFramingMode === 'applied'
+        ? 'crop'
+        : 'full';
+    void runPreviewUiAction(
+      'Automatic preview rebuild',
+      async () => {
+        const committed = await buildPreviewSample({ mode });
+        if (committed && !previewDisposed) drawPreview();
+        return committed;
+      }
+    );
+  }, delayMs => delayMs);
+  const syncAutoTitleSoon = debounce(() => {
+    if (!cleanupComplete && !previewDisposed) syncAutoTitle();
+  }, 0);
   let previewPendingFrame = null;
   let previewBuildToken = 0;
 
   /** @type {{ x: number; y: number; width: number; height: number }} */
   let cropRect01 = { x: 0, y: 0, width: 1, height: 1 };
   let cropEnabled = false;
+  // The frame Fit the cells set last (null: none): while the frame is still
+  // it, the shape note has nothing to offer.
+  let cellsFrameRect = null;
 
   /** @type {{ scale: number; ox: number; oy: number; viewportRect: { x: number; y: number; width: number; height: number } | null } | null} */
   let previewGeom = null;
@@ -1471,32 +1526,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ) {
       return;
     }
-    if (previewRebuildTimer !== null) {
-      clearTimeout(previewRebuildTimer);
-      previewRebuildTimer = null;
-    }
-    previewRebuildTimer = setTimeout(() => {
-      previewRebuildTimer = null;
-      if (
-        cleanupComplete ||
-        previewDisposed ||
-        !previewEnabledCheckbox.checked
-      ) {
-        return;
-      }
-      const mode =
-        cropEnabled && previewFramingMode === 'applied'
-          ? 'crop'
-          : 'full';
-      void runPreviewUiAction(
-        'Automatic preview rebuild',
-        async () => {
-          const committed = await buildPreviewSample({ mode });
-          if (committed && !previewDisposed) drawPreview();
-          return committed;
-        }
-      );
-    }, delayMs);
+    rebuildPreviewSoon(delayMs);
   }
 
   function invalidatePreviewSamples({
@@ -1508,10 +1538,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     previewBuildToken++;
     cancelPendingPreviewFrame();
     releasePreviewSamples();
-    if (previewRebuildTimer !== null) {
-      clearTimeout(previewRebuildTimer);
-      previewRebuildTimer = null;
-    }
+    rebuildPreviewSoon.cancel();
     if (rebuild) queuePreviewRebuild(rebuildDelayMs);
   }
 
@@ -1520,27 +1547,31 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     previewEpochFence.close();
     previewBuildToken++;
     cancelPendingPreviewFrame();
-    if (previewDrawTimer !== null) {
-      clearTimeout(previewDrawTimer);
-      previewDrawTimer = null;
-    }
-    if (previewRebuildTimer !== null) {
-      clearTimeout(previewRebuildTimer);
-      previewRebuildTimer = null;
-    }
-    if (previewTitleTimer !== null) {
-      clearTimeout(previewTitleTimer);
-      previewTitleTimer = null;
-    }
+    drawPreviewSoon.cancel();
+    rebuildPreviewSoon.cancel();
+    syncAutoTitleSoon.cancel();
     endCropDrag();
     releasePreviewSamples();
     lastAutoTitle = '';
   });
 
+  /** The shape a locked frame keeps (its width / height on screen), taken when Lock aspect is turned on. */
+  let lockedFrameAspect = null;
+
+  /** The frame's shape on screen (width / height). */
+  function frameAspectNow() {
+    const viewportAspect = getViewportAspect();
+    return (cropRect01.width / Math.max(1e-6, cropRect01.height)) * viewportAspect;
+  }
+
+  /**
+   * The shape the plot takes: the frame's while framing (a locked frame the
+   * shape it had when locked), else the view's. The figure fills its width at
+   * the height this shape gives (`fillSingleViewWidth`).
+   */
   function getExportAspect() {
-    const w = Math.max(1, parseInt(widthInput.value, 10) || DEFAULT_SIZE.width);
-    const h = Math.max(1, parseInt(heightInput.value, 10) || DEFAULT_SIZE.height);
-    return w / h;
+    if (cropEnabled && cropLockCheckbox.checked && lockedFrameAspect !== null) return lockedFrameAspect;
+    return cropEnabled ? frameAspectNow() : getViewportAspect();
   }
 
   function getViewportAspect() {
@@ -1562,9 +1593,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   function syncCropUi() {
     cropResetBtn.disabled = !cropEnabled;
-    cropLockCheckbox.disabled = !cropEnabled;
+    setControlAvailability(cropLockCheckbox, cropEnabled ? null : 'turn Frame export on to frame the figure first');
     cropConfirmBtn.disabled = !cropEnabled;
-    cropFitPlotBtn.disabled = !cropEnabled;
     lockAspectBtn.disabled = !cropEnabled;
     lockAspectBtn.setAttribute('aria-pressed', cropLockCheckbox.checked ? 'true' : 'false');
 
@@ -1591,13 +1621,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         const frameAspect = (c.width * vw) / Math.max(1e-6, c.height * vh);
         frameLabel = formatAspectLabel(frameAspect);
 
-        const exportW = Math.max(100, parseInt(widthInput.value, 10) || DEFAULT_SIZE.width);
-        const exportH = Math.max(100, parseInt(heightInput.value, 10) || DEFAULT_SIZE.height);
-        const fullScale = Math.min(exportW / vw, exportH / vh);
-        const cropW = Math.max(1e-6, c.width * vw);
-        const cropH = Math.max(1e-6, c.height * vh);
-        const cropScale = Math.min(exportW / cropW, exportH / cropH);
-        const zoom = cropScale / Math.max(1e-6, fullScale);
+        // The plot fills the figure's width with the frame instead of the
+        // whole view: the frame is magnified by the view's width over its own.
+        const zoom = 1 / Math.max(1e-6, c.width);
         if (Number.isFinite(zoom) && zoom > 1.01) zoomLabel = ` • Zoom ${zoom.toFixed(2)}×`;
       }
     }
@@ -1691,6 +1717,43 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     return normalized ? { enabled: true, ...normalized } : null;
   }
 
+  /**
+   * The preview's one line when a panel is far from the shape of the cells
+   * it draws: each panel's source (its pane, or the frame) against the frame
+   * that holds its cells (`engine.cellsFrame`, every panel's for Export all
+   * views), with Fit the cells offered. The figure fills its width at the
+   * height the panels' shapes give, so a narrow pane of a wide embedding is a
+   * tall figure with the cells in a band. Hidden while the frame is the one
+   * Fit the cells set, and with the preview off.
+   */
+  function syncShapeNote() {
+    const fitted = cropEnabled && cellsFrameRect !== null
+      && ['x', 'y', 'width', 'height'].every(key => Math.abs(cropRect01[key] - cellsFrameRect[key]) < 1e-9);
+    let text = null;
+    if (previewEnabledCheckbox.checked && !fitted) {
+      const exportAllViews = exportAllViewsCheckbox.checked;
+      const viewIds = engine.figureViewIds({ exportAllViews });
+      const grid = viewIds.length > 1;
+      const cells = engine.cellsFrame({ exportAllViews });
+      const crop = getCropOptionForExport();
+      const panels = cells === null ? [] : viewIds
+        .map(viewId => getPreviewRenderStateForView(viewId))
+        .filter(renderState => renderState !== null)
+        .map(renderState => ({
+          source: figureSourceAspect({ renderState, crop }),
+          cells: (cells.width * renderState.viewportWidth) / Math.max(1e-6, cells.height * renderState.viewportHeight),
+        }));
+      const { far, narrower } = panelShapeAgainstCells(panels);
+      if (far) {
+        // One short line; why is its title.
+        text = `${grid ? 'Panels' : 'Plot'} ${narrower ? 'narrower' : 'wider'} than the cells:`;
+        shapeNote.title = `Each plot takes ${crop === null ? 'its pane\'s shape on screen' : 'the frame\'s shape'}, and the figure fills its width at the height that shape gives, so the cells fill only ${narrower ? 'a band across' : 'part of'} it. Fit the cells frames the cells instead.`;
+      }
+    }
+    shapeNote.hidden = text === null;
+    shapeNoteText.textContent = text ?? '';
+  }
+
   function getActiveViewIdForPreview() {
     const viewId = String(state.getActiveViewId());
     if (viewId.length === 0) {
@@ -1774,18 +1837,8 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         ? state.getTotalHighlightedCellCount()
         : 0;
     return Object.freeze({
-      aspect: Object.freeze({
-        height: Math.max(
-          1,
-          parseInt(heightInput.value, 10) ||
-            DEFAULT_SIZE.height
-        ),
-        width: Math.max(
-          1,
-          parseInt(widthInput.value, 10) ||
-            DEFAULT_SIZE.width
-        ),
-      }),
+      // The width the figure fills (figure pixels): a sample is of one figure.
+      figureWidth: figureWidthPx(),
       crop: crop === null
         ? null
         : Object.freeze({
@@ -1843,15 +1896,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       );
     } catch {
       return false;
-    }
-  }
-
-  // Seed centroid label font size from the on-screen overlay CSS when available.
-  if (typeof document !== 'undefined') {
-    const labelLayer = document.getElementById('label-layer');
-    const cssPx = labelLayer ? parseFloat(getComputedStyle(labelLayer).fontSize || '') : NaN;
-    if (Number.isFinite(cssPx) && cssPx > 0) {
-      centroidLabelFontSizeInput.value = String(Math.round(cssPx));
     }
   }
 
@@ -1996,6 +2040,20 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           crop
         });
         const cameraState = presented.cameraState;
+        const pointDiameterViewportPx =
+          presented.renderState.pointSize *
+          presented.lodSizeMultiplier;
+        // Each sampled cell's sprite as the viewer draws it, at its depth
+        // (`createViewportPointDiameter`), as the export's circles are.
+        const diameterAt = createViewportPointDiameter(presented.renderState);
+        const pointDiameters = new Float32Array(reduced.x.length);
+        for (let i = 0; i < reduced.x.length; i++) {
+          const at = reduced.index[i] * dimensionLevel;
+          const x = positions[at];
+          const y = dimensionLevel > 1 ? positions[at + 1] : 0;
+          const z = dimensionLevel > 2 ? positions[at + 2] : 0;
+          pointDiameters[i] = diameterAt(x, y, z, pointDiameterViewportPx);
+        }
         return {
           cameraState,
           certificate,
@@ -2004,9 +2062,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           layoutKey: state.getViewLayoutKey(viewId),
           mode,
           navMode: cameraState.navigationMode,
-          pointDiameterViewportPx:
-            presented.renderState.pointSize *
-            presented.lodSizeMultiplier,
+          pointDiameters,
           reduced,
           renderState: presented.renderState,
           ticket,
@@ -2049,16 +2105,17 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const cappedSample =
       candidate.reduced.scannedSourceCount <
       candidate.reduced.candidateSourceCount;
-    const sampleNote = cappedSample
-      ? ` • ${formatCount(candidate.reduced.scannedSourceCount)} of ${formatCount(candidate.reduced.candidateSourceCount)} source IDs scanned`
-      : '';
     const label = wantsCrop ? 'Framed preview' : 'Preview sample';
     const sampleCount = candidate.reduced.x.length;
     const emptyNote =
-      sampleCount === 0 ? ' • no visible points' : '';
+      sampleCount === 0 ? ' • no visible cells' : '';
+    // One short line; how the sample was drawn is its detail (found 2026-11-10: "250,000 of
+    // 561,947 source IDs scanned" on the line).
     previewStatus.textContent =
-      `${label}: ${formatCountOf(sampleCount, 'point')}` +
-      `${sampleNote}${emptyNote}`;
+      `${label}: ${formatCountOf(sampleCount, 'cell')}${emptyNote}`;
+    previewStatus.title = cappedSample
+      ? `Drawn from ${formatCount(candidate.reduced.scannedSourceCount)} of ${formatCountOf(candidate.reduced.candidateSourceCount, 'cell')} spread evenly, for speed; the export draws every visible cell.`
+      : 'The export draws every visible cell.';
     return true;
   }
 
@@ -2070,94 +2127,56 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ) {
       return;
     }
-    if (previewDrawTimer !== null) {
-      clearTimeout(previewDrawTimer);
-    }
-    previewDrawTimer = setTimeout(() => {
-      previewDrawTimer = null;
-      if (cleanupComplete || previewDisposed) return;
-      // The viewer background can change while this panel is open, so the
-      // reference-grid control's availability is re-resolved every draw.
-      syncAnnotationUi();
-      drawPreview();
-    }, 80);
+    drawPreviewSoon();
   }
 
-  function computeApproxBoundsFromSample({
-    reduced,
-    normTransform,
-    cropPx = null,
-  }) {
-    const positions = reduced?.sourcePositions;
-    if (
-      !(positions instanceof Float32Array) ||
-      positions.length !== (reduced?.x?.length ?? -1) * 3
-    ) {
-      return null;
-    }
-    let minX = Infinity;
-    let maxX = -Infinity;
-    let minY = Infinity;
-    let maxY = -Infinity;
-    const outN = reduced.x.length;
-    for (let i = 0; i < outN; i++) {
-      if (cropPx && reduced?.x && reduced?.y) {
-        const vx = reduced.x[i];
-        const vy = reduced.y[i];
-        if (vx < cropPx.x || vx > cropPx.x + cropPx.width) continue;
-        if (vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
-      }
-      const base = i * 3;
-      const real = denormalizeXY(positions[base], positions[base + 1], normTransform);
-      if (!Number.isFinite(real.x) || !Number.isFinite(real.y)) continue;
-      if (real.x < minX) minX = real.x;
-      if (real.x > maxX) maxX = real.x;
-      if (real.y < minY) minY = real.y;
-      if (real.y > maxY) maxY = real.y;
-    }
-    if (!Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) return null;
-    return { minX, maxX, minY, maxY };
+  /**
+   * The vector field the preview draws (`components/vector-field-figure.js`),
+   * as the export does: the shown field's vectors are read once per view,
+   * embedding, field and color scheme (`engine.figureVectorField`), and the
+   * arrows are planned at each draw on the view's own cells, borrowed.
+   */
+  let previewVectorField = { key: null, field: null, pending: null };
+  /** What the preview's vector field is read for (the sample's view and embedding, the field, its colors), or null when none is shown. */
+  function previewVectorFieldKey(sample) {
+    const shown = readShownVectorFieldOverlay(document);
+    if (shown === null || !sample) return null;
+    return [sample.viewId, sample.layoutKey, shown.fieldId, shown.colormapId, state.getDatasetGeneration()].join('\u0000');
   }
 
-  function computeApproxCameraBoundsFromSample({
-    reduced,
-    viewMatrix,
-    cropPx = null,
-  }) {
-    const positions = reduced?.sourcePositions;
-    if (
-      !(positions instanceof Float32Array) ||
-      positions.length !== (reduced?.x?.length ?? -1) * 3 ||
-      !viewMatrix
-    ) {
-      return null;
-    }
-    let minX = Infinity;
-    let maxX = -Infinity;
-    let minY = Infinity;
-    let maxY = -Infinity;
-    const outN = reduced.x.length;
-    for (let i = 0; i < outN; i++) {
-      if (cropPx && reduced?.x && reduced?.y) {
-        const vx = reduced.x[i];
-        const vy = reduced.y[i];
-        if (vx < cropPx.x || vx > cropPx.x + cropPx.width) continue;
-        if (vy < cropPx.y || vy > cropPx.y + cropPx.height) continue;
+  /** The vector field the preview draws now, read for this sample, or null (none shown, or not read yet). */
+  function previewVectorFieldNow(sample) {
+    const key = previewVectorFieldKey(sample);
+    return key !== null && previewVectorField.key === key ? previewVectorField.field : null;
+  }
+
+  function drawPreviewVectorField(ctx, sample, plotRect, crop, style) {
+    const key = previewVectorFieldKey(sample);
+    if (key === null) return;
+    if (previewVectorField.key !== key) {
+      if (previewVectorField.pending !== key) {
+        previewVectorField = { ...previewVectorField, pending: key };
+        engine.figureVectorField(sample.viewId).then((field) => {
+          if (previewDisposed || previewVectorField.pending !== key) return;
+          previewVectorField = { key, field, pending: null };
+          schedulePreviewDraw();
+        }, (error) => {
+          if (previewVectorField.pending === key) previewVectorField = { ...previewVectorField, pending: null };
+          reportPreviewFailure('vector field', error);
+        });
       }
-      const base = i * 3;
-      const x = positions[base];
-      const y = positions[base + 1];
-      const z = positions[base + 2];
-      const cx = viewMatrix[0] * x + viewMatrix[4] * y + viewMatrix[8] * z + viewMatrix[12];
-      const cy = viewMatrix[1] * x + viewMatrix[5] * y + viewMatrix[9] * z + viewMatrix[13];
-      if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
-      if (cx < minX) minX = cx;
-      if (cx > maxX) maxX = cx;
-      if (cy < minY) minY = cy;
-      if (cy > maxY) maxY = cy;
+      return;
     }
-    if (!Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) return null;
-    return { minX, maxX, minY, maxY };
+    const field = previewVectorField.field;
+    if (field === null) return;
+    viewer.withBorrowedViewData(sample.viewId, ({ positions, transparency, dimensionLevel, pointCount }) => {
+      // The cells changed since the vectors were read: the next read draws them.
+      if (field.vectors.length !== pointCount * dimensionLevel) return;
+      drawCanvasVectorFieldOf(ctx, {
+        data: { vectorField: field, positions, transparency }, dimension: dimensionLevel,
+        renderState: sample.renderState, plotRect, crop, ...style,
+      });
+    });
   }
 
   function drawPreview() {
@@ -2167,12 +2186,15 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ) {
       return;
     }
+    // Every picture of the preview says whether a panel is far from the shape
+    // asked for, against the panes as they are now (a resized window, a view
+    // kept or removed reaches here through the presented-state rebuild).
+    syncShapeNote();
 
     const ctx = /** @type {CanvasRenderingContext2D|null} */ (previewCanvas.getContext('2d'));
     if (!ctx) return;
 
-    const exportW = Math.max(100, parseInt(widthInput.value, 10) || DEFAULT_SIZE.width);
-    const exportH = Math.max(100, parseInt(heightInput.value, 10) || DEFAULT_SIZE.height);
+    const exportW = figureWidthPx();
     const canvasW = previewCanvas.width;
     const canvasH = previewCanvas.height;
 
@@ -2188,17 +2210,17 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
     const titleText = String(titleInput.value || '').trim();
     const fontFamily = String(fontSelect.value || 'Arial, Helvetica, sans-serif');
-    const baseFontSizePx = Math.max(6, parseInt(fontSizeInput.value, 10) || 12);
-    const legendFontSizePx = Math.max(6, parseInt(legendFontSizeInput.value, 10) || baseFontSizePx);
-    const tickFontSizePx = Math.max(6, parseInt(tickFontSizeInput.value, 10) || baseFontSizePx);
-    const axisLabelFontSizePx = Math.max(6, parseInt(axisLabelFontSizeInput.value, 10) || baseFontSizePx);
-    const titleFontSizePx = Math.max(10, parseInt(titleFontSizeInput.value, 10) || Math.max(14, Math.round(baseFontSizePx * 1.25)));
-    const centroidLabelFontSizePx = Math.max(6, parseInt(centroidLabelFontSizeInput.value, 10) || baseFontSizePx);
+    // The text at its printed size (points as figure pixels), as the export sets it.
+    const baseFontSizePx = textPx(fontSizeInput, 'base');
+    const legendFontSizePx = textPx(legendFontSizeInput, 'legend');
+    const tickFontSizePx = textPx(tickFontSizeInput, 'ticks');
+    const axisLabelFontSizePx = textPx(axisLabelFontSizeInput, 'axisLabel');
+    const titleFontSizePx = textPx(titleFontSizeInput, 'title');
+    const centroidLabelFontSizePx = textPx(centroidLabelFontSizeInput, 'centroidLabel');
 
     const includeLegend = includeLegendCheckbox.checked;
     const legendPosition = legendPosSelect.value === 'bottom' ? 'bottom' : 'right';
     const includeAxes = includeAxesCheckbox.checked;
-    const axesEligible = includeAxes;
 
     const legendViewId = sample?.viewId || getActiveViewIdForPreview();
     const legendField = includeLegend && typeof state.getFieldForView === 'function'
@@ -2207,26 +2229,96 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const legendModel = legendField && typeof state.getLegendModel === 'function' ? state.getLegendModel(legendField) : null;
     const legendFieldKey = legendField?.key || null;
 
-    const layout = computeSingleViewLayout({
+    // The preview's source: the view, or the crop once framing is applied.
+    // The plot takes its aspect and the source fills it (`plot-fit.js`).
+    const rs = sample?.renderState || getPreviewRenderStateForView(getActiveViewIdForPreview());
+    // Axes only where they are rulers (`figureViewHasAxes`), as the export draws them.
+    let previewPresented = null;
+    if (!sample) {
+      try {
+        previewPresented = getPresentedPreviewState(getActiveViewIdForPreview());
+      } catch {
+        previewPresented = null;
+      }
+    }
+    const axesEligible = includeAxes && (sample
+      ? figureViewHasAxes({ dimension: sample.dim, navigationMode: sample.navMode })
+      : previewPresented !== null && figureViewHasAxes({
+        dimension: previewPresented.dimensionLevel,
+        navigationMode: previewPresented.cameraState.navigationMode,
+      }));
+    // The raw crop input, not a normalized rect: `assertCropRect01()`
+    // returns a four-key rect that is not itself valid crop input.
+    const previewCrop = cropEnabled && previewFramingMode === 'applied'
+      ? { enabled: true, ...cropRect01 }
+      : null;
+    // The axes and their margins, laid out as the export lays them out
+    // (`computeFigureLayout`): what they show is the sample's view.
+    let previewAxes = null;
+    if (axesEligible && sample) {
+      if (typeof state.dimensionManager?.getNormTransform !== 'function') {
+        throw new TypeError(
+          'Figure preview state must publish dimensionManager.getNormTransform().'
+        );
+      }
+      const bounds = computeSourceAxisBounds({
+        renderState: rs,
+        crop: previewCrop,
+        dimension: sample.dim,
+        cameraState: sample.cameraState,
+        normTransform: state.dimensionManager.getNormTransform(sample.layoutKey),
+      });
+      if (bounds !== null) {
+        previewAxes = {
+          bounds,
+          xLabel: xLabelInput.value,
+          yLabel: yLabelInput.value,
+          tickFontPx: tickFontSizePx,
+          labelFontPx: axisLabelFontSizePx,
+        };
+      }
+    }
+    // The legend's entry for the highlighted cells the view draws, as the
+    // export's (`figureHighlightLegend`).
+    const highlightedTotal = typeof state.getTotalHighlightedCellCount === 'function'
+      ? state.getTotalHighlightedCellCount()
+      : 0;
+    const legendHighlight = includeLegend && highlightedTotal > 0
+      && typeof state.getHighlightedCellCount === 'function' && state.getHighlightedCellCount() > 0
+      ? highlightLegendEntry({ pageName: state.getActivePage?.()?.name ?? null, cellCount: highlightedTotal })
+      : null;
+    // The export's layout of the figure that fills its width (`fillSingleViewWidth`).
+    const layout = fillSingleViewWidth({
       width: exportW,
-      height: exportH,
+      plotAspect: figureSourceAspect({ renderState: rs, crop: previewCrop }),
       title: titleText,
-      includeAxes: axesEligible,
+      titleFontSizePx,
+      axes: previewAxes,
       includeLegend,
       legendPosition,
       legendModel,
-      legendFontSizePx
+      legendFieldKey,
+      legendHighlight,
+      // The vector field's key, rows of the legend as the export lays it out.
+      legendVectorKey: includeLegend && previewVectorFieldNow(sample) !== null
+        ? vectorFieldLegendKey(previewVectorFieldNow(sample))
+        : null,
+      legendFontSizePx,
+      fontFamily
     });
 
     const totalW = layout.totalWidth;
     const totalH = layout.totalHeight;
+    lastPreviewFigure = { width: totalW, height: totalH };
+    syncSizeReadout(lastPreviewFigure);
     const s = Math.min(canvasW / totalW, canvasH / totalH);
     const ox = (canvasW - totalW * s) / 2;
     const oy = (canvasH - totalH * s) / 2;
     ctx.setTransform(s, 0, 0, s, ox, oy);
 
     const background = backgroundSelect.value || 'white';
-    const viewerBgHex = rgb01ToHex(getPreviewRenderStateForView(legendViewId)?.bgColor) || '#ffffff';
+    const previewBg = getPreviewRenderStateForView(legendViewId)?.bgColor;
+    const viewerBgHex = previewBg ? hexOfRgb01(previewBg) : '#ffffff';
     const backgroundColor = background === 'custom'
       ? String(backgroundColorInput.value || '#ffffff')
       : (background === 'viewer' ? viewerBgHex : '#ffffff');
@@ -2237,9 +2329,9 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       ctx.fillRect(0, 0, totalW, totalH);
     }
 
-    if (titleText) {
-      const titleSize = Math.max(14, titleFontSizePx);
-      const rect = layout.titleRect || { x: layout.outerPadding, y: layout.outerPadding, width: totalW - layout.outerPadding * 2, height: 0 };
+    if (layout.titleRect) {
+      const titleSize = layout.titleFontPx;
+      const rect = layout.titleRect;
       ctx.save();
       ctx.fillStyle = ink.text;
       ctx.font = `${titleSize}px ${fontFamily}`;
@@ -2254,17 +2346,18 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     ctx.lineWidth = 1;
     ctx.strokeRect(plotRect.x, plotRect.y, plotRect.width, plotRect.height);
 
-    // Compute the on-screen (full) viewport rectangle inside plotRect (letterboxed).
+    // The on-screen (full) viewport's place in plot space: the plot itself
+    // unless a crop is applied (the source fills the plot).
     const reduced = sample?.reduced || null;
-    const rs = sample?.renderState || getPreviewRenderStateForView(getActiveViewIdForPreview());
-    const fullViewportW = Math.max(1, (rs?.viewportWidth || 1));
-    const fullViewportH = Math.max(1, (rs?.viewportHeight || 1));
-    const vpScale = Math.min(plotRect.width / fullViewportW, plotRect.height / fullViewportH);
+    const placement = createPlotPlacement({ renderState: rs, plotRect, crop: previewCrop });
+    const fullViewportW = rs.viewportWidth;
+    const fullViewportH = rs.viewportHeight;
+    const viewportTopLeft = placement.viewportToPlot(0, 0);
     const viewportRect = {
-      x: plotRect.x + (plotRect.width - fullViewportW * vpScale) / 2,
-      y: plotRect.y + (plotRect.height - fullViewportH * vpScale) / 2,
-      width: fullViewportW * vpScale,
-      height: fullViewportH * vpScale
+      x: viewportTopLeft.x,
+      y: viewportTopLeft.y,
+      width: fullViewportW * placement.scale,
+      height: fullViewportH * placement.scale
     };
     previewGeom = { scale: s, ox, oy, viewportRect };
 
@@ -2273,11 +2366,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     // omitted it would misdescribe the file the button is about to write.
     const previewReferenceGrid = resolveExportReferenceGrid();
     if (previewReferenceGrid !== null && rs?.mvpMatrix && rs?.viewMatrix) {
-      // The raw crop input, not a normalized rect: `assertCropRect01()`
-      // returns a four-key rect that is not itself valid crop input.
-      const previewCrop = cropEnabled && previewFramingMode === 'applied'
-        ? { enabled: true, ...cropRect01 }
-        : null;
       const previewSurface = resolveReferenceGridSurface({
         appearance: previewReferenceGrid,
         background,
@@ -2332,41 +2420,38 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const appliedFraming = cropEnabled && previewFramingMode === 'applied';
     const usingCropSample = appliedFraming && Boolean(previewSampleCrop) && sample === previewSampleCrop && Boolean(previewSampleCrop?.crop);
 
-    // Plot-space mapping for viewport coords (full viewport or crop viewport).
+    // Plot-space mapping for the sample's coordinates: a framed sample's are
+    // crop-local; a full sample's are viewport-local, and while framing is
+    // applied before its framed sample exists, only its cells inside the crop
+    // are drawn.
     let srcX0 = 0;
     let srcY0 = 0;
-    let srcW = fullViewportW;
-    let srcH = fullViewportH;
     let cropPxForBounds = null;
 
-    if (appliedFraming) {
-      if (usingCropSample) {
-        srcW = Math.max(1, Number(reduced.viewportWidth) || 1);
-        srcH = Math.max(1, Number(reduced.viewportHeight) || 1);
-      } else {
-        const norm = assertCropRect01({ enabled: true, ...cropRect01 });
-        if (norm) cropRect01 = norm;
-        if (norm) {
-          srcX0 = norm.x * fullViewportW;
-          srcY0 = norm.y * fullViewportH;
-          srcW = Math.max(1, norm.width * fullViewportW);
-          srcH = Math.max(1, norm.height * fullViewportH);
-          cropPxForBounds = { x: srcX0, y: srcY0, width: srcW, height: srcH };
-        }
+    if (appliedFraming && !usingCropSample) {
+      const norm = assertCropRect01({ enabled: true, ...cropRect01 });
+      if (norm) cropRect01 = norm;
+      if (norm) {
+        srcX0 = norm.x * fullViewportW;
+        srcY0 = norm.y * fullViewportH;
+        cropPxForBounds = {
+          x: srcX0,
+          y: srcY0,
+          width: norm.width * fullViewportW,
+          height: norm.height * fullViewportH,
+        };
       }
     }
 
-    const plotScale = Math.min(plotRect.width / srcW, plotRect.height / srcH);
-    const plotOffsetX = plotRect.x + (plotRect.width - srcW * plotScale) / 2;
-    const plotOffsetY = plotRect.y + (plotRect.height - srcH * plotScale) / 2;
+    // The source fills the plot: no letterbox offset.
+    const plotScale = placement.scale;
+    const plotOffsetX = plotRect.x;
+    const plotOffsetY = plotRect.y;
 
-    const pointRadiusViewportPx =
-      sample.pointDiameterViewportPx / 2;
-    const rawPointRadiusPx = pointRadiusViewportPx * plotScale;
     // Preview is heavily downscaled; enforce a minimum dot size in *screen pixels*
     // so points remain visible even when the exported figure is large.
     const minPreviewRadiusPx = (1.2 / Math.max(0.0001, s)) / 2; // 1.2px diameter on screen
-    const pointRadiusPx = Math.max(rawPointRadiusPx, minPreviewRadiusPx);
+    const pointDiameters = sample.pointDiameters;
 
     // Points (preview always uses the reduced sample).
     ctx.save();
@@ -2430,6 +2515,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       });
       const { x, y } = mapped;
       ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
+      const pointRadiusPx = Math.max(pointDiameters[i] * 0.5 * plotScale, minPreviewRadiusPx);
       if (pointRadiusPx <= 1) {
         const sz = pointRadiusPx * 2;
         ctx.fillRect(x - pointRadiusPx, y - pointRadiusPx, sz, sz);
@@ -2441,6 +2527,13 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
 
     ctx.restore();
+
+    // The vector field the view shows, as the export draws it: arrows on a grid.
+    drawPreviewVectorField(ctx, sample, plotRect, appliedFraming ? getCropOptionForExport() : null, {
+      ink, fontFamily, fontSizePx: baseFontSizePx,
+      haloColor: background === 'transparent' ? ink.halo : backgroundColor,
+      inPlotKey: !layout.vectorKeyInLegend,
+    });
 
     // Centroid points + labels (matches the viewer overlay; no separate export toggles).
     const centroidFlags = viewer.getCentroidFlags(String(sample.viewId));
@@ -2454,7 +2547,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       const centroidLabelTexts = Array.isArray(vctx?.centroidLabels)
         ? vctx.centroidLabels.map((entry) => String(entry?.el?.textContent ?? entry?.text ?? ''))
         : null;
-      const centroidRadiusPx = Math.max(0.5, (Number(sample.renderState.pointSize || 5) * 4.0) * 0.5 * plotScale);
 
       drawCanvasCentroidOverlay({
         ctx,
@@ -2464,7 +2556,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
         flags: { points: showCentroidPoints, labels: showCentroidLabels },
         renderState: sample.renderState,
         plotRect,
-        pointRadiusPx: centroidRadiusPx,
+        pointDiameterViewportPx: sample.renderState.pointSize * 4,
         crop: appliedFraming ? getCropOptionForExport() : null,
         fontFamily,
         labelFontSizePx: centroidLabelFontSizePx,
@@ -2478,6 +2570,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       drawCanvasOrientationIndicator({
         ctx,
         plotRect,
+        plotScale: placement.scale,
         viewMatrix: sample.renderState.viewMatrix,
         cameraState: sample.cameraState,
         fontFamily,
@@ -2487,87 +2580,38 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
 
     if (emphasizeSelection && typeof state?.getHighlightedCellCount === 'function') {
-      const count = state.getHighlightedCellCount();
-      if (count > 0) {
-        const label = `n = ${formatCount(count)} selected`;
-        const boxPad = 6;
-        const boxH = Math.max(16, Math.round(baseFontSizePx * 1.35));
-        const boxW = Math.min(
-          Math.max(1, plotRect.width - 16),
-          Math.max(90, Math.round(label.length * (baseFontSizePx * 0.62) + boxPad * 2))
-        );
-        const boxX = plotRect.x + 8;
-        const boxY = plotRect.y + 8;
-        ctx.save();
-        ctx.globalAlpha = 0.85;
-        ctx.fillStyle = ink.surface;
-        ctx.fillRect(boxX, boxY, boxW, boxH);
-        ctx.globalAlpha = 1;
-        ctx.strokeStyle = ink.frame;
-        ctx.lineWidth = 1;
-        ctx.strokeRect(boxX, boxY, boxW, boxH);
-        ctx.fillStyle = ink.surfaceInk;
-        ctx.font = `${baseFontSizePx}px ${fontFamily}`;
-        ctx.textAlign = 'left';
-        ctx.textBaseline = 'alphabetic';
-        ctx.fillText(label, boxX + boxPad, boxY + boxH - boxPad);
-        ctx.restore();
-      }
+      // The export's badge (`utils/selection-badge.js`), not a copy of it.
+      const badge = buildSelectionBadge({
+        count: state.getHighlightedCellCount(),
+        plotRect,
+        fontSizePx: baseFontSizePx,
+      });
+      if (badge) drawCanvasSelectionBadge(ctx, badge, fontFamily, baseFontSizePx, ink);
     }
 
     // Legend.
-    if (includeLegend && layout.legendRect) {
+    if (layout.legendRect) {
       drawCanvasLegend({
         ctx,
         legendRect: layout.legendRect,
-        fieldKey: legendFieldKey,
+        legendPlan: layout.legendPlan,
         model: legendModel,
         fontFamily,
-        fontSize: legendFontSizePx,
         backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor,
         ink
       });
     }
 
-    // Axes (approximate bounds from preview sample).
-    if (
-      axesEligible &&
-      reduced.sourcePositions instanceof Float32Array &&
-      reduced.sourcePositions.length > 0
-    ) {
-      const navMode = assertNavigationMode(sample.navMode);
-      if (typeof state.dimensionManager?.getNormTransform !== 'function') {
-        throw new TypeError(
-          'Figure preview state must publish dimensionManager.getNormTransform().'
-        );
-      }
-      const useCameraAxes = sample?.dim > 2 && navMode !== 'planar' && sample?.renderState?.viewMatrix;
-      const bounds = (
-        useCameraAxes
-          ? computeApproxCameraBoundsFromSample({
-            reduced: sample.reduced,
-            viewMatrix: sample.renderState.viewMatrix,
-            cropPx: appliedFraming && !usingCropSample ? cropPxForBounds : null
-          })
-          : computeApproxBoundsFromSample({
-            reduced: sample.reduced,
-            normTransform: state.dimensionManager.getNormTransform(sample.layoutKey),
-            cropPx: appliedFraming && !usingCropSample ? cropPxForBounds : null
-          })
-      );
-      if (bounds !== null) {
-        drawCanvasAxes({
-          ctx,
-          plotRect,
-          bounds,
-          xLabel: xLabelInput.value,
-          yLabel: yLabelInput.value,
-          fontFamily,
-          tickFontSize: tickFontSizePx,
-          labelFontSize: axisLabelFontSizePx,
-          color: ink.text
-        });
-      }
+    // Axes: the rulers of what the plot shows, exactly as the export draws
+    // them (the layout's plan); a plot without cells has none.
+    if (layout.axes !== null && reduced.x.length > 0) {
+      drawCanvasAxes({
+        ctx,
+        plotRect,
+        axes: layout.axes,
+        fontFamily,
+        color: ink.text
+      });
     }
 
     // Framing overlay (photography-style crop guide).
@@ -3005,12 +3049,25 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     evt.preventDefault();
   });
 
+  /**
+   * The words of the last control that refused its value while reading the
+   * form (`refuseControl`): what an agent's export or picture is told, never
+   * another control that happens to be invalid.
+   */
+  let refusedBecause = null;
+
+  /** A control refuses its value: said on it, kept for the caller's refusal; null. */
+  function refuseControl(input, message) {
+    input.setCustomValidity(message);
+    input.reportValidity();
+    refusedBecause = message;
+    return null;
+  }
+
   function readExactIntegerInput(input, label, minimum, maximum = Number.MAX_SAFE_INTEGER) {
     const raw = input.value;
     if (!/^(0|[1-9][0-9]*)$/.test(raw)) {
-      input.setCustomValidity(`${label} must be a whole number.`);
-      input.reportValidity();
-      return null;
+      return refuseControl(input, `${label} must be a whole number.`);
     }
     const value = Number(raw);
     if (
@@ -3018,11 +3075,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       value < minimum ||
       value > maximum
     ) {
-      input.setCustomValidity(
-        `${label} must be between ${minimum} and ${maximum}.`
-      );
-      input.reportValidity();
-      return null;
+      return refuseControl(input, `${label} must be between ${minimum} and ${maximum}.`);
     }
     input.setCustomValidity('');
     return value;
@@ -3032,16 +3085,12 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     // A decimal box: a point or a comma (`readDecimalInput`).
     const value = readDecimalInput(input);
     if (Number.isNaN(value)) {
-      input.setCustomValidity(`${label} must be a decimal number.`);
-      input.reportValidity();
-      return null;
+      return refuseControl(input, `${label} must be a decimal number.`);
     }
     if (!Number.isFinite(value) || value < minimum || value > maximum) {
-      input.setCustomValidity(
-        `${label} must be between ${minimum} and ${maximum}.`
-      );
-      input.reportValidity();
-      return null;
+      return refuseControl(input, maximum === Infinity
+        ? `${label} must be at least ${minimum}.`
+        : `${label} must be between ${minimum} and ${maximum}.`);
     }
     input.setCustomValidity('');
     return value;
@@ -3056,7 +3105,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     if (exportInFlight) {
       // The person stops the export where it is: its reads, its worker
       // requests still queued and its passes end, and nothing is reported.
-      cancel(activeExportAbortController, 'user', 'Figure export was cancelled.');
+      cancel(activeExportAbortController, 'user', 'Figure export was canceled.');
       return;
     }
     await runFigureExport({ forAction: false });
@@ -3074,7 +3123,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     exportInFlight = true;
     const abortController = new AbortController();
     activeExportAbortController = abortController;
-    const stopWithCaller = signal === null ? () => {} : onAbort(signal, () => cancel(abortController, 'user', 'Figure export was cancelled.'));
+    const stopWithCaller = signal === null ? () => {} : onAbort(signal, () => cancel(abortController, 'user', 'Figure export was canceled.'));
     let ended;
     exportEnded = new Promise(resolve => {
       ended = resolve;
@@ -3082,13 +3131,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     setBusy(true);
     try {
       const written = await exportFigureFromUi(abortController.signal, { forAction });
-      if (forAction && written === null) {
-        const invalid = container.querySelector(':invalid');
-        throw new ActionRefused(
-          `The figure export settings are not valid${invalid?.validationMessage ? `: ${invalid.validationMessage}` : ''}; figure_export_set changes them.`,
-          { code: 'bad-value', type: 'figure.export' },
-        );
-      }
+      if (forAction && written === null) throw invalidSettingsRefusal('figure.export');
       return written;
     } catch (error) {
       if (forAction) throw error;
@@ -3110,6 +3153,49 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     }
   }
 
+  /** A control refused its value: the agent hears the control's words. */
+  function invalidSettingsRefusal(type) {
+    return new ActionRefused(
+      `The figure export settings are not valid${refusedBecause === null ? '' : `: ${refusedBecause.replace(/\.$/, '')}`}; figure_export_set changes them.`,
+      { code: 'bad-value', type },
+    );
+  }
+
+  /**
+   * The figure Export would download now, as a PNG at 96 dpi (one figure
+   * pixel per CSS pixel), returned instead of written: the panel's settings
+   * (size, frame, background, fonts, title, legends, every view as panels
+   * while Export all views is on), whatever Download's format. `notes`: what
+   * the figure cannot reproduce of what the view shows (the person's dialog
+   * before a download). An agent previewing its figure sees what the person
+   * will get (`view.picture` source "export", L24-1).
+   *
+   * @param {{signal: AbortSignal}} how The caller's Stop
+   * @returns {Promise<{blob: Blob, notes: string[], plot: {width: number, height: number}|null}>}
+   *   `plot`: the one view's plot in the figure, null for a figure of every view
+   */
+  async function renderExportPicture({ signal }) {
+    refusedBecause = null;
+    const request = readFigureRequest();
+    if (request === null) throw invalidSettingsRefusal('view.picture');
+    const notes = figureFidelityWarnings({ shaderAccurate: true }).map(warning => `${warning.title}: ${warning.detail}`);
+    const { blob, plot, legendMovedBelow } = await engine.renderFigure({
+      ...request,
+      strategy: null,
+      optimizedTargetCount: null,
+      signal,
+      format: 'png',
+      dpi: 96,
+    });
+    // The width asked, in figure pixels (the picture is the figure at 96 dpi, one pixel each), and the DPI a PNG download takes.
+    return {
+      blob, notes, plot, legendMovedBelow,
+      asked: { width: request.width },
+      dpi: Number(dpiSelect.value),
+      colorblindMode: previewEnabledCheckbox.checked ? (previewModeSelect.value || 'none') : 'none',
+    };
+  }
+
   // An agent's, a notebook's or a replay's export (`figure.export`): the Download button's, with the settings as they are.
   cleanupFns.push(getActions().provide('figure.export', async (params, { signal }) => {
     if (exportInFlight) {
@@ -3119,48 +3205,92 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }));
 
   /**
-   * Read the form and export: resolves to the files written, or to null
-   * when the form refused a value (said on its control) or the person
-   * declined what the figure cannot reproduce.
+   * The Figure export panel's settings as a figure request, without what
+   * Download adds (format, dpi, SVG strategy): what Export would draw. Null
+   * when a control refused its value (said on the control).
    */
-  async function exportFigureFromUi(signal, { forAction = false } = {}) {
-    const width = readExactIntegerInput(widthInput, 'Width', 100, 20_000);
-    if (width === null) return null;
-    const height = readExactIntegerInput(heightInput, 'Height', 100, 20_000);
-    if (height === null) return null;
-
-    const mode = downloadSelect.value;
-    if (!['svg', 'png', 'svg+png', 'png-multi', 'all'].includes(mode)) {
-      throw new TypeError('Figure export download mode is not a current UI value.');
+  function readFigureRequest() {
+    const widthMm = readExactDecimalInput(widthInput, 'Figure width (mm)', FIGURE_EXPORT_SETTING_RANGES.widthMm[0], Infinity);
+    if (widthMm === null) return null;
+    // The figure fills its width (`height: null`), in figure pixels (1/96 inch).
+    const width = figureWidthPxOf(widthMm);
+    const height = null;
+    // Text in points, drawn at its printed size: points as figure pixels.
+    const textSize = (input, label) => {
+      const pt = readExactDecimalInput(input, `${label} (pt)`, ...FIGURE_EXPORT_SETTING_RANGES.fontSize);
+      if (pt === null) return null;
+      if (!Number.isInteger(pt * 2)) return refuseControl(input, `${label} is set in whole or half points.`);
+      return figurePxOfPt(pt);
+    };
+    const baseFontSizePx = textSize(fontSizeInput, 'Base text size');
+    if (baseFontSizePx === null) return null;
+    const legendFontSizePx = textSize(legendFontSizeInput, 'Legend text size');
+    if (legendFontSizePx === null) return null;
+    const tickFontSizePx = textSize(tickFontSizeInput, 'Tick label size');
+    if (tickFontSizePx === null) return null;
+    const axisLabelFontSizePx = textSize(axisLabelFontSizeInput, 'Axis label size');
+    if (axisLabelFontSizePx === null) return null;
+    const titleFontSizePx = textSize(titleFontSizeInput, 'Title size');
+    if (titleFontSizePx === null) return null;
+    const centroidLabelFontSizePx = textSize(centroidLabelFontSizeInput, 'Centroid label size');
+    if (centroidLabelFontSizePx === null) return null;
+    const selectionMutedOpacity = readExactDecimalInput(
+      selectionMutedOpacityInput,
+      'Muted selection opacity',
+      0,
+      1
+    );
+    if (selectionMutedOpacity === null) return null;
+    if (!['right', 'bottom'].includes(legendPosSelect.value)) {
+      throw new TypeError('Figure export legend position is not a current UI value.');
     }
-    const needsSvg = mode === 'svg' || mode === 'svg+png' || mode === 'all';
-    const needsPng = mode === 'png' || mode === 'svg+png' || mode === 'png-multi' || mode === 'all';
-    const multiPng = mode === 'png-multi' || mode === 'all';
-    const dpi = needsPng && !multiPng
-      ? readExactIntegerInput(dpiSelect, 'DPI', 72, 1200)
-      : null;
-    if (needsPng && !multiPng && dpi === null) return null;
-
-    const strategy = needsSvg ? strategySelect.value : null;
-    if (
-      needsSvg &&
-      !['full-vector', 'optimized-vector', 'hybrid'].includes(strategy)
-    ) {
-      strategySelect.setCustomValidity('Choose an SVG point strategy.');
-      strategySelect.reportValidity();
-      return null;
+    if (!['viewer', 'white', 'transparent', 'custom'].includes(backgroundSelect.value)) {
+      throw new TypeError('Figure export background is not a current UI value.');
     }
-    strategySelect.setCustomValidity('');
-    const optimizedTargetCount = strategy === 'optimized-vector'
-      ? readExactIntegerInput(
-          optimizedTargetCountInput,
-          'Optimized vector target',
-          1000,
-          5_000_000
-        )
-      : null;
-    if (strategy === 'optimized-vector' && optimizedTargetCount === null) return null;
+    if (!isHexColor(backgroundColorInput.value)) {
+      return refuseControl(backgroundColorInput, 'Background color must be #RRGGBB.');
+    }
+    backgroundColorInput.setCustomValidity('');
+    if (fontSelect.value.trim().length === 0) {
+      throw new TypeError('Figure export font family must be non-empty.');
+    }
 
+    return {
+      width,
+      height,
+      exportAllViews: exportAllViewsCheckbox.checked,
+      title: titleInput.value,
+      includeAxes: includeAxesCheckbox.checked,
+      includeLegend: includeLegendCheckbox.checked,
+      legendPosition: legendPosSelect.value,
+      xLabel: xLabelInput.value,
+      yLabel: yLabelInput.value,
+      background: backgroundSelect.value,
+      backgroundColor: backgroundColorInput.value,
+      fontFamily: fontSelect.value,
+      fontSizePx: baseFontSizePx,
+      legendFontSizePx,
+      tickFontSizePx,
+      axisLabelFontSizePx,
+      titleFontSizePx,
+      centroidLabelFontSizePx,
+      crop: getCropOptionForExport(),
+      referenceGrid: resolveExportReferenceGrid(),
+      // pointRadiusPx removed - export now uses viewer's pointSize directly (WYSIWYG)
+      showOrientation: showOrientationCheckbox.checked,
+      depthSort3d: depthSortCheckbox.checked,
+      emphasizeSelection: emphasizeSelectionCheckbox.checked,
+      selectionMutedOpacity,
+    };
+  }
+
+  /**
+   * What the figure cannot reproduce of what the view shows (a render mode,
+   * an unreadable background, an overlay; with `shaderAccurate`, a PNG's or a
+   * hybrid SVG's exact points without WebGL2): the person's dialog before a
+   * download, the agent's refusal, a picture's notes.
+   */
+  function figureFidelityWarnings({ shaderAccurate }) {
     const activeViewId = getActiveViewIdForPreview();
 
     /** @type {{ title: string; detail: string }[]} */
@@ -3183,8 +3313,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       )
     );
 
-    const needsShaderAccurateRasterization = needsPng || (needsSvg && strategy === 'hybrid');
-    if (needsShaderAccurateRasterization) {
+    if (shaderAccurate) {
       const rs = getPreviewRenderStateForView(activeViewId);
       const missing = [];
       if (!hasUsableWebgl2Context()) missing.push('WebGL2');
@@ -3206,6 +3335,43 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
           viewer.getShowConnectivity() && viewer.hasConnectivityData(),
       })
     );
+    return warnings;
+  }
+
+  /**
+   * Read the form and export: resolves to the files written, or to null
+   * when the form refused a value (said on its control) or the person
+   * declined what the figure cannot reproduce.
+   */
+  async function exportFigureFromUi(signal, { forAction = false } = {}) {
+    refusedBecause = null;
+    const request = readFigureRequest();
+    if (request === null) return null;
+
+    const mode = downloadSelect.value;
+    if (!['svg', 'png', 'svg+png', 'png-multi', 'all'].includes(mode)) {
+      throw new TypeError('Figure export download mode is not a current UI value.');
+    }
+    const needsSvg = mode === 'svg' || mode === 'svg+png' || mode === 'all';
+    const needsPng = mode === 'png' || mode === 'svg+png' || mode === 'png-multi' || mode === 'all';
+    const multiPng = mode === 'png-multi' || mode === 'all';
+    const dpi = needsPng && !multiPng
+      ? readExactIntegerInput(dpiSelect, 'DPI', 72, 1200)
+      : null;
+    if (needsPng && !multiPng && dpi === null) return null;
+
+    const strategy = needsSvg ? strategySelect.value : null;
+    const optimizedTargetCount = strategy === 'optimized-vector'
+      ? readExactIntegerInput(
+          optimizedTargetCountInput,
+          'Optimized vector target',
+          1000,
+          5_000_000
+        )
+      : null;
+    if (strategy === 'optimized-vector' && optimizedTargetCount === null) return null;
+
+    const warnings = figureFidelityWarnings({ shaderAccurate: needsPng || (needsSvg && strategy === 'hybrid') });
 
     if (forAction && warnings.length > 0) {
       // The person's dialog would block it: the agent hears the same words.
@@ -3220,96 +3386,32 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     });
     if (!proceed) return null;
 
-      const baseFontSizePx = readExactIntegerInput(fontSizeInput, 'Base font size', 1, 500);
-      if (baseFontSizePx === null) return null;
-      const legendFontSizePx = readExactIntegerInput(legendFontSizeInput, 'Legend font size', 1, 500);
-      if (legendFontSizePx === null) return null;
-      const tickFontSizePx = readExactIntegerInput(tickFontSizeInput, 'Tick font size', 1, 500);
-      if (tickFontSizePx === null) return null;
-      const axisLabelFontSizePx = readExactIntegerInput(axisLabelFontSizeInput, 'Axis-label font size', 1, 500);
-      if (axisLabelFontSizePx === null) return null;
-      const titleFontSizePx = readExactIntegerInput(titleFontSizeInput, 'Title font size', 1, 500);
-      if (titleFontSizePx === null) return null;
-      const centroidLabelFontSizePx = readExactIntegerInput(centroidLabelFontSizeInput, 'Centroid-label font size', 1, 500);
-      if (centroidLabelFontSizePx === null) return null;
-      const selectionMutedOpacity = readExactDecimalInput(
-        selectionMutedOpacityInput,
-        'Muted selection opacity',
-        0,
-        1
-      );
-      if (selectionMutedOpacity === null) return null;
-      if (!['right', 'bottom'].includes(legendPosSelect.value)) {
-        throw new TypeError('Figure export legend position is not a current UI value.');
-      }
-      if (!['viewer', 'white', 'transparent', 'custom'].includes(backgroundSelect.value)) {
-        throw new TypeError('Figure export background is not a current UI value.');
-      }
-      if (!/^#[0-9a-fA-F]{6}$/.test(backgroundColorInput.value)) {
-        backgroundColorInput.setCustomValidity('Background color must be #RRGGBB.');
-        backgroundColorInput.reportValidity();
-        return null;
-      }
-      backgroundColorInput.setCustomValidity('');
-      if (fontSelect.value.trim().length === 0) {
-        throw new TypeError('Figure export font family must be non-empty.');
-      }
+    const baseOptions = { ...request, strategy, optimizedTargetCount };
 
-      const baseOptions = {
-        width,
-        height,
-        exportAllViews: exportAllViewsCheckbox.checked,
-        title: titleInput.value,
-        includeAxes: includeAxesCheckbox.checked,
-        includeLegend: includeLegendCheckbox.checked,
-        legendPosition: legendPosSelect.value,
-        xLabel: xLabelInput.value,
-        yLabel: yLabelInput.value,
-        background: backgroundSelect.value,
-        backgroundColor: backgroundColorInput.value,
-        fontFamily: fontSelect.value,
-        fontSizePx: baseFontSizePx,
-        legendFontSizePx,
-        tickFontSizePx,
-        axisLabelFontSizePx,
-        titleFontSizePx,
-        centroidLabelFontSizePx,
-        crop: getCropOptionForExport(),
-        referenceGrid: resolveExportReferenceGrid(),
-        // pointRadiusPx removed - export now uses viewer's pointSize directly (WYSIWYG)
-        showOrientation: showOrientationCheckbox.checked,
-        depthSort3d: depthSortCheckbox.checked,
-        emphasizeSelection: emphasizeSelectionCheckbox.checked,
-        selectionMutedOpacity,
-        strategy,
-        optimizedTargetCount
-      };
+    /** @type {{ format: 'svg'|'png'; dpi: number|null }[]} */
+    const jobs = [];
+    if (needsSvg) jobs.push({ format: 'svg', dpi: null });
+    if (needsPng) {
+      if (multiPng) jobs.push(...[150, 300, 600].map((d) => ({ format: 'png', dpi: d })));
+      else jobs.push({ format: 'png', dpi });
+    }
 
-      /** @type {{ format: 'svg'|'png'; dpi: number|null }[]} */
-      const jobs = [];
-      if (needsSvg) jobs.push({ format: 'svg', dpi: null });
-      if (needsPng) {
-        if (multiPng) jobs.push(...[150, 300, 600].map((d) => ({ format: 'png', dpi: d })));
-        else jobs.push({ format: 'png', dpi });
-      }
-
-      const results = jobs.length === 1
-        ? [await engine.exportFigure({
-          ...baseOptions,
-          signal,
-          format: jobs[0].format,
-          dpi: jobs[0].dpi,
-        })]
-        : await engine.exportFigures({
-          ...baseOptions,
-          signal,
-          jobs
-        });
-      return {
-        files: results.map((written, index) => ({ format: written.format, file: written.filename, dpi: jobs[index].dpi })),
-        zip: results.length > 1,
-      };
-
+    const results = jobs.length === 1
+      ? [await engine.exportFigure({
+        ...baseOptions,
+        signal,
+        format: jobs[0].format,
+        dpi: jobs[0].dpi,
+      })]
+      : await engine.exportFigures({
+        ...baseOptions,
+        signal,
+        jobs
+      });
+    return {
+      files: results.map((written, index) => ({ format: written.format, file: written.filename, dpi: jobs[index].dpi })),
+      zip: results.length > 1,
+    };
   }
 
   // The four sections are one exclusive disclosure list: opening one closes
@@ -3362,20 +3464,21 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
   syncFormatDependentUi();
   syncCropUi();
+  syncSizeReadout();
 
   // A session may be saved while a number box holds a half-typed value; it
   // records each box's last valid value instead (`trackCommittedNumber`).
   const committedNumber = (input, label, range, integer = true) =>
     trackCommittedNumber(input, { label, range, integer, signal: domLifecycle.signal });
+  // The width (millimetres) and the text sizes (points) are decimal boxes.
   const committedNumbers = {
-    width: committedNumber(widthInput, 'width', FIGURE_EXPORT_SETTING_RANGES.plotSize),
-    height: committedNumber(heightInput, 'height', FIGURE_EXPORT_SETTING_RANGES.plotSize),
-    base: committedNumber(fontSizeInput, 'base font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
-    legend: committedNumber(legendFontSizeInput, 'legend font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
-    ticks: committedNumber(tickFontSizeInput, 'tick font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
-    axisLabel: committedNumber(axisLabelFontSizeInput, 'axis-label font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
-    title: committedNumber(titleFontSizeInput, 'title font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
-    centroidLabel: committedNumber(centroidLabelFontSizeInput, 'centroid-label font size', FIGURE_EXPORT_SETTING_RANGES.fontSize),
+    width: committedNumber(widthInput, 'width (mm)', FIGURE_EXPORT_SETTING_RANGES.widthMm, false),
+    base: committedNumber(fontSizeInput, 'base text size (pt)', FIGURE_EXPORT_SETTING_RANGES.fontSize, false),
+    legend: committedNumber(legendFontSizeInput, 'legend text size (pt)', FIGURE_EXPORT_SETTING_RANGES.fontSize, false),
+    ticks: committedNumber(tickFontSizeInput, 'tick label size (pt)', FIGURE_EXPORT_SETTING_RANGES.fontSize, false),
+    axisLabel: committedNumber(axisLabelFontSizeInput, 'axis label size (pt)', FIGURE_EXPORT_SETTING_RANGES.fontSize, false),
+    title: committedNumber(titleFontSizeInput, 'title size (pt)', FIGURE_EXPORT_SETTING_RANGES.fontSize, false),
+    centroidLabel: committedNumber(centroidLabelFontSizeInput, 'centroid label size (pt)', FIGURE_EXPORT_SETTING_RANGES.fontSize, false),
     selectionMutedOpacity: committedNumber(
       selectionMutedOpacityInput,
       'non-selected opacity',
@@ -3400,7 +3503,6 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       version: FIGURE_EXPORT_SESSION_SETTINGS_VERSION,
       sizePreset: presetSelect.value,
       width: committedNumbers.width.read(),
-      height: committedNumbers.height.read(),
       frame: cropEnabled
         ? {
           lockAspect: cropLockCheckbox.checked,
@@ -3444,7 +3546,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       },
       download: downloadSelect.value,
       dpi: Number(dpiSelect.value),
-      svgStrategy: strategySelect.value === '' ? null : strategySelect.value,
+      svgStrategy: strategySelect.value,
       optimizedTargetCount: committedNumbers.optimizedTargetCount.read(),
       exportAllViews: exportAllViewsCheckbox.checked,
     };
@@ -3464,20 +3566,20 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     const exact = assertFigureExportSessionSettings(settings);
 
     presetSelect.value = exact.sizePreset;
-    widthInput.value = String(exact.width);
-    heightInput.value = String(exact.height);
+    writeDecimalInput(widthInput, exact.width);
+    lastPreviewFigure = null;
 
     backgroundSelect.value = exact.background;
     backgroundColorInput.value = exact.backgroundColor;
     fontSelect.value = exact.fontFamily;
     autoTextSizingCheckbox.checked = exact.autoTextSize;
     if (!exact.autoTextSize) {
-      fontSizeInput.value = String(exact.fontSizes.base);
-      legendFontSizeInput.value = String(exact.fontSizes.legend);
-      tickFontSizeInput.value = String(exact.fontSizes.ticks);
-      axisLabelFontSizeInput.value = String(exact.fontSizes.axisLabel);
-      titleFontSizeInput.value = String(exact.fontSizes.title);
-      centroidLabelFontSizeInput.value = String(exact.fontSizes.centroidLabel);
+      writeDecimalInput(fontSizeInput, exact.fontSizes.base);
+      writeDecimalInput(legendFontSizeInput, exact.fontSizes.legend);
+      writeDecimalInput(tickFontSizeInput, exact.fontSizes.ticks);
+      writeDecimalInput(axisLabelFontSizeInput, exact.fontSizes.axisLabel);
+      writeDecimalInput(titleFontSizeInput, exact.fontSizes.title);
+      writeDecimalInput(centroidLabelFontSizeInput, exact.fontSizes.centroidLabel);
     }
 
     xLabelInput.value = exact.xLabel;
@@ -3493,7 +3595,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
 
     downloadSelect.value = exact.download;
     dpiSelect.value = String(exact.dpi);
-    strategySelect.value = exact.svgStrategy ?? '';
+    strategySelect.value = exact.svgStrategy;
     optimizedTargetCountInput.value = String(exact.optimizedTargetCount);
     exportAllViewsCheckbox.checked = exact.exportAllViews;
 
@@ -3508,6 +3610,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     cropRect01 = exact.frame === null
       ? { x: 0, y: 0, width: 1, height: 1 }
       : { ...exact.frame.rect };
+    lockedFrameAspect = cropEnabled && cropLockCheckbox.checked ? frameAspectNow() : null;
 
     if (exact.titleFollowsDataset) {
       titleAutofillEnabled = true;
@@ -3524,6 +3627,7 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
     for (const tracked of Object.values(committedNumbers)) tracked.commit();
     syncFormatDependentUi();
     syncCropUi();
+    syncSizeReadout();
     invalidatePreviewSamples({ rebuild: false });
     if (exact.preview.enabled) {
       // The preview toggle's own path builds the sample the settings show.
@@ -3566,7 +3670,25 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   cleanupFns.push(getActions().provide('figure-export.set', params => {
     const current = exportSessionSettings();
     const given = figureExportSettingsOf(params);
+    if (given.frame === FIGURE_EXPORT_FRAME_CELLS) {
+      // Fit the cells: the frame every cell the figure draws fills, as the
+      // panel's button sets it; a frame is drawn on the preview, so it is on.
+      const rect = engine.cellsFrame({ exportAllViews: given.exportAllViews ?? current.exportAllViews });
+      if (rect === null) {
+        throw new ActionRefused('No cell is drawn in the figure\'s views, so there is nothing to fit the frame to.', { code: 'unavailable', type: 'figure-export.set' });
+      }
+      given.frame = { lockAspect: false, rect };
+      if (!Object.hasOwn(given, 'preview')) given.preview = { ...current.preview, enabled: true };
+    }
     const next = { ...current, ...given };
+    // A width and its preset go together: a preset sets its width, a width
+    // given alone is its preset's when it is one, else custom.
+    if (Object.hasOwn(given, 'sizePreset') && !Object.hasOwn(given, 'width') && Object.hasOwn(FIGURE_WIDTH_PRESETS, given.sizePreset)) {
+      next.width = FIGURE_WIDTH_PRESETS[given.sizePreset];
+    }
+    if (Object.hasOwn(given, 'width') && !Object.hasOwn(given, 'sizePreset')) {
+      next.sizePreset = Object.keys(FIGURE_WIDTH_PRESETS).find(key => FIGURE_WIDTH_PRESETS[key] === given.width) ?? 'custom';
+    }
     // A value the panel derives becomes the person's when its switch is turned off,
     // and is derived again when it is turned back on.
     if (Object.hasOwn(given, 'autoTextSize') && !Object.hasOwn(given, 'fontSizes')) {
@@ -3582,9 +3704,29 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
       throw refusalOf(error);
     }
     const changed = changedFigureExportSettings(current, exact);
+    if (params.frame === FIGURE_EXPORT_FRAME_CELLS) cellsFrameRect = { ...given.frame.rect };
     if (Object.keys(changed).length === 0) return null;
     importSessionSettings(exact);
     return { changed: Object.keys(changed).length };
+  }));
+
+  // The settings as an agent, a notebook or a script reads them back, by the
+  // names `figure-export.set` takes (an agent set them and, after the history
+  // or a session put them back, could not check them: L14-4).
+  cleanupFns.push(getActions().provide('figure-export.get', () => {
+    let settings;
+    try {
+      settings = exportSessionSettings();
+    } catch (error) {
+      throw new ActionRefused(
+        `A figure export setting holds a value it cannot use, so the settings cannot be read now: ${String(error?.message ?? error)}`,
+        { code: 'bad-value', type: 'figure-export.get' }
+      );
+    }
+    // The record's format version is no setting.
+    const named = { ...settings };
+    delete named.version;
+    return figureExportParamsOf(named);
   }));
 
   // What the person's changes are compared with: the settings last recorded
@@ -3619,5 +3761,5 @@ export function initFigureExportUI({ state, viewer, container, engine }) {
   }
   for (const type of ['input', 'change', 'click', 'pointerup', 'keyup']) listen(container, type, observeSettings);
 
-  return { setCellsPresent, destroy, exportSessionSettings, importSessionSettings };
+  return { setCellsPresent, destroy, exportSessionSettings, importSessionSettings, renderExportPicture };
 }

@@ -29,6 +29,7 @@ import { methodsParagraph } from './exports/methods.js';
 import { historyPseudocode } from './exports/pseudocode.js';
 import { pageVersion } from '../utils/page-version.js';
 import { quoteName } from '../actions/targets/names.js';
+import { HISTORY_WAITS_FOR_DATASET } from '../ui/no-dataset.js';
 
 /**
  * Provide the history's persistence actions on `dispatcher`. Returns what
@@ -49,7 +50,7 @@ export function providePersistenceActions({ dispatcher, histories, serializer, d
   function shown(type) {
     const history = histories.current();
     if (history === null || history.active === null) {
-      throw new ActionRefused('The history starts once the dataset is open.', { code: 'unavailable', type });
+      throw new ActionRefused(HISTORY_WAITS_FOR_DATASET, { code: 'unavailable', type });
     }
     return history;
   }
@@ -107,7 +108,7 @@ export function providePersistenceActions({ dispatcher, histories, serializer, d
       if (await histories.savedStates.remove(id) !== 1) throw new Error(`The saved state "${id}" could not be removed from this browser.`);
       return { saved: id, name: state.name, dataset: state.dataset?.name ?? null, steps: state.steps };
     }),
-    dispatcher.provide('history.share', async params => {
+    dispatcher.provide('history.share', async (params, { signal }) => {
       const history = shown('history.share');
       const scope = shareScopeOf(params);
       let trackers = 'active';
@@ -124,10 +125,12 @@ export function providePersistenceActions({ dispatcher, histories, serializer, d
         }
         if (branches.length === 0) branches = 'main-and-shown';
       }
-      const { blob, shared } = await serializer.writeShare({ choice: { ...scope, trackers, branches } });
+      const { blob, shared } = await serializer.writeShare({ choice: { ...scope, trackers, branches }, signal });
       const facts = datasetFacts();
       const file = params.file ?? `${facts.name ?? 'Cellucid history'}.cellucid-session`;
       download(blob, file);
+      // The whole history written down: leaving it is no longer losing it (`dataset-history.js` `unkept`).
+      if (shared.scope.content === 'history') histories.markSaved();
       return {
         file, bytes: blob.size, content: shared.scope.content,
         trackers: shared.history.trackers.map(idName),

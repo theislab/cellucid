@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 SCHEMA_VERSION = 1
-# Arrays with more elements than this are summarised instead of listed.
+# Arrays with more elements than this are summarized instead of listed.
 FULL_LIMIT = 1000
 SAFE_INT = 2**53 - 1
 # numpy dtype kinds that hold strings ('T' is numpy 2's StringDType)

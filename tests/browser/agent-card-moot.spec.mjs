@@ -40,7 +40,7 @@ test('a connector agent\'s waiting card is refused when the person loads a saved
       const { getActions } = await import('/assets/js/app/actions/index.js');
       try {
         await getActions().dispatch('color.by', { field: { source: 'obs', key: 'cell_type' } }, {
-          origin: 'agent', agent: 'ChatGPT', turn: 'turn-c1', connection: { id: 'g1', kind: 'connector', client: 'ChatGPT', host: 'chatgpt.com' },
+          origin: 'agent', agent: 'ChatGPT', turn: 'turn-c1', connection: { id: 'g1', kind: 'connector', client: 'ChatGPT', host: 'chatgpt.com', known: true },
         });
         window.__outcome = { ok: true };
       } catch (error) {
@@ -52,7 +52,7 @@ test('a connector agent\'s waiting card is refused when the person loads a saved
   await expect(card).toHaveCount(1);
   const historyBefore = await page.evaluateHandle(() => window._cellucidHistories.current());
 
-  // The person loads the saved session: the question is refused with its sentence, and nothing is coloured.
+  // The person loads the saved session: the question is refused with its sentence, and nothing is colored.
   const chooser = page.waitForEvent('filechooser');
   await clickLoadSession(page);
   await (await chooser).setFiles(sessionPath);

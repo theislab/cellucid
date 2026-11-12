@@ -23,6 +23,7 @@ import { getActions } from '../../actions/index.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
 import { dispatchFromControl } from '../../actions/control-dispatch.js';
 import { viewNameOf } from '../../actions/targets/views.js';
+import { provideShortcut } from '../onboarding/keyboard-shortcuts.js';
 
 const EXACT_OPTION_KEYS = Object.freeze([
   'cameraControls',
@@ -218,16 +219,6 @@ function captureBoolean(input, label) {
 function restoreRange(input, state, apply) {
   input.value = state.raw;
   apply();
-}
-
-function isTextEntryTarget(target) {
-  if (target === null || typeof target !== 'object') {
-    return false;
-  }
-  return (
-    ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) ||
-    target.isContentEditable === true
-  );
 }
 
 /**
@@ -448,7 +439,7 @@ export function initVisualizationReset(options) {
 
     backgroundSelect.value = initialUIState.background;
     viewer.setBackground(initialUIState.background);
-    // Smoke's lower-layer colours follow the background (`rendering/read-cell-layer.js`).
+    // Smoke's lower-layer colors follow the background (`rendering/read-cell-layer.js`).
     renderControls.markSmokeDirty();
 
     // Navigation mode has no useful app-init capture: the page starts on Orbit
@@ -593,19 +584,13 @@ export function initVisualizationReset(options) {
   listen(resetCameraBtn, 'click', () => {
     void dispatchFromControl('display.reset', {}, { failure: 'Reset failed', category: 'render' });
   });
-  listen(document, 'keydown', (event) => {
-    if (isTextEntryTarget(event.target)) {
-      return;
-    }
-    // A chord (⌘R reloads) and a held key's repeats are not the shortcut.
-    if (event.ctrlKey || event.metaKey || event.altKey || event.repeat) return;
-    if (event.key === 'r' || event.key === 'R') {
-      void dispatchFromControl(
-        'camera.reset',
-        { view: viewNameOf(viewer, viewer.getFocusedViewId()) },
-        { failure: 'Camera reset failed', category: 'render' }
-      );
-    }
+  // R (`shortcut-table.js`): the focused view's camera, as its action.
+  const withdrawResetKey = provideShortcut('camera.reset', () => {
+    void dispatchFromControl(
+      'camera.reset',
+      { view: viewNameOf(viewer, viewer.getFocusedViewId()) },
+      { failure: 'Camera reset failed', category: 'render' }
+    );
   });
 
   const withdrawDisplayReset = getActions().provide('display.reset', () => {
@@ -618,6 +603,7 @@ export function initVisualizationReset(options) {
     if (destroyed) return;
     destroyed = true;
     withdrawDisplayReset();
+    withdrawResetKey();
     lifecycleController.abort();
   }
 

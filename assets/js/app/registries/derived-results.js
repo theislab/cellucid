@@ -18,6 +18,7 @@
  */
 
 import { orderByKey } from '../../utils/radix-order.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
 /** Who an entry belongs to. */
 export const DERIVED_RESULT_OWNERS = Object.freeze(['notebook', 'markers', 'signature']);
@@ -67,25 +68,17 @@ export class DerivedResultsRegistry {
     this._geneSets = new Map();
     /** @type {Map<string, {id: string, owner: string, origin: string, key: string, cells: Uint32Array, values: Float32Array}>} */
     this._scores = new Map();
-    this._listeners = new Set();
+    this._listeners = createListenerSet('the derived results');
     this._nextNotebookSet = 1;
   }
 
   /** Run `listener` after every change; returns the unsubscribe function. */
   onChange(listener) {
-    if (typeof listener !== 'function') throw new TypeError('A derived results listener must be a function');
-    this._listeners.add(listener);
-    return () => this._listeners.delete(listener);
+    return this._listeners.add(listener);
   }
 
   _changed() {
-    for (const listener of [...this._listeners]) {
-      try {
-        listener();
-      } catch (error) {
-        console.error('[DerivedResults] listener failed:', error);
-      }
-    }
+    this._listeners.notify();
   }
 
   /** Every gene set, in the order they were made. */

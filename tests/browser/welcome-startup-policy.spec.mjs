@@ -28,26 +28,22 @@ const FIXTURE = Object.freeze({
 async function installWelcomePaintProbe(page) {
   await page.addInitScript(() => {
     globalThis.__cellucidWelcomePaintProbe = {
-      unhideCalls: 0,
+      openCalls: 0,
       visibleFrames: 0,
     };
 
-    const originalRemove = DOMTokenList.prototype.remove;
-    DOMTokenList.prototype.remove = function (...tokens) {
-      const modal = document.getElementById('welcome-modal');
-      if (
-        modal !== null
-        && modal.classList === this
-        && tokens.includes('hidden')
-      ) {
-        globalThis.__cellucidWelcomePaintProbe.unhideCalls += 1;
+    // The welcome is a <dialog> the page opens with showModal().
+    const originalShowModal = HTMLDialogElement.prototype.showModal;
+    HTMLDialogElement.prototype.showModal = function (...args) {
+      if (this.id === 'welcome-modal') {
+        globalThis.__cellucidWelcomePaintProbe.openCalls += 1;
       }
-      return Reflect.apply(originalRemove, this, tokens);
+      return Reflect.apply(originalShowModal, this, args);
     };
 
     const inspectFrame = () => {
       const modal = document.getElementById('welcome-modal');
-      if (modal !== null && !modal.classList.contains('hidden')) {
+      if (modal !== null && modal.open) {
         globalThis.__cellucidWelcomePaintProbe.visibleFrames += 1;
       }
       requestAnimationFrame(inspectFrame);
@@ -77,7 +73,7 @@ async function expectWelcomeNeverPainted(page) {
   expect(await page.evaluate(
     () => globalThis.__cellucidWelcomePaintProbe,
   )).toEqual({
-    unhideCalls: 0,
+    openCalls: 0,
     visibleFrames: 0,
   });
 }

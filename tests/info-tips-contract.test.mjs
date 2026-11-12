@@ -111,8 +111,9 @@ test('every tip has a title, a body and docs links named by their target', () =>
 
 /** Every distinct link the tips use, pinned. */
 const PINNED_LINKS = [
-  'b_data_loading/13_data_mapping#neighbour-graph',
+  'b_data_loading/13_data_mapping#neighbor-graph',
   'b_data_loading/13_data_mapping#genes-and-expression',
+  'b_data_loading/13_data_mapping#expression-values',
   'b_data_loading/13_data_mapping#latent-space',
   'b_data_loading/13_data_mapping#vector-fields',
   'b_data_loading/21_subsampled_loading#cells-to-open',
@@ -135,7 +136,7 @@ const PINNED_LINKS = [
   'b_data_loading/13_data_mapping#at-a-glance',
   'b_data_loading/13_data_mapping#choose-the-embeddings-views-can-show',
   'b_data_loading/13_data_mapping#dimension-and-columns-of-an-array',
-  'b_data_loading/13_data_mapping#files-without-a-umap-the-best-guess',
+  'b_data_loading/13_data_mapping#the-default-of-each-dimension-and-the-best-guess',
   'b_data_loading/13_data_mapping#several-embeddings-at-once',
   'b_data_loading/14_open_from_link#the-address-bar',
   'b_data_loading/01_loading_options_overview#the-dataset-box',
@@ -148,7 +149,8 @@ const PINNED_LINKS = [
   'b_data_loading/16_private_drive_onedrive#work-and-school-accounts-administrator-approval',
   'c_core_interactions/01_navigation_modes_orbit_planar_free_fly#each-view-navigates-on-its-own',
   'c_core_interactions/01_navigation_modes_orbit_planar_free_fly#pick-the-right-mode-fast-guidance',
-  'c_core_interactions/02_camera_controls_advanced#camera-path-playback-is-opt-in',
+  'c_core_interactions/08_camera_path#the-keyframes-list',
+  'c_core_interactions/08_camera_path#playback-settings',
   'c_core_interactions/02_camera_controls_advanced#free-fly-controls',
   'c_core_interactions/02_camera_controls_advanced#keyboard-shortcuts-that-affect-camera-navigation',
   'd_fields_coloring_legends/08_cell_info#cost-on-large-datasets',
@@ -168,7 +170,7 @@ const PINNED_LINKS = [
   'c_core_interactions/05_dimension_switching_1d_2d_3d#keys-1-2-and-3',
   'c_core_interactions/07_screenshots#connectivity-edges',
   'd_fields_coloring_legends/01_field_types_and_sources#categorical-vs-continuous-what-changes-in-the-app',
-  'd_fields_coloring_legends/02_field_selector_ux#deleted-fields-panel-restore-vs-confirm-deletion',
+  'd_fields_coloring_legends/02_field_selector_ux#deleted-fields-panel-restore-vs-delete-for-good',
   'd_fields_coloring_legends/02_field_selector_ux#the-one-active-field-rule-obs-vs-gene-expression',
   'd_fields_coloring_legends/03_color_by_behavior#categorical-color-by-discrete-labels',
   'd_fields_coloring_legends/03_color_by_behavior#live-filtering-vs-filter-performance-predictability',
@@ -193,11 +195,13 @@ const PINNED_LINKS = [
   'h_analysis/05_analysis_mode_correlation_analysis#what-correlation-mode-is-for',
   'h_analysis/06_analysis_mode_differential_expression_de#filters-and-labels',
   'h_analysis/06_analysis_mode_differential_expression_de#groups-pages-or-categories',
+  'h_analysis/06_analysis_mode_differential_expression_de#paired-samples',
   'h_analysis/06_analysis_mode_differential_expression_de#replicates-pseudobulk',
   'h_analysis/06_analysis_mode_differential_expression_de#statistics-exact-implementation',
   'h_analysis/06_analysis_mode_differential_expression_de#what-de-is-for-in-cellucid',
   'h_analysis/07_analysis_mode_gene_signature#gene-sets',
   'h_analysis/07_analysis_mode_gene_signature#genes-not-in-the-dataset',
+  'h_analysis/07_analysis_mode_gene_signature#group-by-a-field',
   'h_analysis/07_analysis_mode_gene_signature#methods',
   'h_analysis/07_analysis_mode_gene_signature#what-a-gene-signature-is-user-facing',
   'h_analysis/08_analysis_mode_genes_panel#excluded-and-selected-genes',
@@ -212,6 +216,7 @@ const PINNED_LINKS = [
   'h_analysis/12_analysis_mode_composition#cell-types-samples-and-condition',
   'h_analysis/12_analysis_mode_composition#cells',
   'h_analysis/12_analysis_mode_composition#display',
+  'h_analysis/12_analysis_mode_composition#paired-samples',
   'h_analysis/12_analysis_mode_composition#tests',
   'h_analysis/12_analysis_mode_composition#what-composition-answers',
   'h_analysis/12_analysis_mode_composition#without-samples',
@@ -281,6 +286,9 @@ const PINNED_LINKS = [
   'g_agents/02_connect_claude_and_chatgpt#what-the-relay-carries-and-keeps',
   'g_agents/03_permissions_and_what_agents_see#permissions',
   'g_agents/03_permissions_and_what_agents_see#what-agents-are-sent',
+  'd_fields_coloring_legends/02_field_selector_ux#group-categories-into-a-new-field',
+  // The keyboard shortcuts page, generated from the shortcut table (R9K-4).
+  'o_accessibility_privacy_security/03_keyboard_shortcuts#moving-by-keys',
 ];
 
 const usedLinks = [...new Set(Object.values(INFO_TIPS).flatMap(tip => tip.links.map(link => `${link.page}#${link.anchor}`)))].sort();

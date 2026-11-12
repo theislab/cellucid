@@ -13,7 +13,9 @@
  *   too, hiding every control inside them from keyboard users.
  * - Selects built by the shared form helpers had no accessible name at all.
  * - The multi-select popup is appended to `<body>`, so sequential focus never
- *   reached it and Escape left focus stranded.
+ *   reached it and Escape left focus stranded. It is a non-modal popover its
+ *   button opens (`popovertarget`): next in the focus order, no Tab trap, no
+ *   `aria-modal` (F146).
  * - Copying an analysis mode into a floating window produced duplicate element
  *   ids, so the copy's label toggled the sidebar's checkbox.
  * - The lazily built analysis controls joined the session UI-control inventory,
@@ -24,6 +26,7 @@
  */
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
+import { tabKey } from './helpers/dialog-keys.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 
 const PREPARED_DATASET_URL =
@@ -215,11 +218,11 @@ test('page chips are operable and announced without a mouse', async ({ page }) =
   await expect(afterSpace).toHaveAttribute('aria-pressed', 'true');
   await expect(afterSpace).toBeFocused();
 
-  // The colour picker is a separate, individually named control, and no
+  // The color picker is a separate, individually named control, and no
   // interactive control is nested inside the chip's toggle button.
   await expect(
     page.locator(`${panelFor('detailed')} .color-swatch-input`)
-  ).toHaveAccessibleName(/^Colour for /);
+  ).toHaveAccessibleName(/^Highlight color for /);
   expect(await page.evaluate(selector => (
     [...document.querySelectorAll(`${selector} .analysis-page-tabs .chip`)].map(chip => ({
       tag: chip.tagName,
@@ -282,8 +285,9 @@ test('collapsible settings sections open from the keyboard', async ({ page }) =>
   expect(productErrors).toEqual([]);
 });
 
-test('the multi-select popup takes focus, keeps it, and hands it back', async ({
-  page
+test('the multi-select popup takes focus, is next in the Tab order, and hands it back', async ({
+  page,
+  browserName,
 }) => {
   const productErrors = observeProductErrors(page);
   await openDataset(page);
@@ -295,19 +299,21 @@ test('the multi-select popup takes focus, keeps it, and hands it back', async ({
   await page.keyboard.press('Enter');
   await expect(trigger).toHaveAttribute('aria-expanded', 'true');
 
-  const panel = page.locator('.multi-select-dropdown-panel:not([hidden])');
+  const panel = page.locator('.multi-select-dropdown-panel:popover-open');
   await expect(panel).toBeVisible();
+  await expect(panel).not.toHaveAttribute('aria-modal', /.*/);
   await expect(panel.locator('.multi-select-dropdown-search')).toBeFocused();
 
-  // Tab cycles inside the popup instead of walking back into the sidebar.
-  for (let step = 0; step < 6; step++) {
-    await page.keyboard.press('Tab');
-    await expect
-      .poll(() => page.evaluate(
-        () => document.activeElement?.closest('.multi-select-dropdown-panel') !== null
-      ))
-      .toBe(true);
-  }
+  // Tab walks on through the popup's own controls (a non-modal popup: no
+  // trap, the page stays usable).
+  await page.keyboard.press(tabKey(browserName));
+  await expect
+    .poll(() => page.evaluate(
+      () => document.activeElement?.closest('.multi-select-dropdown-panel') !== null
+    ))
+    .toBe(true);
+  await page.keyboard.press(tabKey(browserName, { shift: true }));
+  await expect(panel.locator('.multi-select-dropdown-search')).toBeFocused();
 
   await page.keyboard.press('Escape');
   await expect(trigger).toHaveAttribute('aria-expanded', 'false');

@@ -1,6 +1,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome, expectWelcomeShown } from './helpers/welcome.mjs';
+import { expectContained, tabWalk } from './helpers/dialog-keys.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import {
   ORCID_SEARCH_DEBOUNCE_MS,
@@ -190,20 +191,17 @@ test('analysis modal owns focus and releases every active pointer interaction on
       const modal = createAnalysisModal();
       openModal(modal);
       const closeButton = modal.querySelector('.analysis-modal-close');
+      // A modal `<dialog>` (R9E-18): the browser makes the page inert and
+      // holds Tab; nothing says `aria-modal` by hand.
       const initial = {
         closeFocused: document.activeElement === closeButton,
         labelled:
           modal.getAttribute('aria-labelledby') === modal._title.id,
-        modal: modal.getAttribute('aria-modal'),
-        role: modal.getAttribute('role')
+        modal: modal.matches(':modal'),
+        ariaModal: modal.getAttribute('aria-modal'),
+        tag: modal.tagName
       };
-
-      closeButton.dispatchEvent(new KeyboardEvent('keydown', {
-        bubbles: true,
-        cancelable: true,
-        key: 'Tab'
-      }));
-      const tabStayedInside = document.activeElement === closeButton;
+      const tabStayedInside = document.body.matches(':has(dialog:modal)');
 
       const target = modal.querySelector(scenario.selector);
       let capturedPointer = null;
@@ -241,11 +239,13 @@ test('analysis modal owns focus and releases every active pointer interaction on
         userSelect: readEffectiveInlineUserSelect()
       };
 
-      document.dispatchEvent(new KeyboardEvent('keydown', {
-        bubbles: true,
-        cancelable: true,
-        key: 'Escape'
-      }));
+      // Escape is the browser's: it closes the dialog (`cancel`, then
+      // `close`), as `close()` does; the view's close follows.
+      // The `close` event is a queued task of its own, ordered with no other
+      // task source: wait for it, never a timer (a zero timer can run first).
+      const closed = new Promise(resolve => modal.addEventListener('close', resolve, { once: true }));
+      modal.close();
+      await closed;
       if (modal._closePromise === null) {
         throw new Error('Escape did not publish the modal close owner.');
       }
@@ -274,8 +274,9 @@ test('analysis modal owns focus and releases every active pointer interaction on
     expect(result.initial).toEqual({
       closeFocused: true,
       labelled: true,
-      modal: 'true',
-      role: 'dialog'
+      modal: true,
+      ariaModal: null,
+      tag: 'DIALOG'
     });
     expect(result.tabStayedInside).toBe(true);
     expect(result.during).toEqual({
@@ -1078,11 +1079,11 @@ test('community profile modal cannot outlive its controls owner', async ({
 
     // The click's handler opens the dialog after work of its own: a task at
     // a time until it has, however many that takes.
-    while (!document.querySelector('.community-annotation-modal-overlay')) {
+    while (!document.querySelector('.community-annotation-dialog:not(.community-annotation-details-dialog)')) {
       await new Promise(resolve => setTimeout(resolve, 0));
     }
     const overlay = document.querySelector(
-      '.community-annotation-modal-overlay'
+      '.community-annotation-dialog:not(.community-annotation-details-dialog)'
     );
     if (!(overlay instanceof HTMLElement)) {
       throw new Error('Synthetic annotation profile modal did not open');
@@ -1188,7 +1189,7 @@ test('pending community profile launch cannot cross controls teardown', async ({
     const outcome = {
       listenersRemaining: datasetListeners.size,
       modalCount: document.querySelectorAll(
-        '.community-annotation-modal-overlay'
+        '.community-annotation-dialog:not(.community-annotation-details-dialog)'
       ).length,
       postDestroyMutations: mutations.length,
       stableMarkup: container.innerHTML === markupAfterDestroy,
@@ -1282,13 +1283,13 @@ test('community profile publication survives reentrant focus lifecycle changes',
     await nextTurns();
     window.removeEventListener('focusin', closeOnFocus);
     const autoClosed = !document.querySelector(
-      '.community-annotation-modal-overlay'
+      '.community-annotation-dialog:not(.community-annotation-details-dialog)'
     );
 
     findEdit(autoCloseOwner.container).click();
     await nextTurns();
     const reopened = document.querySelector(
-      '.community-annotation-modal-overlay'
+      '.community-annotation-dialog:not(.community-annotation-details-dialog)'
     ) instanceof HTMLElement;
     autoCloseOwner.controls.destroy();
     const autoCloseListenersRemaining = autoCloseOwner.listeners.size;
@@ -1317,7 +1318,7 @@ test('community profile publication survives reentrant focus lifecycle changes',
       destroyedMarkupStable:
         destroyOwner.container.innerHTML === markupAfterReentrantDestroy,
       modalCount: document.querySelectorAll(
-        '.community-annotation-modal-overlay'
+        '.community-annotation-dialog:not(.community-annotation-details-dialog)'
       ).length,
       reopened,
     };
@@ -1807,7 +1808,8 @@ test('community annotation GitHub sync controls expose exact accessible identiti
 });
 
 test('welcome modal owns focus, contains Tab, and returns it on close', async ({
-  page
+  page,
+  browserName
 }) => {
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
@@ -1815,29 +1817,23 @@ test('welcome modal owns focus, contains Tab, and returns it on close', async ({
   const modal = page.locator('#welcome-modal');
   const startButton = page.locator('#welcome-start-btn');
   const learnMore = modal.getByRole('link', { name: /Learn more/ });
-  const canvas = page.locator('#glcanvas');
 
-  // The modal is `aria-modal="true"`, so focus must enter it and stay inside.
-  // It lands on the dialog itself, so no choice opens looking pre-selected.
+  // A modal <dialog>: focus enters it and the page behind is inert. It lands
+  // on the dialog itself, so no choice opens looking pre-selected.
   await expectWelcomeShown(page);
+  expect(await modal.evaluate(dialog => dialog.matches(':modal'))).toBe(true);
   await expect(modal).toBeFocused();
   await expect(startButton).not.toBeFocused();
 
-  await page.keyboard.press('Tab');
-  await expect(startButton).toBeFocused();
-  await page.keyboard.press('Tab');
-  await expect(learnMore).toBeFocused();
-  await page.keyboard.press('Tab');
-  await expect(startButton).toBeFocused();
-  await page.keyboard.press('Tab');
-  await expect(learnMore).toBeFocused();
-  await expect(canvas).not.toBeFocused();
-
-  await page.keyboard.press('Shift+Tab');
-  await expect(startButton).toBeFocused();
-  await page.keyboard.press('Shift+Tab');
-  await expect(learnMore).toBeFocused();
-  await expect(canvas).not.toBeFocused();
+  const forward = await tabWalk(page, browserName, '#welcome-modal', 6);
+  expectContained(forward, 'Tab');
+  expect(forward[0]).toEqual({ at: 'welcome-start-btn', inside: true });
+  expect(forward.some(stop => stop.inside && stop.at === 'welcome-start-btn')).toBe(true);
+  expect(forward.some(stop => stop.inside && stop.at.includes('Learn more'))).toBe(true);
+  await learnMore.focus();
+  const backward = await tabWalk(page, browserName, '#welcome-modal', 6, { shift: true });
+  expectContained(backward, 'Shift+Tab');
+  expect(backward[0]).toEqual({ at: 'welcome-start-btn', inside: true });
 
   await page.keyboard.press('Escape');
   await expect(modal).toBeHidden();
@@ -1889,7 +1885,8 @@ test('welcome modal owns focus, contains Tab, and returns it on close', async ({
 });
 
 test('licence modal owns focus, contains Tab, and returns it to its link', async ({
-  page
+  page,
+  browserName
 }) => {
   const productErrors = observeProductErrors(page);
   await page.goto(PREPARED_DATASET_URL, { waitUntil: 'domcontentloaded' });
@@ -1903,26 +1900,23 @@ test('licence modal owns focus, contains Tab, and returns it to its link', async
   const modal = page.locator('#license-modal');
   const closeButton = page.locator('#license-close-btn');
   const body = modal.locator('.license-body');
-  const canvas = page.locator('#glcanvas');
 
-  // The licence text scrolls, so it is a declared tab stop in every engine.
+  // The license text scrolls, so it is a declared tab stop in every engine.
   await expect(body).toHaveAttribute('tabindex', '0');
 
   await link.click();
   await expect(modal).toBeVisible();
+  expect(await modal.evaluate(dialog => dialog.matches(':modal'))).toBe(true);
   await expect(closeButton).toBeFocused();
 
-  await page.keyboard.press('Tab');
-  await expect(body).toBeFocused();
-  await page.keyboard.press('Tab');
-  await expect(closeButton).toBeFocused();
-  await expect(canvas).not.toBeFocused();
-
-  await page.keyboard.press('Shift+Tab');
-  await expect(body).toBeFocused();
-  await page.keyboard.press('Shift+Tab');
-  await expect(closeButton).toBeFocused();
-  await expect(canvas).not.toBeFocused();
+  const forward = await tabWalk(page, browserName, '#license-modal', 4);
+  expectContained(forward, 'Tab');
+  // The text (no id: named by its words) after Close, and Close again.
+  const isText = stop => stop.inside && stop.at.startsWith('Copyright');
+  expect(isText(forward[0])).toBe(true);
+  expect(forward.some(stop => stop.inside && stop.at === 'license-close-btn')).toBe(true);
+  const backward = await tabWalk(page, browserName, '#license-modal', 4, { shift: true });
+  expectContained(backward, 'Shift+Tab');
 
   await closeButton.click();
   await expect(modal).toBeHidden();
@@ -1935,9 +1929,10 @@ test('licence modal owns focus, contains Tab, and returns it to its link', async
   await expect(modal).toBeHidden();
   await expect(link).toBeFocused();
 
+  // The backdrop: a press and a release outside the card.
   await link.press('Enter');
   await expect(modal).toBeVisible();
-  await modal.locator('.license-backdrop').click({ position: { x: 4, y: 4 } });
+  await page.mouse.click(4, 4);
   await expect(modal).toBeHidden();
   await expect(link).toBeFocused();
 

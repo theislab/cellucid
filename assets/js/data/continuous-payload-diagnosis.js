@@ -3,10 +3,10 @@
  *
  * What to say when a continuous payload contains a value that cannot be drawn.
  *
- * A colour scale needs a finite minimum and maximum. `NaN` is representable —
- * Cellucid draws it as the neutral grey that means "no value here" — but an
+ * A color scale needs a finite minimum and maximum. `NaN` is representable —
+ * Cellucid draws it as the neutral gray that means "no value here" — but an
  * infinity is not: it has no position on any scale, and it makes the whole
- * field's range infinite, so every other cell collapses onto one colour. The
+ * field's range infinite, so every other cell collapses onto one color. The
  * reader therefore refuses a field containing one.
  *
  * Refusing is the easy half. The hard half is saying *why* in a way the person
@@ -63,7 +63,7 @@ export function createNonFiniteTally(total) {
 }
 
 /**
- * Record one value that is neither finite nor countable towards a range.
+ * Record one value that is neither finite nor countable toward a range.
  *
  * @param {NonFiniteTally} tally
  * @param {number} value
@@ -81,7 +81,7 @@ export function recordNonFiniteValue(tally, value, index) {
   }
 }
 
-/** Whether the tally holds a value that has no position on a colour scale. */
+/** Whether the tally holds a value that has no position on a color scale. */
 export function hasUndrawableValues(tally) {
   return tally.positiveInfinity > 0 || tally.negativeInfinity > 0;
 }
@@ -138,7 +138,7 @@ const REMEDY_BY_KIND = Object.freeze({
  * The complete message for a payload that cannot be drawn.
  *
  * Four lines, each answering one question, in the order a reader asks them:
- * what is wrong, how much of it, where, and what to do. The notification centre
+ * what is wrong, how much of it, where, and what to do. The notification center
  * renders newlines, so this reads as four lines on screen.
  *
  * @param {object} options
@@ -155,7 +155,7 @@ function describeUndrawablePayload({ subject, tally }) {
     .join(', ');
   const lines = [
     `${noun} "${owner.name}" contains ${formatCount(undrawable)} `
-    + `infinite ${countNoun(undrawable, 'value')}, so it has no colour scale.`,
+    + `infinite ${countNoun(undrawable, 'value')}, so it has no color scale.`,
     `Of ${formatCountOf(tally.total, 'cell')}: ${describeKinds(tally)}.`,
   ];
   if (examples.length > 0) {
@@ -175,7 +175,7 @@ function describeUndrawablePayload({ subject, tally }) {
  * The complete message for a payload that holds no value at all.
  *
  * Distinct from the infinity case and from an empty download: every cell is
- * explicitly missing, so there is nothing to scale and nothing to colour, and
+ * explicitly missing, so there is nothing to scale and nothing to color, and
  * the remedy is different — this is usually a column that was never computed.
  *
  * @param {object} options
@@ -188,7 +188,7 @@ function describeEmptyPayload({ subject, tally }) {
   const noun = owner.kind === 'gene' ? 'Gene' : 'Field';
   return [
     `${noun} "${owner.name}" has no value in any of `
-    + `${formatCountOf(tally.total, 'cell')}, so it has no colour scale.`,
+    + `${formatCountOf(tally.total, 'cell')}, so it has no color scale.`,
     `Every value is NaN, which Cellucid reads as "not measured here".`,
     owner.kind === 'gene'
       ? 'Check that the expression matrix being served is the one that was '

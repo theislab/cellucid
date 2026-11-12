@@ -27,7 +27,7 @@
  * from a startup that fails the same way on every reload. It is the same call
  * `github-auth-session` makes for a corrupt stored session, and for the same
  * reason. Nothing is silent — `main.js` reports the discarded value once the
- * notification centre exists.
+ * notification center exists.
  */
 
 /** The `localStorage` key. */
@@ -72,15 +72,16 @@ export const AUTOMATIC_ANTIALIAS_CELL_LIMIT = 5_000_000;
 export const AUTOMATIC_ANTIALIAS_CELL_LIMIT_FLAT = 200_000;
 
 function assertStorage(storage, operation) {
+  // Null: this browser keeps nothing for the site (`utils/web-storage.js`).
+  if (storage === null) return null;
   if (
-    storage === null
-    || typeof storage !== 'object'
+    typeof storage !== 'object'
     || typeof storage.getItem !== 'function'
     || typeof storage.setItem !== 'function'
     || typeof storage.removeItem !== 'function'
   ) {
     throw new TypeError(
-      `${operation} requires one current key/value storage.`
+      `${operation} requires one current key/value storage, or null.`
     );
   }
   return storage;
@@ -102,11 +103,13 @@ function assertStorage(storage, operation) {
  * `auto`. Only the last is something to tell the user about, and it comes back in
  * `discarded` rather than being swallowed.
  *
- * @param {Storage} storage
+ * @param {Storage|null} storage - Null where this browser keeps nothing
  * @returns {ResolvedAntialiasPreference}
  */
 export function resolveAntialiasPreference(storage) {
-  assertStorage(storage, 'Reading the antialiasing preference');
+  if (assertStorage(storage, 'Reading the antialiasing preference') === null) {
+    return { mode: DEFAULT_ANTIALIAS_MODE, discarded: null };
+  }
   let stored;
   try {
     stored = storage.getItem(ANTIALIAS_STORAGE_KEY);
@@ -132,19 +135,28 @@ export function resolveAntialiasPreference(storage) {
 }
 
 /**
- * Store the antialiasing preference.
+ * Store the antialiasing preference where this browser keeps it. A browser
+ * that keeps nothing for the site, or refuses the write (a full store), keeps
+ * the choice for this page only: the choice is made either way.
  *
- * @param {Storage} storage
+ * @param {Storage|null} storage
  * @param {'auto'|'on'|'off'} mode
+ * @returns {boolean} Whether it is kept for the next visit
  */
 export function writeAntialiasPreference(storage, mode) {
-  assertStorage(storage, 'Storing the antialiasing preference');
+  const kept = assertStorage(storage, 'Storing the antialiasing preference');
   if (!ANTIALIAS_MODES.includes(mode)) {
     throw new TypeError(
       'Antialiasing preference must be exactly "auto", "on", or "off".'
     );
   }
-  storage.setItem(ANTIALIAS_STORAGE_KEY, mode);
+  if (kept === null) return false;
+  try {
+    kept.setItem(ANTIALIAS_STORAGE_KEY, mode);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

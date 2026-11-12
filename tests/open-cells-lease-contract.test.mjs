@@ -275,9 +275,12 @@ test('a growth step waits for a cell export, and an export asked during one read
     release.resolve();
     await step;
     while (outcomes.length === 0) await turn();
-    assert.deepEqual(outcomes[0], ['complete', 'Export the field (CSV): cluster.csv (58 B)']);
+    // The obs-column CSV: header, kind and categories rows (the field's
+    // categories in its order, F125), then a row per cell.
+    assert.deepEqual(outcomes[0], ['complete', 'Export the field (CSV): cluster.csv (85 B)']);
     const first = await saved[0].text();
-    assert.equal(first.trim().split('\n').length, 2 + 3, 'every row of the three cells it began on');
+    assert.equal(first, 'obs_name,cluster\nkind,categorical\ncategories,"[""a"",""b""]"\ncell0,a\ncell1,b\ncell2,a\n',
+      'the three header rows, then every row of the three cells it began on');
 
     // An export clicked while a step commits starts on the cells after it,
     // with the adapter of that reading.
@@ -289,7 +292,7 @@ test('a growth step waits for a cell export, and an export asked during one read
     while (outcomes.length === 1) await turn();
     assert.equal(outcomes[1][0], 'complete', JSON.stringify(outcomes[1]));
     const second = await saved[1].text();
-    assert.equal(second.trim().split('\n').length, 2 + 7);
+    assert.equal(second.trim().split('\n').length, 3 + 7, 'the three header rows, then every row of the seven cells after the step');
   } finally {
     URL.createObjectURL = originalCreate;
     globalThis.document = previousDocument;

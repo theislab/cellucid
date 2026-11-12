@@ -49,7 +49,7 @@ test('every surface keeps out of the category palettes\' lightness band', () => 
   const palette = Array.from({ length: 24 }, (_, i) => lstarOfSrgb(getCategoryColor(i)));
   const bandMin = Math.min(...palette);
   const bandMax = Math.max(...palette);
-  assert.ok(bandMin > DARK_BAND_MAX_LSTAR, 'dark looks sit below every category colour');
+  assert.ok(bandMin > DARK_BAND_MAX_LSTAR, 'dark looks sit below every category color');
   for (const id of BACKDROP_LOOK_IDS) {
     const look = BACKDROP_LOOKS[id];
     const lstar = lstarOfSrgb(look.surface.map((c) => c / 255));
@@ -59,7 +59,7 @@ test('every surface keeps out of the category palettes\' lightness band', () => 
   assert.ok(bandMax < 92);
 });
 
-test('dominant colours: distinct, weighted by visibility, blind to filtered cells', () => {
+test('dominant colors: distinct, weighted by visibility, blind to filtered cells', () => {
   const count = 3000;
   const colors = new Uint8Array(count * 4);
   const visibility = new Uint8Array(count).fill(1);
@@ -79,7 +79,7 @@ test('dominant colours: distinct, weighted by visibility, blind to filtered cell
   assert.equal(filtered.sampled, 2000);
 });
 
-test('a tint keeps its hue at unit luminance, whatever the data colour', () => {
+test('a tint keeps its hue at unit luminance, whatever the data color', () => {
   for (const srgb of [[1, 0.6, 0], [0, 0.47, 0.78], [0.1, 0.1, 0.1], [1, 1, 1]]) {
     const tint = shapeBackdropTint(srgb, 0.8);
     assert.ok(Math.abs(linearLuminance(tint) - 1) < 1e-6);
@@ -137,21 +137,25 @@ test('idle costs nothing: no animation frame, ambient motion capped and gated', 
 });
 
 test('figure export maps every plot pixel to the pane NDC it shows', () => {
-  // A 200 × 100 pane letterboxed into a 300 × 300 plot at (10, 20): the pane
-  // fills the width and sits centred vertically, as the points do.
+  // A 200 × 100 pane on a 300 × 150 plot at (10, 20): the plot has the pane's
+  // aspect and the pane fills it, as the points do.
   const renderState = { viewportWidth: 200, viewportHeight: 100 };
-  const plotRect = { x: 10, y: 20, width: 300, height: 300 };
+  const plotRect = { x: 10, y: 20, width: 300, height: 150 };
   const { ndcTransform: [sx, sy, ox, oy], viewportPerPlot } = resolveBackdropLookPlacement({ renderState, plotRect });
   assert.ok(Math.abs(viewportPerPlot - 200 / 300) < 1e-12);
   const pane = (cx, cy) => [cx * sx + ox, cy * sy + oy];
-  // Left and right plot edges are the pane's left and right edges.
+  // Every plot edge is the pane's own edge: nothing past it, no band.
   assert.deepEqual(pane(-1, 0).map((v) => +v.toFixed(9)), [-1, 0]);
   assert.deepEqual(pane(1, 0).map((v) => +v.toFixed(9)), [1, 0]);
-  // The plot is taller than the pane: its top shows above the pane (NDC > 1).
-  assert.ok(Math.abs(pane(0, 1)[1] - 2) < 1e-9);
-  assert.ok(Math.abs(pane(0, -1)[1] + 2) < 1e-9);
+  assert.deepEqual(pane(0, 1).map((v) => +v.toFixed(9)), [0, 1]);
+  assert.deepEqual(pane(0, -1).map((v) => +v.toFixed(9)), [0, -1]);
+  // A plot of another aspect is a caller error: a figure is never letterboxed.
+  assert.throws(
+    () => resolveBackdropLookPlacement({ renderState, plotRect: { x: 0, y: 0, width: 300, height: 300 } }),
+    /aspect/
+  );
 
-  // A crop: the right half of the pane fills the plot.
+  // A crop: the right half of the pane (100 × 100) fills a square plot.
   const crop = { enabled: true, x: 0.5, y: 0, width: 0.5, height: 1 };
   const cropped = resolveBackdropLookPlacement({ renderState, plotRect: { x: 0, y: 0, width: 100, height: 100 }, crop });
   const [csx, , cox] = cropped.ndcTransform;
@@ -182,6 +186,7 @@ test('the scene redraws while a look fades and never for its tints or its bakes 
   // Only the family on screen keeps its bake; leaving the looks releases all.
   assert.match(renderer, /evictFamiliesExcept\(family\);/);
   assert.match(renderer, /evictFamiliesExcept\(null\);/);
-  // A change of the reduced-motion setting is honoured at once.
-  assert.match(renderer, /addEventListener\?\.\('change', onReducedMotion\)/);
+  // A change of the reduced-motion setting is honored at once.
+  assert.match(renderer, /const stopReducedMotionWatch = onReducedMotionChange\(onReducedMotion\);/);
+  assert.match(renderer, /stopReducedMotionWatch\(\);/);
 });

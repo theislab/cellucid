@@ -7,6 +7,8 @@
  * @module ui/core/phone-sheet-memory
  */
 
+import { webStorage } from '../../../utils/web-storage.js';
+
 /** The session-storage key `viewport-init.js` reads. */
 const PHONE_SHEET_KEY = 'cellucid:phone-sheet';
 
@@ -19,7 +21,7 @@ const PHONE_SHEET_KEY = 'cellucid:phone-sheet';
  */
 export function rememberPhoneSheet(ownerWindow, state) {
   try {
-    ownerWindow.sessionStorage.setItem(PHONE_SHEET_KEY, state);
+    webStorage('sessionStorage', ownerWindow)?.setItem(PHONE_SHEET_KEY, state);
   } catch {
     // Nothing is kept: the next load starts with the peek bar.
   }

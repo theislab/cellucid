@@ -37,17 +37,18 @@ const B3_TYPES = {
   'setting.set': ['settings', 'views'],
   'layout.panel.float': ['layout'],
   'layout.panel.dock': ['layout'],
+  'layout.panel.dock-all': ['layout'],
   'layout.panel.place': ['layout'],
   'layout.section.open': ['layout'],
   'layout.sidebar.show': ['layout'],
   'layout.sidebar.width': ['layout'],
-  'layout.theme.set': ['layout'],
+  'layout.theme.set': ['layout', 'settings'], // an unchosen background follows the theme (F46, F66)
   'analysis.open': ['analysis', 'layout'],
   'analysis.close': ['analysis'],
   'analysis.pages.set': ['analysis'],
   'analysis.run': ['analysis'],
   // A window's place, size and fold are layout (History v2 §3.15.5); opening,
-  // copying or closing one changes both what is analysed and the layout.
+  // copying or closing one changes both what is analyzed and the layout.
   'analysis.window.copy': ['analysis', 'layout'],
   'analysis.window.close': ['analysis', 'layout'],
   'analysis.window.place': ['layout'],
@@ -58,7 +59,7 @@ const B3_TYPES = {
   'analysis.size.set': ['layout'],
 };
 const B3_READS = [
-  'settings.list', 'layout.get', 'analysis.list', 'analysis.result', 'analysis.cancel', 'history.get',
+  'settings.list', 'layout.get', 'analysis.list', 'analysis.result', 'history.get',
   'dataset.summary', 'fields.list', 'field.categories', 'genes.search', 'cells.values', 'field.summary',
   'views.state', 'view.picture',
 ];
@@ -143,12 +144,17 @@ test('how an analysis is shown is one action: each analysis\'s view keys, named 
   assert.equal(view.describe({ analysis: 'dotplot', in: 2, view: { more: true } }, null), 'Opened More options of Dot plot in window 2');
   assert.equal(view.describe({ analysis: 'signature', view: { set: 'T cells' } }, null), 'Showed the gene set T cells in Gene signature');
   assert.equal(view.describe({ analysis: 'markers', view: { more: true, show: 'list' } }, null), 'Changed how Marker genes is shown');
+  assert.equal(view.describe({ analysis: 'dotplot', view: { groups: ['values', 'layout'] } }, null), 'Showed Values, Layout options of Dot plot');
+  assert.equal(view.describe({ analysis: 'dotplot', in: 1, view: { groups: [] } }, null), 'Closed the option groups of Dot plot in window 1');
   assert.equal(view.code({ analysis: 'markers', in: 'panel', view: { group: 'B cells' } }), 'analysis_view("markers", {"group":"B cells"})');
   // The plot an expanded view draws: its options by name (composition's Plot, a heatmap's Show values).
   assert.equal(schemaProblem(view.params, { analysis: 'composition', view: { plot: [{ option: 'view', value: 'bar' }] } }), null);
   assert.match(schemaProblem(view.params, { analysis: 'composition', view: { plot: [] } }), /at least 1/);
   assert.equal(view.describe({ analysis: 'markers', view: { plot: [{ option: 'showValues', value: true }] } }, null),
     'Set showValues to true in the plot of Marker genes');
+  // Made, it is named as the options column labels it (found 2026-11-10: option keys on the step).
+  assert.equal(view.describe({ analysis: 'markers', view: { plot: [{ option: 'transform', value: 'zscore' }] } }, { changed: 'plot', plot: ['Transform set to z-score'] }),
+    'Marker genes: Transform set to z-score');
   assert.notEqual(view.coalesce({ analysis: 'composition', in: 'panel', view: { plot: [{ option: 'view', value: 'bar' }] } }),
     view.coalesce({ analysis: 'composition', in: 'panel', view: { plot: [{ option: 'legendPosition', value: 'right' }] } }));
   // A burst of the same change is one step; another key is another step (its parameters still say all it changed).
@@ -160,7 +166,38 @@ test('how an analysis is shown is one action: each analysis\'s view keys, named 
   assert.notEqual(key({ analysis: 'markers', in: 'panel', view: { more: true } }), key({ analysis: 'markers', in: 1, view: { more: true } }));
   // An analysis sent another's genes opens with them in one step.
   const set = catalog.get('analysis.signature.set');
-  assert.equal(set.describe({ options: { geneSets: [] }, show: true }, null), 'Opened Gene signature with geneSets');
+  assert.equal(set.describe({ options: { geneSets: [] }, show: true }, null), 'Opened Gene signature: Gene sets set to none');
+  // A step names an option as its form does, with its value (found 2026-11-10: "Set geneSets of Dot plot").
+  const dotplot = catalog.get('analysis.dotplot.set');
+  assert.equal(dotplot.describe({ options: { scale: 'var' } }, null), 'Dot plot: Color set to Mean, scaled 0–1 per gene');
+  assert.equal(dotplot.describe({ options: { geneSets: [{ name: 'Set 1', genes: ['KLRD1', 'PRF1'] }] } }, null),
+    'Dot plot: Genes set to Set 1 (2 genes)');
+  assert.equal(dotplot.describe({ options: { groupBy: 'cell_type' } }, null), 'Dot plot: Group by set to cell_type');
+  assert.equal(dotplot.describe({ options: { cells: 'visible' } }, null), 'Dot plot: Cells set to Visible cells');
+  assert.equal(dotplot.describe({ options: { cells: 'page:Early EP' } }, null), 'Dot plot: Cells set to page Early EP');
+  assert.equal(dotplot.describe({ options: { swapAxes: true } }, null), 'Dot plot: Genes down, groups across set to On');
+  // Several options: each by what was chosen (found 2026-11-11, L3-11: "Marker genes: Group by, Compare against, … set").
+  assert.equal(dotplot.describe({ in: 2, options: { scale: 'var', plot: 'matrix' } }, null), 'Dot plot: Color Mean, scaled 0–1 per gene; plot Matrix plot in window 2');
+  const markers = catalog.get('analysis.markers.set');
+  assert.equal(markers.describe({ options: { groupBy: 'cell_type', compareAgainst: 'rest', testGroups: { mode: 'subset', ids: ['Alpha', 'Beta'] }, direction: 'up', topN: 5 } }, null),
+    'Marker genes: Group by cell_type; compare against Rest; groups to test Alpha and Beta; direction Up; top genes per group 5');
+  assert.equal(catalog.get('analysis.composition.set').describe({ options: { barsBy: 'sample', values: 'count' }, show: true }, null),
+    'Opened Composition: Bars per Sample; show Cell counts');
+  assert.equal(catalog.get('analysis.correlation.set').describe({ options: { variableX: { type: 'gene_expression', key: 'Ins1' }, variableY: null, method: 'spearman' } }, null),
+    'Correlation: X axis Ins1; Y axis none; method Spearman');
+  // The markers of every group sent on: the sets counted, not listed.
+  const sets = ['Alpha', 'Beta', 'Delta', 'Epsilon'].map(name => ({ name: `${name} markers`, genes: ['A', 'B'] }));
+  assert.equal(set.describe({ options: { geneSets: sets }, show: true }, null), 'Opened Gene signature: Gene sets set to 4 gene sets (8 genes)');
+  // Run, a step names the options it changed (its outcome), not those given as they were.
+  assert.equal(markers.describe({ options: { groupBy: 'cell_type', direction: 'up', topN: 5 }, show: true }, { changed: 'topN', opened: true }),
+    'Opened Marker genes: Top genes per group set to 5');
+  assert.equal(markers.describe({ options: { groupBy: 'clusters', topN: 5 } }, { changed: 'groupBy, topN' }),
+    'Marker genes: Group by clusters; top genes per group 5');
+  assert.equal(markers.describe({ options: { topN: 5 }, show: true }, { changed: '', opened: true }), 'Opened Marker genes');
+  // Past five, the rest are counted.
+  assert.equal(markers.describe({ options: { groupBy: 'clusters', direction: 'both', topN: 10, method: 'ttest', correction: 'bonferroni', maxAdjP: 0.01, minLog2FC: 1 } }, null),
+    'Marker genes: Group by clusters; direction Both; top genes per group 10; method t-test (Welch); multiple testing Bonferroni; and 2 more options');
+  assert.equal(dotplot.describe({ options: {} }, null), 'Dot plot: options unchanged');
   assert.equal(set.code({ in: 'panel', options: {}, show: true }), 'analysis_set("signature", {}, show=True)');
   assert.notEqual(set.coalesce({ in: 'panel', options: { geneSets: [] }, show: true }), set.coalesce({ in: 'panel', options: { geneSets: [] }, show: false }));
   const collapse = catalog.get('analysis.window.collapse');
@@ -265,7 +302,7 @@ test('history.get reads the path to the step shown, or every branch, with who to
   const history = createHistory({
     dispatcher, domains, dataset: { id: 'd', name: 'D', cellOrder: null }, newTrackerId: () => `t-00000000-0000-4000-8000-${String(++n).padStart(12, '0')}`, now: () => 1000,
   });
-  await assert.rejects(dispatcher.dispatch('history.get', {}), /starts once the dataset is open/);
+  await assert.rejects(dispatcher.dispatch('history.get', {}), /starts once a dataset is open/);
   await history.startTracker({ name: 'Main work' });
   await dispatcher.dispatch('layout.theme.set', { theme: 'dark' }, { origin: 'agent', agent: 'Claude', turn: 'turn-1' });
   await dispatcher.dispatch('setting.set', { setting: 'point-size', value: 3 });
@@ -318,7 +355,7 @@ test('a result records what it was computed on, and is stale exactly when that c
   const page = { id: 'page_1', name: 'T cells', highlightedGroups: [{ id: 'g', enabled: true, cellIndices: Uint32Array.of(1, 2) }] };
   const state = fakeState({ kept: [1, 2, 3, 4], pages: [page] });
   const dataset = { id: 'demo', method: 'uniform', seed: 7 };
-  const inputs = { state, dataset, pageIds: ['page_1', 'restof__page_1'], options: { n: 1 }, genesReadFor: { cells: 2, of: 4 }, visible: null };
+  const inputs = { state, dataset, pageIds: ['page_1', 'restof__page_1'], options: { n: 1 }, genesReadFor: { cells: 2, of: 4 }, visible: null, values: null };
   const recorded = await captureProvenance(inputs);
   requireProvenance(structuredClone(recorded));
   assert.deepEqual(describeProvenance(recorded).pages, [{ name: 'T cells', cells: 2 }, { name: 'Rest of T cells', cells: null }]);
@@ -335,6 +372,8 @@ test('a result records what it was computed on, and is stale exactly when that c
   assert.deepEqual(await now({ state: fakeState({ kept: [1, 2, 3, 5], pages: [page] }) }), ['The open cells changed since this result.']);
   assert.deepEqual(await now({ state: fakeState({ kept: [1, 2, 3, 4], pages: [page], mapping: { x: 2 } }) }), ['The data mapping changed since this result.']);
   assert.deepEqual(await now({ options: { n: 2 } }), ['The settings changed since this result.']);
+  // The values its genes were read in, as the analysis declares them (none here).
+  assert.deepEqual(await now({ values: { normalize: true, log1p: true } }), ['The expression values changed since this result (no gene values then, normalized · log1p now).']);
   assert.deepEqual(await now({ visible: Uint8Array.of(1, 0) }), ['The cells the view shows changed since this result.']);
   assert.deepEqual(await now({ dataset: { ...dataset, id: 'other' } }), ['This result was computed on another dataset.']);
   assert.deepEqual(await now({ pageIds: ['page_1'] }), ['The pages chosen changed since this result (T cells, Rest of T cells then, T cells now).']);
@@ -374,7 +413,7 @@ test('the visible cells are copied once per change of the set, never per visibil
   assert.deepEqual([...first.cells], [1, 1, 0, 1]);
   assert.notEqual(first.cells, state.categoryTransparency, 'a copy: the transparency is written in place');
   assert.equal(visibleCellsNow(state).cells, first.cells, 'asked again, the same copy');
-  // A pass that leaves the set as it was (a recolour): the same revision and copy.
+  // A pass that leaves the set as it was (a recolor): the same revision and copy.
   state._transparencyEpoch = 2;
   assert.deepEqual(visibleCellsNow(state), first);
   // The set changes in place: a new revision and a new copy; the earlier copy is kept as it was.

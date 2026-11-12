@@ -11,7 +11,8 @@
  *
  * Replicates: '' (cells are the observations) or a categorical sample
  * field: pseudobulk, each sample's cells of a group one observation
- * (`stats/pseudobulk.js`).
+ * (`stats/pseudobulk.js`); paired, a sample with cells in both groups one
+ * pair.
  *
  * Display options (the volcano re-drawn, nothing tested again): maxAdjP,
  * minLog2FC, minPct, labels.
@@ -19,7 +20,8 @@
  * @module analysis/options/de-options
  */
 
-import { defineOptions } from './option-schema.js';
+import { CELL_SCOPE_MEANS, defineOptions } from './option-schema.js';
+import { defaultCellTypeField } from './composition-options.js';
 import { cellScopeChoices, geneFilterOptions, testOptions } from './marker-options.js';
 
 const pageChoices = context => (context?.pages ?? []).map(page => ({ value: page.id, label: page.name }));
@@ -48,6 +50,7 @@ export const DE_OPTIONS = defineOptions({
       defaultText: 'The first page',
       when: record => record.compare === 'pages',
       choices: pageChoices,
+      pages: true,
     },
     {
       key: 'pageB', kind: 'select', label: 'Group B', tip: 'analysis-differential', group: 'essentials',
@@ -55,11 +58,12 @@ export const DE_OPTIONS = defineOptions({
       defaultText: 'The second page',
       when: record => record.compare === 'pages',
       choices: pageChoices,
+      pages: true,
     },
     {
       key: 'field', kind: 'select', label: 'Field', tip: 'analysis-differential', group: 'essentials',
-      default: context => context?.categoricalFields?.[0]?.key ?? '',
-      defaultText: 'The first categorical field with two or more categories',
+      default: defaultCellTypeField,
+      defaultText: 'The coloring field when it is not named like a sample, else the best field named like a cell type, annotation, lineage or cluster, else the first not named like a sample',
       when: record => record.compare === 'categories',
       choices: fieldChoices,
     },
@@ -77,6 +81,7 @@ export const DE_OPTIONS = defineOptions({
     },
     {
       key: 'within', kind: 'select', label: 'Within', tip: 'analysis-groups-and-cells', group: 'cells',
+      means: `${CELL_SCOPE_MEANS}, or category (the cells of Within categories of Within field)`,
       default: 'all',
       defaultText: 'All cells',
       choices: context => [...cellScopeChoices(context), { value: 'category', label: 'Categories of a field' }],
@@ -99,6 +104,7 @@ export const DE_OPTIONS = defineOptions({
     },
     {
       key: 'replicates', kind: 'select', label: 'Replicates', tip: 'analysis-replicates', group: 'test',
+      means: 'empty: each cell an observation; or a sample or donor field: pseudobulk, each sample\'s cells of a group one observation (counts: its raw summed counts, TMM-normalized log-CPM; otherwise its mean), limma\'s moderated t across samples (the test to trust when groups come from different donors)',
       default: '',
       defaultText: 'None (cells)',
       choices: context => [
@@ -113,8 +119,17 @@ export const DE_OPTIONS = defineOptions({
       default: 10, min: 1, integer: true,
       when: record => record.replicates !== '',
     },
-    // Pseudobulk is one test (Welch's t across samples): the cell-level
-    // method and p-value convention apply only without replicates.
+    {
+      // The same donors in both groups (two organs of one fetus): the donor
+      // blocked in the linear model, its own level taken out
+      // (`stats/pseudobulk.js`).
+      key: 'paired', kind: 'boolean', label: 'Pair samples across groups', tip: 'analysis-paired', group: 'test',
+      means: 'true: the sample (donor) is a blocking factor, limma ~ donor + group over the samples with cells in both groups, samples in one group only left out; the result\'s about says how many samples are in both',
+      default: false,
+      when: record => record.replicates !== '',
+    },
+    // Pseudobulk is one test (limma's moderated t across samples): the
+    // cell-level method and p-value convention apply only without replicates.
     ...testOptions('test').map(entry => (
       entry.key === 'method' || entry.key === 'pConvention'
         ? { ...entry, when: (record, context) => record.replicates === '' && (entry.when === undefined || entry.when(record, context)) }
@@ -134,7 +149,7 @@ export const DE_OPTIONS = defineOptions({
     },
     ...geneFilterOptions('filters'),
     {
-      key: 'labels', kind: 'number', label: 'Labelled genes', tip: 'analysis-filters', group: 'labels',
+      key: 'labels', kind: 'number', label: 'Labeled genes', tip: 'analysis-filters', group: 'labels',
       default: 15, min: 0, integer: true,
     },
   ],

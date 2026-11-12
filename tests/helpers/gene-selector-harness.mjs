@@ -185,7 +185,10 @@ class FakeInputElement extends FakeElement {
 
   select() {}
 
-  blur() {}
+  /** As a browser's: leaving the box fires `blur` on it. */
+  blur() {
+    this.dispatch('blur', { relatedTarget: null });
+  }
 }
 
 class FakeButtonElement extends FakeElement {

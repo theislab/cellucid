@@ -11,10 +11,10 @@
  * base edge share a pixel (the resolve averages the ring blended over each
  * sample, not over the average). What WebGL2 does keep is the scene target
  * itself (`scene-msaa-target.js`): its renderbuffer holds every sample of the
- * last frame, colour, depth and stencil, until something draws over it.
+ * last frame, color, depth and stencil, until something draws over it.
  *
  * The samples the rings cover do not depend on the pulse phase. The phase
- * (`u_time`, `u_glow` of HP_FS_HIGHLIGHT) only colours a fragment; whether a
+ * (`u_time`, `u_glow` of HP_FS_HIGHLIGHT) only colors a fragment; whether a
  * fragment exists depends on the highlight records, the style, the camera and
  * the point size. So while highlights pulse in a multisampled frame, the
  * highlight pass also writes 1 into the stencil of every sample it covers
@@ -23,7 +23,7 @@
  * are unchanged (`viewer.js`, maskedPulsePaneReady) differs from that frame
  * only at those samples, and finds them marked:
  *
- * 1. the marked samples are reset to what the frame's clear writes, colour and
+ * 1. the marked samples are reset to what the frame's clear writes, color and
  *    depth, and the stencil test is left passing only there
  *    (`beginMaskedPane`);
  * 2. the pane is drawn exactly as a whole frame draws it (backdrop, grid,
@@ -34,7 +34,7 @@
  * whole draw of this frame gives it too: no ring touches it, and nothing else
  * changed. A sample inside starts from the clear values and receives the same
  * fragments in the same order as in a whole draw. Every draw computes its
- * fragment's colour once per pixel and its depth per sample, neither of which
+ * fragment's color once per pixel and its depth per sample, neither of which
  * depends on which samples the stencil test lets through, so each sample ends
  * with the value a whole draw gives it, and the resolve is the whole frame's
  * resolve, pixel for pixel. The mark costs nothing (the ring pass the frame
@@ -47,7 +47,7 @@
  *   the frame is then drawn whole);
  * - the only depth function in the scene's passes is `LEQUAL` (`viewer.js`,
  *   the point renderer), which the reset puts back after its own `ALWAYS`;
- * - the clear colour is the context's, read from its state shadow, and is
+ * - the clear color is the context's, read from its state shadow, and is
  *   written by a draw: `clear` ignores the stencil test.
  */
 
@@ -189,9 +189,9 @@ export function createPulseSampleMask(gl) {
 
     /**
      * Start a pane over its kept samples: reset the marked ones to the
-     * frame's clear values (colour from the context, depth 1) and leave the
+     * frame's clear values (color from the context, depth 1) and leave the
      * stencil test passing only there. `width`/`height` are the drawing
-     * buffer's: points may be rasterised outside their pane's viewport
+     * buffer's: points may be rasterized outside their pane's viewport
      * wherever no scissor bounds them, so the reset covers the whole buffer
      * and the scissor (in a grid) bounds it.
      */

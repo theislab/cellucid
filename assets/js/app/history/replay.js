@@ -5,7 +5,7 @@
  * again by name, in a new tracker whose start says where it comes from
  * (`start.kind 'replay'`, a `Link`, the report and the name mapping kept;
  * `history.js` `replay`). Each step's parameters are brought to this
- * catalogue's version first (`upgradeParams`), then the mapping's names put
+ * catalog's version first (`upgradeParams`), then the mapping's names put
  * in place of the recorded ones (`mapParams`). A step that does not match
  * here is kept in the new tracker, flagged with the reason, never dropped.
  *
@@ -22,7 +22,7 @@
 import { assembleHistory } from '../session/history-file.js';
 import { HISTORY_ID_PATTERNS, nameKey, OUTSIDE_CHANGE_TYPE, REPLAY_OUTCOMES } from './model.js';
 import { formatCountOf } from '../../utils/format-units.js';
-import { throwIfAborted } from '../../utils/abort.js';
+import { awaitWithSignal } from '../../utils/abort.js';
 import { CATEGORY_LABEL } from '../actions/definitions/params.js';
 
 /**
@@ -89,11 +89,9 @@ export function replayPlanOf(saved, { tracker: trackerRef = null, branch: branch
  */
 export async function readReplayPlan(source, { signal = null, ...choice } = {}) {
   try {
-    throwIfAborted(signal);
-    const eager = await source.readEager();
-    throwIfAborted(signal);
-    const rest = await source.readRest();
-    throwIfAborted(signal);
+    // A read changes nothing: a Stop ends it at once, wherever it is (the source is canceled below).
+    const eager = await awaitWithSignal(source.readEager(), signal);
+    const rest = await awaitWithSignal(source.readRest(), signal);
     // Parameters that name arrays only the rest holds come with it (`history-file.js` `assembleHistory`).
     return replayPlanOf(assembleHistory(eager, rest).history, choice);
   } catch (error) {
@@ -235,7 +233,7 @@ export function mapParams(definition, params, mapping) {
 
 /**
  * The key a name missing in a replay is chosen by: the same name missing in
- * several steps (a gene coloured by twice) is chosen once.
+ * several steps (a gene colored by twice) is chosen once.
  * @param {{kind: string, name: string, field: string|null}} missing - `ReplayEntry.missing`
  */
 export function missingKey(missing) {

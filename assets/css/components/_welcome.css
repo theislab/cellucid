@@ -14,30 +14,15 @@
    Welcome dialog: the card over the viewer
    ========================================================================= */
 
-/* The dialog fills what the screen shows: `100dvh`, not the layout
-   viewport, so on a phone no part of it sits under the browser's toolbars.
-   `touch-action: manipulation` keeps a double tap on it from zooming the
-   page. */
+/* A dialog layer (components/_modals.css) holding the card. It fills what
+   the screen shows (`100dvh`), so on a phone no part of it sits under the
+   browser's toolbars. `touch-action: manipulation` keeps a double tap on it
+   from zooming the page. */
 .welcome-modal {
-  position: fixed;
-  inset: 0;
-  height: 100dvh;
-  z-index: var(--z-modal);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: var(--space-5);
   touch-action: manipulation;
 }
 
-.welcome-modal.hidden {
-  display: none;
-}
-
-.welcome-backdrop {
-  position: absolute;
-  inset: 0;
-  background: var(--color-surface-overlay);
+.welcome-modal::backdrop {
   backdrop-filter: blur(4px);
 }
 
@@ -88,7 +73,7 @@
   margin-bottom: 0;
 }
 
-/* The wordmark is grey-scale ink drawn for a light surface. In the dark theme
+/* The wordmark is gray-scale ink drawn for a light surface. In the dark theme
    it is inverted (the hue rotation keeps any tint where it was), so the card
    follows the theme like every other surface. */
 :root[data-theme="dark"] .welcome-logo {
@@ -269,9 +254,10 @@
   font-style: normal;
   font-size: var(--type-compact);
   font-weight: var(--font-weight-medium);
-  color: var(--color-text-secondary);
+  /* The quieter text token, not a faded one: secondary text at 60% fell to
+     2.87:1 on the light card (lens-a11y LF-7). */
+  color: var(--color-text-tertiary);
   margin-bottom: var(--space-1);
-  opacity: var(--opacity-60);
 }
 
 .welcome-quote-text {
@@ -284,7 +270,7 @@
   font-style: normal;
   font-size: var(--type-hint);
   margin-top: var(--space-1);
-  opacity: var(--opacity-60);
+  color: var(--color-text-tertiary);
 }
 
 .welcome-quote-book {
@@ -313,7 +299,7 @@
 /* A narrow phone, or a phone with its text made larger (the browser's text
    size or zoom leaves fewer CSS pixels across): the dialog's gutters and the
    insets of its rows narrow, so the tagline and each choice's lines keep to
-   one line from 360 px at 130 % (277 CSS px across) up. */
+   one line from 360 px at 130% (277 CSS px across) up. */
 @media (max-width: 340px) {
   .welcome-modal {
     padding: var(--space-3);

@@ -1,10 +1,10 @@
 /**
- * Every way a gene is chosen colours by it or says why not
+ * Every way a gene is chosen colors by it or says why not
  * (`app/utils/gene-lookup.js`, `ui/modules/field-selector-gene-expression.js`).
  *
  * Found on the live site: opening the Suo sample from a link, typing
  * `AC058791.1` in Gene expression and pressing Enter did nothing -- no
- * colours, no message. The sample opens progressively (a first view, then
+ * colors, no message. The sample opens progressively (a first view, then
  * more cells in steps); the choice took the dataset generation when Enter
  * was pressed, its load waited for the step under way (as it must), the step
  * advanced the generation, and the choice took its own gene for one of a
@@ -218,6 +218,35 @@ test('Enter chooses what the box says, typed, pasted or set, and says when it na
   await settleTurn();
 });
 
+test('leaving the box, by Escape or elsewhere, names the gene shown, never a name that chose nothing', async t => {
+  // Found 2026-11-10 on Suo: CD19 shown, "CD3E" typed (not among its genes) and
+  // Enter, then Escape: the box kept saying CD3E while the cells showed CD19.
+  recordNotifications(t);
+  const { loads, onLoad } = heldLoads();
+  const { dom } = mountGeneSelector(exportedGenes('CD3E', 'CD19'), { onLoad });
+  search(dom, 'CD19');
+  press(dom, 'Enter');
+  await settleTurn();
+  for (const load of loads) load.resolve();
+  await settleTurn();
+  assert.equal(dom.geneSearch.value, 'CD19');
+
+  search(dom, 'NOTAGENE1');
+  press(dom, 'Enter');
+  await settleTurn();
+  assert.equal(statusRegion(dom).textContent, 'NOTAGENE1 is not a gene in this dataset.');
+  press(dom, 'Escape');
+  assert.equal(dom.geneSearch.value, 'CD19', 'Escape names the gene shown');
+  assert.equal(dom.geneDropdown.hidden, true);
+  assert.equal(statusRegion(dom).textContent, '', 'and drops what was said of the name it gave up');
+
+  // Typed and left without Enter (a click on the cells, Tab): the gene shown again.
+  search(dom, 'CD3');
+  dom.geneSearch.dispatch('blur', { relatedTarget: null });
+  assert.equal(dom.geneSearch.value, 'CD19');
+  assert.equal(loads.length, 1, 'nothing chosen by leaving');
+});
+
 test('a gene chosen while the open cells change is shown on the cells after the change', async t => {
   recordNotifications(t);
   const { loads, onLoad } = heldLoads();
@@ -428,7 +457,7 @@ test('a gene list replaced before or while the gene is read: the choice follows 
   await owner.destroy();
 });
 
-test('colouring by a gene from elsewhere refuses, with the reason, a name the list cannot choose', async () => {
+test('coloring by a gene from elsewhere refuses, with the reason, a name the list cannot choose', async () => {
   const { loads, onLoad } = heldLoads();
   const listing = { pending: false, failure: null };
   const { api } = mountGeneSelector(exportedGenes('CD3E'), { onLoad, listing });

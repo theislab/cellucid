@@ -388,12 +388,12 @@ test('a full-detail recolor rewrites only the color stream, in place', () => {
 
 for (const count of POINT_COUNTS) {
   test(
-    `ordered colour gather of ${count.toLocaleString('en-US')} points is byte-identical ` +
+    `ordered color gather of ${count.toLocaleString('en-US')} points is byte-identical ` +
     'to a whole-buffer gather',
     () => {
       const pointCount = count + 3;
       const { colors, renderer, tracker } = createStreamFixture(pointCount);
-      // Colours: one GPU pass over the whole store, byte-identical to a
+      // Colors: one GPU pass over the whole store, byte-identical to a
       // whole-buffer gather, through no CPU staging.
       const colorOrder = makeOrder(pointCount, pointCount);
       const colorStore = tracker.gl.createBuffer();
@@ -437,13 +437,13 @@ test('an ordered recolor rewrites the accepted color store without reallocating 
   }
 });
 
-test('an ordered colour write refuses an order that does not cover every point', () => {
+test('an ordered color write refuses an order that does not cover every point', () => {
   const pointCount = 9;
   const { renderer, tracker } = createStreamFixture(pointCount);
   const colorStore = tracker.gl.createBuffer();
   assert.throws(
     () => renderer._writeOrderedColors(colorStore, renderer._colors, makeRecord(makeOrder(5, pointCount)), 'colors'),
-    /5 slots for 9 colours/,
+    /5 slots for 9 colors/,
   );
 });
 

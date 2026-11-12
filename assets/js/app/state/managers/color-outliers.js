@@ -73,13 +73,13 @@ export const colorOutlierMethods = {
    * Set the active categorical field's outlier threshold. The field's
    * quantiles are got on the first threshold below 1 (never when the field
    * is picked: `state/managers/outlier-quantiles.js`); the filter applies
-   * once they arrive, at the threshold the control holds by then. Cancelled
+   * once they arrive, at the threshold the control holds by then. Canceled
    * or failed, the threshold is back at 1 and the field's outlier status
    * says why.
    *
    * @param {number} threshold
    * @returns {Promise<void>} Settles once the threshold is applied, or the
-   *   quantiles were cancelled or failed.
+   *   quantiles were canceled or failed.
    */
   async setOutlierThresholdForActive(threshold) {
     if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
@@ -97,7 +97,7 @@ export const colorOutlierMethods = {
       try {
         quantiles = await this.ensureOutlierQuantiles(fieldIndex);
       } catch {
-        // Cancelled or failed: the outlier status says which, and why.
+        // Canceled or failed: the outlier status says which, and why.
         return;
       }
       if (quantiles === null || this.getActiveField() !== field) return;
@@ -137,7 +137,7 @@ export const colorOutlierMethods = {
    * The quantiles the active outlier filter reads, or null while it is off.
    *
    * This is the active field's own decoded array. No view keeps a copy: the
-   * array is immutable once published, and every view that colours by the
+   * array is immutable once published, and every view that colors by the
    * field reads the same one.
    *
    * @returns {Float32Array|null}

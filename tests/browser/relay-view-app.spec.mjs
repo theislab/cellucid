@@ -26,7 +26,7 @@ import { resultDataText } from '../../assets/js/app/agent/bridge/relay-protocol.
 const dataText = value => resultDataText(JSON.stringify(value));
 const EMPTY = dataText({});
 
-/** A 64 × 48 PNG of one colour, as base64. */
+/** A 64 × 48 PNG of one color, as base64. */
 async function pngOf(page, color) {
   return page.evaluate(async fill => {
     const canvas = new OffscreenCanvas(64, 48);
@@ -74,8 +74,8 @@ const HOST = `<!doctype html><html><head><meta charset="utf-8"><title>host</titl
   window.send = message => frame.contentWindow.postMessage(message, '*');
 </script></body></html>`;
 
-/** The canvas's colour at its centre, from inside the card. */
-function centreColour(page) {
+/** The canvas's color at its center, from inside the card. */
+function centreColor(page) {
   return page.frameLocator('#card').locator('#picture').evaluate(canvas => {
     if (canvas.hidden || canvas.width === 0) return null;
     const [r, g, b] = canvas.getContext('2d').getImageData(canvas.width / 2, canvas.height / 2, 1, 1).data;
@@ -91,7 +91,7 @@ test('the card speaks MCP Apps: initialize, then a picture drawn, Refresh and Op
   await page.setContent(HOST);
   const red = await pngOf(page, '#ff0000');
   const blue = await pngOf(page, '#0000ff');
-  const meta = { 'cellucid/view': { dataset: 'Pancreas', link: 'https://www.cellucid.com/?dataset=pancreas', step: { id: 's3', label: 'Coloured by cell_type' }, version: '0.9.7' } };
+  const meta = { 'cellucid/view': { dataset: 'Pancreas', link: 'https://www.cellucid.com/?dataset=pancreas', step: { id: 's3', label: 'Colored by cell_type' }, version: '0.9.7' } };
   await page.evaluate(html => { document.getElementById('card').srcdoc = html; }, viewAppHtml());
   await expect.poll(() => page.evaluate(() => window.hostInitialized)).toBe(true);
   const initialize = await page.evaluate(() => window.hostLog.find(message => message.method === 'ui/initialize'));
@@ -111,11 +111,11 @@ test('the card speaks MCP Apps: initialize, then a picture drawn, Refresh and Op
       { type: 'image', data: png, mimeType: 'image/png' }],
     isError: false, _meta: metadata,
   } }), [red, meta, dataText({ png: { image: 1, mimeType: 'image/png', bytes: 100 }, width: 64, height: 48, notes: ['The grid is not drawn.'] })]);
-  await expect.poll(() => centreColour(page)).toEqual([255, 0, 0]);
+  await expect.poll(() => centreColor(page)).toEqual([255, 0, 0]);
   await expect(card.locator('#title')).toHaveText('Pancreas');
   await expect(card.locator('#notes')).toHaveText('The grid is not drawn.');
   await expect(card.locator('#open')).toHaveText('Open in Cellucid');
-  await expect(card.locator('#status')).toHaveText(/^The view at .+, after step s3: Coloured by cell_type\. Refresh draws it as it is now\.$/);
+  await expect(card.locator('#status')).toHaveText(/^The view at .+, after step s3: Colored by cell_type\. Refresh draws it as it is now\.$/);
   // It says its size to the host.
   await expect.poll(() => page.evaluate(() => window.hostLog.filter(message => message.method === 'ui/notifications/size-changed').length)).toBeGreaterThan(0);
 
@@ -124,7 +124,7 @@ test('the card speaks MCP Apps: initialize, then a picture drawn, Refresh and Op
     window.hostAnswers.view_picture = { content: [{ type: 'text', text }, { type: 'image', data: png, mimeType: 'image/png' }], isError: false, _meta: metadata };
   }, [blue, meta, EMPTY]);
   await card.locator('#refresh').click();
-  await expect.poll(() => centreColour(page)).toEqual([0, 0, 255]);
+  await expect.poll(() => centreColor(page)).toEqual([0, 0, 255]);
   const [refresh] = await page.evaluate(() => window.hostCalls);
   expect(refresh.name).toBe('view_picture');
   expect(refresh.arguments.legend).toBe(true);
@@ -154,7 +154,7 @@ test('a dataset opened is drawn by asking for its view; a picture left out and a
     content: [{ type: 'text', text }],
     isError: false, _meta: { 'cellucid/view': { dataset: 'Lung', link: null, version: '0.9.7' } },
   } }), dataText({ name: 'Lung', kind: 'sample', cells: 10, total_cells: 10, genes: 5, saved_states: 0, already_open: false }));
-  await expect.poll(() => centreColour(page)).toEqual([0, 255, 0]);
+  await expect.poll(() => centreColor(page)).toEqual([0, 255, 0]);
   await expect(card.locator('#title')).toHaveText('Lung');
   // No public link: the button opens Cellucid itself.
   await expect(card.locator('#open')).toHaveText('Open Cellucid');

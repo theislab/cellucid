@@ -100,7 +100,7 @@ export async function createDrag(page, { files = [], folder = null }) {
   }, { files, folder });
 }
 
-/** Drag over the viewer, then drop; returns whether the page cancelled it. */
+/** Drag over the viewer, then drop; returns whether the page canceled it. */
 export async function dragAndDrop(page, dataTransfer, { drop = true } = {}) {
   return page.evaluate(({ dataTransfer, drop }) => {
     const target = document.getElementById('glcanvas');

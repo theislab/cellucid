@@ -9,8 +9,9 @@
  *   title.
  * - **Connector address**: what to add in Claude (Customize › Connectors ›
  *   Add custom connector) or ChatGPT, with Copy.
- * - **A code**: typed when the page that asks is on another device; the
- *   relay says who asks, and the approval dialog asks the person.
+ * - **A code**: typed in a Cellucid tab of the browser that shows the page
+ *   that asks (only that browser can claim it: `bridge/relay-client.js`);
+ *   the relay says who asks, and the approval dialog asks the person.
  * - **The approval link's arrival** (`#cellucid_connect=…`, taken out of the
  *   address before any module ran: `bridge/connect-fragment.js`): claimed at
  *   once, the panel opened, the approval asked; a code that cannot be
@@ -29,19 +30,16 @@
 import { relayOriginForPage, startRelayClientForPage } from '../bridge/relay-client.js';
 import { normalizeConnectCode } from '../bridge/connect-code.js';
 import { readTabSecret } from '../bridge/tab-secret.js';
-import { copyWithFeedback } from '../../ui/components/app-dialog.js';
 import { buildShareUrl } from '../../ui/modules/share-dialog.js';
 import { getCurrentHistory } from '../../history/current.js';
 import { createApprovalDialog } from './approval-dialog.js';
 import { createConnectionsDialog } from './connections-dialog.js';
 import { describeConnectStatus } from './model.js';
+import { failureDetails, failureText, joinFailure, sayFailure } from '../../../utils/errors.js';
+import { copyText } from '../../utils/clipboard.js';
 
 /** How often the line counts down to the next try while offline. */
 const COUNTDOWN_MS = 1000;
-
-function errorText(error) {
-  return error instanceof Error ? error.message : String(error);
-}
 
 /**
  * @param {{
@@ -88,13 +86,13 @@ export function initAgentConnect(dom, {
     address = relayOriginForPage();
   } catch (error) {
     // A local page told to use a relay that is not an exact origin.
-    dom.status.textContent = 'The relay address of this page is wrong';
-    dom.status.title = errorText(error);
+    dom.status.textContent = 'The relay address of this page is wrong.';
+    dom.status.title = failureText(error);
     dom.status.dataset.tone = 'warning';
   }
   dom.address.value = address ?? '';
   dom.copy.disabled = address === null;
-  dom.copy.addEventListener('click', () => void copyWithFeedback(dom.copy, dom.address.value), { signal });
+  dom.copy.addEventListener('click', () => void copyText(dom.address.value, { what: 'the connector address', button: dom.copy, category: 'connectivity' }), { signal });
   dom.address.addEventListener('focus', () => dom.address.select(), { signal });
 
   function render() {
@@ -126,7 +124,7 @@ export function initAgentConnect(dom, {
       connectionsDialog.render(connections);
     } catch (error) {
       connections = null;
-      connectionsDialog.render(null, `The list could not be read: ${errorText(error)}`);
+      connectionsDialog.render(null, `${joinFailure(`The list could not be read`, sayFailure(error))}`);
     }
     render();
   }
@@ -151,7 +149,7 @@ export function initAgentConnect(dom, {
       sayCode('');
     },
     failed: (approval, error) => {
-      notifications.error(`The answer to ${approval.client.agent} did not reach the relay: ${errorText(error)}`, { category: 'connectivity' });
+      notifications.error(`${joinFailure(`The answer to ${approval.client.agent} did not reach the relay`, sayFailure(error))}`, { category: 'connectivity', ...failureDetails(error) });
     },
   });
 
@@ -208,7 +206,7 @@ export function initAgentConnect(dom, {
       },
       onApprovalError: ({ display, error }) => {
         dom.section.open = true;
-        notifications.error(`The connection with code ${display} cannot be approved: ${errorText(error)}`, { category: 'connectivity' });
+        notifications.error(`${joinFailure(`The connection with code ${display} cannot be approved`, sayFailure(error))}`, { category: 'connectivity', ...failureDetails(error) });
       },
       onStatus: status => {
         followApprovals(status);
@@ -220,8 +218,8 @@ export function initAgentConnect(dom, {
     });
   } catch (error) {
     client = null;
-    dom.status.textContent = 'Agents cannot connect on this page';
-    dom.status.title = errorText(error);
+    dom.status.textContent = 'Agents cannot connect on this page.';
+    dom.status.title = failureText(error);
     dom.status.dataset.tone = 'warning';
   }
   render();
@@ -231,7 +229,7 @@ export function initAgentConnect(dom, {
     if (client === null) return;
     const code = normalizeConnectCode(dom.code.value);
     if (code === null) {
-      sayCode('Codes look like ABCD-EFGH', 'warning', 'A connect code has eight letters and digits, like ABCD-EFGH.');
+      sayCode('Codes look like ABCD-EFGH.', 'warning', 'A connect code has eight letters and digits, like ABCD-EFGH.');
       return;
     }
     sayCode('Asking who it is…');
@@ -241,8 +239,8 @@ export function initAgentConnect(dom, {
       sayCode('');
     } catch (error) {
       // One short line here; the relay's whole answer in a notification.
-      sayCode('Code not accepted', 'warning', errorText(error));
-      notifications.error(`The code ${dom.code.value} was not accepted: ${errorText(error)}`, { category: 'connectivity' });
+      sayCode('Code not accepted', 'warning', failureText(error));
+      notifications.error(`${joinFailure(`The code ${dom.code.value} was not accepted`, sayFailure(error))}`, { category: 'connectivity', ...failureDetails(error) });
     }
   }, { signal });
   dom.code.addEventListener('input', () => sayCode(''), { signal });

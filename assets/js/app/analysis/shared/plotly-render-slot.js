@@ -10,6 +10,7 @@
 import { loadPlotly, purgePlot } from '../plots/plotly-loader.js';
 import { PlotRenderSlot, readHostLayoutBox } from './plot-render-slot.js';
 import { refitToSize } from '../plots/size-fit.js';
+import { InternalError } from '../../../utils/errors.js';
 
 function combineErrors(errors, message) {
   const present = [...new Set(errors.filter(Boolean))];
@@ -215,7 +216,7 @@ export class PlotlyRenderSlot {
 
   render(payload, options = {}) {
     if (this._destroyed) {
-      return Promise.reject(new Error('PlotlyRenderSlot has been destroyed'));
+      return Promise.reject(new InternalError('PlotlyRenderSlot has been destroyed'));
     }
     const rendering = this._slot.render(payload, options);
     return rendering.then(candidate => {

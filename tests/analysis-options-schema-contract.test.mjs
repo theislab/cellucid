@@ -169,3 +169,29 @@ test('every analysis page states its defaults exactly as its options schema', as
   const unknown = [...tables.keys()].filter(id => !SCHEMAS.some(schema => schema.id === id));
   assert.deepEqual(unknown, [], 'no table names an analysis without options');
 });
+
+test('a list of groups has one form, the picker\'s order: an agent\'s order is kept as the field\'s, so no refresh rewrites it (L25-2)', () => {
+  // Kanemaru's categories as the picker lists them (largest first); the agent named ten in its own order.
+  const groups = ['Myocardial fibroblast', 'Adventitial fibroblast', 'Great vessel progenitors', 'Valve interstitial cells', 'Epicardial fibroblast']
+    .map((id, i) => ({ id, name: id, count: 1000 - i, color: null }));
+  const context = { ...CONTEXT, groupsFor: () => groups };
+  const asked = { mode: 'subset', ids: ['Epicardial fibroblast', 'Adventitial fibroblast', 'Myocardial fibroblast'] };
+  for (const [schema, key, extra] of [
+    [MARKER_OPTIONS, 'testGroups', { groupBy: 'cell_type' }],
+    [DE_OPTIONS, 'categoriesA', { compare: 'categories', field: 'cell_type' }],
+  ]) {
+    const record = { ...schema.defaults(context), ...extra, [key]: asked };
+    const normalized = schema.normalize(record, context);
+    assert.deepEqual(normalized[key], { mode: 'subset', ids: ['Myocardial fibroblast', 'Adventitial fibroblast', 'Epicardial fibroblast'] }, `${schema.id}.${key}`);
+    // The picker reads back the same value (known groups in its order): nothing changes on a refresh.
+    const readBack = { mode: 'subset', ids: groups.filter(group => normalized[key].ids.includes(group.id)).map(group => group.id) };
+    assert.deepEqual(readBack, normalized[key]);
+    // Normalizing twice is normalizing once; "all" and an unknown order of groups not listed are kept.
+    assert.deepEqual(schema.normalize(normalized, context), normalized);
+    assert.deepEqual(schema.normalize({ ...record, [key]: { mode: 'all' } }, context)[key], { mode: 'all' });
+    const unlisted = schema.normalize({ ...record, [key]: { mode: 'subset', ids: ['zeta', 'Epicardial fibroblast', 'alpha'] } }, context)[key];
+    assert.deepEqual(unlisted.ids, ['Epicardial fibroblast', 'zeta', 'alpha']);
+    // Before the groups are known (none listed), the value is kept as given.
+    assert.deepEqual(schema.normalize(record, CONTEXT)[key], asked);
+  }
+});

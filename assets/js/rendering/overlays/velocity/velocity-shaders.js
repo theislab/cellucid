@@ -35,6 +35,59 @@
 import { FOG_GLSL } from '../../shaders/fog-shaders.js';
 import { LINEAR_TEXEL_GLSL } from '../../linear-texture.js';
 
+/**
+ * Below this vector length (render space) a particle is not drawn: its cell
+ * shows no motion (`PARTICLE_RENDER_VS` discards it). A field whose every
+ * vector is shorter shows nothing at all, which the loader says when it reads
+ * one (`ensureVectorField`, R9V-6).
+ */
+export const VELOCITY_STILL_SPEED = 0.00001;
+
+/**
+ * The most energy a pass reads from the trail or the bloom. The trail
+ * adds every particle drawn and keeps up to 0.995 of it a frame, so at the
+ * dials' far ends (500K particles of size 30, intensity 1.5, glow 1, trail
+ * persistence 0.995) a pixel's sum passes the half-float target's largest
+ * value and becomes infinite, which turns NaN wherever it is multiplied by
+ * zero or divided by itself. Every pass that reads the trail clamps it here
+ * first; the tone curve is saturated far below (ACES is within 0.3 % of white
+ * from 10), so a clamped pixel looks the same.
+ */
+export const TRAIL_ENERGY_CEILING = 1024;
+const CEILING_GLSL = `vec4(${TRAIL_ENERGY_CEILING.toFixed(1)})`;
+
+/**
+ * The weights of a symmetric blur of `taps` taps a side (the center and
+ * `taps - 1` on each side, one texel step apart) from one Gaussian of width
+ * `sigma` taps, normalized so the center plus both sides sum to exactly one:
+ * a blur pass neither adds nor removes light. Every blur here takes its
+ * weights from this one definition (R9V-11: the hand-typed bloom kernel summed
+ * to 1.0008, a 0.08% gain each pass, and its zero last tap read two texels
+ * for nothing).
+ *
+ * @param {number} sigma - in taps
+ * @param {number} taps - the center and one side
+ * @returns {ReadonlyArray<number>}
+ */
+export function gaussianBlurWeights(sigma, taps) {
+  if (!(sigma > 0) || !Number.isInteger(taps) || taps < 2) {
+    throw new RangeError('A blur kernel needs a positive width and at least two taps.');
+  }
+  const raw = Array.from({ length: taps }, (_, i) => Math.exp(-(i * i) / (2 * sigma * sigma)));
+  const total = raw[0] + 2 * raw.slice(1).reduce((sum, weight) => sum + weight, 0);
+  return Object.freeze(raw.map(weight => weight / total));
+}
+
+/** The bloom's separable blur: 6 taps a side, σ = 1.25 taps. */
+export const BLOOM_BLUR_WEIGHTS = gaussianBlurWeights(1.25, 6);
+/** The anamorphic blur: 5 taps a side, σ = 1.8 taps, shared between its axes. */
+export const ANAMORPHIC_BLUR_WEIGHTS = gaussianBlurWeights(1.8, 5);
+
+/** A weight list as a GLSL `const float[]` (float32 literals; the sum stays one within float precision). */
+function glslWeights(weights) {
+  return `const float weights[${weights.length}] = float[${weights.length}](${weights.map(weight => Math.fround(weight).toPrecision(9)).join(', ')});`;
+}
+
 export const PARTICLE_UPDATE_VS = `#version 300 es
 precision highp float;
 precision highp int;
@@ -320,7 +373,8 @@ uniform float u_frameScale; // elapsed 60 Hz frames
 out vec4 fragColor;
 
 void main() {
-  vec4 prev = texture(u_previousFrame, v_uv);
+  // Clamped: a sum past the target's range is kept finite (TRAIL_ENERGY_CEILING).
+  vec4 prev = min(texture(u_previousFrame, v_uv), ${CEILING_GLSL});
 
   // A zero-delta frame is an exact identity operation, including values below
   // the normal trail-retirement cutoff.
@@ -424,7 +478,7 @@ void main() {
   v_velocity = a_velocity;
 
   // Discard invisible or extremely slow particles
-  if (v_alpha < 0.01 || speed < 0.00001) {
+  if (v_alpha < 0.01 || speed < ${VELOCITY_STILL_SPEED.toFixed(5)}) {
     gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
     gl_PointSize = 0.0;
     v_pointSize = 0.0;
@@ -519,6 +573,10 @@ uniform float u_intensity;
 uniform float u_glowAmount;
 uniform float u_coreSharpness;
 uniform float u_cometStretch;
+// What this draw contributes to the trail, per channel: 1 for a frame of the
+// flow; for a step of a still picture, the trail fade the steps after it
+// would have applied (VelocityOverlay stillFlowTrace).
+uniform vec4 u_weight;
 
 out vec4 fragColor;
 
@@ -652,8 +710,8 @@ void main() {
 
   // Final output - premultiplied alpha for additive blending. Fog has already
   // dimmed the intensity with distance (depthBrightness above), which fades a
-  // particle toward whatever is behind it; no fog colour is mixed in.
-  fragColor = vec4(particleColor * intensity, intensity);
+  // particle toward whatever is behind it; no fog color is mixed in.
+  fragColor = vec4(particleColor * intensity, intensity) * u_weight;
 }
 `;
 
@@ -677,7 +735,8 @@ uniform float u_knee;
 out vec4 fragColor;
 
 void main() {
-  vec4 color = texture(u_source, v_uv);
+  // Clamped before any arithmetic (TRAIL_ENERGY_CEILING): the bloom is never infinite.
+  vec4 color = min(texture(u_source, v_uv), ${CEILING_GLSL});
 
   // Calculate perceptual luminance
   float luma = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
@@ -713,20 +772,13 @@ void main() {
   vec2 texelSize = 1.0 / vec2(textureSize(u_source, 0));
   vec2 offset = u_direction * texelSize * u_blurSize;
 
-  // 13-tap Gaussian blur weights for high quality
-  const float weights[7] = float[7](
-    0.1964825501511404,
-    0.2969069646728344,
-    0.09447039785044732,
-    0.010381362401148057,
-    0.0003951489674184668,
-    0.000005226574605564482,
-    0.0
-  );
+  // 11-tap Gaussian (BLOOM_BLUR_WEIGHTS, gaussianBlurWeights): normalized to
+  // one, no zero tap (times an infinite texel a zero tap was NaN).
+  ${glslWeights(BLOOM_BLUR_WEIGHTS)}
 
   vec4 result = texture(u_source, v_uv) * weights[0];
 
-  for (int i = 1; i < 7; i++) {
+  for (int i = 1; i < ${BLOOM_BLUR_WEIGHTS.length}; i++) {
     vec2 offsetI = offset * float(i);
     result += texture(u_source, v_uv + offsetI) * weights[i];
     result += texture(u_source, v_uv - offsetI) * weights[i];
@@ -756,12 +808,13 @@ void main() {
   // Anamorphic: stretch horizontally more than vertically
   vec2 offset = texelSize * u_blurSize * vec2(u_anamorphicRatio, 1.0 / u_anamorphicRatio);
 
-  // 9-tap separable blur with anamorphic weighting
-  const float weights[5] = float[5](0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+  // 9-tap Gaussian (ANAMORPHIC_BLUR_WEIGHTS, gaussianBlurWeights), split 0.7
+  // horizontal / 0.3 vertical: the pass still sums to one.
+  ${glslWeights(ANAMORPHIC_BLUR_WEIGHTS)}
 
   vec4 result = texture(u_source, v_uv) * weights[0];
 
-  for (int i = 1; i < 5; i++) {
+  for (int i = 1; i < ${ANAMORPHIC_BLUR_WEIGHTS.length}; i++) {
     // Horizontal samples (more weight)
     vec2 offsetH = vec2(offset.x * float(i), 0.0);
     result += texture(u_source, v_uv + offsetH) * weights[i] * 0.7;
@@ -831,6 +884,26 @@ vec3 ACESFilmEnhanced(vec3 x) {
   result = result + shadowBoost * (1.0 - result) * (1.0 - result);
 
   return clamp(result, 0.0, 1.0);
+}
+
+// Hue-preserving tone mapping (R9V-11). The trail is an HDR sum of the
+// particles' colors; mapped channel by channel, a saturated color's largest
+// channels reached white first and its smallest lagged, so a purple flow
+// (viridis's slow end: G near 0) turned magenta before white and a teal one
+// cyan. The luminance is mapped instead and the color scaled with it, keeping
+// its hue; a color brighter than the display shows moves toward white along
+// its own hue, as far as its brightest channel needs.
+const vec3 TONE_LUMA = vec3(0.2126, 0.7152, 0.0722);
+vec3 toneMapPreservingHue(vec3 color) {
+  float lumIn = dot(color, TONE_LUMA);
+  if (!(lumIn > 0.0)) return vec3(0.0);
+  float lumOut = ACESFilmEnhanced(vec3(lumIn)).x;
+  vec3 mapped = color * (lumOut / lumIn);
+  float peak = max(mapped.r, max(mapped.g, mapped.b));
+  if (peak > 1.0) {
+    mapped = mix(mapped, vec3(lumOut), clamp((peak - 1.0) / max(peak - lumOut, 1e-6), 0.0, 1.0));
+  }
+  return mapped;
 }
 
 // Soft S-curve for contrast - more filmic than linear
@@ -907,6 +980,10 @@ void main() {
     trail = texture(u_trailTex, uv);
     bloom = texture(u_bloomTex, uv);
   }
+  // Clamped before any arithmetic (TRAIL_ENERGY_CEILING): an infinite channel
+  // would turn NaN in the tone curve and draw as a colored rim.
+  trail = min(trail, ${CEILING_GLSL});
+  bloom = min(bloom, ${CEILING_GLSL});
 
   // Early discard for empty pixels
   float totalAlpha = trail.a + bloom.a * u_bloomStrength;
@@ -917,9 +994,11 @@ void main() {
   vec3 bloomColor = bloom.rgb * u_bloomStrength;
   vec3 color = trail.rgb;
 
-  // Screen blend for bloom (prevents over-brightening)
-  vec3 screenBlend = 1.0 - (1.0 - color) * (1.0 - bloomColor * 0.5);
-  color = color + bloomColor * 0.7 + (screenBlend - color) * 0.3;
+  // Screen blend for bloom (prevents over-brightening). The screen term is
+  // for display values: past 1 it is zero, where (1 - color) turned negative
+  // and flipped the sign of the bloom per channel.
+  vec3 screenBlend = 1.0 - (1.0 - min(color, vec3(1.0))) * (1.0 - bloomColor * 0.5);
+  color = color + bloomColor * 0.7 + (screenBlend - min(color, vec3(1.0))) * 0.3;
 
   // === EXPOSURE ===
   color *= u_exposure;
@@ -938,11 +1017,13 @@ void main() {
   color = mix(color, shadowAdjust, shadowMask * 0.4);
   color = mix(color, highlightAdjust, highlightMask * 0.25);
 
-  // === CONTRAST (Soft S-curve) ===
-  color = softContrast(color, u_contrast);
+  // === TONE MAPPING (hue-preserving) ===
+  color = toneMapPreservingHue(color);
 
-  // === TONE MAPPING ===
-  color = ACESFilmEnhanced(color);
+  // === CONTRAST (Soft S-curve) ===
+  // On display values: an S-curve clamps its input to [0, 1], so on HDR
+  // values it pulled each channel past 1 toward 1.25 and bent the hue.
+  color = softContrast(color, u_contrast);
 
   // === COLOR TINT ===
   color *= u_colorTint;

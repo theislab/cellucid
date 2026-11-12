@@ -5,7 +5,7 @@
  *
  * Each is a disclosure under a section heading, collapsed by default, whose
  * header says what it holds in one line while collapsed (`setSummary`), so
- * nothing is hidden silently: "100 % cells · genes 6 %", "3 embeddings ·
+ * nothing is hidden silently: "100% cells · genes 6%", "3 embeddings ·
  * UMAP 2D". Whether each is open is this viewer's preference, kept in this
  * browser (`localStorage`, every access guarded: a window that keeps nothing
  * starts collapsed) and never in a session or the address.
@@ -18,7 +18,8 @@
  */
 
 import { bindDisclosure } from '../components/controls.js';
-import { formatCompactCount } from '../components/display-format.js';
+import { formatShare, formatCompactCount } from '../../../utils/format-units.js';
+import { webStorage } from '../../../utils/web-storage.js';
 
 /** The sections, by name: their header button and summary ids. */
 export const SESSION_SECTIONS = Object.freeze({
@@ -49,44 +50,32 @@ function writeOpen(storage, name, open) {
 }
 
 function storageOf(ownerDocument) {
-  try {
-    return ownerDocument.defaultView?.localStorage ?? null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * A percent of the cells as a section summary writes it: whole from 10 up,
- * two significant figures below, never 100 short of every one.
- *
- * @param {number} part
- * @param {number} whole
- * @returns {string}
- */
-function percentText(part, whole) {
-  if (!(whole > 0) || part >= whole) return '100';
-  const percent = (100 * part) / whole;
-  if (percent >= 10) return String(Math.min(99, Math.round(percent)));
-  return String(Number(percent.toPrecision(2)));
+  return webStorage('localStorage', ownerDocument.defaultView);
 }
 
 /**
  * The Subsampling summary: the share of the dataset's cells open, and, when
- * genes are read for a sample of them, its share of the open cells ("100 %
- * cells · genes 0.17 %"); "" with no dataset.
+ * genes are read for a sample of them, its share of the open cells ("100%
+ * cells · genes 0.17%"); "" with no dataset.
  *
  * @param {{nObs: number, kept: ArrayLike<number>|null}|null} subset - The open cells (`getCellSubset`)
  * @param {{cells: number, of: number}|null} genes - The gene sample (`DataState.getGeneSample`)
  * @param {{cells: number, target: number}|null} [growth] - Genes being read for more cells
+ * @param {{cells: number, target: number}|null} [opening] - A progressive opening growing in
+ *   place (`open-cells-resize.js`): the share it grows to, and how many cells are read so far
+ *   ("100% cells · reading 131K"), as the Subsampling control shows it. The cells open so far
+ *   alone ("23% cells") read as a subsample someone chose.
  * @returns {string}
  */
-export function subsamplingSummary(subset, genes, growth = null) {
+export function subsamplingSummary(subset, genes, growth = null, opening = null) {
   if (subset === null || subset === undefined) return '';
+  if (opening !== null && opening !== undefined) {
+    return `${formatShare(opening.target, subset.nObs)} cells · reading ${formatCompactCount(opening.cells)}`;
+  }
   const open = subset.kept === null ? subset.nObs : subset.kept.length;
-  const cells = `${percentText(open, subset.nObs)} % cells`;
+  const cells = `${formatShare(open, subset.nObs)} cells`;
   if (growth !== null && growth !== undefined) return `${cells} · reading genes ${formatCompactCount(growth.cells)}`;
-  return genes === null || genes === undefined ? cells : `${cells} · genes ${percentText(genes.cells, genes.of)} %`;
+  return genes === null || genes === undefined ? cells : `${cells} · genes ${formatShare(genes.cells, genes.of)}`;
 }
 
 /**

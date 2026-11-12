@@ -8,7 +8,7 @@
  * - compute in flight is two tasks per worker, capped by half the memory
  *   budget over the bytes a gene carries;
  * - the read-ahead is the genes consumed while one is fetched plus the
- *   compute in flight, and buffered genes never hold more than 30 % of the
+ *   compute in flight, and buffered genes never hold more than 30% of the
  *   budget (the memory gate holds even when the budget is tiny);
  * - once per window (≥ 250 ms and ≥ 32 genes): workers idle while reads are
  *   pending (read-bound) double the read-ahead, a doubling that did not
@@ -109,7 +109,7 @@ test('the read-ahead is the genes consumed while one is fetched, plus the comput
   assert.equal(linked.tuner.prefetchDepth(), Math.ceil(4 * (20 + 400 / 40)) + 8);
 });
 
-test('the memory gate holds: buffered genes never pass 30 % of the budget', () => {
+test('the memory gate holds: buffered genes never pass 30% of the budget', () => {
   for (const [budget, bytes, poolSize] of [
     [1_000_000, 10_000, 4],
     [100_000, 10_000, 4],     // compute in flight (5) above the gate (3)
@@ -291,7 +291,7 @@ test('a gene of a cell subset holds a position and a value a cell until measured
   assert.equal(genesPerTaskFor({ geneCount: 30_000, poolSize: 8, cellCount: 1_000_000, budgetBytes: GB, bytesPerCell: 8 }), 4);
   const unmeasured = createRunTuner({ poolSize: 4, cellCount: 25_000, bytesPerCell: 8, genesPerTask: 2, budgetBytes: () => 1_000_000 });
   assert.equal(unmeasured.taskBytes(), 25_000 * 8 * 2);
-  // 30 % of 1 MB over 400 kB a task: the gate holds no more than one task.
+  // 30% of 1 MB over 400 kB a task: the gate holds no more than one task.
   assert.equal(unmeasured.bufferedTasks(), 1);
   unmeasured.observeRead({ bytes: 20_000, ms: 1, genes: 2 });
   assert.equal(unmeasured.taskBytes(), 20_000);

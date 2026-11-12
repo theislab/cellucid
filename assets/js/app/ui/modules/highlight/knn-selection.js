@@ -13,8 +13,7 @@ import {
   HIGHLIGHT_MODE_COPY,
   SELECTION_NOTICE,
   idleSelectionNoticeHtml,
-  selectionNoticeHtml
-} from './mode-copy.js';
+  selectionNoticeHtml, combineHelpHtml } from './mode-copy.js';
 import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
 import {
@@ -126,10 +125,10 @@ export function initKnnSelection(options) {
     if (destroyed) return;
     requireCompletedSelectionEvent(knnEvent, 'knn', state.pointCount);
 
-    const stepsLabel = knnEvent.steps > 1 ? ` (${knnEvent.steps} selections)` : '';
     void confirmer.confirm({
       tool: 'knn',
-      label: `KNN${stepsLabel} (${formatCountOf(knnEvent.cellCount, 'cell')})`,
+      // Named by the tool (the list shows its count); a second on the page is `KNN 2`.
+      label: 'KNN',
       cellIndices: knnEvent.cellIndices
     });
 
@@ -139,7 +138,7 @@ export function initKnnSelection(options) {
       cellIndices: knnEvent.cellIndices,
       source: 'knn',
       onFailure: error => {
-        if (!destroyed) showSelectionDeliveryFailure(error, 'knn');
+        if (!destroyed) showSelectionDeliveryFailure(error, 'knn', viewerHostSource.getHostRuntime());
       }
     }));
 
@@ -198,7 +197,7 @@ export function initKnnSelection(options) {
 
     // The empty state before the first step is recorded like any other, so
     // Undo can reach it — the annotation tool has always done this, and a
-    // greyed-out Undo immediately after dragging reads as a broken control.
+    // grayed-out Undo immediately after dragging reads as a broken control.
     pushHistoryStep(selectionState, 'knnHistory', {
       candidates: selectionState.lastKnnCandidates,
       step: selectionState.lastKnnStep
@@ -377,7 +376,7 @@ export function initKnnSelection(options) {
 
     if (stepEvent.step === 0 && stepEvent.keepControls) {
       const stepInfo =
-        '<strong>No selection</strong><br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>';
+        `<strong>No selection</strong><br><small>${combineHelpHtml()}</small>`;
 
       showKnnControls(0, notice);
 
@@ -399,7 +398,7 @@ export function initKnnSelection(options) {
       : stepEvent.degree === 0
         ? 'seed only'
         : `${stepEvent.degree}° neighbors`;
-    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCountOf(stepEvent.candidateCount, 'cell')} (${degreeLabel})${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCountOf(stepEvent.candidateCount, 'cell')} (${degreeLabel})${modeLabel}<br><small>${combineHelpHtml()}</small>`;
 
     showKnnControls(stepEvent.candidateCount, notice);
 

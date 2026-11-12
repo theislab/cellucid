@@ -408,7 +408,7 @@ test('cell lookups under the pointer, and the Cell info card, do not redraw the 
     'Current UI fixture',
   );
   // The field activation is asynchronous and redraws the scene when it lands
-  // (new colours, labels and centroids). Its legend is the sign it has landed;
+  // (new colors, labels and centroids). Its legend is the sign it has landed;
   // until then its redraw can fall into any window measured below.
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);

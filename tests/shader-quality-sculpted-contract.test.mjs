@@ -1,6 +1,6 @@
 /**
  * The `sculpted` shader quality: soft studio-lit, antialiased sphere
- * impostors whose centre shows the legend colour, drawn opaque so the edge can
+ * impostors whose center shows the legend color, drawn opaque so the edge can
  * be a multisample coverage mask with depth on, and a selection that holds
  * still.
  *
@@ -46,7 +46,7 @@ test('one list names every quality, the default first and unchanged', () => {
   assert.deepEqual(Object.keys(HIGHLIGHT_STYLES_BY_QUALITY).sort(), [...SHADER_QUALITIES].sort());
 });
 
-test('a sculpted sphere centre shows exactly the legend colour', () => {
+test('a sculpted sphere centre shows exactly the legend color', () => {
   // The fragment shader multiplies its lighting by u_invCenterShade, which
   // writePointShaderFrame derives from the same constants the shader is built
   // from, so the lighting is exactly one at the normal (0, 0, 1).
@@ -62,7 +62,7 @@ test('a sculpted sphere centre shows exactly the legend colour', () => {
   assert.equal(frame.invCenterShade, 1 / sculptedCenterShade(lightDir));
 
   // Linear light is the square of the display value and is encoded back with
-  // a square root, so the round trip of a lit-by-one colour is exact.
+  // a square root, so the round trip of a lit-by-one color is exact.
   for (const source of [HP_FS_SCULPTED, HP_FS_SCULPTED_NO_DEPTH]) {
     assert.match(source, /vec3 albedo = v_color \* v_color;/);
     assert.match(source, /vec3 shaded = sqrt\(lit\);/);

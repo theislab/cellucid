@@ -8,6 +8,7 @@
  * state.
  */
 import { expect, test } from './helpers/test.mjs';
+import { tabKey } from './helpers/dialog-keys.mjs';
 
 const PAGES = [
   ['/404.html', 'Page not found'],
@@ -53,7 +54,7 @@ for (const [address, heading] of PAGES) {
     // Keyboard focus is drawn. WebKit, like Safari, moves to links with
     // Option+Tab (plain Tab reaches them only with "Press Tab to highlight
     // each item" on).
-    const tab = test.info().project.name === 'webkit' ? 'Alt+Tab' : 'Tab';
+    const tab = tabKey(test.info().project.name);
     let outline = 'none';
     for (let step = 0; step < 4 && outline === 'none'; step += 1) {
       await page.keyboard.press(tab);
@@ -92,7 +93,7 @@ test('the footer keeps its links to one quiet line and opens each page in a new 
     const tops = await footer.locator('p').nth(line).locator('a').evaluateAll(anchors => anchors.map(anchor => Math.round(anchor.getBoundingClientRect().top)));
     expect(new Set(tops).size, `footer line ${line + 1}`).toBe(1);
   }
-  // The accessibility statement sits beside the licence, on its line.
+  // The accessibility statement sits beside the license, on its line.
   const license = footer.locator('p').nth(2).locator('a');
   await expect(license).toHaveText(['BSD 3-Clause license', 'Accessibility']);
   const licenseRows = await license.evaluateAll(anchors => anchors.map(anchor => Math.round(anchor.getBoundingClientRect().top)));

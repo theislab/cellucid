@@ -6,10 +6,12 @@
  * hold (the navigation mode is the `camera` domain's, the navigation
  * settings the `settings` domain's controls):
  *
- *     {keyframes: [{id, name, camera, …}, …],   // as the keyframe store exports them
+ *     {keyframes: [{id, label, camera, …, hold?}, …], // as the keyframe store exports them (`hold` only when it rests)
  *      nextIndex,                               // the number the next keyframe takes
  *      loopBackKeyframeId,                      // the keyframe a loop returns to, or null
  *      autoplay, loopPlayback,                  // booleans
+ *      captions?,                               // false when captions are off; absent: on
+ *                                               // (an added key, `record-keys.js`)
  *      positionMethod, rotationMethod, easing,  // interpolation choices
  *      defaultSpeed}                            // the speed slider, as its text
  *
@@ -47,11 +49,17 @@ export function createCameraPathDomain({ cinematicCamera }) {
       if (a.keyframes.length !== b.keyframes.length) {
         lines.push(`Camera path: ${formatCountOf(b.keyframes.length, 'keyframe')} (was ${a.keyframes.length})`);
       } else if (!sameValue(a.keyframes, b.keyframes)) {
-        lines.push('Camera path: keyframes changed');
+        const withoutHold = keyframes => keyframes.map(({ hold, ...keyframe }) => keyframe);
+        lines.push(sameValue(withoutHold(a.keyframes), withoutHold(b.keyframes))
+          ? 'Camera path: holds changed'
+          : 'Camera path: keyframes changed');
       }
-      for (const [key, label] of [['loopPlayback', 'loop'], ['autoplay', 'autoplay'], ['positionMethod', 'position interpolation'],
+      for (const [key, label] of [['loopPlayback', 'loop'], ['autoplay', 'autoplay'], ['captions', 'captions'], ['positionMethod', 'position interpolation'],
         ['rotationMethod', 'rotation interpolation'], ['easing', 'easing'], ['defaultSpeed', 'speed'], ['loopBackKeyframeId', 'loop back']]) {
-        if (!sameValue(a[key], b[key])) lines.push(`Camera path: ${label} ${typeof b[key] === 'boolean' ? (b[key] ? 'on' : 'off') : String(b[key])}`);
+        // An added key absent from a record is its default (`record-keys.js`).
+        const before = key === 'captions' ? (a.captions ?? true) : a[key];
+        const after = key === 'captions' ? (b.captions ?? true) : b[key];
+        if (!sameValue(before, after)) lines.push(`Camera path: ${label} ${typeof after === 'boolean' ? (after ? 'on' : 'off') : String(after)}`);
       }
       return lines;
     },

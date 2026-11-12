@@ -55,8 +55,10 @@ test('steps, undo and redo, a branch made by acting after going back, a group, t
   const errors = observeProductErrors(page);
   await open(page);
   await expect(page.locator('#history-status')).toContainText('Every change you make appears here');
-  await takeSteps(page, [['color.by', { field: CELL_TYPE }], hide(['alpha']), hide(['beta']), hide(['gamma'])]);
-  await expect.poll(() => labels(page)).toEqual(['Opened', 'Coloured by cell_type', 'Hid alpha of cell_type', 'Hid beta of cell_type', 'Hid gamma of cell_type']);
+  // The fixture opens colored by cell_type (its first coloring, part of "Opened"): color by score is a step.
+  await expect(page.locator('#categorical-field option:checked')).toHaveText('cell_type');
+  await takeSteps(page, [['color.by', { field: SCORE }], hide(['alpha']), hide(['beta']), hide(['gamma'])]);
+  await expect.poll(() => labels(page)).toEqual(['Opened', 'Colored by score', 'Hid alpha of cell_type', 'Hid beta of cell_type', 'Hid gamma of cell_type']);
   await expect(page.locator('#history-status')).toHaveText('4 steps');
 
   await page.locator('#history-undo-btn').click();
@@ -77,11 +79,11 @@ test('steps, undo and redo, a branch made by acting after going back, a group, t
   await expect(page.locator('#history-branch-btn')).toContainText('Branch 1');
 
   // Group the first two steps: Shift+click, then Ctrl/⌘+G.
-  await row(page, 'Coloured by cell_type').click();
+  await row(page, 'Colored by score').click();
   await row(page, 'Hid alpha of cell_type').click({ modifiers: ['Shift'] });
   await page.keyboard.press('ControlOrMeta+g');
-  await page.locator('.confirm-dialog-overlay .confirm-dialog-textarea').fill('QC');
-  await page.locator('.confirm-dialog-overlay').getByRole('button', { name: 'Group', exact: true }).click();
+  await page.locator('dialog.confirm-dialog .confirm-dialog-textarea').fill('QC');
+  await page.locator('dialog.confirm-dialog').getByRole('button', { name: 'Group', exact: true }).click();
   await expect.poll(async () => (await facts(page)).groups).toBe(1);
   await expect(row(page, 'QC')).toHaveAttribute('data-kind', 'group');
 
@@ -92,7 +94,7 @@ test('steps, undo and redo, a branch made by acting after going back, a group, t
   await takeSteps(page, [show(['alpha'])]);
   expect((await facts(page)).steps).toBe(before.steps);
   await page.locator('#history-undo-btn').click();
-  const ask = page.locator('.confirm-dialog-overlay');
+  const ask = page.locator('dialog.confirm-dialog');
   await expect(page.locator('.confirm-dialog-title')).toHaveText('Keep your changes first?');
   await ask.getByRole('button', { name: 'Keep and go' }).click();
   await expect.poll(async () => (await facts(page)).steps).toBe(before.steps + 1);
@@ -102,7 +104,7 @@ test('steps, undo and redo, a branch made by acting after going back, a group, t
   expect(errors).toEqual([]);
 });
 
-test('a stale step: Run again brings a highlight up to date; a keyframe, which Run again would only add again, offers none', async ({ page }) => {
+test('a stale step: Run again brings a highlight up to date; a keyframe holds the camera it captured and is never stale', async ({ page }) => {
   const errors = observeProductErrors(page);
   await open(page);
   const cellsOfGroup = () => page.evaluate(() => window._cellucidState.getActivePage().highlightedGroups.map(group => group.cellCount));
@@ -112,11 +114,31 @@ test('a stale step: Run again brings a highlight up to date; a keyframe, which R
 
   const keyframe = page.locator('#history-graph .hg-row', { has: page.locator('.hg-label', { hasText: /^Saved camera path keyframe/ }) });
   await keyframe.locator('.hg-details-btn').click();
-  await expect(keyframe.locator('.history-detail-warning')).toContainText('Stale since');
-  await expect(keyframe.getByRole('button', { name: 'Run again' }), 'another keyframe is not this one brought up to date').toHaveCount(0);
+  // A keyframe holds the camera it captured (`captures: ['camera']`): the
+  // camera moving on after it makes it no older (owner, 2026-11-10, F57).
+  await expect(keyframe.locator('.hg-details')).toBeVisible();
+  await expect(keyframe.locator('.history-detail-warning')).toHaveCount(0);
+  await expect(keyframe.getByRole('button', { name: 'Run again' })).toHaveCount(0);
   const highlight = page.locator('#history-graph .hg-row', { has: page.locator('.hg-label', { hasText: /^Highlighted score from/ }) });
   await highlight.locator('.hg-details-btn').click();
-  await expect(highlight.locator('.history-detail-warning')).toContainText('Stale since');
+  // Each reason names its own input and the step that changed it (F156).
+  await expect(highlight.locator('.history-detail-warning')).toContainText(/Stale: Filters changed at step \d+ \(“Hid alpha of cell_type”\)\./);
+  // The details sit inside the list: every action is quiet (no pill, no
+  // filled button), one line each, at the details' own text size (F98).
+  const detailButtons = await highlight.locator('.hg-details button').evaluateAll(buttons => buttons.map(button => {
+    const style = getComputedStyle(button);
+    return {
+      text: button.textContent.trim(),
+      quiet: button.classList.contains('btn-quiet'),
+      filled: button.classList.contains('btn-primary'),
+      oneLine: button.getBoundingClientRect().height <= parseFloat(style.lineHeight) * 1.5 + parseFloat(style.paddingTop) + parseFloat(style.paddingBottom) + 2,
+      sameSize: style.fontSize === getComputedStyle(button.closest('.hg-details')).fontSize,
+    };
+  }));
+  expect(detailButtons.length).toBeGreaterThan(3);
+  for (const each of detailButtons) expect(each, each.text).toEqual({ ...each, quiet: true, filled: false, oneLine: true, sameSize: true });
+  expect(detailButtons.map(each => each.text)).toContain('More…');
+  expect(detailButtons.map(each => each.text)).toContain('Add note');
 
   const steps = (await facts(page)).steps;
   await highlight.getByRole('button', { name: 'Run again' }).click();
@@ -126,14 +148,15 @@ test('a stale step: Run again brings a highlight up to date; a keyframe, which R
   expect(await cellsOfGroup(), 'one group, brought up to date in its place').toHaveLength(1);
   await expect(page.locator('#history-graph .hg-label', { hasText: /^Updated the cells of score from/ })).toHaveCount(1);
   const stale = await page.evaluate(() => window._cellucidHistories.current().stale().map(entry => entry.step.label));
-  expect(stale, 'the highlight is no longer stale; the keyframe still is').toEqual([expect.stringMatching(/^Saved camera path keyframe/)]);
+  expect(stale, 'nothing is stale: the highlight is brought up to date, the keyframe never was').toEqual([]);
   expect(errors).toEqual([]);
 });
 
 test('the History ⋯ menu shows whole above the page, wherever its section ends, and goes back in place when it closes', async ({ page }) => {
   const errors = observeProductErrors(page);
   await open(page);
-  await takeSteps(page, [['color.by', { field: CELL_TYPE }]]);
+  // A step (the fixture opens colored by cell_type, so coloring by it again would be none).
+  await takeSteps(page, [['color.by', { field: SCORE }]]);
   const button = page.locator('#history-menu-btn');
   await expect(button).toBeEnabled();
   // The section's last row at the bottom of the sidebar: a menu inside it would overflow the section.
@@ -147,7 +170,7 @@ test('the History ⋯ menu shows whole above the page, wherever its section ends
   for (let index = 0; index < count; index++) {
     const item = items.nth(index);
     if (!await item.isVisible()) continue;
-    // What a press at the item's centre reaches is the item: nothing clips or covers it.
+    // What a press at the item's center reaches is the item: nothing clips or covers it.
     const reached = await item.evaluate(element => {
       const box = element.getBoundingClientRect();
       const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
@@ -183,13 +206,14 @@ test('the History ⋯ menu shows whole above the page, wherever its section ends
 test('a group says where the step shown is inside it; search by the part changed and the day; the (i) tip opens History settings', async ({ page }) => {
   const errors = observeProductErrors(page);
   await open(page);
-  await takeSteps(page, [['color.by', { field: CELL_TYPE }], hide(['alpha']), hide(['beta']), ['color.by', { field: SCORE }]]);
+  // The fixture opens colored by cell_type: score first, then back to cell_type, are both steps.
+  await takeSteps(page, [['color.by', { field: SCORE }], hide(['alpha']), hide(['beta']), ['color.by', { field: CELL_TYPE }]]);
   // Group the three first steps, then show the second of them: the collapsed group says "at 2 of 3".
-  await row(page, 'Coloured by cell_type').click();
+  await row(page, 'Colored by score').click();
   await row(page, 'Hid beta of cell_type').click({ modifiers: ['Shift'] });
   await page.keyboard.press('ControlOrMeta+g');
-  await page.locator('.confirm-dialog-overlay .confirm-dialog-textarea').fill('QC');
-  await page.locator('.confirm-dialog-overlay').getByRole('button', { name: 'Group', exact: true }).click();
+  await page.locator('dialog.confirm-dialog .confirm-dialog-textarea').fill('QC');
+  await page.locator('dialog.confirm-dialog').getByRole('button', { name: 'Group', exact: true }).click();
   await expect(row(page, 'QC')).toHaveAttribute('data-kind', 'group');
   await expect(row(page, 'QC').locator('.hg-meta')).toHaveText('3 steps');
   await page.evaluate(() => window._cellucidHistories.current().jump('s2'));
@@ -229,13 +253,14 @@ test('Show this step’s view puts the camera back where the step kept it, even 
     try { localStorage.setItem('cellucid:history-settings', JSON.stringify({ recordCamera: false })); } catch { /* none kept */ }
   });
   await open(page);
-  await takeSteps(page, [['color.by', { field: CELL_TYPE }]]);
+  // A step (the fixture opens colored by cell_type, so coloring by it again would be none).
+  await takeSteps(page, [['color.by', { field: SCORE }]]);
   const kept = await page.evaluate(() => window._cellucidViewer.getViewCameraState('live'));
   // The camera moves (not recorded), then a step: that step keeps the moved camera; the first keeps the first.
   await takeSteps(page, [['camera.set', await turnedCamera(page, 40)]]);
   await takeSteps(page, [hide(['alpha'])]);
   const steps = (await facts(page)).steps;
-  const first = row(page, 'Coloured by cell_type');
+  const first = row(page, 'Colored by score');
   await first.locator('.hg-details-btn').click();
   await first.getByRole('button', { name: 'Show this step’s view' }).click();
   await expect.poll(() => page.evaluate(() => window._cellucidViewer.getViewCameraState('live').orbit.theta)).toBeCloseTo(kept.orbit.theta, 6);
@@ -247,7 +272,7 @@ test('Show this step’s view puts the camera back where the step kept it, even 
 test('memory: once the history passes what the device has room for, the status line names the largest parts, with a way to act', async ({ page }) => {
   const errors = observeProductErrors(page);
   await open(page);
-  await takeSteps(page, [['highlight.category', { field: CELL_TYPE, category: 'gamma' }], ['color.by', { field: CELL_TYPE }]]);
+  await takeSteps(page, [['highlight.category', { field: CELL_TYPE, categories: ['gamma'] }], ['color.by', { field: SCORE }]]);
   const chip = page.locator('#history-memory-btn');
   await expect(chip).toBeHidden();
   // Something else takes all the room (as a very large dataset would): the history is now past what is left for it.

@@ -58,9 +58,11 @@ import { recordAllocationFailure, recordAllocationSuccess } from './memory-budge
 import { allocateLargeArray } from '../utils/large-arrays.js';
 import { formatBytes, formatCountOf } from '../utils/format-units.js';
 import { matchesChecksum } from '../formats/io/page-checks.js';
+import { AnnDataFormatError } from './anndata/elements.js';
 import { readWhole, requireHeld, writeAt } from '../formats/io/sync-access.js';
-import { cancelled, onAbort } from '../utils/abort.js';
+import { abortReason, cancelled, onAbort } from '../utils/abort.js';
 import { measureOf } from '../utils/machine.js';
+import { yieldToMacrotask } from '../utils/yield-macrotask.js';
 
 /**
  * How long one part of a background index's synchronous work runs before the
@@ -435,10 +437,6 @@ function rangedCost(positions, count, storedBytesPerEntry, costs) {
   return Math.ceil(requests / costs.shapingConcurrency) * roundTripBytesOf(costs) + span * storedBytesPerEntry;
 }
 
-/** Resolves on a later task, after every read asked for in this one. */
-function nextTask() {
-  return new Promise(resolve => (typeof setImmediate === 'function' ? setImmediate(resolve) : setTimeout(resolve, 0)));
-}
 
 /**
  * The row holding entry `position` of a row-major matrix with row
@@ -636,7 +634,7 @@ class SparseStructure {
     const toBuy = storedValueBytes * (this._nnz - this._keptEntries) / this._nnz;
     if (this._batch === null) {
       const batch = { cost: 0, wholeIsCheaper: null };
-      batch.wholeIsCheaper = nextTask().then(() => {
+      batch.wholeIsCheaper = yieldToMacrotask().then(() => {
         if (this._batch === batch) this._batch = null;
         // Ranges already read count too (rent until renting has cost what
         // buying does): once they and this task's together would pay for
@@ -1342,7 +1340,7 @@ class KeptReads {
     return new Promise((resolve, reject) => {
       if (this._pending === null) {
         this._pending = [];
-        nextTask().then(() => this._readPending());
+        yieldToMacrotask().then(() => this._readPending());
       }
       this._pending.push({ name, column, start, count, resolve, reject });
     });
@@ -1746,23 +1744,23 @@ export function createColumnStoreFactory({ memoryBudgetBytes, openDiskFiles = nu
 // ---------------------------------------------------------------------------
 
 /**
- * The items of `items`, each with `fetch(item)` resolved, fetching the next
+ * The items of `items`, each with `load(item)` resolved, fetching the next
  * item's data before the current one is handed out: reading and decoding the
  * next slab overlaps with processing this one. A read-ahead of one slab keeps
  * at most two slabs resident; `depth` slabs ahead keep `depth + 1`.
  *
  * @template T, D
  * @param {AsyncIterable<T>|Iterable<T>} items
- * @param {(item: T) => Promise<D>} fetch
+ * @param {(item: T) => Promise<D>} load
  * @param {number} [depth] - Items fetched ahead of the one handed out
  * @returns {AsyncGenerator<{item: T, data: D}>}
  */
-async function* withReadAhead(items, fetch, depth = 1) {
+async function* withReadAhead(items, load, depth = 1) {
   const iterator = (items[Symbol.asyncIterator] ?? items[Symbol.iterator]).call(items);
   const pull = async () => {
     const { value, done } = await iterator.next();
     if (done) return null;
-    const data = Promise.resolve().then(() => fetch(value));
+    const data = Promise.resolve().then(() => load(value));
     data.catch(() => {});
     return { item: value, data };
   };
@@ -2199,7 +2197,7 @@ export class RowMajorColumnIndex {
     if (this._keptReady()) {
       return this._fromStore('column', column, { signal });
     }
-    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (signal?.aborted) return Promise.reject(abortReason(signal));
     const restartScan = this.phase === 'unindexed';
     let request = this._requests.get(column);
     if (request === undefined) {
@@ -2231,7 +2229,7 @@ export class RowMajorColumnIndex {
     return new Promise((resolve, reject) => {
       const stopWaiting = onAbort(signal, () => {
         this._withdraw(entry);
-        reject(signal.reason);
+        reject(abortReason(signal));
       });
       entry.promise.then(
         values => {
@@ -2536,15 +2534,15 @@ export class RowMajorColumnIndex {
       for (let index = 0; index < raw.length; index++) {
         const pointer = toCount(raw[index], `${label} indptr`);
         if (index === 0 && pointer !== previousPointer) {
-          throw new Error(
+          throw new AnnDataFormatError(
             row === 0 ? `${label} indptr must start at zero` : (row === fromRow ? `${label} changed while it was read; reopen the file` : `${label} indptr must be monotonic`)
           );
         }
         if (index > 0 && pointer < pointers[index - 1]) {
-          throw new Error(`${label} indptr must be monotonic`);
+          throw new AnnDataFormatError(`${label} indptr must be monotonic`);
         }
         if (pointer > nnz) {
-          throw new Error(`${label} indptr last value must equal the non-zero count (${nnz})`);
+          throw new AnnDataFormatError(`${label} indptr ${pointer} at row ${row + index} is past its ${formatCountOf(nnz, 'stored value')}`);
         }
         pointers[index] = pointer;
       }
@@ -2567,7 +2565,7 @@ export class RowMajorColumnIndex {
       row = pointerEnd;
     }
     if (previousPointer !== nnz) {
-      throw new Error(`${label} indptr last value must equal the non-zero count (${nnz})`);
+      throw new AnnDataFormatError(`${label} indptr last value must equal the non-zero count (${nnz})`);
     }
   }
 
@@ -2670,7 +2668,7 @@ export class RowMajorColumnIndex {
    * gene is waiting (its values are wanted from this slab), values are read
    * on demand (a link slower than a disk), and the slab's values whole cost
    * no more bytes than one round trip of the link moves -- the round trip
-   * they save. On a 40,000-cell file over 150 ms at 5 MB/s, a 1 % subsample's
+   * they save. On a 40,000-cell file over 150 ms at 5 MB/s, a 1% subsample's
    * first gene read pointers, indices, then values: three round trips where
    * two do. Only a round trip at the pass's end is saved: a slab's waiting
    * values asked for after its indices arrive while the slabs after it are
@@ -2815,7 +2813,7 @@ export class RowMajorColumnIndex {
           for (let index = from; index < to; index++) {
             const column = indices[index];
             if (!(column >= 0 && column < nCols) || (!integral && !Number.isInteger(column))) {
-              throw new RangeError(
+              throw new AnnDataFormatError(
                 `Sparse matrix column index ${column} at entry ${slab.entryStart + index} is outside its ` +
                 `${nCols}-column shape`
               );

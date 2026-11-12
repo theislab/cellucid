@@ -22,7 +22,7 @@ import { createViewerHostResults } from '../assets/js/app/viewer-host/results.js
 import { DerivedResultsRegistry } from '../assets/js/app/registries/derived-results.js';
 import { formatGmt, parseGmt } from '../assets/js/app/analysis/shared/gene-sets.js';
 import {
-  CSV_KINDS, KIND_ROW, OBS_NAME_COLUMN, columnName, csvCell, fieldCsv, float32Text, highlightsCsv, highlightsH5ad,
+  CATEGORIES_ROW, CSV_KINDS, KIND_ROW, OBS_NAME_COLUMN, columnName, csvCell, fieldCsv, float32Text, highlightsCsv, highlightsH5ad,
 } from '../assets/js/app/exports/cell-exports.js';
 import { createCellIdentity } from '../assets/js/data/cell-identity.js';
 import { orderedCellIdentity } from './helpers/ordered-cell-identity.mjs';
@@ -145,6 +145,35 @@ test('every result reaches the host once, in original positions, and only what c
   await until(() => source.sent.some(item => item.header), 'the restored field sent');
   assert.equal(read, 1);
   assert.deepEqual(source.sent.filter(item => item.header).map(item => item.header.id), ['user_cat_2']);
+  results.dispose();
+});
+
+test('a categorical result carries the colors it is shown in, in the view in focus, and goes again when they change (RCC-1)', async () => {
+  const state = stateWithResults();
+  const source = recordingSource();
+  const results = createViewerHostResults({ state, viewerHostSource: source, getCellIdentity: () => createCellIdentity({ nObs: 6 }) });
+  await results.resync();
+  const colorsSent = () => source.sent.filter(item => item.header?.id === 'user_cat_1').map(item => item.header.meta.colors);
+  // Opened in Cellucid's own colors by position.
+  assert.deepEqual(colorsSent(), [['#ff9900', '#0077c8']]);
+
+  // A category recolored (the legend, an undo, an agent): sent again with the new colors, nothing else.
+  source.sent.length = 0;
+  const field = state.obsData.fields[0];
+  // As `setColorForCategory` / `setCategoryStates` leave it, and say it (`colors:changed`).
+  field._categoryColors = colorsOf([[1, 0.6, 0], [0, 0.5, 0.5]]);
+  state.emit('colors:changed', { field });
+  await until(() => source.sent.some(item => item.header), 'the recolored field sent');
+  assert.deepEqual(source.sent.filter(item => item.header).map(item => item.header.id), ['user_cat_1']);
+  assert.deepEqual(colorsSent(), [['#ff9900', '#008080']]);
+
+  // The view in focus changed (`setActiveView` swaps in that view's field
+  // objects, then says the visibility changed): its colors, here its palette.
+  source.sent.length = 0;
+  state.obsData = { fields: [{ ...field, _categoryColors: undefined, palette: [[0.2, 0.4, 0.6], [1, 1, 1]] }, state.obsData.fields[1]] };
+  state.emit('visibility:changed');
+  await until(() => source.sent.some(item => item.header?.id === 'user_cat_1'), 'the focused view\'s colors sent');
+  assert.deepEqual(colorsSent(), [['#336699', '#ffffff']]);
   results.dispose();
 });
 
@@ -335,11 +364,39 @@ test('the shared GMT fixture reads as Python and R read it', () => {
 });
 
 test('the shared obs-column CSV fixture is the format the web app writes', () => {
-  const text = sharedFixture('obs-columns.csv', 'b0da8ee441532a3ac2199e9e22f827c82002c4e63ce1b7bec5fc3d4800ec41e9');
-  const [header, kinds] = text.split('\n');
+  const text = sharedFixture('obs-columns.csv', '0353146eabba6a9fa76c565a5710dcce275471fcbfd7674f3a86d8c6e2799db2');
+  const [header, kinds, categories] = text.split('\n');
   assert.equal(header.split(',')[0], OBS_NAME_COLUMN);
   assert.deepEqual(kinds.split(','), [KIND_ROW, 'highlight', 'categorical', 'categorical', 'continuous']);
   assert.ok(kinds.split(',').slice(1).every(kind => CSV_KINDS.includes(kind)));
+  // Each categorical's categories in its field's order (not the rows'
+  // order of first appearance; one no cell holds), as a JSON array of
+  // strings in one CSV cell; nothing for the other kinds.
+  assert.equal(categories, [
+    CATEGORIES_ROW, '', csvCell(JSON.stringify(['10', '1', '0', 'unused, "quoted"'])), csvCell(JSON.stringify(['False', 'True'])), '',
+  ].join(','));
+});
+
+test('a field\'s CSV lists its categories in the field\'s order, a category no cell holds among them (F125)', async () => {
+  const state = withExportState();
+  // A trajectory's order, the reverse of the rows' first appearance, one
+  // category no cell holds, and labels that are numbers and booleans.
+  state.obsData.fields.push(
+    { key: 'stage', kind: 'category', categories: ['Pre-endocrine', 'Progenitor', 'Endocrine', 'Unassigned'],
+      codes: Uint8Array.of(2, 1, 2, 0, 1, 255), loaded: true },
+    { key: 'cluster', kind: 'category', categories: [10, 2, true], codes: Uint8Array.of(1, 0, 2, 1, 0, 0), loaded: true },
+  );
+  const stage = await fieldCsv({ state, adapter: fakeAdapter(), fieldIndex: 2 });
+  assert.equal(await stage.blob.text(), [
+    'obs_name,stage',
+    'kind,categorical',
+    'categories,"[""Pre-endocrine"",""Progenitor"",""Endocrine"",""Unassigned""]"',
+    'c0,Endocrine', '"c,1",Progenitor', 'c2,Endocrine', 'c3,Pre-endocrine', 'c4,Progenitor', 'c5,',
+    '',
+  ].join('\n'));
+  // Written as text, as the cells write them.
+  const cluster = await fieldCsv({ state, adapter: fakeAdapter(), fieldIndex: 3 });
+  assert.equal((await cluster.blob.text()).split('\n')[2], 'categories,"[""10"",""2"",""true""]"');
 });
 
 /**
@@ -395,6 +452,7 @@ test('the highlighted cells and a field export as obs-column CSV, names quoted',
   assert.equal(await cells.blob.text(), [
     'obs_name,cellucid_highlight__highlight_1,cellucid_highlight__highlight_2',
     'kind,highlight,highlight',
+    'categories,,',
     'c0,true,false',
     '"c,1",false,false',
     'c2,true,true',
@@ -404,9 +462,10 @@ test('the highlighted cells and a field export as obs-column CSV, names quoted',
     '',
   ].join('\n'));
   const field = await fieldCsv({ state, adapter, fieldIndex: 0 });
-  assert.equal(await field.blob.text(), 'obs_name,annotation\nkind,categorical\nc0,B\n"c,1",T\nc2,\nc3,B\nc4,T\nc5,B\n');
+  assert.equal(await field.blob.text(),
+    'obs_name,annotation\nkind,categorical\ncategories,"[""B"",""T""]"\nc0,B\n"c,1",T\nc2,\nc3,B\nc4,T\nc5,B\n');
   const score = await fieldCsv({ state, adapter, fieldIndex: 1 });
-  assert.equal(await score.blob.text(), 'obs_name,score\nkind,continuous\nc0,0.5\n"c,1",\nc2,1\nc3,2\nc4,3\nc5,4\n');
+  assert.equal(await score.blob.text(), 'obs_name,score\nkind,continuous\ncategories,\nc0,0.5\n"c,1",\nc2,1\nc3,2\nc4,3\nc5,4\n');
   assert.equal(field.filename, 'annotation.csv');
   assert.equal(csvCell('a"b'), '"a""b"');
 });
@@ -423,6 +482,7 @@ test('every export lists cells ascending by original position, whatever order th
   assert.equal(await cells.blob.text(), [
     'obs_name,cellucid_highlight__highlight_1,cellucid_highlight__highlight_2',
     'kind,highlight,highlight',
+    'categories,,',
     'cell0,false,false',
     'cell1,false,false',
     'cell2,false,false',
@@ -433,7 +493,9 @@ test('every export lists cells ascending by original position, whatever order th
   ].join('\n'));
   // The annotation's codes are in open order: B T - B T B for cells 5 0 4 1 3 2.
   const field = await fieldCsv({ state, adapter, fieldIndex: 0 });
-  assert.equal(await field.blob.text(), 'obs_name,annotation\nkind,categorical\ncell0,T\ncell1,B\ncell2,B\ncell3,T\ncell4,\ncell5,B\n');
+  // Its categories in the field's order (B, T), not the rows' (T first).
+  assert.equal(await field.blob.text(),
+    'obs_name,annotation\nkind,categorical\ncategories,"[""B"",""T""]"\ncell0,T\ncell1,B\ncell2,B\ncell3,T\ncell4,\ncell5,B\n');
   const made = await highlightsH5ad({ state, adapter, pageId: state.getActivePageId() });
   const reader = await readH5ad(new Uint8Array(await made.blob.arrayBuffer()));
   assert.deepEqual(await reader.readObsNames(), ['cell3', 'cell4', 'cell5']);
@@ -513,7 +575,7 @@ test('an .h5ad subset is read back exactly by Cellucid\'s own reader', async () 
   });
 });
 
-test('an .h5ad reads only the highlighted rows and keeps each categorical\'s order, label type and colours (K-10, K-11)', async () => {
+test('an .h5ad reads only the highlighted rows and keeps each categorical\'s order, label type and colors (K-10, K-11)', async () => {
   const state = withExportState();
   state.obsData.fields.push(
     {
@@ -534,7 +596,7 @@ test('an .h5ad reads only the highlighted rows and keeps each categorical\'s ord
   assert.equal((await reader.getObsField('annotation')).ordered, false);
   assert.deepEqual((await reader.getObsField('flag')).categories, [false, true], 'boolean labels stay booleans');
   reader.close();
-  // The colours as shown, as Scanpy keeps them.
+  // The colors as shown, as Scanpy keeps them.
   const python = [path.resolve(process.cwd(), '../.environments/python/venv/bin/python'), 'python3'].find(candidate => {
     if (candidate.includes('/') && !existsSync(candidate)) return false;
     return spawnSync(candidate, ['-c', 'import anndata'], { encoding: 'utf8' }).status === 0;

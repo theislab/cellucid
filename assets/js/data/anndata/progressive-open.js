@@ -105,7 +105,7 @@ function firstViewEmbedding(root, nObs) {
  * spread evenly, so each chunk is priced at its own bytes to fetch when
  * anything is kept, not at the mean: a revisit of a GitHub Zarr folder
  * whose first visit kept 65,536 of its 561,947 cells priced every chunk at
- * 88 % of its bytes and opened 750 cells.
+ * 88% of its bytes and opened 750 cells.
  *
  * @param {Object} root - The store's root (every cell)
  * @param {number} nObs
@@ -453,7 +453,7 @@ export async function planProgressiveOpening(resolution, { nObs, costOf, link, d
   // A share over a link whose round trips cost anything opens whole
   // (`grownLater`, and `chunkedPlan`'s own completion check): decided
   // before its first view is priced (`costOf` walks its cells: 60 ms of a
-  // 50 % share's opening of 10M cells).
+  // 50% share's opening of 10M cells).
   if (kept !== null && priced(link) && loadedRoundTripMs(link) > 0) return null;
   const cost = priced(link) ? await costOf(target) : null;
   // Measured after `costOf`, which may have decoded the first chunk to measure it.
@@ -487,7 +487,7 @@ export async function planProgressiveOpening(resolution, { nObs, costOf, link, d
  * reads the same bytes in more readings, each a loaded round trip of its
  * own (`loadedRoundTripMs`), so as priced it ends later wherever a round
  * trip costs anything (the bandwidth measured at opening is a lower bound:
- * it prices both alike). Measured, a 50 % uniform share of a 10M-cell file
+ * it prices both alike). Measured, a 50% uniform share of a 10M-cell file
  * on a local web host: grown from chunks, all 5M cells at 4.5 s; read
  * whole, 2.8 s. Every cell of a priority-ordered file grows as before: its
  * prefixes are the file's own order.

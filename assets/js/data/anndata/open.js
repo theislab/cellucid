@@ -13,8 +13,8 @@
  *
  * - an HDF5 file opens through `formats/hdf5`, a Zarr store (a picked
  *   folder, a `.zarr.zip`, a folder on a web host) through `formats/zarr`;
- *   a layout view (`views/`) presents a root it recognises as AnnData,
- *   every array read in place; a root none recognises is AnnData as stored;
+ *   a layout view (`views/`) presents a root it recognizes as AnnData,
+ *   every array read in place; a root none recognizes is AnnData as stored;
  * - a single-stream format is transcoded (`transcode/`) into an AnnData
  *   Zarr store, which the Zarr reader then opens.
  *
@@ -26,14 +26,15 @@
  * file is assumed to be, and its per-file reads are not measured.
  *
  * Errors the person who opened the file can act on are explained here, once,
- * for every format: a file that is not what it claims, a damaged one, and a
- * feature the browser cannot read (a compression filter, a codec), each with
- * what to do instead.
+ * for every format: a web page in place of data (a link's sign-in or preview
+ * page, a page saved under a data file's name), a file that is not what it
+ * claims, a damaged one, and a feature the browser cannot read (a
+ * compression filter, a codec), each with what to do instead.
  *
  * @module data/anndata/open
  */
 
-import { LOCAL_POLICY, REMOTE_POLICY, blobByteSource, httpByteSource } from '../../formats/io/byte-source.js';
+import { LOCAL_POLICY, REMOTE_POLICY, blobByteSource, httpByteSource, looksLikeWebPage } from '../../formats/io/byte-source.js';
 import { createByteReader } from '../../formats/io/byte-reader.js';
 import { equivalentS3Urls } from '../../formats/io/s3.js';
 import { forgetFileInMemory, forgetOtherVersionsInMemory, rangeCacheAddress, rangeCacheKey, withRangeCache } from '../../formats/io/range-cache.js';
@@ -63,12 +64,13 @@ import {
   isInputFormatId,
   layoutOfHead,
 } from '../input-formats.js';
-import { ANNDATA_OPENING_PATHS, H5AD_FORMAT, ZARR_FORMAT } from './elements.js';
+import { ANNDATA_OPENING_PATHS, AnnDataFormatError, H5AD_FORMAT, ZARR_FORMAT, attributeValue } from './elements.js';
 import { LAYOUT_VIEWS } from './views/index.js';
 import { LayoutRefusal } from './views/refusal.js';
 import { TRANSCODERS } from './transcode/index.js';
 import { THIS_TAB, findKeptDownload, forgetKeptCopy, forgetOtherVersions, keepDownload } from './transcode/space.js';
 import { decompressed } from '../../formats/rds/stream.js';
+import { RdsFormatError, RdsUnsupportedError } from '../../formats/rds/errors.js';
 import { linkIdentity } from '../sources/link-credentials.js';
 import { formatCountOf } from '../../utils/format-units.js';
 import { throwIfAborted } from '../../utils/abort.js';
@@ -241,9 +243,13 @@ function subjectOf(format) {
   return format !== null && isInputFormatId(format) ? `This ${inputFormat(format).label} file` : 'This file';
 }
 
+/** The formats whose files are AnnData (or MuData, AnnData per modality) as stored. */
+const ANNDATA_NATIVE_FORMATS = new Set(['h5ad', 'zarr', 'h5mu', 'mudata-zarr']);
+
 /**
  * The error a person sees for a failure of the format packages: an
- * unsupported feature (with what to do), or a damaged or mistaken file. Any
+ * unsupported feature (with what to do), a damaged or mistaken file, or a
+ * file whose AnnData parts break the format (`AnnDataFormatError`). Any
  * other error is returned as it is.
  *
  * @param {unknown} error
@@ -255,7 +261,7 @@ export function explainFormatError(error, format) {
   const known = format !== null && isInputFormatId(format) ? inputFormat(format) : null;
   const writeAgain = known?.writeAgain ?? 'Write it again with anndata, or serve it with cellucid serve, then open the new file.';
   if (error instanceof LayoutRefusal) {
-    // A recognised file Cellucid does not show; its message says what to do.
+    // A recognized file Cellucid does not show; its message says what to do.
     return explained(error.message, error, { reason: error.reason });
   }
   if (error instanceof Hdf5UnsupportedError || error instanceof ZarrUnsupportedError || error instanceof ZipUnsupportedError) {
@@ -272,6 +278,28 @@ export function explainFormatError(error, format) {
         error
       );
     }
+    return explained(
+      `${subjectOf(format)} could not be read (${error.message}). It may be corrupted or truncated. ${writeAgain}`,
+      error
+    );
+  }
+  if (error instanceof AnnDataFormatError) {
+    // The container read fine; an element in it is not what its writer
+    // should have written (anndata's, or a format presented as AnnData:
+    // a Loom file, a 10x matrix).
+    const rule = error.message.replace(/\.$/, '');
+    return explained(
+      known === null || ANNDATA_NATIVE_FORMATS.has(known.id)
+        ? `${subjectOf(format)} breaks the AnnData format: ${rule}. ${writeAgain}`
+        : `${subjectOf(format)} is not laid out as its format requires: ${rule}. ${writeAgain}`,
+      error
+    );
+  }
+  if (error instanceof RdsUnsupportedError) {
+    // Written for the person already: what the file uses and what to do.
+    return explained(error.message, error, { feature: error.feature ?? null });
+  }
+  if (error instanceof RdsFormatError) {
     return explained(
       `${subjectOf(format)} could not be read (${error.message}). It may be corrupted or truncated. ${writeAgain}`,
       error
@@ -396,7 +424,16 @@ async function identify(source, expect) {
     throw new TypeError('A dataset source is a file {file}, a folder {files, rootName} or a folder URL {url}.');
   }
   const named = isInputFormatId(expect?.format) ? expect : fileFormatOfName(file.name ?? '');
-  const sniffed = layoutOfHead(await headOf(file));
+  const head = await headOf(file);
+  const sniffed = layoutOfHead(head);
+  if (sniffed === null && looksLikeWebPage(head)) {
+    // A page, not data: what to do is to get the file itself, not to write
+    // it again.
+    const name = file.name ?? 'This file';
+    throw explained(typeof file.url === 'string'
+      ? `${name}: its link answered with a web page (a sign-in, preview or error page), not the file. Open the file's direct download link instead.`
+      : `${name} is a web page saved under a data file's name, not the data. Download the file itself (on GitHub, its raw file) and open that.`);
+  }
   if (sniffed !== null) {
     // The content decides; the name still names the format when it agrees.
     const agrees = named !== null && named.layout === sniffed.layout && inputFormat(named.format).container === sniffed.container;
@@ -415,8 +452,8 @@ async function identify(source, expect) {
  * What opening a file expected to hold `format` reads with its root
  * (`openHdf5(reader, {load})`): its layout view's `openingPaths`, or an
  * AnnData store's (`ANNDATA_OPENING_PATHS`). Named before the file is
- * recognised, they only let those reads start with the root's own; what a
- * file holds is still recognised from its root, and each view and the
+ * recognized, they only let those reads start with the root's own; what a
+ * file holds is still recognized from its root, and each view and the
  * reader load what they read.
  *
  * @param {string|null} format
@@ -427,18 +464,29 @@ function openingPathsOf(format) {
 }
 
 /**
+ * Whether a root bears any mark of an AnnData store: a declared encoding
+ * (anndata 0.8 and later), or obs, var or X (an older anndata's layout,
+ * `older-layouts.js`). A root with none is no AnnData store at all.
+ */
+function hasAnnDataMarks(root) {
+  return attributeValue(root, 'encoding-type') !== undefined || ['obs', 'var', 'X'].some(key => root.has(key));
+}
+
+/**
  * Present one opened container as an AnnData store root: the first format of
  * that container and layout (in registry order) whose layout view
- * recognises the root presents it through its view; a root no view
- * recognises is the one format of that container and layout read as stored
- * (AnnData: `h5ad`, `zarr`).
+ * recognizes the root presents it through its view; a root no view
+ * recognizes is the one format of that container and layout read as stored
+ * (AnnData: `h5ad`, `zarr`) when it bears an AnnData store's marks
+ * (`hasAnnDataMarks`), and is refused as none of the formats otherwise. A
+ * view's refusal is explained as the format the view presents.
  *
  * @param {Object} root - The container's root group (`openHdf5`, `openZarr`)
  * @param {{container: string, layout: 'file'|'zip'|'folder', name: string, signal?: AbortSignal|null,
  *   activity?: Object|null, fromLink?: boolean, files?: Map<string, File>, base?: string}} context - `files`
  *   and `base`: a folder format's files and the folder of the file opened (`views/index.js`);
  *   `fromLink`: opened from a link, which a view's refusal advises for; `signal` and `activity`: the
- *   opening's, for what recognising and presenting the root loads
+ *   opening's, for what recognizing and presenting the root loads
  * @param {{formats?: ReadonlyArray<Object>, views?: Readonly<Record<string, Object>>}} [tables] -
  *   The registry and the views (the module's own by default)
  * @returns {Promise<{format: string, root: Object, readerFormat: import('./elements.js').AnnDataFormat}>}
@@ -449,7 +497,14 @@ export async function presentStore(root, { container, layout, name, ...context }
   for (const format of candidates) {
     const view = views[format.id];
     if (view !== undefined && await view.recognize(root, options)) {
-      const viewed = await view.view(root, { name, layout, signal: null, activity: null, ...context });
+      // A view's refusal is said of the format the content is, whatever
+      // the name promised (a Loom file named .h5).
+      let viewed;
+      try {
+        viewed = await view.view(root, { name, layout, signal: null, activity: null, ...context });
+      } catch (error) {
+        throw explainFormatError(error, format.id);
+      }
       if (typeof root.close === 'function' && typeof viewed?.close !== 'function') {
         throw new TypeError(`The ${format.id} layout view must close the store it presents.`);
       }
@@ -457,8 +512,15 @@ export async function presentStore(root, { container, layout, name, ...context }
     }
   }
   const stored = candidates.find(format => views[format.id] === undefined && format.access !== 'stream');
-  if (stored === undefined) {
-    throw explained(`${name} is a ${container} file that holds none of the formats Cellucid reads.`);
+  if (stored === undefined || !hasAnnDataMarks(root)) {
+    // Nothing of any format this container holds: said so, not read as
+    // AnnData to be refused for a part an AnnData store would have (no
+    // embedding, no obs).
+    const kind = container === 'hdf5' ? 'an HDF5 file' : 'a Zarr store';
+    throw explained(
+      `${name} is ${kind}, but not in any format Cellucid reads from one ` +
+      `(${candidates.map(format => format.label).join(', ')}): it has no obs, var or X, nor the parts the others are recognized by.`
+    );
   }
   return { format: stored.id, root, readerFormat: container === 'hdf5' ? H5AD_FORMAT : ZARR_FORMAT };
 }

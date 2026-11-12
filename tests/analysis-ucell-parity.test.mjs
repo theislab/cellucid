@@ -82,7 +82,7 @@ function definitionScore(cell, members, maxRank) {
     return greater + (equal + 1) / 2;
   };
   // The UCell package's u_stat: max rank at most the genes, ranks at or past
-  // it count as it, normalised by the range S·maxRank − S(S+1)/2.
+  // it count as it, normalized by the range S·maxRank − S(S+1)/2.
   const cap = Math.min(maxRank, row.length);
   let sum = 0;
   for (const s of members) {

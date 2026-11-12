@@ -56,7 +56,12 @@ function createDataLayer() {
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
+    // No coloring field: each analysis falls back to its ranked default.
+    getColoringCategoricalField() { return null; },
     getAvailableVariables(type) {
       if (type === 'gene_expression') return GENES.map(key => ({ key }));
       if (type === 'categorical_obs') {

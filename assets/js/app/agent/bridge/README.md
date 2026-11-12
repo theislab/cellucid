@@ -1,8 +1,8 @@
 # `app/agent/bridge/`: this tab's end of the Cellucid relay, and of local agent connections
 
 **Owns:** the calls of agents that reach this tab from outside it (`agent-calls.js`
-`createAgentCalls`: run as the agent through its connection, turns, the tool list for that
-connection, the person asked and answering, a stop; one engine for the relay's `connector`
+`createAgentCalls`: run as the agent through its connection, turns, the tool list and the
+person's settings told to the agent, the person asked and answering, a stop; one engine for the relay's `connector`
 connections and the `local` connections of `cellucid mcp`, which the viewer channel carries:
 `data/viewer-host-source.js` `onAgent`), what the Python and R packages' `cellucid mcp` reads
 before a page answers (`local-agents.js`: the status tool, the app names, `mcpToolsDocument`,
@@ -11,7 +11,7 @@ relay (`relay-client.js`), the wire it speaks
 (`relay-protocol.js`, bundled into the relay), this browser's pairing (`tab-secret.js`:
 localStorage, Forget), connect codes (`connect-code.js`) and the head script that takes a
 relay approval link's code out of the address before any module runs
-(`connect-fragment.js`, a classic script in `index.html`), the catalogue as MCP tools
+(`connect-fragment.js`, a classic script in `index.html`), the catalog as MCP tools
 (`mcp-tools.js`), outcomes as MCP content (`mcp-content.js`), and one tool call run in this tab
 (`tool-call.js` `runToolCall`: the relay's calls and the chat bar's go through it), and what a
 result may carry of the data (`data-guard.js`).
@@ -54,10 +54,12 @@ the person sees on their own screen now.
   to the relay; a call whose time runs out while the person is asked is answered to the agent
   as such and detached (`detach`): the question stays open and the call goes on, whatever the
   link does next.
-- A tool list is made for the connection asking (`permissionFor({kind, connection})`, the
-  presence layer's settings with what the person allowed for that connection): each change
-  (`change`) and each question (a `confirm` kind) reads "asks", "runs without asking" or
-  "refused" (`mcp-tools.js` `permissionKindOf`).
+- The tool list is one list for every connection, the same whatever the person's settings
+  (`mcp-tools.js`). What the settings make of each kind of action for a connection
+  (`permissionFor({kind, connection})`: the presence layer's settings with what the person allowed
+  for that connection), the dataset's data switch and what History leaves out are told to its
+  agent after its first result and after any result once they changed (`agent-calls.js`,
+  `../settings-told.js`), as the chat's model is told them with the person's message.
 - The tab secret is sent only to the deployed relay (`DEFAULT_RELAY_ORIGIN`), or to
   `window.__CELLUCID_RELAY_ORIGIN__` on a local development host.
 - A result's JSON is its data, between `RESULT_DATA_TAGS` (`<cellucid-data>…</cellucid-data>`,
@@ -72,7 +74,7 @@ the person sees on their own screen now.
   or does not classify, and a value summary over groups an agent shaped by naming cells
   (`SHAPED_INPUTS`), before it runs and again once it ran; `toolResultOf` sends no picture and no
   single-cell statistic (`SINGLE_CELL_STATISTICS`: a minimum, a maximum, a median), each said
-  after the data. It is not anonymisation (`SUMMARIES_ONLY_CAVEAT`).
+  after the data. It is not anonymization (`SUMMARIES_ONLY_CAVEAT`).
 - A result's text is cut to `RESULT_TEXT_CHARS` with both counts stated, never silently (the tags
   stay whole);
   pictures travel as image content (image `Blob`s in a result, and strings its result schema

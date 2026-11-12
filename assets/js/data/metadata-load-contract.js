@@ -1,33 +1,5 @@
-import { abortReason, onAbort, throwIfAborted } from '../utils/abort.js';
+import { abortReason, onAbort, requireSignalOrNull, throwIfAborted } from '../utils/abort.js';
 import { isPlainRecord, requireKeys } from '../utils/exact-record.js';
-
-function isAbortSignal(value) {
-  return Boolean(
-    value &&
-    typeof value === 'object' &&
-    typeof value.aborted === 'boolean' &&
-    typeof value.addEventListener === 'function' &&
-    typeof value.removeEventListener === 'function'
-  );
-}
-
-/**
- * Require the exact internal cancellation value used between loader owners.
- * Undefined is not an alias for no signal: callers must pass either the
- * owning AbortSignal or explicit null.
- *
- * @param {unknown} signal
- * @param {string} label
- * @returns {AbortSignal|null}
- */
-export function validateAbortSignalOrNull(signal, label) {
-  if (signal !== null && !isAbortSignal(signal)) {
-    throw new TypeError(
-      `${label} must be an AbortSignal or exact null`
-    );
-  }
-  return signal;
-}
 
 /**
  * Validate the one exact options seam shared by public metadata loaders.
@@ -41,7 +13,7 @@ export function getMetadataLoadSignal(options, label) {
   const signal = Object.hasOwn(options, 'signal')
     ? options.signal
     : null;
-  return validateAbortSignalOrNull(
+  return requireSignalOrNull(
     signal,
     `${label} options.signal`
   );
@@ -72,7 +44,7 @@ export async function loadMetadataBatchAtomically(
   if (!Array.isArray(items)) {
     throw new TypeError(`${label} items must be an array`);
   }
-  validateAbortSignalOrNull(ownerSignal, `${label} owner signal`);
+  requireSignalOrNull(ownerSignal, `${label} owner signal`);
   if (typeof loadItem !== 'function') {
     throw new TypeError(`${label} loader must be a function`);
   }

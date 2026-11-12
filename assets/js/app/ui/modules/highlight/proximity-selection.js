@@ -13,8 +13,7 @@ import {
   HIGHLIGHT_MODE_COPY,
   SELECTION_NOTICE,
   idleSelectionNoticeHtml,
-  selectionNoticeHtml
-} from './mode-copy.js';
+  selectionNoticeHtml, combineHelpHtml } from './mode-copy.js';
 import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
 import {
@@ -131,10 +130,10 @@ export function initProximitySelection(options) {
       state.pointCount
     );
 
-    const stepsLabel = proximityEvent.steps > 1 ? ` (${proximityEvent.steps} drags)` : '';
     void confirmer.confirm({
       tool: 'proximity',
-      label: `Proximity${stepsLabel} (${formatCountOf(proximityEvent.cellCount, 'cell')})`,
+      // Named by the tool (the list shows its count); a second on the page is `Proximity 2`.
+      label: 'Proximity',
       cellIndices: proximityEvent.cellIndices
     });
 
@@ -144,7 +143,7 @@ export function initProximitySelection(options) {
       cellIndices: proximityEvent.cellIndices,
       source: 'proximity',
       onFailure: error => {
-        if (!destroyed) showSelectionDeliveryFailure(error, 'proximity');
+        if (!destroyed) showSelectionDeliveryFailure(error, 'proximity', viewerHostSource.getHostRuntime());
       }
     }));
 
@@ -169,7 +168,7 @@ export function initProximitySelection(options) {
     }
     if (stepEvent.cancelled !== true) {
       // A drag that starts on empty space while a selection already exists is
-      // centred on that selection's plane, and the renderer reports -1 for the
+      // centered on that selection's plane, and the renderer reports -1 for the
       // cell it did not hit. The preview accepts that; so must the step, or the
       // add or subtract the user just drew is thrown away at release.
       requireSafeInteger(
@@ -217,7 +216,7 @@ export function initProximitySelection(options) {
 
     // The empty state before the first step is recorded like any other, so
     // Undo can reach it — the annotation tool has always done this, and a
-    // greyed-out Undo immediately after dragging reads as a broken control.
+    // grayed-out Undo immediately after dragging reads as a broken control.
     pushHistoryStep(selectionState, 'proximityHistory', {
       candidates: selectionState.lastProximityCandidates,
       step: selectionState.lastProximityStep
@@ -409,7 +408,7 @@ export function initProximitySelection(options) {
 
     if (stepEvent.step === 0 && stepEvent.keepControls) {
       const stepInfo =
-        '<strong>No selection</strong><br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>';
+        `<strong>No selection</strong><br><small>${combineHelpHtml()}</small>`;
 
       showProximityControls(0, notice);
 
@@ -428,7 +427,7 @@ export function initProximitySelection(options) {
       modeLabel = ' <span class="lasso-mode-tag intersect">intersected</span>';
     }
 
-    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCountOf(stepEvent.candidateCount, 'cell')}${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCountOf(stepEvent.candidateCount, 'cell')}${modeLabel}<br><small>${combineHelpHtml()}</small>`;
 
     showProximityControls(stepEvent.candidateCount, notice);
 

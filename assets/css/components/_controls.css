@@ -11,7 +11,7 @@
    Blocks and groups
    --------------------------------------------------------------------- */
 
-/* One labelled control, or one row of controls. Inside a group or a box,
+/* One labeled control, or one row of controls. Inside a group or a box,
    blocks are spaced by their own top margin. A panel's direct children are
    spaced by the panel's gap (--control-group-gap) alone: block, group and box
    margins are zero-specificity (:where) so `.accordion-content > *` clears
@@ -121,6 +121,15 @@
   white-space: nowrap;
 }
 
+/* What the row counts: its own column, never cut by a long name (as `.legend-count`). */
+.list-item-count {
+  flex: none;
+  font-size: var(--type-readout);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+}
+
 .list-item[data-disabled="true"] .list-item-text {
   color: var(--color-text-tertiary);
   text-decoration: line-through;
@@ -132,7 +141,7 @@
 
 /* A field label: the caption above the control it names. It is always a
    `<label for>`; the text is sentence case without a colon, medium weight in
-   the secondary text colour. Zero specificity, so a component that needs a different
+   the secondary text color. Zero specificity, so a component that needs a different
    label (an option label, below) overrides it without a fight. A composite
    control that no single <label> can name (a group of page chips, a pair of
    selects) takes the same caption as `span.field-label`, referenced by the
@@ -186,12 +195,15 @@
 }
 
 /* A live status line: what just happened to the control above it. */
+/* A message may hold a token longer than the panel (a link, a file path): it breaks rather
+   than running out of the sidebar (found 2026-11-10: a failure naming a URL). */
 .status-line {
   margin: var(--space-0-5) 0 0;
   font-family: var(--font-sans);
   font-size: var(--type-hint);
   line-height: var(--leading-normal);
   color: var(--color-text-secondary);
+  overflow-wrap: break-word;
 }
 
 /* A live region has to stay in the accessibility tree while it is empty, or
@@ -222,7 +234,7 @@
    --------------------------------------------------------------------- */
 
 .obs-select {
-  /* The frame colour, one property so a state (invalid) recolours the frame
+  /* The frame color, one property so a state (invalid) recolors the frame
      however it is drawn (a border here, an inset ring on touch below). */
   --field-frame: var(--color-border-control);
   display: block;
@@ -292,7 +304,7 @@ textarea.obs-select {
 
 /* The one drawn dropdown chevron. Only a native <select> gets it — on a text
    field it promised a list that is not there — and its text stops short of
-   the chevron instead of running underneath it. The chevron is centred on the
+   the chevron instead of running underneath it. The chevron is centered on the
    control's own height, so a taller or shorter select needs no override. */
 select.obs-select,
 button.obs-select[aria-haspopup="menu"] {
@@ -534,7 +546,7 @@ input[type="checkbox"]:disabled,
    user can see. Symmetric negative block margins collapse the margin box to
    the thumb's height: the row is exactly as tall as what is drawn, so the
    label above and the field below keep their full gap. (Collapsing to the
-   3px track let the thumb overhang both neighbours.) The track is painted by
+   3px track let the thumb overhang both neighbors.) The track is painted by
    the track pseudo-elements, not by the input background. */
 .slider-row input[type="range"] {
   flex: 1;
@@ -549,7 +561,7 @@ input[type="checkbox"]:disabled,
 }
 
 /* Ring is inset so it brackets the track and thumb instead of spilling into the
-   neighbouring rows that the 24px hit area overlaps. */
+   neighboring rows that the 24px hit area overlaps. */
 .slider-row input[type="range"]:focus-visible {
   outline-offset: calc(-1 * var(--space-1));
 }
@@ -718,7 +730,7 @@ input[type="checkbox"]:disabled,
   opacity: var(--opacity-70);
 }
 
-/* A colour swatch, and the invisible native colour input laid over it. */
+/* A color swatch, and the invisible native color input laid over it. */
 .color-swatch {
   position: relative;
   flex: none;
@@ -750,6 +762,16 @@ input[type="checkbox"]:disabled,
   background: transparent;
   opacity: 0;
   cursor: pointer;
+}
+
+/* The input takes keyboard focus but is invisible, so the ring it would draw
+   is too: the swatch it edits draws the shared ring instead (WCAG 2.4.7). In
+   an analysis page chip the input is the swatch's neighbor, not its child
+   (a control cannot sit inside the chip's button). */
+.color-swatch:has(> .color-swatch-input:focus-visible),
+.analysis-page-chip:has(> .color-swatch-input:focus-visible) .color-swatch {
+  outline: var(--border-width-2) solid var(--color-border-focus);
+  outline-offset: var(--space-0-5);
 }
 
 /* ------------------------------------------------------------------------
@@ -1095,7 +1117,7 @@ input[type="checkbox"]:disabled,
 .view-title-chip:active:not(.active),
 .cap-search-item:active,
 .community-annotation-repo-card:active,
-.license-close:active,
+.app-dialog-close:active,
 .analysis-modal-close:active {
   background-color: var(--color-interactive-secondary-active);
 }

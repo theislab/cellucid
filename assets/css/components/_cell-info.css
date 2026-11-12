@@ -12,6 +12,10 @@
   /* One 240 px column; a card with more loaded fields than the window's
      height holds takes more (ui/modules/cell-info.js fitCard). */
   max-width: calc(240px * var(--cell-info-columns, 1));
+  /* As wide as its text, up to the columns: its text may wrap, so its
+     shrink-to-fit width would otherwise follow the narrowest a word allows
+     (multi-column cards came out too narrow, names broken mid-word). */
+  width: max-content;
   padding: var(--space-1-5) var(--space-2);
   border: var(--border-light);
   /* Solid, not frosted: a backdrop filter over the WebGL canvas would be
@@ -36,15 +40,20 @@
   opacity: 1;
 }
 
-/* One line: colour dot, value, and (for a category) its visible count. */
+/* Color dot, value, and (for a category) its visible count. The card is
+   aria-hidden and takes no pointer, so nothing on it can be revealed later:
+   a long label or field name wraps (inside its 240 px column) instead of
+   being cut with an ellipsis (R9U-4). */
 .cell-info-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--space-1-5);
 }
 
 .cell-info-swatch {
   flex: none;
+  /* Centered on the value's first line. */
+  margin-top: calc((var(--type-label) * var(--leading-tight) - var(--space-2)) / 2);
   width: var(--space-2);
   height: var(--space-2);
   border-radius: var(--radius-full);
@@ -58,21 +67,17 @@
 .cell-info-value {
   flex: 1 1 auto;
   min-width: 0;
-  overflow: hidden;
   font-size: var(--type-label);
   font-weight: var(--font-weight-semibold);
   font-variant-numeric: tabular-nums;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .cell-info-field {
   margin-top: var(--space-0-5);
-  overflow: hidden;
   color: var(--color-text-secondary);
   font-size: var(--type-hint);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .cell-info-value.is-missing,
@@ -81,7 +86,7 @@
   font-style: italic;
 }
 
-/* Where the value sits on the field's colour scale. */
+/* Where the value sits on the field's color scale. */
 .cell-info-scale {
   margin-top: var(--space-1-5);
 }
@@ -129,8 +134,11 @@
 }
 
 .cell-info-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  /* Name and value share the row by their own lengths: each gives way in
+     proportion when the two do not fit (a short value never squeezes a long
+     name, as a fixed share of the row did), and both wrap rather than cut. */
+  display: flex;
+  justify-content: space-between;
   column-gap: var(--space-2);
   padding-bottom: var(--space-0-5);
   break-inside: avoid;
@@ -151,27 +159,28 @@
 }
 
 .cell-info-rows dt {
-  overflow: hidden;
+  flex: 0 1 auto;
+  /* Never squeezed to a sliver by a long value. */
+  min-width: min(40%, 8em);
   color: var(--color-text-secondary);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .cell-info-rows dd {
+  flex: 0 1 auto;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--space-1-5);
   min-width: 0;
   margin: 0;
-  overflow: hidden;
   text-align: right;
   justify-content: flex-end;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .cell-info-dot {
   flex: none;
+  margin-top: calc((var(--type-label) * var(--leading-tight) - var(--space-2)) / 2);
   width: var(--space-2);
   height: var(--space-2);
   border-radius: var(--radius-full);

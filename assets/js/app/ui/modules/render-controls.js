@@ -7,11 +7,11 @@
  * (grid/quality/density/etc) to the Viewer.
  *
  * Antialiasing is the one control here that publishes to two places: to the
- * viewer, like its neighbours, and to `localStorage`, because the preference
+ * viewer, like its neighbors, and to `localStorage`, because the preference
  * describes the machine rather than the view. It also has a third state its
  * checkbox cannot show — `auto`, which defers to the dataset's cell count.
  * Everything else about it — ownership, restore, rollback — follows the same
- * rules as its neighbours.
+ * rules as its neighbors.
  *
  * Also exposes a `markSmokeDirty()` hook used by the coordinator to trigger
  * debounced smoke rebuilds after visibility changes.
@@ -73,10 +73,21 @@ import {
 import {
   VIEWER_BACKGROUND_ERROR_MESSAGE,
   isViewerBackground,
+  backgroundForTheme,
 } from '../../../rendering/viewer-backgrounds.js';
 import { requireExactObjectKeys } from '../../../utils/exact-record.js';
 import { PLACES } from '../place-names.js';
 import { ownDeferredAvailability } from '../core/deferred-control-readiness.js';
+import { setControlAvailability } from '../core/control-availability.js';
+import { defineControlReadout } from '../core/control-readout.js';
+import { SMOKE_NEEDS_ONE_VIEW } from './view-controls.js';
+
+/** Why Force LOD level is off while level of detail is. */
+const FORCED_LOD_UNAVAILABLE = 'Turn Level of detail (LOD) on to force a level.';
+import { failureDetails, joinFailure, sayFailure } from '../../../utils/errors.js';
+import { webStorage } from '../../../utils/web-storage.js';
+import { upperFirst } from '../../../utils/text-case.js';
+import { debounce } from '../../../utils/debounce.js';
 
 const RENDER_MODES = Object.freeze(['points', 'smoke']);
 const VIEWER_BACKGROUND_STORAGE_KEY = 'cellucid_viewer_background';
@@ -482,7 +493,10 @@ export function initRenderControls(options) {
   // Slider input remains debounced. A committed visibility generation first
   // gets one paint opportunity, then starts density work in the following
   // frame so a large build cannot hide the newly published UI state.
-  let smokeRebuildTimeout = null;
+  const rebuildSmokeOnceSettled = debounce(() => {
+    if (destroyed) return;
+    rebuildDirtySmokeIfActive();
+  }, 300);
   let committedSmokeRebuildQueued = false;
   let smokePaintFrame = null;
   let smokeBuildFrame = null;
@@ -500,23 +514,15 @@ export function initRenderControls(options) {
 
   function scheduleSliderSmokeRebuild() {
     if (destroyed) return;
-    if (smokeRebuildTimeout !== null) clearTimeout(smokeRebuildTimeout);
     smokeDirty = true;
-    smokeRebuildTimeout = setTimeout(() => {
-      smokeRebuildTimeout = null;
-      if (destroyed) return;
-      rebuildDirtySmokeIfActive();
-    }, 300);
+    rebuildSmokeOnceSettled();
   }
 
   function markSmokeDirty() {
     if (destroyed) return;
     smokeDirty = true;
     if (renderModeSelect.value !== 'smoke' || committedSmokeRebuildQueued) return;
-    if (smokeRebuildTimeout !== null) {
-      clearTimeout(smokeRebuildTimeout);
-      smokeRebuildTimeout = null;
-    }
+    rebuildSmokeOnceSettled.cancel();
     committedSmokeRebuildQueued = true;
     smokePaintFrame = requestAnimationFrame(() => {
       smokePaintFrame = null;
@@ -537,10 +543,7 @@ export function initRenderControls(options) {
     if (destroyed) return;
     smokeDirty = false;
     smokeBuiltOnce = true;
-    if (smokeRebuildTimeout !== null) {
-      clearTimeout(smokeRebuildTimeout);
-      smokeRebuildTimeout = null;
-    }
+    rebuildSmokeOnceSettled.cancel();
   }
 
   function sliderToPointSize(sliderValue) {
@@ -553,10 +556,14 @@ export function initRenderControls(options) {
     return sliderPositionToPointSize(raw);
   }
 
+  // What a slider position reads as, for the readout here and for the
+  // history naming a value of the past (`core/control-readout.js`).
+  const pointSizeReadout = defineControlReadout(pointSizeInput, value => formatPointSize(sliderToPointSize(value)));
+
   function applyPointSizeFromSlider() {
     const size = sliderToPointSize(pointSizeInput.value);
     viewer.setPointSize(size);
-    pointSizeDisplay.textContent = formatPointSize(size);
+    pointSizeDisplay.textContent = pointSizeReadout(pointSizeInput.value);
   }
 
   /**
@@ -702,6 +709,7 @@ export function initRenderControls(options) {
   // ---------------------------------------------------------------------------
 
   function publishSmokeSlider(input, display, label, scale, publish) {
+    defineControlReadout(input, position => scale(Number(position)).readout);
     const { value, readout } = scale(readExactRange(input, label, '1'));
     display.textContent = readout;
     publish(value);
@@ -813,6 +821,7 @@ export function initRenderControls(options) {
   }
 
   {
+    defineControlReadout(smokeGridInput, position => smokeGridScale(Number(position)).readout);
     const { value, readout } = smokeGridScale(
       readExactRange(smokeGridInput, 'Smoke grid density', '1')
     );
@@ -849,20 +858,61 @@ export function initRenderControls(options) {
   listen(pointSizeInput, 'input', applyPointSizeFromSlider);
 
   let currentBackground = initialBackground;
+  // The person picked a background on this page (kept or not).
+  let backgroundPickedHere = false;
   backgroundSelect.value = initialBackground;
   viewer.setBackground(initialBackground);
-  listen(backgroundSelect, 'change', () => {
+  // A background the person never chose (none kept) follows the theme: its twin in the
+  // theme's group. It is not kept, so it goes on following (owner, 2026-11-10).
+  const followTheme = event => {
+    let chosen;
+    try {
+      chosen = webStorage('localStorage')?.getItem(VIEWER_BACKGROUND_STORAGE_KEY) ?? null;
+    } catch {
+      chosen = null;
+    }
+    // A pick this browser did not keep holds for this page.
+    if (chosen !== null || backgroundPickedHere) return;
+    const next = backgroundForTheme(currentBackground, event.detail.theme);
+    if (next === currentBackground) return;
+    viewer.setBackground(next);
+    backgroundSelect.value = next;
+    document.documentElement.dataset.viewerBackground = next;
+    currentBackground = next;
+    markSmokeDirty();
+  };
+  // ThemeManager tells the page's window (`utils/theme-manager.js`).
+  const themeTarget = backgroundSelect.ownerDocument?.defaultView ?? null;
+  if (themeTarget !== null) listen(themeTarget, 'cellucid:theme-change', followTheme);
+  // Only a person's own pick is kept as their background (`isTrusted`): a
+  // restore (undo, a session, a starting view) or an action shows its value
+  // without making it the person's choice, so a background never picked
+  // goes on following the theme (owner, 2026-11-10, F46). An undo of a theme
+  // step put the background back through this event and kept it.
+  listen(backgroundSelect, 'change', event => {
     let preferencePublished = false;
     let viewerPublished = false;
     try {
       const next = assertViewerBackground(backgroundSelect.value);
-      localStorage.setItem(VIEWER_BACKGROUND_STORAGE_KEY, next);
-      preferencePublished = true;
+      if (event?.isTrusted === true) {
+        backgroundPickedHere = true;
+        // Kept for the next visit where this browser keeps anything for the
+        // site (`utils/web-storage.js`); the pick is made either way.
+        try {
+          const storage = webStorage('localStorage');
+          if (storage !== null) {
+            storage.setItem(VIEWER_BACKGROUND_STORAGE_KEY, next);
+            preferencePublished = true;
+          }
+        } catch {
+          // A full or refusing store: this page keeps the pick.
+        }
+      }
       viewer.setBackground(next);
       viewerPublished = true;
       document.documentElement.dataset.viewerBackground = next;
       currentBackground = next;
-      // Smoke's colours of the cells with no value or not read are made
+      // Smoke's colors of the cells with no value or not read are made
       // from the background (`rendering/read-cell-layer.js`).
       markSmokeDirty();
     } catch (error) {
@@ -870,7 +920,7 @@ export function initRenderControls(options) {
       const rollbackFailures = [];
       if (preferencePublished) {
         try {
-          localStorage.setItem(VIEWER_BACKGROUND_STORAGE_KEY, currentBackground);
+          webStorage('localStorage')?.setItem(VIEWER_BACKGROUND_STORAGE_KEY, currentBackground);
         } catch (rollbackError) {
           rollbackFailures.push(rollbackError);
         }
@@ -892,6 +942,10 @@ export function initRenderControls(options) {
       throw error;
     }
   });
+
+  for (const input of [lightingStrengthInput, fogDensityInput, sizeAttenuationInput]) {
+    defineControlReadout(input, value => formatDecimal(Number(value), 0));
+  }
 
   function updateLightingStrength() {
     const raw = readExactRange(
@@ -933,7 +987,7 @@ export function initRenderControls(options) {
     if (requested === 'smoke' && viewer.hasSnapshots()) {
       renderModeSelect.value = currentRenderMode;
       getNotificationCenter().warning(
-        'Volumetric smoke requires a single view. Clear snapshots first.',
+        `${upperFirst(SMOKE_NEEDS_ONE_VIEW)}.`,
         { category: 'rendering' }
       );
       return;
@@ -983,15 +1037,15 @@ export function initRenderControls(options) {
   // (`onFullDetailFrameCost` below), and a row that appeared and went with
   // it moved every control under it 40 px at a time the GPU decided.
   // Offered once the deferred controls are admitted only while level of detail is on.
-  ownDeferredAvailability(hpLodForceInput, () => acceptedLodEnabled);
+  ownDeferredAvailability(hpLodForceInput, () => (acceptedLodEnabled ? null : FORCED_LOD_UNAVAILABLE));
+  defineControlReadout(hpLodForceInput, value => formatForcedLodLevel(assertForcedLodLevel(value, 'Forced LOD level')));
   function syncForcedLodUi() {
     syncForcedLodRange();
-    hpLodForceInput.disabled = !acceptedLodEnabled;
-    // Why it is unavailable, on the row (a disabled slider gets no hover in every browser) and on
-    // the slider itself, for what reads the control.
-    const reason = acceptedLodEnabled ? '' : 'Turn Level of detail (LOD) on to force a level.';
-    hpLodForceContainer.title = reason;
-    hpLodForceInput.title = reason;
+    // Why it is unavailable, on the slider (`setControlAvailability`) and on
+    // its row (a disabled slider gets no hover in every browser).
+    const reason = acceptedLodEnabled ? null : FORCED_LOD_UNAVAILABLE;
+    setControlAvailability(hpLodForceInput, reason);
+    hpLodForceContainer.title = reason ?? '';
     hpLodForceDisplay.textContent = formatForcedLodLevel(
       assertForcedLodLevel(hpLodForceInput.value, 'Forced LOD level')
     );
@@ -1002,8 +1056,8 @@ export function initRenderControls(options) {
     console.error(`[RenderControls] ${control} could not be changed:`, exactError);
     try {
       getNotificationCenter().error(
-        `${control} was not changed: ${exactError.message}`,
-        {
+        `${joinFailure(`${control} was not changed`, sayFailure(exactError))}`,
+        { ...failureDetails(exactError),
           category: 'rendering',
           title: 'Renderer setting unavailable'
         }
@@ -1278,7 +1332,7 @@ export function initRenderControls(options) {
       const measured = `a frame of every cell took ${before} on this device, `
         + `over the ${Math.round(automaticPerformance.budgetMilliseconds)} ms that keeps moving the view smooth, and ${after} with ${turned.join(' and ')}`;
       hpPerformanceStatus.textContent = `Turned on for this dataset: ${measured}. Turn either off to draw every cell.`;
-      notify(`${turned.length === 2 ? 'Level of detail and frustum culling are' : `${turned[0][0].toUpperCase()}${turned[0].slice(1)} is`} on: ${measured}. Render settings › Performance can turn them off.`);
+      notify(`${turned.length === 2 ? 'Level of detail and frustum culling are' : `${upperFirst(turned[0])} is`} on: ${measured}. Render settings › Performance can turn them off.`);
       return;
     }
     // No automatic choice may make a frame slower, and one not proven faster
@@ -1311,7 +1365,7 @@ export function initRenderControls(options) {
   // ---------------------------------------------------------------------------
 
   const antialiasingAvailable = viewer.isAntialiasingAvailable();
-  const storedAntialias = resolveAntialiasPreference(localStorage);
+  const storedAntialias = resolveAntialiasPreference(webStorage('localStorage'));
   let antialiasPreferenceMode = storedAntialias.mode;
   let datasetCellCount = null;
   let viewDimension = null;
@@ -1430,7 +1484,7 @@ export function initRenderControls(options) {
     try {
       // An explicit click ends automatic selection for good, in both directions:
       // a user who ticks the box on an eighteen-million-cell dataset means it.
-      writeAntialiasPreference(localStorage, requested ? 'on' : 'off');
+      writeAntialiasPreference(webStorage('localStorage'), requested ? 'on' : 'off');
       antialiasPreferenceMode = requested ? 'on' : 'off';
       publishAntialiasing(requested);
     } catch (error) {
@@ -1493,10 +1547,7 @@ export function initRenderControls(options) {
       stopWaiting();
       smokeDirty = false;
       committedSmokeRebuildQueued = false;
-      if (smokeRebuildTimeout !== null) {
-        clearTimeout(smokeRebuildTimeout);
-        smokeRebuildTimeout = null;
-      }
+      rebuildSmokeOnceSettled.cancel();
       if (smokePaintFrame !== null) {
         if (typeof globalThis.cancelAnimationFrame === 'function') {
           globalThis.cancelAnimationFrame(smokePaintFrame);

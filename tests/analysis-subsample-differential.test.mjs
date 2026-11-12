@@ -27,7 +27,7 @@
  *   within 1e-13 relative (`expm1`, `log2` of each side's libm, at most an
  *   ulp each); Wilcoxon p within 1e-12 relative (the normal tail in
  *   float64 by other special-function code, as `analysis-scanpy-rank-genes-parity`
- *   measures); Welch t within 1e-10 (centred against raw moments) and its p
+ *   measures); Welch t within 1e-10 (centered against raw moments) and its p
  *   within 3e-10: the app's incomplete beta (`tCDF`) stops its continued
  *   fraction once a factor is within 1e-10 of 1, so its relative error is a
  *   few 1e-10 (1.1e-10 measured here against SciPy's `stdtr`);
@@ -42,7 +42,7 @@
  *   of a few hundred terms in another order);
  * - the mean signature score of each cell: exactly (float32 sums of
  *   quarters are exact, one division rounded once);
- * - the neighbour graph: the induced subgraph's edges, as pairs of original
+ * - the neighbor graph: the induced subgraph's edges, as pairs of original
  *   positions, and its largest weight, exactly;
  * - the vector field's vectors and the outlier quantiles, bit for bit: the
  *   ones `prepare()` stores are the whole dataset's, gathered (decision
@@ -397,7 +397,7 @@ async function checkOpening(view, opening, { label, stored, allCategories = true
     assert.equal(scorer.scores[positionOf.get(p)], opening.signature[rank], `${label}: signature of cell ${p}`);
   });
 
-  // The neighbour graph on the open cells: the induced subgraph, its
+  // The neighbor graph on the open cells: the induced subgraph, its
   // edges named by original positions.
   if (view.graphs.includes('connectivities')) {
     const edges = await view.loader.getConnectivityEdges('connectivities');

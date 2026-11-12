@@ -34,8 +34,29 @@ function quiet(t) {
 
 test('a file without uns[\'cellucid\'] states nothing', () => {
   assert.deepEqual(requireCellucidFileMetadata(null, 'h5ad'), {
-    id: null, name: null, description: null, citation: null, source: null, defaults: {}, outlierQuantiles: null,
+    id: null, name: null, description: null, citation: null, source: null, defaults: {}, outlierQuantiles: null, totalCounts: null,
   });
+});
+
+test('totalCounts names the field of each matrix\'s cell totals and what they cover', () => {
+  const anndata = requireCellucidFileMetadata({ totalCounts: { field: 'total_counts', over: 'stored genes' } }, 'h5ad');
+  assert.deepEqual([...anndata.totalCounts], [[null, { field: 'total_counts', over: 'stored genes' }]]);
+  const mudata = requireCellucidFileMetadata({
+    totalCounts: { rna: { field: 'nCount_RNA', over: 'all genes' }, prot: { field: 'prot:total_counts', over: 'stored genes' } },
+  }, 'h5mu');
+  assert.deepEqual([...mudata.totalCounts], [
+    ['rna', { field: 'nCount_RNA', over: 'all genes' }],
+    ['prot', { field: 'prot:total_counts', over: 'stored genes' }],
+  ]);
+  // A source's gene panel (the atlases' 8,192 integration genes): more than the file stores, not every gene.
+  const panel = requireCellucidFileMetadata({ totalCounts: { field: 'total_counts', over: 'source panel' } }, 'h5ad');
+  assert.deepEqual([...panel.totalCounts], [[null, { field: 'total_counts', over: 'source panel' }]]);
+  assert.throws(() => requireCellucidFileMetadata({ totalCounts: { field: 'total_counts', over: 'some genes' } }, 'h5ad'),
+    /\['over'\] must be 'all genes', 'source panel' or 'stored genes'; got 'some genes'/);
+  assert.throws(() => requireCellucidFileMetadata({ totalCounts: { field: 'total_counts' } }, 'h5ad'), /must hold 'over'/);
+  assert.throws(() => requireCellucidFileMetadata({ totalCounts: { field: 'total_counts', over: 'all genes', base: 2 } }, 'h5ad'),
+    /totalCounts/);
+  assert.throws(() => requireCellucidFileMetadata({ totalCounts: { rna: 'total_counts' } }, 'h5mu'), /must be a mapping \{field, over\}/);
 });
 
 test('every key is read as it is stored, and a single text may be a one-element list', () => {
@@ -95,7 +116,7 @@ test('a key not in the contract, or a value of the wrong shape, refuses the file
     [{ id: 'ends.' }, /not ending with '\.'/],
     [{ id: ['a', 'b'] }, /non-empty text/],
     [{ name: '' }, /non-empty text/],
-    [{ name: ' padded' }, /white space/],
+    [{ id: ' padded' }, /white space/],
     [{ name: 'zero​width' }, /no glyph/],
     [{ citation: { url: 'https://x.org' } }, /citation'\]\['text'\]/],
     [{ citation: { text: 'x', url: 'ftp://x.org' } }, /http\(s\) address/],
@@ -204,4 +225,24 @@ test('an unknown key in uns[\'cellucid\'] refuses the file when it opens', async
     /uns\['cellucid'\] may contain only: .*\(unexpected: colour\)/
   );
   assert.equal(source.datasetId, null);
+});
+
+test('descriptive text is read trimmed, an identifier still refused for a space at either end (R9U-9)', () => {
+  const read = requireCellucidFileMetadata({
+    id: 'pbmc',
+    name: ' PBMC 3k ',
+    description: 'One paragraph typed by hand. \n',
+    citation: { text: '﻿Smith J, et al. A study. 2024. ', url: 'https://doi.org/10.1/x' },
+    source: { name: 'GEO\t', url: 'https://example.org/' },
+  }, 'h5ad');
+  assert.equal(read.name, 'PBMC 3k');
+  assert.equal(read.description, 'One paragraph typed by hand.');
+  assert.equal(read.citation.text, 'Smith J, et al. A study. 2024.');
+  assert.equal(read.source.name, 'GEO');
+  // White space alone: an empty description, a name that is no name.
+  assert.equal(requireCellucidFileMetadata({ description: '  ' }, 'h5ad').description, '');
+  assert.throws(() => requireCellucidFileMetadata({ name: '  ' }, 'h5ad'), /\['name'\] must be non-empty text/);
+  // Identifiers and fields keep the strict rule; a space inside prose stays.
+  assert.throws(() => requireCellucidFileMetadata({ id: 'pbmc ' }, 'h5ad'), /\['id'\] must not start or end with white space/);
+  assert.equal(requireCellucidFileMetadata({ name: 'PBMC  3k' }, 'h5ad').name, 'PBMC  3k');
 });

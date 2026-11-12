@@ -204,7 +204,7 @@ test('the empty state reads in both themes', async ({ page }) => {
   expect(productErrors).toEqual([]);
 });
 
-test('gene results and the colour palette menu work from the keyboard alone', async ({
+test('gene results and the color palette menu work from the keyboard alone', async ({
   page,
 }) => {
   const productErrors = observeProductErrors(page);

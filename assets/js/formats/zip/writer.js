@@ -21,9 +21,9 @@
  *   takes (the File System Access API, a Blob's parts).
  * - **Deterministic bytes.** Every entry is a regular `0644` file of a Unix
  *   writer, dated 1980-01-01 00:00 (the earliest a ZIP carries), with its
- *   name in UTF-8 (flag 11) exactly as given (never normalised: a Zarr
+ *   name in UTF-8 (flag 11) exactly as given (never normalized: a Zarr
  *   store's keys name its entries byte for byte), two names that are one
- *   once normalised refused: an archive's bytes depend on its entries alone,
+ *   once normalized refused: an archive's bytes depend on its entries alone,
  *   as cellucid-python's `_zip_folder` and cellucid-r's writer make them.
  * - **Streaming.** Nothing is held but the central directory being built
  *   (46 bytes, the name and any ZIP64 field per entry, packed into segments
@@ -237,7 +237,7 @@ export function createZipWriter(sink) {
   let offset = 0;
   let count = 0;
   let finished = false;
-  /** Paths added, by their normalised form, so no entry is named twice (`archive.js` refuses an archive that has one). */
+  /** Paths added, by their normalized form, so no entry is named twice (`archive.js` refuses an archive that has one). */
   const paths = new Map();
   /** The central directory, packed into segments of `DIRECTORY_SEGMENT_BYTES`. */
   const directory = [];
@@ -275,13 +275,13 @@ export function createZipWriter(sink) {
     } catch (error) {
       return Promise.reject(error);
     }
-    // Two names that are one once normalised (NFC) are one entry to a reader
-    // that normalises (`names.js` `entryPath`, macOS's unzip): refused.
+    // Two names that are one once normalized (NFC) are one entry to a reader
+    // that normalizes (`names.js` `entryPath`, macOS's unzip): refused.
     const key = path.normalize('NFC');
     if (paths.has(key)) {
       return Promise.reject(new Error(paths.get(key) === path
         ? `The ZIP archive already has an entry '${path}'.`
-        : `The ZIP entry '${path}' is the entry '${paths.get(key)}' written in another Unicode form; readers that normalise names would take them for one.`));
+        : `The ZIP entry '${path}' is the entry '${paths.get(key)}' written in another Unicode form; readers that normalize names would take them for one.`));
     }
     paths.set(key, path);
     const run = queue.then(async () => {

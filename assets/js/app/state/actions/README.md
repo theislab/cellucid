@@ -3,8 +3,8 @@
 **Owns:** the implementations of the actions that need nothing but the state
 (`app/actions/definitions/{fields,coloring,filters,mapping}.js`): field
 renames, deletes, restores and purges, fields made from highlight pages or
-pushed by a notebook, category renames, merges and deletes, category colours
-and continuous colour settings, every filter (categories, cells kept of a
+pushed by a notebook, category renames, merges and deletes, category colors
+and continuous color settings, every filter (categories, cells kept of a
 category, ranges, outliers, turned off, removed), cells hidden one by one,
 gene sets, and the data mapping (`field-actions.js`). The names their
 parameters give are resolved by `app/actions/targets/` (a field by

@@ -73,7 +73,7 @@ export function adoptRangeCachePort(port) {
     const { id, pieces, held } = event.data ?? {};
     // The waiter settles itself (and stops its deadline); a late answer of
     // pieces finds none. A late answer of what the page holds is still
-    // learnt.
+    // learned.
     const waiter = own.waiting.get(id);
     if (waiter !== undefined) {
       own.late.delete(id);
@@ -224,7 +224,7 @@ function ask(own, message, deadlineMs, signal) {
 /**
  * What this worker knows the page holds of `key`: ranges `[start, end)`,
  * sorted and joined. Asked of the page once (`holds`, waited for no longer
- * than `deadlineMs`; a later answer is learnt when it comes), then grown by
+ * than `deadlineMs`; a later answer is learned when it comes), then grown by
  * the ranges this worker hands it.
  */
 function heldRanges(own, key, deadlineMs, signal) {
@@ -350,7 +350,7 @@ export function withRangeCache(source, key, address = null) {
     // Each part is a request of its own, and a held piece between two parts
     // splits them: one smaller than the gap worth fetching to save a request
     // on this link (`planMergeGap`, as the byte reader prices its plans) is
-    // fetched again with its neighbours. Held chunks scattered through a
+    // fetched again with its neighbors. Held chunks scattered through a
     // read (a gene read before, the first view's cells) would otherwise turn
     // one request into as many as there are pieces, a round trip each.
     if (parts.length > 1 && options.link?.measured) {
@@ -405,6 +405,9 @@ export function storeObjectsKey(url, version) {
   return JSON.stringify(['store', linkIdentity(url), version]);
 }
 
+/** What the page keeps for an object a store's host answered as absent (`storeObjects`). */
+const ABSENT_MARK = Uint8Array.of(0);
+
 /** A file entry of the worker side known without asking the page (`stores`). */
 const KNOWN = Object.freeze({ abandoned: false, join: () => Promise.resolve() });
 
@@ -457,7 +460,12 @@ function storeHeld(own, prefix, deadlineMs, signal) {
  * Null when the store names no version or this realm reaches no cache.
  *
  * @param {string|null} prefix - `storeObjectsKey`
- * @returns {{whole: Function, range: Function, suffix: Function, keepWhole: Function, keepRange: Function, keepSuffix: Function}|null}
+ * An object the host answered as absent (a chunk a Zarr writer left out, as
+ * it holds only the fill value) is kept as such (`keepAbsent`), so the
+ * store's other openings of this version do not ask for it again (`absent`:
+ * known from what the page holds of the store, without a further question).
+ *
+ * @returns {{whole: Function, range: Function, suffix: Function, absent: Function, keepWhole: Function, keepRange: Function, keepSuffix: Function, keepAbsent: Function}|null}
  */
 export function storeObjects(prefix) {
   if (prefix === null || channel === null) return null;
@@ -468,6 +476,9 @@ export function storeObjects(prefix) {
   // An object's last bytes, asked for by their count (a shard's index, read
   // before its object's size is known): kept as an object of their own.
   const suffixKey = (key, length) => `${prefix}\u0002${length}\u0000${key}`;
+  // An object answered as absent: one byte under a key of its own (the page
+  // keeps bytes, and what it holds is what the worker learns of the store).
+  const absentKey = key => `${prefix}\u0003${key}`;
   const boundOf = link => {
     const latency = link?.latencyMs;
     return Number.isFinite(latency) ? latency : (link?.responses?.timeoutMs ?? 0);
@@ -514,6 +525,17 @@ export function storeObjects(prefix) {
       const range = at?.own.files.get(suffixKey(key, length))?.ranges[0];
       if (range === undefined || range[0] !== 0 || range[1] !== length) return null;
       return piece(at.own, suffixKey(key, length), 0, length, at.bound, signal);
+    },
+    /** Whether the page knows object `key` as absent from this version. */
+    async absent(key, { link = null, signal = null } = {}) {
+      const at = await known(link, signal);
+      return (at?.own.files.get(absentKey(key))?.ranges.length ?? 0) > 0;
+    },
+    /** Tell the page object `key` is absent from this version. */
+    keepAbsent(key) {
+      if (channel === null) return;
+      knownFile(channel, absentKey(key));
+      keep(absentKey(key), 0, ABSENT_MARK, null);
     },
     /** Hand the page the last `bytes.length` bytes of object `key`. */
     keepSuffix(key, bytes) {

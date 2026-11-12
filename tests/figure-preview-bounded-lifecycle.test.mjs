@@ -100,7 +100,6 @@ test('large-N preview reads and retains only bounded sampled ownership', () => {
   assert.equal(reduced.index.length, targetCount);
   assert.equal(reduced.scannedSourceCount, maxScanPoints);
   assert.equal(reduced.candidateSourceCount, pointCount);
-  assert.equal(reduced.sourcePositions.length, targetCount * 3);
   assert.equal(reduced.highlighted.length, targetCount);
   assert.equal(
     Array.from(reduced.highlighted).every(value => value === 255),
@@ -109,9 +108,9 @@ test('large-N preview reads and retains only bounded sampled ownership', () => {
   for (let outputIndex = 0; outputIndex < targetCount; outputIndex++) {
     const sourceIndex = reduced.index[outputIndex];
     assert.equal(sourceIndex % stride, 0);
-    assert.equal(
-      reduced.sourcePositions[outputIndex * 3],
-      positionsOwner[sourceIndex * 3]
+    // Identity projection on a 100 × 100 viewport: x is the source's own.
+    assert.ok(
+      Math.abs(reduced.x[outputIndex] - (positionsOwner[sourceIndex * 3] * 0.5 + 0.5) * 100) < 1e-3
     );
   }
 
@@ -139,7 +138,6 @@ test('large-N preview reads and retains only bounded sampled ownership', () => {
     reduced.rgba,
     reduced.alpha,
     reduced.index,
-    reduced.sourcePositions,
     reduced.highlighted,
   ].reduce((sum, owner) => sum + owner.byteLength, 0);
   assert.ok(retainedBytes < 10_000, retainedBytes);
@@ -250,14 +248,8 @@ test('small sparse highlights preserve exact source positions and sampled owners
     const slot = slotBySource.get(sourceIndex);
     assert.notEqual(slot, undefined);
     assert.equal(reduced.highlighted[slot], 255);
-    assert.deepEqual(
-      Array.from(
-        reduced.sourcePositions.subarray(slot * 3, slot * 3 + 3)
-      ),
-      Array.from(
-        positions.subarray(sourceIndex * 3, sourceIndex * 3 + 3)
-      )
-    );
+    assert.ok(Math.abs(reduced.x[slot] - (positions[sourceIndex * 3] * 0.5 + 0.5) * 100) < 1e-3);
+    assert.ok(Math.abs(reduced.y[slot] - (0.5 - positions[sourceIndex * 3 + 1] * 0.5) * 100) < 1e-3);
   }
 });
 
@@ -385,7 +377,6 @@ test('empty and fully cropped reductions publish deterministic empty owners', ()
       highlighted: empty.highlighted.length,
       index: empty.index.length,
       rgba: empty.rgba.length,
-      sourcePositions: empty.sourcePositions.length,
       x: empty.x.length,
       y: empty.y.length,
     },
@@ -394,7 +385,6 @@ test('empty and fully cropped reductions publish deterministic empty owners', ()
       highlighted: 0,
       index: 0,
       rgba: 0,
-      sourcePositions: 0,
       x: 0,
       y: 0,
     }
@@ -419,7 +409,6 @@ test('empty and fully cropped reductions publish deterministic empty owners', ()
     },
   });
   assert.equal(cropped.index.length, 0);
-  assert.equal(cropped.sourcePositions.length, 0);
   assert.equal(cropped.highlighted.length, 0);
   assert.equal(cropped.scannedSourceCount, 1);
   assert.equal(cropped.candidateSourceCount, 1);
@@ -446,7 +435,7 @@ test('preview UI borrows N-sized data and fences every retained lifecycle owner'
     /viewer\.getView(?:Positions|Colors|Transparency)\(/
   );
   assert.doesNotMatch(source, /sample\.positions/);
-  assert.match(source, /reduced\.sourcePositions/);
+  assert.doesNotMatch(source, /reduced\.sourcePositions|computeApprox\w*BoundsFromSample/);
   assert.match(
     source,
     /const maxScanPoints = PREVIEW_MAX_SCAN_POINTS;/
@@ -481,7 +470,7 @@ test('preview UI borrows N-sized data and fences every retained lifecycle owner'
   );
   assert.match(
     source,
-    /clearTimeout\(previewRebuildTimer\)/
+    /releasePreviewSamples\(\);\n\s*rebuildPreviewSoon\.cancel\(\);/
   );
   assert.match(source, /runPreviewUiAction\('Preview toggle'/);
   assert.match(source, /runPreviewUiAction\('Preview refresh'/);
@@ -498,9 +487,7 @@ test('preview UI borrows N-sized data and fences every retained lifecycle owner'
   assert.match(source, /previewEpochFence\.accepts\(/);
   assert.match(source, /previewEpochFence\.close\(\)/);
   assert.match(source, /cancelPendingPreviewFrame\(\)/);
-  assert.match(source, /clearTimeout\(previewDrawTimer\)/);
-  assert.match(source, /clearTimeout\(previewRebuildTimer\)/);
-  assert.match(source, /clearTimeout\(previewTitleTimer\)/);
+  assert.match(source, /drawPreviewSoon\.cancel\(\);\n\s*rebuildPreviewSoon\.cancel\(\);\n\s*syncAutoTitleSoon\.cancel\(\);/);
   assert.match(source, /endCropDrag\(\)/);
   assert.match(source, /releasePreviewSamples\(\)/);
   assert.match(
@@ -554,7 +541,7 @@ test('figure-export UI exposes its stable idempotent cleanup owner', async () =>
     /const destroy = \(\) => \{\s*if \(cleanupComplete\) return exportEnded;\s*cleanupComplete = true;\s*container\.__cellucidCleanup = \(\) => exportEnded;/
   );
   assert.match(source, /\s{4}return exportEnded;\n  \};\n  container\.__cellucidCleanup = destroy;/);
-  assert.match(source, /return \{ setCellsPresent, destroy, exportSessionSettings, importSessionSettings \};\s*\n\}/);
+  assert.match(source, /return \{ setCellsPresent, destroy, exportSessionSettings, importSessionSettings, renderExportPicture \};\s*\n\}/);
 });
 
 test('figure-export Export is offered only while the runtime has cells', async () => {
@@ -570,6 +557,6 @@ test('figure-export Export is offered only while the runtime has cells', async (
   assert.match(source, /exportBtn\.disabled = !exportBusy && !cellsPresent;/);
   assert.match(
     source,
-    /exportBtn\.title = cellsPresent \? '' : 'Load a dataset to export a figure';/
+    /exportBtn\.title = cellsPresent \? '' : openADatasetTo\('export a figure'\);/
   );
 });

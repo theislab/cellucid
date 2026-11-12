@@ -14,6 +14,7 @@ import {
   stoppableOpening,
 } from '../assets/js/data/opening-progress.js';
 import { TransferLog } from '../assets/js/data/transfer-log.js';
+import { until } from './helpers/settles.mjs';
 
 /** A read activity log that reports what the test records. */
 function fakeLog() {
@@ -65,7 +66,7 @@ test('Cancel stops every layer at once and ends the opening as cancelled', () =>
   assert.equal(progress.cancel(), true);
   assert.deepEqual(stopped.sort(), ['inner', 'outer']);
   assert.equal(seen.at(-1).state, 'cancelled');
-  assert.equal(seen.at(-1).message, 'Opening x was cancelled.');
+  assert.equal(seen.at(-1).message, 'Opening x was canceled.');
   // The layers then unwind with their abort errors: nothing changes.
   inner.fail(openingCancelledError('x'));
   outer.fail(openingCancelledError('x'));
@@ -207,7 +208,7 @@ test('a request made again shows as Retrying with why; a whole-file read shows i
 test('reads are named as people say them', () => {
   assert.equal(describeOpeningRead({ kind: 'field', label: "categories of obs['cell_type']" }), 'Reading field cell_type');
   assert.equal(describeOpeningRead({ kind: 'names', label: 'gene names of var' }), 'Reading gene names');
-  assert.equal(describeOpeningRead({ kind: 'graph', label: "obsp['connectivities']" }), 'Reading the neighbour graph');
+  assert.equal(describeOpeningRead({ kind: 'graph', label: "obsp['connectivities']" }), 'Reading the neighbor graph');
 });
 
 test('a file read whole is said up front, by a layer or by the reader, and the note lasts while the opening runs', () => {
@@ -239,7 +240,7 @@ test('a stoppable layer stops on Cancel or on its signal, and rejects with why',
   assert.equal(stops, 1);
   assert.equal(cancelled.stopped, true);
   assert.equal(cancelled.outcome(new Error('The AnnData file was closed')).name, 'AbortError');
-  assert.throws(() => cancelled.throwIfStopped(), /Opening a\.h5ad was cancelled/);
+  assert.throws(() => cancelled.throwIfStopped(), /Opening a\.h5ad was canceled/);
   cancelled.release();
 
   const controller = new AbortController();
@@ -262,11 +263,11 @@ test('an outer layer that finishes after an inner one says the outcome', () => {
   loader.end();
   change.end();
   // The file's own layer says what was opened.
-  file.end('User data ready: 120 cells');
+  file.end('Opened sample: 120 cells');
   assert.equal(seen.at(-1).state, 'running');
   startup.dismiss();
   assert.equal(seen.at(-1).state, 'done');
-  assert.equal(seen.at(-1).message, 'User data ready: 120 cells');
+  assert.equal(seen.at(-1).message, 'Opened sample: 120 cells');
 });
 
 /** Timers on a clock the test moves (`OpeningProgress`'s `after`). */
@@ -463,4 +464,55 @@ test('while a startup step deadline measures the wait, the opening does not meas
   startup.end();
   assert.equal(stepListeners.size, 0, 'an ended opening stops hearing of step deadlines');
   assert.equal(clock.pending, 0);
+});
+
+test('the rate is of the time the reads ran: a wait on the person is not in it, and none is shown while asked (F76)', t => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const { log, progress, seen, setWaiting } = stallHarness();
+  const file = progress.begin({ title: 'pancreas-objects.rda' });
+  const read = { ...STRUCTURE, label: 'the structure of pancreas-objects.rda', bytesTotal: 0, bytesPlanned: 0 };
+  log.record({ ...read, bytesFetched: 1 });
+  now = 1000;
+  log.record({ ...read, bytesFetched: 1_048_576 });
+  assert.match(seen.at(-1).detail, /^1\.0 MB read · 1\.0 MB\/s$/);
+  // "Open which one?": the person thinks for a minute; nothing is read.
+  setWaiting(true);
+  now = 61_000;
+  log.record({ ...read, status: 'done', bytesFetched: 1_048_576 });
+  assert.doesNotMatch(seen.at(-1).detail, /\/s/, 'no rate beside the question');
+  setWaiting(false);
+  now = 62_000;
+  log.record({ id: 2, kind: 'embedding', label: "obsm['X_umap'] columns 0, 1", status: 'running', bytesFetched: 1_048_576, bytesTotal: 0 });
+  assert.match(seen.at(-1).detail, /^2\.0 MB read · 1\.0 MB\/s$/, 'two seconds of reading, the minute of thought left out');
+  file.end();
+});
+
+test('notices kept until the next opening are handed over once, as it begins (R9U-13)', () => {
+  const { progress } = harness();
+  // A failure card, a refused file, a sample view not applied: kept by id.
+  assert.equal(progress.untilNextOpening('note-1'), 'note-1');
+  progress.untilNextOpening('note-2');
+  progress.untilNextOpening('note-2');
+  assert.deepEqual(progress.takeEarlierNotices(), ['note-1', 'note-2']);
+  assert.deepEqual(progress.takeEarlierNotices(), [], 'handed over once');
+  assert.throws(() => progress.untilNextOpening(''), TypeError);
+  assert.throws(() => progress.untilNextOpening(undefined), TypeError, 'a notice that was never published has no id');
+});
+
+test('an opening\'s question waits for the welcome: asked once it is closed, never on top of it (R9U-14)', async () => {
+  const { progress, seen } = harness();
+  const { holdStartupFor } = await import('../assets/js/utils/startup-sequence.js');
+  let close;
+  holdStartupFor(new Promise(resolve => { close = resolve; }));
+  const opening = progress.begin({ title: 'objects.rda' });
+  const answer = opening.choose({ question: 'Which object?', options: ['a', 'b'] });
+  for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(seen.at(-1).choice ?? null, null, 'not asked while the welcome is up');
+  close();
+  await until(() => (seen.at(-1).choice ?? null) !== null, 'the question once the welcome closed');
+  assert.equal(seen.at(-1).choice.question, 'Which object?');
+  seen.at(-1).choice.choose(1);
+  assert.equal(await answer, 1);
+  opening.end();
 });

@@ -35,6 +35,9 @@
  * @module app/history/history-settings
  */
 
+import { webStorage } from '../../utils/web-storage.js';
+import { createListenerSet } from '../../utils/listener-set.js';
+
 const STORAGE_KEY = 'cellucid:history-settings';
 
 /** Every setting, its label and its default. */
@@ -70,15 +73,23 @@ export function offDomainsOf(settings) {
   return Object.entries(DETAIL_DOMAINS).filter(([key]) => settings[key] === false).map(([, domain]) => domain);
 }
 
-const listeners = new Set();
+const listeners = createListenerSet('the history settings');
+
+/**
+ * The settings set on this page that this browser did not keep (it keeps
+ * nothing for this site, or refused the write): they hold for this page.
+ */
+const unkept = {};
 
 function read(storage) {
+  let stored = {};
   try {
     const parsed = JSON.parse(storage?.getItem?.(STORAGE_KEY) ?? 'null');
-    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) stored = parsed;
   } catch {
-    return {};
+    stored = {};
   }
+  return { ...stored, ...unkept };
 }
 
 /**
@@ -89,7 +100,7 @@ function read(storage) {
  * @returns {{recordCamera: boolean, recordLayout: boolean, recordNewDatasets: boolean, askWhilePaused: boolean,
  *   personName: string|null, autosave: boolean, reportPictures: boolean}}
  */
-export function historySettings(storage = globalThis.localStorage) {
+export function historySettings(storage = webStorage('localStorage')) {
   const stored = read(storage);
   return Object.freeze(Object.fromEntries(Object.entries(HISTORY_SETTINGS).map(([key, setting]) => [
     key, valueOf(setting, stored[key]),
@@ -104,22 +115,23 @@ export function historySettings(storage = globalThis.localStorage) {
  * @param {boolean|string|null} value
  * @param {Storage|null|undefined} [storage]
  */
-export function setHistorySetting(key, value, storage = globalThis.localStorage) {
+export function setHistorySetting(key, value, storage = webStorage('localStorage')) {
   if (!Object.hasOwn(HISTORY_SETTINGS, key)) throw new RangeError(`There is no history setting "${key}"`);
   const setting = HISTORY_SETTINGS[key];
   if (setting.kind === 'boolean' && typeof value !== 'boolean') throw new TypeError(`The history setting "${key}" is on or off`);
   if (setting.kind === 'name' && value !== null && typeof value !== 'string') throw new TypeError(`The history setting "${key}" is a name or nothing`);
   value = valueOf(setting, value);
   const next = { ...read(storage), [key]: value };
+  delete unkept[key];
   try {
-    storage?.setItem?.(STORAGE_KEY, JSON.stringify(next));
+    if (storage === null || storage === undefined) throw new Error('This browser keeps nothing for this site.');
+    storage.setItem(STORAGE_KEY, JSON.stringify(next));
   } catch {
     // A browser that keeps no localStorage keeps the setting for this page only.
+    unkept[key] = value;
   }
   const settings = { ...historySettings(storage), [key]: value };
-  for (const listener of [...listeners]) {
-    try { listener(settings); } catch (error) { console.error('[history-settings] listener failed', error); }
-  }
+  listeners.notify(settings);
 }
 
 /**
@@ -129,6 +141,5 @@ export function setHistorySetting(key, value, storage = globalThis.localStorage)
  * @returns {() => void}
  */
 export function onHistorySettingsChange(listener) {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
+  return listeners.add(listener);
 }

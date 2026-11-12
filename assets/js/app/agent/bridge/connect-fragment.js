@@ -11,6 +11,11 @@
  * without that one segment, so a reload, a bookmark or a shared link never
  * carries it. Every other part of the fragment stays where it is.
  *
+ * A page inside another site's frame takes the code out but keeps none: a
+ * site that frames Cellucid could otherwise lay its own page over the
+ * approval dialog and have the person click Allow unseen (clickjacking;
+ * GitHub Pages cannot send `frame-ancestors`).
+ *
  * It runs before `auth-fragment-init.js`, which takes a GitHub sign-in's
  * whole fragment. The key is `CONNECT_FRAGMENT_KEY` of
  * `app/agent/bridge/relay-protocol.js` (a classic script cannot import it; a
@@ -38,7 +43,7 @@
   Object.defineProperty(window, 'cellucidConnectFragment', {
     configurable: true,
     enumerable: false,
-    value: code,
+    value: window.top === window ? code : null,
     writable: false,
   });
   const rest = kept.length > 0 ? `#${kept.join('&')}` : '';

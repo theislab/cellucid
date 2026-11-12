@@ -337,7 +337,7 @@ test('a named save stays as it was made; renamed and removed with what only it h
   assert.equal(await renameSavedState(named, 'Fig. 2', page.store), true);
   assert.equal((await listSavedStates(page.store)).find(state => state.id === named).name, 'Fig. 2');
   assert.equal(await removeSavedStates([page.autosave.entryId], page.store), 1);
-  // The named save's values stay; the louvain colour only the autosave held goes.
+  // The named save's values stay; the louvain color only the autosave held goes.
   const values = [...database.stores.get('values').values()].map(record => record.skeleton.by);
   assert.ok(values.includes('leiden') && !values.includes('louvain'));
   const { source, history } = await readBack(page.store, named);

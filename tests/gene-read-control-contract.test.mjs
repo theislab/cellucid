@@ -2,7 +2,7 @@
  * Genes read for (`ui/modules/gene-read-control.js`), the one control that
  * changes how many of the open cells a gene is read for, and the Session
  * panel's collapsible sections it sits in (`ui/modules/session-sections.js`):
- * the steps it offers (the share read now, then 1, 5, 10, 25, 50 and 100 %
+ * the steps it offers (the share read now, then 1, 5, 10, 25, 50 and 100%
  * above it, never past what the gene index fits here), its one status line
  * (the chosen step's cells and cost, priced again as the link changes, or
  * how far a read is and the time left), Read (the chosen step, priced and
@@ -12,6 +12,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { shareText } from '../assets/js/utils/format-units.js';
 
 class FakeNode {
   constructor(tag, ownerDocument) {
@@ -87,7 +88,7 @@ const doc = fakeDocument();
 globalThis.document = doc;
 
 const {
-  GENE_READ_STEPS, createGeneReadNote, geneReadPercentText, geneReadStatus, geneReadSteps, initGeneReadControl, nearestGeneReadStep, revealGeneReadControl,
+  GENE_READ_STEPS, createGeneReadNote, geneReadStatus, geneReadSteps, initGeneReadControl, nearestGeneReadStep, revealGeneReadControl,
 } = await import('../assets/js/app/ui/modules/gene-read-control.js');
 const { SESSION_SECTIONS, expandSessionSection, initSessionSections, subsamplingSummary } = await import('../assets/js/app/ui/modules/session-sections.js');
 
@@ -157,7 +158,7 @@ function controlDom() {
 
 test('the steps: the share read now, each fixed share above it, and the most the gene index fits as the last', () => {
   assert.deepEqual([...GENE_READ_STEPS], [1, 5, 10, 25, 50, 100]);
-  // HLCA: 3,769 of 2,282,447 open cells read (0.17 %).
+  // HLCA: 3,769 of 2,282,447 open cells read (0.17%).
   assert.deepEqual(geneReadSteps(3_769, 2_282_447), [3_769, 22_824, 114_122, 228_245, 570_612, 1_141_224, 2_282_447]);
   // A sample above some steps starts above them.
   assert.deepEqual(geneReadSteps(30_000, 200_000), [30_000, 50_000, 100_000, 200_000]);
@@ -174,12 +175,12 @@ test('the steps: the share read now, each fixed share above it, and the most the
 });
 
 test('the percent box: whole from 10 up, two figures below, never 100 short of every cell', () => {
-  assert.equal(geneReadPercentText(3_769, 2_282_447), '0.17');
-  assert.equal(geneReadPercentText(22_824, 2_282_447), '1');
-  assert.equal(geneReadPercentText(114_122, 2_282_447), '5');
-  assert.equal(geneReadPercentText(2_282_446, 2_282_447), '99');
-  assert.equal(geneReadPercentText(2_282_447, 2_282_447), '100');
-  assert.equal(geneReadPercentText(31_539, 200_000), '16');
+  assert.equal(shareText(3_769, 2_282_447), '0.17');
+  assert.equal(shareText(22_824, 2_282_447), '1');
+  assert.equal(shareText(114_122, 2_282_447), '5');
+  assert.equal(shareText(2_282_446, 2_282_447), '99');
+  assert.equal(shareText(2_282_447, 2_282_447), '100');
+  assert.equal(shareText(31_539, 200_000), '16');
 });
 
 test('the status line: the chosen cells and their cost, compact; a read under way and its time left', () => {
@@ -219,7 +220,7 @@ test('the control: hidden without a sample; a step chosen is priced, priced agai
   assert.deepEqual(state.asked.map(entry => entry.cells), [2_282_447]);
   state.asked[0].answer.resolve({ bytes: 9.8e9, ms: 4.5e6, index: { refusal: null, fits: 2_282_447 } });
   await settle();
-  // The 10 % step: priced, then read.
+  // The 10% step: priced, then read.
   dom.slider.value = '3';
   dom.slider.dispatch('input');
   assert.equal(dom.percent.value, '10');
@@ -235,7 +236,7 @@ test('the control: hidden without a sample; a step chosen is priced, priced agai
   state.asked.at(-1).answer.resolve({ bytes: 980e6, ms: 610_000, index: { refusal: null, fits: 228_245 } });
   await settle();
   assert.equal(dom.status.textContent, '228K of 2.3M cells · 935 MB, ~10 min');
-  // An answer for an earlier choice is dropped: the 25 % step asked, then the 5 % one.
+  // An answer for an earlier choice is dropped: the 25% step asked, then the 5% one.
   dom.slider.value = '4';
   dom.slider.dispatch('input');
   const stale = state.asked.at(-1);
@@ -259,7 +260,7 @@ test('the control: hidden without a sample; a step chosen is priced, priced agai
   state.asked.at(-1).answer.resolve({ bytes: 2.2e9, ms: 290_000, index: { refusal: null, fits: 570_612 } });
   await settle();
   assert.deepEqual(state.reads, [570_612]);
-  assert.equal(said.at(-1), 'Reading genes for 25 % of the open cells (570,612 cells) (2.0 GB, ~4 min 50 s)');
+  assert.equal(said.at(-1), 'Reading genes for 25% of the open cells (570,612 cells) (2.0 GB, ~4 min 50 s)');
   // While it reads: Stop, the cells read so far and the time left, the slider still.
   state.growth = { cells: 22_000, target: 570_612 };
   state.emit();
@@ -297,7 +298,7 @@ test('Read never asks for more cells than the gene index fits here, and no room 
   const dom = controlDom();
   const state = createState({ cells: 40_000, of: 455_000 });
   const control = initGeneReadControl({ dom, state, openCellsKey: () => 'every cell' });
-  // Chosen before the room was asked: 100 %.
+  // Chosen before the room was asked: 100%.
   dom.slider.value = '4';
   dom.slider.dispatch('input');
   state.asked.at(-1).answer.resolve({ bytes: 3e9, ms: 600_000, index: { refusal: 'the gene index of 455,000 cells needs 3 GB', fits: 120_000 } });
@@ -328,7 +329,7 @@ test('Read never asks for more cells than the gene index fits here, and no room 
   assert.match(none.status.title, /Genes cannot be read for more cells here: the gene index of 455,000 cells needs 3 GB\./);
 });
 
-test('the line that links to it says the sample in one compact line, its exact words in the (i), and reveals the control', () => {
+test('the line that links to it says the sample in one compact line, its exact words in the (i), and reveals the control', async () => {
   const note = createGeneReadNote({ className: 'analysis-gene-read', tip: 'gene-sample', label: 'About the gene sample' });
   note.set('Genes read for 3.8K of 2.3M cells', 'Genes are read for 3,769 of the 2,282,447 open cells.');
   assert.equal(note.link.textContent, 'Genes read for 3.8K of 2.3M cells');
@@ -346,6 +347,11 @@ test('the line that links to it says the sample in one compact line, its exact w
   doc.documentElement = { dataset: {} };
   note.link.ownerDocument = doc;
   note.link.click();
+  // Nothing opens before the sidebar is shown (R9K-2: a section opened in the
+  // moment the sidebar's action starts is kept outside the history).
+  assert.equal(panel.open, false, 'the Session panel waits for the sidebar');
+  // Opened, brought into view and focused once it is (`revealInSidebar`).
+  await settle();
   assert.equal(panel.open, true, 'the Session panel opens');
   assert.equal(header.getAttribute('aria-expanded'), 'true', 'Subsampling opens');
   assert.equal(block.scrolled, true);
@@ -356,10 +362,21 @@ test('the line that links to it says the sample in one compact line, its exact w
 
 test('the Session sections: collapsed by default, a one-line summary, the open state kept per viewer (never failing without storage)', () => {
   assert.equal(subsamplingSummary(null, null), '');
-  assert.equal(subsamplingSummary({ nObs: 562_000, kept: null }, null), '100 % cells');
-  assert.equal(subsamplingSummary({ nObs: 2_282_447, kept: null }, { cells: 3_769, of: 2_282_447 }), '100 % cells · genes 0.17 %');
-  assert.equal(subsamplingSummary({ nObs: 1_000, kept: new Uint32Array(100) }, { cells: 60, of: 100 }), '10 % cells · genes 60 %');
-  assert.equal(subsamplingSummary({ nObs: 1_000, kept: null }, null, { cells: 2_000, target: 10_000 }), '100 % cells · reading genes 2K');
+  assert.equal(subsamplingSummary({ nObs: 562_000, kept: null }, null), '100% cells');
+  assert.equal(subsamplingSummary({ nObs: 2_282_447, kept: null }, { cells: 3_769, of: 2_282_447 }), '100% cells · genes 0.17%');
+  assert.equal(subsamplingSummary({ nObs: 1_000, kept: new Uint32Array(100) }, { cells: 60, of: 100 }), '10% cells · genes 60%');
+  assert.equal(subsamplingSummary({ nObs: 1_000, kept: null }, null, { cells: 2_000, target: 10_000 }), '100% cells · reading genes 2K');
+  // A progressive opening growing in place says the share it grows to and the cells read so far,
+  // as the Subsampling control does: the cells open so far alone ("23% cells") read as a chosen
+  // subsample (Suo, R9X-18).
+  assert.equal(
+    subsamplingSummary({ nObs: 561_947, kept: new Uint32Array(131_072) }, null, null, { cells: 131_072, target: 561_947 }),
+    '100% cells · reading 131K'
+  );
+  assert.equal(
+    subsamplingSummary({ nObs: 1_000, kept: new Uint32Array(100) }, null, null, { cells: 100, target: 500 }),
+    '50% cells · reading 100'
+  );
 
   const page = fakeDocument();
   const values = new Map();
@@ -375,8 +392,8 @@ test('the Session sections: collapsed by default, a one-line summary, the open s
   const toggle = page.getElementById(SESSION_SECTIONS.subsampling.toggle);
   assert.equal(toggle.getAttribute('aria-expanded'), 'false');
   assert.equal(page.getElementById(`${SESSION_SECTIONS.subsampling.toggle}-body`).hidden, true);
-  sections.setSummary('subsampling', '100 % cells · genes 6 %');
-  assert.equal(page.getElementById(SESSION_SECTIONS.subsampling.summary).textContent, '100 % cells · genes 6 %');
+  sections.setSummary('subsampling', '100% cells · genes 6%');
+  assert.equal(page.getElementById(SESSION_SECTIONS.subsampling.summary).textContent, '100% cells · genes 6%');
   assert.equal(expandSessionSection(page, 'subsampling'), true);
   assert.equal(toggle.getAttribute('aria-expanded'), 'true');
   assert.deepEqual(JSON.parse(values.get('cellucid_session_sections')), { subsampling: true });

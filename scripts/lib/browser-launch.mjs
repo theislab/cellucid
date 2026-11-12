@@ -3,10 +3,10 @@
  * `benchmark-*.mjs`, `efficiency-floor/*`): the machine's GPU, and the WebGL
  * renderer each run drew with, recorded and checked.
  *
- * A software rasteriser (SwiftShader, llvmpipe) draws every frame on the CPU:
+ * A software rasterizer (SwiftShader, llvmpipe) draws every frame on the CPU:
  * a frame of millions of points then costs seconds, and a synchronous GL call
  * (a frame-cost measurement, a read-back) holds the main thread for it, so a
- * timing taken on one measures the rasteriser, not the app. Chromium starts
+ * timing taken on one measures the rasterizer, not the app. Chromium starts
  * on the GPU (Metal through ANGLE on macOS), Firefox with WebGL forced on;
  * `requireHardwareRenderer` refuses a run that still lands on a software
  * renderer unless the run asked for one (`--software-gl`: a machine without
@@ -62,7 +62,7 @@ export function browserLaunchOptions(engine, { args = [], headless = true, softw
  * The WebGL renderer `page` draws with (`WEBGL_debug_renderer_info`'s
  * unmasked renderer), classified by the app's own rule
  * (`renderer-identity.js`, `classifyRasterizer`). Throws when WebGL 2 is
- * missing, or when the rasteriser is software or cannot be identified and
+ * missing, or when the rasterizer is software or cannot be identified and
  * `softwareGl` is not set: a run records this string with its results.
  *
  * @param {import('playwright').Page|import('playwright').Frame} page

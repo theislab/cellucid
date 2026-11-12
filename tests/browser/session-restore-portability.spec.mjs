@@ -39,6 +39,7 @@ import { ENCODED_SAMPLE_CATALOG_URL, SAMPLE_ORIGIN } from './helpers/origins.mjs
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
+import { chooseFiles } from './helpers/file-input.mjs';
 
 const DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}`
@@ -258,11 +259,12 @@ test('a session saved by another engine restores, and says so once', async ({
     1,
     'a successful restore is announced exactly once',
   );
-  // Load State used to add a third announcement of the same event. The one other notice is the
-  // offer to undo the load (its trackers were added beside the ones shown).
-  expect(await publishedNotifications(page)).toEqual([
-    { title: 'Loaded', message: RESTORED },
-    { title: '', message: 'Loaded "Tracker 1 (shared)" from other-engine.cellucid-session beside yours.' },
+  // Load State used to add a third announcement of the same event, and the offer to undo the load
+  // was a second notice of it (found 2026-11-10). One notice says how the load ended: the restore,
+  // what it added beside the trackers shown, and Undo. (The progress card, published only when the
+  // read outlasts NOTICE_AFTER_MS, gives way to it and says nothing of the outcome.)
+  expect((await publishedNotifications(page)).filter(notice => notice.title !== 'Loading')).toEqual([
+    { title: 'Loaded "Tracker 1 (shared)" beside yours', message: RESTORED },
   ]);
   await expect(page.locator('#split-view-badges-list > *')).not.toHaveCount(0);
   expect(await readLiveOrbit(page)).toEqual(savedOrbit);
@@ -433,17 +435,25 @@ test('a published sample view that cannot be applied is reported once', async ({
 }, testInfo) => {
   await recordNotifications(page);
   await openDataset(page);
-  let rewroteSelect = false;
+  let brokeCamera = false;
   const stateBytes = await rewriteSession(
     await saveSession(page, testInfo, 'broken.cellucid-session'),
     {
-      // A select value the control does not offer: refused when the settings
-      // are put back, after the file has been read.
-      settings: value => { rewroteSelect = breakFirstSelect(value); },
+      // A camera no view can take (a negative distance): refused when the
+      // cameras are put back, after the file has been read. Not a setting: a
+      // saved setting this version cannot use is said and left as shown, and
+      // never fails the view (next test).
+      camera: value => {
+        for (const state of cameraStatesIn(value)) {
+          state.orbit.radius = -1;
+          state.orbit.targetRadius = -1;
+          brokeCamera = true;
+        }
+      },
     },
     { startingView: true },
   );
-  expect(rewroteSelect, 'the saved session must contain a select').toBe(true);
+  expect(brokeCamera, 'the saved session must hold a camera').toBe(true);
   await servePublishedDefault(page, stateBytes);
 
   await page.reload({ waitUntil: 'domcontentloaded' });
@@ -461,6 +471,70 @@ test('a published sample view that cannot be applied is reported once', async ({
     'the restore progress entry must not repeat the sample-view failure',
   ).toEqual([]);
   expect(published.filter(restored)).toEqual([]);
+
+  // R9U-13: the notice is about this dataset; the next opening withdraws it,
+  // so it never reads as the next dataset's (two samples in a row left two).
+  const unavailable = page.locator('#notification-center .notification').filter({ hasText: 'Sample view unavailable' });
+  await expect(unavailable).toHaveCount(1);
+  await chooseFiles(
+    page.locator('#user-data-file-input'),
+    path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'current-ui-smoke.zarr.zip'),
+  );
+  await expect(page.locator('#notification-center .notification-success').filter({ hasText: /Opened .+: 120 cells/ })).toHaveCount(1);
+  await expect(unavailable).toHaveCount(0);
+});
+
+test('a published sample view saved by an earlier version applies: a setting this version cannot use is said, never failing the view', async ({
+  page,
+}, testInfo) => {
+  // Found 2026-11-11: every sample's starting view holds the Figure export
+  // record of version 1 (an SVG strategy left unchosen, null); once version 2
+  // refused null, every sample opened on "Sample view unavailable".
+  const productErrors = observeProductErrors(page);
+  await recordNotifications(page);
+  await openDataset(page);
+  await poseCamera(page);
+  const savedOrbit = await readLiveOrbit(page);
+  let rewroteSelect = false;
+  const stateBytes = await rewriteSession(
+    await saveSession(page, testInfo, 'earlier.cellucid-session'),
+    {
+      settings: value => {
+        value.figureExport = { ...value.figureExport, version: 1, svgStrategy: null };
+        // And a choice this version's control does not offer (not the
+        // background, which a starting view leaves as shown).
+        const applied = Object.entries(value.controls).filter(([id]) => id !== 'background-select');
+        rewroteSelect = applied.some(([, control]) => breakFirstSelect(control));
+      },
+    },
+    { startingView: true },
+  );
+  expect(rewroteSelect, 'the saved session must contain a select').toBe(true);
+  await servePublishedDefault(page, stateBytes);
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await dismissWelcome(page);
+  await openCollapsedPanels(page);
+  await expect(page.locator('html')).toHaveAttribute('data-startup-phase', 'ready');
+  await expect.poll(
+    () => readLiveOrbit(page),
+    { message: 'the sample view moves the camera to its saved pose' },
+  ).toEqual(savedOrbit);
+  await expectAnnounced(
+    page,
+    ({ message }) => message === '1 saved setting could not be used and stays as shown',
+    1,
+    'the one setting it could not use is said once',
+  );
+  const published = await publishedNotifications(page);
+  expect(published.filter(sampleViewUnavailable)).toEqual([]);
+  expect(published.filter(loadingFailed)).toEqual([]);
+  // The unchosen SVG strategy is read as Full vector.
+  expect(await page.evaluate(async () => {
+    const { getActions } = await import('/assets/js/app/actions/index.js');
+    return (await getActions().dispatch('figure-export.get', {})).outcome.svg_strategy;
+  })).toBe('full-vector');
+  expect(productErrors.filter(text => !/saved setting/.test(text))).toEqual([]);
 });
 
 test('a published sample view of another session format: the dataset opens on its default view, with one short line', async ({

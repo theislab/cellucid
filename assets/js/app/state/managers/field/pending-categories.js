@@ -5,7 +5,7 @@
  * A text or boolean column's categories are the labels its open cells hold
  * (`discovered`, `data/discovered-categories.js`): on a subsample, a label the
  * session was saved with may belong only to cells that are not open. Its
- * legend visibility and colour are held here, by label, and applied when
+ * legend visibility and color are held here, by label, and applied when
  * cells holding it open and the column grows that category
  * (`category-growth.js`). So for a categorical whose dictionary has more
  * categories than there are open cells and than one request reads: it is
@@ -50,7 +50,7 @@ export function forgetPendingCategoryState(field) {
 
 /**
  * What is held for `field`, in the order it was held: the hidden labels and
- * the colours (channels from 0 to 1) of labels its open cells do not hold yet.
+ * the colors (channels from 0 to 1) of labels its open cells do not hold yet.
  * The state domains read it (`app/state/domains/filters.js`, `colors.js`), so
  * a held label is part of the state, not lost on the next capture.
  *
@@ -68,8 +68,8 @@ export function pendingCategoryState(field) {
 
 /**
  * Apply what was held for the labels `field` has now (its categories grew),
- * into its per-category visibility and colours; the caller makes visibility
- * and colours again from them, as it does for every category a growth
+ * into its per-category visibility and colors; the caller makes visibility
+ * and colors again from them, as it does for every category a growth
  * carries.
  *
  * @param {object} state - The data state (`ensureCategoryMetadata`)
@@ -106,7 +106,7 @@ export function applyPendingCategoryState(state, field) {
  * and each other view's context), in field order: what a loaded state names
  * that no open cell holds yet, as the person is told after a load
  * (`app/session/session-serializer.js`). A label held in several views, or
- * for both its visibility and its colour, is counted once.
+ * for both its visibility and its color, is counted once.
  *
  * @param {object} state - The data state (`obsData`, `varData`, `viewContexts`)
  * @returns {Array<{source: 'obs'|'var', key: string, labels: Array<string|boolean>}>}

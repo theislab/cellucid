@@ -274,18 +274,18 @@ test('the page hears a gene on more cells through the reader client, before its 
 
 test('the Dataset box says how much of its neighbour graph a subsample keeps', async () => {
   const { describeDetails, describeGraphShare } = await import('../assets/js/app/ui/modules/dataset-card.js');
-  assert.equal(describeGraphShare({ kept: 120, of: 1200 }), "10 % of the open cells' edges; the others lead to cells not open");
-  assert.equal(describeGraphShare({ kept: 3, of: 1200 }), "0.25 % of the open cells' edges; the others lead to cells not open");
+  assert.equal(describeGraphShare({ kept: 120, of: 1200 }), "10% of the open cells' edges; the others lead to cells not open");
+  assert.equal(describeGraphShare({ kept: 3, of: 1200 }), "0.25% of the open cells' edges; the others lead to cells not open");
   assert.equal(describeGraphShare({ kept: 0, of: 0 }), 'no edge of the open cells');
   const metadata = { id: 'd', name: 'D', stats: { n_cells: 1000, n_genes: 3, n_obs_fields: 0, n_categorical_fields: 0, n_continuous_fields: 0, has_connectivity: true, n_edges: 5000 }, source: null };
   const cells = { nObs: 1000, kept: new Uint32Array(100), spec: { method: 'uniform', nObs: 1000, k: 100, seed: 0 }, autoFit: null };
-  const graphRow = rows => rows.find(row => row.label === 'Neighbour graph').value;
-  assert.match(graphRow(describeDetails(metadata, null, null, null, cells, { kept: 120, of: 1200 })), /\(10 % of the open cells' edges; the others lead to cells not open\)$/);
+  const graphRow = rows => rows.find(row => row.label === 'Neighbor graph').value;
+  assert.match(graphRow(describeDetails(metadata, null, null, null, cells, { kept: 120, of: 1200 })), /\(10% of the open cells' edges; the others lead to cells not open\)$/);
   assert.doesNotMatch(graphRow(describeDetails(metadata, null, null, null, cells, null)), /open cells/);
   assert.doesNotMatch(graphRow(describeDetails(metadata, null, null, null, { ...cells, kept: null }, { kept: 1, of: 2 })), /open cells/);
 });
 
-test('a gene\'s notice says when its first colours come', async () => {
+test('a gene\'s notice says when its first colors come', async () => {
   const { describeGeneReadPlan } = await import('../assets/js/data/gene-read-plan.js');
   const plan = {
     label: 'X', cellMajor: true, built: false, bytesPerSecond: null,
@@ -293,11 +293,11 @@ test('a gene\'s notice says when its first colours come', async () => {
   };
   const fresh = describeGeneReadPlan({ ...plan, progressive: { cells: 228_000, done: 0, next: 7_125, nextStoredBytes: 2e6 } });
   assert.match(fresh, /^61 MB · 228,000 cells to read\.$/m);
-  assert.match(fresh, /^First colours: on 7,125 of 228,000 cells \(1\.9 MB\)\. A sample of the open cells/m);
+  assert.match(fresh, /^First colors: on 7,125 of 228,000 cells \(1\.9 MB\)\. A sample of the open cells/m);
   const raised = describeGeneReadPlan({ ...plan, progressive: { cells: 228_000, done: 22_800, next: 45_600, nextStoredBytes: 5e6 } });
   assert.match(raised, /^61 MB · 205,200 cells to read\.$/m);
-  assert.match(raised, /^Indexed already: 22,800 open cells\. Their colours show at once/m);
-  assert.doesNotMatch(describeGeneReadPlan({ ...plan, progressive: null }), /colours/i);
+  assert.match(raised, /^Indexed already: 22,800 open cells\. Their colors show at once/m);
+  assert.doesNotMatch(describeGeneReadPlan({ ...plan, progressive: null }), /colors/i);
 });
 
 test('reading the open file again with other cells keeps its reader; a failed reading leaves the cells open before', async t => {

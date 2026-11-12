@@ -9,7 +9,7 @@
  * segment), so the next gather writing that segment with the vertex array
  * bound drew INVALID_OPERATION ("A transform feedback buffer that would be
  * written to is also bound to a non-transform-feedback target") and wrote
- * nothing. A kept view's recolour above one segment (16.7M cells) failed that
+ * nothing. A kept view's recolor above one segment (16.7M cells) failed that
  * way. This runs the call sequence that hit it -- a store gathered, drawn
  * through its vertex arrays, gathered again, positions gathered in place from
  * the GPU -- with every write read back against the CPU gather, and checks
@@ -32,7 +32,7 @@ test('a segmented store is gathered again and again, bit for bit, with no WebGL 
     const positions = new PointStore(gl, segmentPoints);
     positions.allocate(count, 8, gl.STATIC_DRAW, allocate, 'positions');
     const colors = new PointStore(gl, segmentPoints);
-    colors.allocate(count, 4, gl.STATIC_DRAW, allocate, 'colours');
+    colors.allocate(count, 4, gl.STATIC_DRAW, allocate, 'colors');
     // Slot s holds source point order[s]: a scrambled permutation.
     const order = new Uint32Array(count);
     for (let slot = 0; slot < count; slot++) order[slot] = (slot * 7_919) % count;
@@ -71,14 +71,14 @@ test('a segmented store is gathered again and again, bit for bit, with no WebGL 
       steps.push({ name, error, glError: gl.getError(), difference: firstDifference(store, source, wordsPerPoint) });
     };
     const first = wordsOf(2_654_435_761, 1);
-    step('colours gathered', () => permuter.writeWords(colors, first, record, 1), colors, first, 1);
-    // A kept view's vertex arrays, drawn once, then its recolour in place.
+    step('colors gathered', () => permuter.writeWords(colors, first, record, 1), colors, first, 1);
+    // A kept view's vertex arrays, drawn once, then its recolor in place.
     const vao = new SegmentedVertexArray(gl);
     vao.setStores(positions, colors, 2);
-    const recolour = wordsOf(40_503, 1);
-    step('colours gathered again (recolour)', () => permuter.writeWords(colors, recolour, record, 1), colors, recolour, 1);
+    const recolor = wordsOf(40_503, 1);
+    step('colors gathered again (recolor)', () => permuter.writeWords(colors, recolor, record, 1), colors, recolor, 1);
     const third = wordsOf(97, 1);
-    step('colours gathered a third time', () => permuter.writeWords(colors, third, record, 1), colors, third, 1);
+    step('colors gathered a third time', () => permuter.writeWords(colors, third, record, 1), colors, third, 1);
     // Positions in source order on the GPU, gathered in place: the source is
     // drawn from the store itself (`_drawSource`), then written back over it.
     const sourceOrder = wordsOf(31, 2);
@@ -87,12 +87,12 @@ test('a segmented store is gathered again and again, bit for bit, with no WebGL 
       positions, { buffer: positions, words: count * 2, page: sourceOrder }, record, 2
     ), positions, sourceOrder, 2);
     const last = wordsOf(12_345, 1);
-    step('colours gathered after the in-place gather', () => permuter.writeWords(colors, last, record, 1), colors, last, 1);
-    // The kept view lets go of its colours, which are deleted.
+    step('colors gathered after the in-place gather', () => permuter.writeWords(colors, last, record, 1), colors, last, 1);
+    // The kept view lets go of its colors, which are deleted.
     vao.setColors(null);
     colors.delete();
     const fresh = new PointStore(gl, segmentPoints);
-    fresh.allocate(count, 4, gl.STATIC_DRAW, allocate, 'colours');
+    fresh.allocate(count, 4, gl.STATIC_DRAW, allocate, 'colors');
     step('a new store gathered', () => permuter.writeWords(fresh, first, record, 1), fresh, first, 1);
     return { segments: positions.segments.length, steps };
   });
@@ -113,7 +113,7 @@ test('a gather pass that fails throws an error naming its call and segment', asy
     const segmentPoints = 4_096;
     const allocate = (_refusal, run) => run();
     const colors = new PointStore(gl, segmentPoints);
-    colors.allocate(count, 4, gl.STATIC_DRAW, allocate, 'colours');
+    colors.allocate(count, 4, gl.STATIC_DRAW, allocate, 'colors');
     const order = new Uint32Array(count).map((_, slot) => count - 1 - slot);
     const plan = linear.planLinearTextureFor(gl, count);
     const texture = gl.createTexture();

@@ -131,7 +131,7 @@ test('the measure of a shown cell fades an odd record', () => {
   recordShownCells(100_000, 1000);
   assert.ok(shownMsPerCell() > 0.005);
   for (let i = 0; i < 12; i++) recordShownCells(100_000, 100);
-  assert.ok(Math.abs(shownMsPerCell() - 0.001) < 0.001 * 0.01, 'back within 1 % of the usual cost');
+  assert.ok(Math.abs(shownMsPerCell() - 0.001) < 0.001 * 0.01, 'back within 1% of the usual cost');
   // An opening of few cells (what any opening costs) counts for little.
   recordShownCells(10, 5);
   assert.ok(shownMsPerCell() < 0.0011);

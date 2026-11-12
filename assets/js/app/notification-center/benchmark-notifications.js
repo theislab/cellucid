@@ -8,7 +8,7 @@
  */
 
 import { NotificationType } from './constants.js';
-import { formatCompactNumber, formatDuration, countNoun } from '../../utils/format-units.js';
+import { formatCompactCount, formatDuration, countNoun } from '../../utils/format-units.js';
 
 function requireNonEmptyString(value, name) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -66,11 +66,11 @@ export const benchmarkNotificationMethods = {
     if (!Number.isSafeInteger(pointCount)) {
       throw new TypeError('Data generation point count must be a safe integer.');
     }
-    const formattedCount = formatCompactNumber(pointCount);
+    const formattedCount = formatCompactCount(pointCount);
     return this.show({
       type: NotificationType.LOADING,
       category: 'benchmark',
-      title: 'Generating Data',
+      title: 'Generating data',
       message: `${formattedCount} ${countNoun(pointCount, 'point')} (${pattern})`
     });
   },
@@ -94,8 +94,8 @@ export const benchmarkNotificationMethods = {
     return this.show({
       type: NotificationType.LOADING,
       category: 'benchmark',
-      title: 'Generating Report',
-      message: 'Collecting system information...'
+      title: 'Generating a report',
+      message: 'Collecting system information…'
     });
   },
 

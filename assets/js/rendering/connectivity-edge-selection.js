@@ -2,7 +2,7 @@
  * Which connectivity edges a pane shows.
  *
  * A graph can hold far more edges than a frame can usefully draw (a k = 15
- * neighbour graph has about 11 edges a cell: 110M at 10M cells), so a pane
+ * neighbor graph has about 11 edges a cell: 110M at 10M cells), so a pane
  * shows the first K of its visible edges in one fixed random order, K being
  * the edge slider's value. An edge is visible when both its endpoints are
  * visible in that pane: shown by every filter and, with level of detail on,

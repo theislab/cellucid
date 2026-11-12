@@ -258,12 +258,15 @@ export class AnalysisWindowManager {
   /**
    * Resolves once the work a window's analysis set off has settled (a new
    * window's first update after its delay: `whenSettled`), so the step that
-   * opened or copied it holds what that work changes.
+   * opened or copied it holds what that work changes. `signal`: what stops
+   * the change that waits; when it aborts, the window's work is stopped and
+   * the wait throws why once it has ended (`BaseAnalysisUI.whenSettled`).
    * @param {string} windowId
+   * @param {{signal?: AbortSignal|null}} [how]
    * @returns {Promise<void>}
    */
-  whenWindowSettled(windowId) {
-    return this._windows.get(windowId)?.ui?.whenSettled?.() ?? Promise.resolve();
+  whenWindowSettled(windowId, { signal = null } = {}) {
+    return this._windows.get(windowId)?.ui?.whenSettled?.({ signal }) ?? Promise.resolve();
   }
 
   getWindowCount() {
@@ -725,6 +728,13 @@ export class AnalysisWindowManager {
   onGenesListed() {
     for (const entry of this._windows.values()) {
       entry.ui.onGenesListed();
+    }
+  }
+
+  /** The fields changed: each window offers the fields there are now (`BaseAnalysisUI.onFieldsChanged`). */
+  onFieldsChanged() {
+    for (const entry of this._windows.values()) {
+      entry.ui.onFieldsChanged();
     }
   }
 

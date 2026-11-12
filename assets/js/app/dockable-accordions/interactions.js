@@ -337,7 +337,7 @@ export function createAccordionInteractions({
     const state = getState(details);
     const rect = knownRect ?? frameRect(frame);
     const { minWidth, minHeight } = sizeLimits(details, state);
-    const { viewportWidth, viewportHeight } = floatingArea();
+    const { viewportWidth, viewportHeight, viewportTop } = floatingArea();
     const width = Math.round(rect.width);
     const height = Math.round(rect.height);
     for (const handle of handles) {
@@ -346,7 +346,7 @@ export function createAccordionInteractions({
       const value = vertical ? height : width;
       const min = vertical ? minHeight : minWidth;
       const max = vertical
-        ? viewportHeight - 2 * FLOATING_MARGIN
+        ? viewportHeight - viewportTop - 2 * FLOATING_MARGIN
         : viewportWidth - 2 * FLOATING_MARGIN;
       handle.setAttribute('aria-valuemin', String(Math.round(Math.min(min, max))));
       handle.setAttribute('aria-valuemax', String(Math.round(Math.max(min, max))));
@@ -413,7 +413,7 @@ export function createAccordionInteractions({
     const state = getState(details);
     const start = frameRect(frame);
     const { minWidth, minHeight } = sizeLimits(details, state);
-    const { viewportWidth, viewportHeight } = floatingArea();
+    const { viewportWidth, viewportHeight, viewportTop } = floatingArea();
     let dx = 0;
     let dy = 0;
     if (edge.includes('n') || edge.includes('s')) {
@@ -426,7 +426,7 @@ export function createAccordionInteractions({
       dx = edge.includes('e') ? delta : -delta;
     }
     const { rect } = resizeFloatingRect({
-      start, edge, dx, dy, minWidth, minHeight, viewportWidth, viewportHeight
+      start, edge, dx, dy, minWidth, minHeight, viewportWidth, viewportHeight, viewportTop
     });
     clearMaximized(details);
     applyRect(details, rect);
@@ -483,11 +483,11 @@ export function createAccordionInteractions({
     const frame = panelFrame(details);
     const state = getState(details);
     const { minWidth, minHeight } = sizeLimits(details, state);
-    const { viewportWidth, viewportHeight } = floatingArea();
+    const { viewportWidth, viewportHeight, viewportTop } = floatingArea();
     const width = Math.max(minWidth, Math.min(rect.width, viewportWidth - 2 * FLOATING_MARGIN));
-    const height = Math.max(minHeight, Math.min(rect.height, viewportHeight - 2 * FLOATING_MARGIN));
+    const height = Math.max(minHeight, Math.min(rect.height, viewportHeight - viewportTop - 2 * FLOATING_MARGIN));
     const { x, y } = clampFloatingPosition({
-      left: rect.left, top: rect.top, width, height, viewportWidth, viewportHeight
+      left: rect.left, top: rect.top, width, height, viewportWidth, viewportHeight, viewportTop
     });
     const box = { left: x, top: y, width, height };
     clearMaximized(details);
@@ -542,7 +542,7 @@ export function createAccordionInteractions({
     const startY = e.clientY;
     const start = frameRect(frame);
     const limits = sizeLimits(details, state);
-    const { viewportWidth, viewportHeight } = floatingArea();
+    const { viewportWidth, viewportHeight, viewportTop } = floatingArea();
     const snap = snapTargetsFor(
       details,
       frame,
@@ -576,6 +576,7 @@ export function createAccordionInteractions({
         ...limits,
         viewportWidth,
         viewportHeight,
+        viewportTop,
         snap
       });
       if (rafId === null) rafId = requestAnimationFrame(flush);
@@ -652,7 +653,7 @@ export function createAccordionInteractions({
   /**
    * Take back the handles and readout this module put on the panel's frame.
    *
-   * `ensureResizeHandles` recognises its handles by their presence, so a panel
+   * `ensureResizeHandles` recognizes its handles by their presence, so a panel
    * unregistered with them attached would be re-registered with handles whose
    * listeners had already been aborted.
    *
@@ -770,7 +771,7 @@ export function createAccordionInteractions({
       const pointerId = e.pointerId;
 
       const preRect = frame.getBoundingClientRect();
-      const { viewportWidth, viewportHeight } = floatingArea();
+      const { viewportWidth, viewportHeight, viewportTop } = floatingArea();
 
       const offsetX = startX - preRect.left;
       const offsetY = startY - preRect.top;
@@ -795,7 +796,8 @@ export function createAccordionInteractions({
           width: preRect.width,
           height: preRect.height,
           viewportWidth,
-          viewportHeight
+          viewportHeight,
+          viewportTop
         });
       }
 

@@ -15,7 +15,7 @@
  * to origin + path for every hit. The query string (dataset ids, `remote`
  * addresses and `data` links, `sampleCatalog`, a subsample) is never part of
  * them. `ga-init.js` also denies advertising storage, advertising use of user
- * data and personalisation, and turns Google signals off, before the tag
+ * data and personalization, and turns Google signals off, before the tag
  * loads. GA4's own "enhanced measurement" and "user-provided data
  * collection" are settings of the GA4 property, not of this code (the
  * documentation's privacy model lists the property's settings): enhanced

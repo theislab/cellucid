@@ -25,10 +25,11 @@
  * @module data/sources/providers/cellxgene
  */
 
-import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy, hostFaultOfResponse } from '../../data-source.js';
+import { DataSourceError, DataSourceErrorCode, fetchWhenNotBusy, hostFaultFailure, hostFaultOfResponse } from '../../data-source.js';
 import { describeRemoteFile } from '../remote-file.js';
 import { fileFormatOfName, titleOfName } from '../../input-formats.js';
 import { cancel } from '../../../utils/abort.js';
+import { webStorage } from '../../../utils/web-storage.js';
 
 export const CENSUS_BUCKET_URL =
   'https://cellxgene-census-public-us-west-2.s3.us-west-2.amazonaws.com';
@@ -133,6 +134,11 @@ async function latestCensusRelease(signal) {
   if (!response.ok) {
     const fault = hostFaultOfResponse(response, 'the Census release list', { url: `${CENSUS_BUCKET_URL}/cell-census/release.json` });
     if (fault !== null) throw fault;
+    // The list is public to everyone: a 401 or 403 is its host refusing this network for now.
+    if (response.status === 401 || response.status === 403) {
+      throw hostFaultFailure({ kind: 'refusing', host: new URL(CENSUS_BUCKET_URL).host, status: response.status, what: 'the Census release list', service: 'CELLxGENE' },
+        { url: `${CENSUS_BUCKET_URL}/cell-census/release.json` });
+    }
     throw new DataSourceError(
       `The CELLxGENE Census release list could not be read (HTTP ${response.status}).`,
       DataSourceErrorCode.NETWORK_ERROR,
@@ -159,7 +165,7 @@ async function latestCensusRelease(signal) {
 /** The release this browser read last, or null. */
 function rememberedRelease() {
   try {
-    const release = JSON.parse(globalThis.localStorage?.getItem(RELEASE_MEMORY_KEY) ?? 'null');
+    const release = JSON.parse(webStorage('localStorage')?.getItem(RELEASE_MEMORY_KEY) ?? 'null');
     return typeof release?.build === 'string' &&
       typeof release?.h5adsUrl === 'string' &&
       release.h5adsUrl.startsWith(`${CENSUS_BUCKET_URL}/`)
@@ -172,7 +178,7 @@ function rememberedRelease() {
 
 function rememberRelease(release) {
   try {
-    globalThis.localStorage?.setItem(RELEASE_MEMORY_KEY, JSON.stringify(release));
+    webStorage('localStorage')?.setItem(RELEASE_MEMORY_KEY, JSON.stringify(release));
   } catch {
     // Storage may be unavailable (a private window): the next link reads
     // the release list first.

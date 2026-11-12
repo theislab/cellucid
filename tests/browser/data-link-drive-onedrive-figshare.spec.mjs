@@ -103,6 +103,14 @@ function watchErrors(page, { expected404 = false } = {}) {
   return errors;
 }
 
+
+/** How many lines the sign-in line's words take. */
+function statusLines(page) {
+  return page.locator('#data-sign-in-text').evaluate(element => (
+    Math.round(element.getBoundingClientRect().height / parseFloat(getComputedStyle(element).lineHeight))
+  ));
+}
+
 test('a public Figshare item opens in place from ?data=, with Range-only reads', async ({ page }) => {
   const bytes = await fixtureBytes();
   await useTestConfig(page.context());
@@ -207,6 +215,8 @@ test('a private Google Drive file: Sign in to Google, the picker on that file, t
   await expect(page.locator('#data-sign-in-text')).toHaveText('Private file on Google Drive.');
   await expect(page.locator('#data-sign-in-btn')).toHaveText('Sign in to Google');
   await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
+  // One status line (F73: beside its button it wrapped into a column of two to four lines).
+  expect(await statusLines(page)).toBe(1);
   // The same step as a notification, for a closed panel.
   await expect(page.locator('#notification-center .notification-action', { hasText: 'Sign in to Google' })).toHaveCount(1);
   await page.locator('#data-sign-in-btn').click();
@@ -396,7 +406,8 @@ test('a OneDrive share link: Sign in with Microsoft (PKCE popup), then read from
   const share = 'https://1drv.ms/u/c/12a1b84edebf20f7/EVjJu5abc';
   await page.goto(`/?${PINNED}data=${encodeURIComponent(share)}`, { waitUntil: 'domcontentloaded' });
   await openPanels(page);
-  await expect(page.locator('#data-sign-in-text')).toHaveText('OneDrive file: sign in with Microsoft to open it.');
+  await expect(page.locator('#data-sign-in-text')).toHaveText('OneDrive files open after a sign-in.');
+  expect(await statusLines(page)).toBe(1);
   await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
   const popup = page.waitForEvent('popup');
   await page.locator('#data-sign-in-btn').click();
@@ -475,7 +486,7 @@ test('a Microsoft sign-in window cut off from Cellucid (Cross-Origin-Opener-Poli
   // The window's return page reaches this page all the same.
   await expect(page.locator('#dataset-cells')).toHaveText('120');
   const lines = await page.evaluate(() => window.__cellucidSignInLines);
-  const closed = 'OneDrive file: sign in with Microsoft to open it. Microsoft\'s sign-in window was closed before it finished.';
+  const closed = 'OneDrive files open after a sign-in. Microsoft\'s sign-in window was closed before it finished.';
   // Chromium and Firefox report a window cut off this way as closed
   // (measured 2026-10-25; WebKit does not): the step said so and offered the
   // button again, and the sign-in finished in that window still counted.
@@ -507,13 +518,13 @@ test('a Microsoft sign-in window closed without signing in ends the attempt, and
   await expect(page.locator('#data-sign-in-text')).toContainText('Finish signing in in the window that opened.');
   await popup.close();
   await expect(page.locator('#data-sign-in-text')).toHaveText(
-    'OneDrive file: sign in with Microsoft to open it. Microsoft\'s sign-in window was closed before it finished.'
+    'OneDrive files open after a sign-in. Microsoft\'s sign-in window was closed before it finished.'
   );
   await expect(page.locator('#data-sign-in-btn')).toBeEnabled();
   expect(errors).toEqual([]);
 });
 
-test('a work account whose organisation lets only an administrator approve Cellucid: the step says so, links the steps, offers another account', async ({ page }) => {
+test('a work account whose organization lets only an administrator approve Cellucid: the step says so, links the steps, offers another account', async ({ page }) => {
   const context = page.context();
   await useTestConfig(context);
   const prompts = [];
@@ -535,7 +546,7 @@ test('a work account whose organisation lets only an administrator approve Cellu
   const firstWindow = await first;
   await expect.poll(() => firstWindow.isClosed()).toBe(true);
   await expect(page.locator('#data-sign-in-text')).toContainText(
-    'Your organisation (Helmholtz Zentrum München) lets only an administrator approve Cellucid.'
+    'Your organization (Helmholtz Zentrum München) lets only an administrator approve Cellucid.'
   );
   await expect(page.locator('#data-sign-in-btn')).toHaveText('Use another account');
   const help = page.locator('#data-sign-in-help');

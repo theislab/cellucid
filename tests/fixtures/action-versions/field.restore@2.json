@@ -1,0 +1,47 @@
+{
+  "examples": [
+    {
+      "field": {
+        "key": "x",
+        "source": "obs"
+      },
+      "which": 1
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "field": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "obs",
+              "var"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "key"
+        ],
+        "type": "object"
+      },
+      "which": {
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "field"
+    ],
+    "type": "object"
+  },
+  "type": "field.restore",
+  "version": 2
+}

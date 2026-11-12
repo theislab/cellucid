@@ -1,5 +1,6 @@
 import { requireExactObjectKeys } from '../utils/exact-record.js';
-import { cancelled, isCancellation, cancel, onAbort } from '../utils/abort.js';
+import { cancelled, isCancellation, cancel, onAbort, requireSignal } from '../utils/abort.js';
+import { InternalError } from '../utils/errors.js';
 
 function attachSecondaryFailure(primaryError, secondaryError) {
   if (
@@ -163,11 +164,7 @@ export async function stageDatasetPositionPayload(options) {
       'Dataset position staging requires a DimensionManager.'
     );
   }
-  if (!(signal instanceof AbortSignal)) {
-    throw new TypeError(
-      'Dataset position staging signal must be an AbortSignal.'
-    );
-  }
+  requireSignal(signal, 'Dataset position staging signal');
   if (signal.aborted) {
     throw cancelled('superseded',
       RELOAD_SUPERSEDED_MESSAGE
@@ -206,7 +203,7 @@ export async function stageDatasetPositionPayload(options) {
       dimension: defaultDimension
     });
     if (dimensionManager.nCells !== generation.identity.stats.n_cells) {
-      throw new Error(
+      throw new InternalError(
         `DimensionManager cell count (${dimensionManager.nCells}) must equal ` +
         `the dataset identity stats.n_cells ` +
         `(${generation.identity.stats.n_cells}).`
@@ -322,6 +319,14 @@ function reloadIdentitiesMatch(left, right) {
  * `beginIfNoActionSince(sequence)`: it supersedes the loads that were already
  * running then, but never anything the user did after it.
  *
+ * `beginStartup()` begins the one change the page starts by itself (the
+ * dataset startup opens: the default sample, or the one its address names).
+ * It supersedes like any change but is no action of the person's: a
+ * connection the person asked for before it began still replaces it when
+ * its server answers (bug hunt R9V-2: a link typed while the default sample
+ * was still being chosen lost to it, because the sample's own beginning
+ * counted as a newer choice).
+ *
  * When the application is torn down, `retire()` stops the change in flight
  * as a newer choice would (its reads end, its opening lets go) and refuses
  * every later one. Teardown then waits only for work that has been told to
@@ -333,6 +338,7 @@ function reloadIdentitiesMatch(left, right) {
  *   readonly actionSequence: number,
  *   readonly settled: boolean,
  *   begin: () => DatasetChangeTransaction,
+ *   beginStartup: () => DatasetChangeTransaction,
  *   beginIfNoActionSince: (sequence: number) => DatasetChangeTransaction|null,
  *   recordAction: () => number,
  *   retire: () => void,
@@ -373,7 +379,7 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
     record.resolveSettled();
   }
 
-  function begin() {
+  function begin({ choice = true } = {}) {
     if (retired) {
       throw cancelled('superseded',
         'The application was closed; no dataset change can begin.'
@@ -386,7 +392,7 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
     const previous = latest;
     const controller = new AbortController();
     const generation = ++latestGeneration;
-    advanceActionSequence();
+    if (choice) advanceActionSequence();
     let resolveSettled;
     const settled = new Promise(resolve => {
       resolveSettled = resolve;
@@ -462,7 +468,7 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
        * superseded one does, and the dataset on screen stays.
        */
       cancel() {
-        cancel(controller, 'user', 'The dataset change was cancelled.');
+        cancel(controller, 'user', 'The dataset change was canceled.');
       }
     });
   }
@@ -475,7 +481,8 @@ export function createLatestDatasetReloadCoordinator(captureIdentity) {
     get settled() {
       return latest === null || latest.settled;
     },
-    begin,
+    begin: () => begin(),
+    beginStartup: () => begin({ choice: false }),
     beginIfNoActionSince(sequence) {
       if (!Number.isSafeInteger(sequence) || sequence < 0) {
         throw new TypeError(

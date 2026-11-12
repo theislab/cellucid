@@ -3,7 +3,7 @@
  * array a data mapping's `latent` names, in which every categorical obs
  * field's outlier quantiles are measured (`mapping-groups.js`).
  *
- * Cells, colours, category filters and every view's outlier threshold are
+ * Cells, colors, category filters and every view's outlier threshold are
  * kept: a threshold is a share of a category ("hide the farthest 5%"), so it
  * means the same in the new space. Applying reads nothing — getting outlier
  * quantiles is its own operation, with progress and Cancel
@@ -15,7 +15,7 @@
  *   threshold below 1 in some view) gets the new ones at once
  *   (`resumeOutlierFilters`), the others on the filter's next use; with no
  *   latent space a field has none, and its outlier filter waits for one;
- * - every view coloured by a categorical field is recoloured, and
+ * - every view colored by a categorical field is recolored, and
  *   `latent-space:changed` tells the interface to redraw the outlier
  *   controls.
  *
@@ -116,7 +116,7 @@ export class DataStateLatentSpaceMethods {
           this._fieldDataCache.set(key, rest);
         }
       }
-      this._recolourCategoricalViews();
+      this._recolorCategoricalViews();
       this.emit('latent-space:changed', {});
     };
 
@@ -130,26 +130,26 @@ export class DataStateLatentSpaceMethods {
   }
 
   /**
-   * Recolour every view coloured by a categorical obs field, so its outlier
+   * Recolor every view colored by a categorical obs field, so its outlier
    * filter reads the quantiles it now has. Focus returns to the view that
    * had it.
    * @private
    */
-  _recolourCategoricalViews() {
+  _recolorCategoricalViews() {
     const focused = this.activeViewId;
-    const colouredBy = viewId => {
+    const coloredBy = viewId => {
       const view = viewId === focused ? this : this.viewContexts.get(viewId);
       if (view?.activeFieldSource !== 'obs' || !(view.activeFieldIndex >= 0)) return null;
       const field = view.obsData?.fields?.[view.activeFieldIndex];
-      // A view whose field is not loaded is coloured when it loads, from
+      // A view whose field is not loaded is colored when it loads, from
       // the descriptor that now names the new payload.
       return field?.kind === 'category' && field.loaded === true ? view.activeFieldIndex : null;
     };
-    const own = colouredBy(focused);
+    const own = coloredBy(focused);
     if (own !== null) this.setActiveField(own);
     for (const viewId of [...(this.viewContexts?.keys() ?? [])]) {
       if (viewId === focused) continue;
-      const index = colouredBy(viewId);
+      const index = coloredBy(viewId);
       if (index === null) continue;
       this.setActiveView(viewId);
       this.setActiveField(index);

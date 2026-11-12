@@ -8,13 +8,14 @@ conversations.
 | Module | What it is |
 | --- | --- |
 | `index.js` | `initAgentChat({dom, actions, presence})`: the bar's controls and settings, sending a message, following the history it keeps the conversation with |
-| `conversation.js` | pure: a conversation (append only), what a model is sent (`modelMessages`), what the history keeps (`transcriptOf`), continuing a kept one (`conversationFrom`; one kept mid-turn has its calls answered, `closeInterrupted`), tokens (`usageOf`, every call) and what left the browser (`sentOf`) per turn |
+| `conversation.js` | pure: a conversation (append only), what a model is sent (`modelMessages`), what the history keeps (`transcriptOf`), continuing a kept one (`conversationFrom`; one kept mid-turn has its calls answered, `closeInterrupted`), one a save or a share takes during a turn ended as saved and its turns marked received (`transcriptForSave`; a received turn offers no Try again, `offersRetry`, and its question no choices), tokens (`usageOf`, every call) and what left the browser (`sentOf`) per turn |
 | `agent-loop.js` | `runAgentTurn`: model call → tool calls (`bridge/tool-call.js`) → results → … ; the effort, the token budget, Stop, waiting out a busy provider, a conversation too long |
-| `context.js` | pure: the context budget (the model's own window) and the summarising rule |
+| `context.js` | pure: the context budget (the model's own window) and the summarizing rule |
 | `keys.js` | API keys: this tab (`sessionStorage`) unless Remember (`localStorage`); Forget |
 | `preferences.js` | what this browser remembers (`cellucid:agent-chat`): provider, model per provider, effort per model, the person's instructions, the token budget, open |
-| `transcript-view.js` | the conversation drawn: messages (Edit, Copy), Markdown replies, a compact row per tool call (Show its step; interrupted when the page closed before it finished), notes (Try again), turn footers (steps, Sent, Undo turn); a streamed piece costs the same however long the chat or the reply |
-| `export.js` | pure: the chat as Markdown (Export; raw HTML escaped and script links left as text, `markdownSafe`), a turn as a short note (what it asked, its steps, why) |
+| `transcript-view.js` | the conversation drawn: messages (Edit, Copy), Markdown replies, a compact row per tool call (Show its step; interrupted when the page closed before it finished) with the model's note before it (`progress`), a long turn's summary row (a disclosure), notes (Try again), turn footers (steps, Sent, Undo turn); a streamed piece costs the same however long the chat or the reply |
+| `work.js` | pure: a turn's work as shown: each call named by what it was about (a read by its action's `describe(args)`, a running or refused call by its title and the names in its arguments, `subjectOf`), and the fold of a turn with more than `LIVE_ROWS` calls (`turnFoldOf`: ended, its answer and what went wrong; running, its latest calls) with the summary's words |
+| `export.js` | pure: the chat as Markdown (Export; every call, named as its row is; raw HTML escaped and script links left as text, `markdownSafe`), a turn as a short note (what it asked, its steps, why) |
 | `suggestions.js` | the first prompts the empty chat offers, from the dataset shown |
 | `markdown.js` | a reply's Markdown as elements, text nodes only; a streamed reply redraws only the blocks that changed (`createMarkdownStream`) |
 | `selection.js` | the selection attached to a message: a reference to the highlighted cells of the active page (its name, groups, counts), never the cells; the chip's words; what the model is told (names as data) |
@@ -40,12 +41,12 @@ is names and counts; the agent reads the cells through the tools, as the dataset
 
 **The context rule** (`context.js`): the budget is the model's context window (Anthropic lists it;
 OpenAI's refusal of a prompt too long is the other trigger). A conversation that would not fit is
-summarised once, at the start of a turn, by the same model; the model is then sent the summary
+summarized once, at the start of a turn, by the same model; the model is then sent the summary
 and what follows it, and a new epoch starts (earlier reasoning is not sent again). The person
 still sees every message; the history keeps every step. A token budget the person sets for a chat
 stops it before the next model call, and before another try of a failed one, once spent, with a
 note. Every call counts: a try that failed or was stopped after the provider began to answer, and
-the summariser's calls, are carried by the next message or note of the turn (`otherCalls`), so the
+the summarizer's calls, are carried by the next message or note of the turn (`otherCalls`), so the
 tokens shown and the budget count them.
 
 **Kept with the history:** after every message, `history.setChat(tracker, id, transcript)` (no

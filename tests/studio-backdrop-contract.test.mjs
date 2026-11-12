@@ -180,7 +180,7 @@ test('floor families as wide as the stage recede instead of drawing a lone cross
 
 test('three evaluated families draw every mark exactly as all families would', () => {
   // The shader evaluates `level`..`level + 2` around each fragment's
-  // footprint. Neighbouring fragments with different levels must agree, so
+  // footprint. Neighboring fragments with different levels must agree, so
   // the window has to equal the strongest of *every* family a mark is on.
   for (const surface of Object.values(STUDIO_SURFACES)) {
     for (let footprint = 1e-4; footprint < 0.5; footprint *= 1.07) {
@@ -353,14 +353,14 @@ test('the shader is generated from the constant table and declares every uniform
   assert.ok(main.lastIndexOf('dFdy(') < main.indexOf('if ('));
 });
 
-test('palette surfaces are exact 8-bit colours and the dark stage is a neutral charcoal below Grid (dark)', () => {
+test('palette surfaces are exact 8-bit colors and the dark stage is a neutral charcoal below Grid (dark)', () => {
   for (const palette of Object.values(STUDIO_PALETTES)) {
     for (const key of ['surface', 'glow', 'ink']) {
       for (const channel of palette[key]) assert.ok(Number.isInteger(channel) && channel >= 0 && channel <= 255);
     }
   }
   const [r, g, b] = STUDIO_PALETTES['studio-dark'].surface;
-  assert.ok(r === g && g === b, 'no colour cast');
+  assert.ok(r === g && g === b, 'no color cast');
   // Grid (dark) is #14161a; its luma is ~21.9.
   assert.ok(0.2126 * r + 0.7152 * g + 0.0722 * b < 0.2126 * 20 + 0.7152 * 22 + 0.0722 * 26);
 });

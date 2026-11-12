@@ -383,7 +383,7 @@ test('a host that stopped answering this site is said to refuse this network for
     const length = Number(end) - Number(start) + 1;
     return new Response(new Uint8Array(length), { status: 206, headers: { 'Content-Length': String(length), 'Content-Range': `bytes ${start}-${end}/${size}` } });
   };
-  // The pace learnt from the block is waited on a clock that jumps to each wait.
+  // The pace learned from the block is waited on a clock that jumps to each wait.
   let clock = 0;
   const hosts = createHostBook({ channel: null, now: () => clock, after: (ms, callback) => { const timer = setImmediate(() => { clock += ms; callback(); }); return () => clearImmediate(timer); } });
   const { LinkMeter } = await import('../assets/js/formats/io/link.js');
@@ -439,7 +439,7 @@ test('a store folder whose host stops answering is asked for the folder, not twi
     answers++;
     return new Response(new Uint8Array(16), { status: 200, headers: { 'Content-Length': '16' } });
   };
-  // The pace learnt from the block is waited on a clock that jumps to each wait.
+  // The pace learned from the block is waited on a clock that jumps to each wait.
   let clock = 0;
   const hosts = createHostBook({ channel: null, now: () => clock, after: (ms, callback) => { const timer = setImmediate(() => { clock += ms; callback(); }); return () => clearImmediate(timer); } });
   const { LinkMeter } = await import('../assets/js/formats/io/link.js');

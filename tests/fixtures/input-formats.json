@@ -209,7 +209,7 @@
       "names": [
         ".cellucid-session"
       ],
-      "said": "This is a Cellucid session file: the history of one dataset, not a dataset. Open its dataset, then load it with State › Session › Load… › Open a session file…; in Python read it with cellucid.read_session(), in R with cellucid_read_session()."
+      "said": "This is a Cellucid session file: the history of one dataset, not a dataset. Open it in the web app: drop it on the page, or choose it with State › Session › Load… › Open a session file…; its dataset opens with it. In Python read it with cellucid.read_session(), in R with cellucid_read_session()."
     }
   ]
 }

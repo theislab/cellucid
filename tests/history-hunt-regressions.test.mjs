@@ -34,9 +34,9 @@ const definitions = [
     touches: ['field-overlays'], reads: [], effect: 'state', describe: p => `Label ${p.to}`, code: p => `label(${JSON.stringify(p.to)})`,
   }),
   defineAction({
-    type: 'color.set', title: 'Set the colour', summary: 'Colour.', group: 'Colours',
+    type: 'color.set', title: 'Set the color', summary: 'Color.', group: 'Colors',
     params: { type: 'object', additionalProperties: false, required: ['color'], properties: { color: { type: 'string', minLength: 1 } } },
-    touches: ['colors'], reads: [], effect: 'view', describe: p => `Coloured ${p.color}`, code: p => `color(${JSON.stringify(p.color)})`,
+    touches: ['colors'], reads: [], effect: 'view', describe: p => `Colored ${p.color}`, code: p => `color(${JSON.stringify(p.color)})`,
   }),
   defineAction({
     type: 'camera.set', title: 'Move the camera', summary: 'Place the camera.', group: 'Camera',

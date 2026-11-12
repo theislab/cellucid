@@ -1,6 +1,9 @@
 /**
  * @fileoverview DataState categorical edit operations.
  *
+ * Grouping categories (`groupCategoriesToNewField`) makes a new derived
+ * user-defined field beside its source, which stays.
+ *
  * Destructive categorical operations are implemented as:
  * - For source fields, a derived user-defined field + soft-delete of the source field.
  * - For user-defined derived fields, an in-place edit when possible (avoids repeated
@@ -18,8 +21,10 @@ import { makeUniqueLabel } from '../../../utils/label-utils.js';
 import {
   buildDeleteToUnassignedTransform,
   buildMergeCategoriesTransform,
+  buildGroupCategoriesTransform,
   applyCategoryIndexMapping,
   carryCategoryStateThroughDelete,
+  carryCategoryStateThroughGroup,
   carryCategoryStateThroughMerge
 } from '../../../utils/categorical-ops.js';
 import { isCategoricalCodes } from '../../../../data/categorical-storage-contract.js';
@@ -85,7 +90,7 @@ function collectHighlightCategoryRemaps(state, fieldIndex, mapping) {
 export class FieldCategoryOpsMethods {
   /**
    * Create a new categorical obs column where one category is merged into a
-   * single canonical `unassigned` bucket (accumulating deletions).
+   * single canonical `Unassigned` bucket (accumulating deletions).
    *
    * This is a destructive edit of the category assignment:
    * - For source fields, we create a user-defined derived field and soft-delete
@@ -170,7 +175,7 @@ export class FieldCategoryOpsMethods {
       );
 
       // Every view's copy of the field takes the new definition; each keeps
-      // its own colours and hidden categories. Freshly computed centroids are
+      // its own colors and hidden categories. Freshly computed centroids are
       // already in each layout's normalized space, and recorded as such.
       this._publishUserDefinedCategorical(fieldId, {
         categories: nextCategories,
@@ -255,10 +260,10 @@ export class FieldCategoryOpsMethods {
 
     getFieldRegistry().invalidate();
     this._syncActiveContext();
-    this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
-
-    // Activate new field before deleting the previous one (avoids a brief "no field" state).
+    // Activate new field before deleting the previous one (avoids a brief "no field" state),
+    // and before it is announced: a listener (the field menus) reads the active field then.
     this.setActiveField(newFieldIndex);
+    this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
 
     // Soft-delete the source field for a clean UX; restoration is available in Deleted Fields.
     this.deleteField(FieldSource.OBS, fieldIndex);
@@ -370,8 +375,8 @@ export class FieldCategoryOpsMethods {
       );
 
       // Every view's copy of the field takes the new definition; each keeps
-      // its own colours and hidden categories, the merged category the
-      // dragged one's colour. Freshly computed centroids are already in each
+      // its own colors and hidden categories, the merged category the
+      // dragged one's color. Freshly computed centroids are already in each
       // layout's normalized space, and recorded as such.
       this._publishUserDefinedCategorical(fieldId, {
         categories: nextCategories,
@@ -458,9 +463,9 @@ export class FieldCategoryOpsMethods {
 
     getFieldRegistry().invalidate();
     this._syncActiveContext();
-    this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
-
+    // Shown before it is announced (the field menus read the active field then).
     this.setActiveField(newFieldIndex);
+    this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
 
     this.deleteField(FieldSource.OBS, fieldIndex);
 
@@ -470,6 +475,95 @@ export class FieldCategoryOpsMethods {
       updatedInPlace: false,
       mergedCategoryLabel: mergedLabel
     };
+  }
+
+  /**
+   * Create a new categorical obs column whose categories group those of
+   * another (`field.group`): each group becomes one category, every category
+   * no group holds is kept as it is or, with `restLabel`, joins that one
+   * (`buildGroupCategoriesTransform`). The source stays as it is (a grouping
+   * is another annotation beside it, never an edit of it), and the new
+   * column is shown. Like every edit of a file's column it is a
+   * category-for-category function of its root column (`_sourceField`), so
+   * cells opened later are labeled from it (`open-cells.js` `derivedCodes`).
+   *
+   * @param {number} fieldIndex
+   * @param {{groups: Array<{label: string, members: number[]}>, restLabel: string|null, newKey: string}} options
+   * @returns {{newFieldIndex: number, newKey: string, categories: number}}
+   */
+  groupCategoriesToNewField(fieldIndex, options) {
+    const fields = this.obsData?.fields;
+
+    StateValidator.validateFieldIndex(fieldIndex, fields);
+    const sourceField = fields[fieldIndex];
+    if (!options || typeof options !== 'object' || Array.isArray(options)) {
+      throw new TypeError('Group-category options must be an object.');
+    }
+    if (sourceField._isDeleted === true) {
+      throw new Error('Deleted fields cannot be grouped.');
+    }
+    StateValidator.validateFieldKey(options.newKey);
+    if (fields.some(field => field && field._isDeleted !== true && field.key === options.newKey)) {
+      throw new Error(`A visible observation field named "${options.newKey}" already exists.`);
+    }
+    if (options.restLabel !== null && (typeof options.restLabel !== 'string' || options.restLabel.length === 0 || options.restLabel !== options.restLabel.trim())) {
+      throw new TypeError('Group-category restLabel must be null or a non-empty trimmed string.');
+    }
+
+    requireEditableCodes(sourceField.codes, this.pointCount);
+    const transform = buildGroupCategoriesTransform(sourceField.categories, options.groups, options.restLabel);
+    const nextCodes = applyCategoryIndexMapping(sourceField.codes, transform.mapping, transform.categories.length);
+    requireEditableCodes(nextCodes, this.pointCount);
+    this.ensureCategoryMetadata(sourceField);
+
+    const rootKey = sourceField._sourceField?.sourceKey || sourceField._originalKey || sourceField.key;
+    const created = this._userDefinedFields.createFromCategoricalCodes(
+      {
+        key: options.newKey,
+        categories: transform.categories,
+        codes: nextCodes,
+        source: FieldSource.OBS,
+        meta: {
+          _sourceField: {
+            kind: 'categorical-obs',
+            sourceKey: rootKey,
+            sourceIndex: fieldIndex
+          },
+          _operation: {
+            type: 'group-categories',
+            groups: options.groups.map(group => ({
+              label: group.label,
+              categories: group.members.map(index => sourceField.categories[index])
+            })),
+            restLabel: options.restLabel
+          }
+        }
+      },
+      this
+    );
+
+    const derivedField = created.field;
+    const carried = carryCategoryStateThroughGroup(transform, {
+      colors: sourceField._categoryColors,
+      visible: sourceField._categoryVisible
+    });
+    derivedField._categoryColors = carried.colors;
+    derivedField._categoryVisible = carried.visible;
+    derivedField._categoryFilterEnabled = sourceField._categoryFilterEnabled;
+    delete derivedField.outlierQuantiles;
+    delete derivedField._outlierThreshold;
+
+    fields.push(derivedField);
+    const newFieldIndex = fields.length - 1;
+
+    getFieldRegistry().invalidate();
+    this._syncActiveContext();
+    // Shown before it is announced: a listener (the field menus) reads the
+    // active field when told of the new one.
+    this.setActiveField(newFieldIndex);
+    this._notifyFieldChange(FieldSource.OBS, newFieldIndex, ChangeType.CREATE, { userDefinedId: created.id });
+
+    return { newFieldIndex, newKey: options.newKey, categories: transform.categories.length };
   }
 
   createCategoricalFromPages(options) {
@@ -541,6 +635,9 @@ export class FieldCategoryOpsMethods {
 
     getFieldRegistry().invalidate();
     this._syncActiveContext();
+    // Shown at once, as a grouping or a copy is: the person made it to see it.
+    // Before it is announced (the field menus read the active field then).
+    this.setActiveField(newIndex);
     this._notifyFieldChange(
       FieldSource.OBS,
       newIndex,

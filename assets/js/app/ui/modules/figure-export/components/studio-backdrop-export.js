@@ -6,7 +6,7 @@
  * pane (`rendering/shaders/studio-shaders.js`): for a 3-D pane, a floor of
  * hairlines seen from above; for a flat or planar pane, a dot surface behind
  * the data; over a
- * surface colour with a soft glow and, on the
+ * surface color with a soft glow and, on the
  * floor, a soft pool of ink under the data. Every constant and every
  * weighting function lives in `rendering/studio-backdrop.js`, and this file
  * evaluates those same functions, so the figure and the screen are computed
@@ -25,7 +25,7 @@
  *   a transform — draws. The glow lightens the viewer's own surface, so it
  *   is drawn only on that paper; the pool is ink at a varying opacity, so it
  *   is exact over any paper, including none.
- * Marks are composited onto the colour beneath them — surface, glow, pool — and
+ * Marks are composited onto the color beneath them — surface, glow, pool — and
  * drawn opaque, so a crossing is as dark as one rule, exactly as the shader's
  * `max()` makes it, never as dark as two.
  *
@@ -67,10 +67,11 @@ import {
   studioGrazingFade,
   studioStageFade,
 } from '../../../../../rendering/studio-backdrop.js';
-import { rgb01ToHex } from '../utils/color-utils.js';
+import { bytesOfHex, hexOfRgb01 } from '../../../../../utils/hex-color.js';
 import {
   clipSegmentDepthRange,
   createPlotProjection,
+  invertMatrix4,
   lerpPoint,
   toClipSpace,
 } from '../utils/plot-projection.js';
@@ -92,47 +93,6 @@ function mixRgb(from, to, amount) {
     from[0] + (to[0] - from[0]) * amount,
     from[1] + (to[1] - from[1]) * amount,
     from[2] + (to[2] - from[2]) * amount,
-  ];
-}
-
-/** Inverse of a column-major 4x4 matrix, or null when it is singular. */
-function invertMatrix4(m) {
-  const a00 = m[0], a01 = m[1], a02 = m[2], a03 = m[3];
-  const a10 = m[4], a11 = m[5], a12 = m[6], a13 = m[7];
-  const a20 = m[8], a21 = m[9], a22 = m[10], a23 = m[11];
-  const a30 = m[12], a31 = m[13], a32 = m[14], a33 = m[15];
-  const b00 = a00 * a11 - a01 * a10;
-  const b01 = a00 * a12 - a02 * a10;
-  const b02 = a00 * a13 - a03 * a10;
-  const b03 = a01 * a12 - a02 * a11;
-  const b04 = a01 * a13 - a03 * a11;
-  const b05 = a02 * a13 - a03 * a12;
-  const b06 = a20 * a31 - a21 * a30;
-  const b07 = a20 * a32 - a22 * a30;
-  const b08 = a20 * a33 - a23 * a30;
-  const b09 = a21 * a32 - a22 * a31;
-  const b10 = a21 * a33 - a23 * a31;
-  const b11 = a22 * a33 - a23 * a32;
-  const det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
-  if (!Number.isFinite(det) || det === 0) return null;
-  const inv = 1 / det;
-  return [
-    (a11 * b11 - a12 * b10 + a13 * b09) * inv,
-    (a02 * b10 - a01 * b11 - a03 * b09) * inv,
-    (a31 * b05 - a32 * b04 + a33 * b03) * inv,
-    (a22 * b04 - a21 * b05 - a23 * b03) * inv,
-    (a12 * b08 - a10 * b11 - a13 * b07) * inv,
-    (a00 * b11 - a02 * b08 + a03 * b07) * inv,
-    (a32 * b02 - a30 * b05 - a33 * b01) * inv,
-    (a20 * b05 - a22 * b02 + a23 * b01) * inv,
-    (a10 * b10 - a11 * b08 + a13 * b06) * inv,
-    (a01 * b08 - a00 * b10 - a03 * b06) * inv,
-    (a30 * b04 - a31 * b02 + a33 * b00) * inv,
-    (a21 * b02 - a20 * b04 - a23 * b00) * inv,
-    (a11 * b07 - a10 * b09 - a12 * b06) * inv,
-    (a00 * b09 - a01 * b07 + a02 * b06) * inv,
-    (a31 * b01 - a30 * b03 - a32 * b00) * inv,
-    (a20 * b03 - a21 * b01 + a22 * b00) * inv,
   ];
 }
 
@@ -220,7 +180,7 @@ export function buildStudioBackdropModel({
   const poolStrength = pool.gate * palette.poolAlpha * floorWeight;
   const poolDeterminant = pool.axisAX * pool.axisBY - pool.axisBX * pool.axisAY;
 
-  /** The colour beneath a mark at viewport pixel (vx, vy). */
+  /** The color beneath a mark at viewport pixel (vx, vy). */
   const baseAt = (vx, vy) => {
     const ndcX = vx / viewportW * 2 - 1;
     const ndcY = 1 - vy / viewportH * 2;
@@ -543,7 +503,7 @@ export function buildStudioBackdropModel({
       }
       stops.push({
         plot: projection.viewportToPlot(measured.screen.x, measured.screen.y),
-        color: rgb01ToHex(mixRgb(base, ink, strength)),
+        color: hexOfRgb01(mixRgb(base, ink, strength)),
       });
     }
     if (!visible) return;
@@ -600,7 +560,7 @@ export function buildStudioBackdropModel({
       cx: plot.x,
       cy: plot.y,
       r: radiusCss * pixelRatio * scale,
-      color: rgb01ToHex(mixRgb(base, ink, strength)),
+      color: hexOfRgb01(mixRgb(base, ink, strength)),
     });
   }
 
@@ -633,7 +593,7 @@ export function buildStudioBackdropModel({
   if (drawGlow) {
     gradients.push({
       matrix: ellipseMatrix(glowCenterX, 0, glowRadiusX, 0, 0, 1),
-      stops: falloffStops(rgb01ToHex(glowColor), 1),
+      stops: falloffStops(hexOfRgb01(glowColor), 1),
     });
   }
   if (poolStrength > 0) {
@@ -646,7 +606,7 @@ export function buildStudioBackdropModel({
         pool.axisBX,
         pool.axisBY
       ),
-      stops: falloffStops(rgb01ToHex(ink), poolStrength),
+      stops: falloffStops(hexOfRgb01(ink), poolStrength),
     });
   }
 
@@ -729,11 +689,11 @@ export function renderSvgStudioBackdrop(model, idPrefix) {
   );
 }
 
-/** A `#rrggbb` colour at an opacity, as a Canvas colour string. */
+/** A `#rrggbb` color at an opacity, as a Canvas color string. */
 function canvasColor(hex, opacity) {
   if (opacity === undefined) return hex;
-  const value = Number.parseInt(hex.slice(1), 16);
-  return `rgba(${(value >> 16) & 255}, ${(value >> 8) & 255}, ${value & 255}, ${opacity})`;
+  const [r, g, b] = bytesOfHex(hex);
+  return `rgba(${r}, ${g}, ${b}, ${opacity})`;
 }
 
 /**

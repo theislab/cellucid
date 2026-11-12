@@ -20,6 +20,7 @@ import { mappingWith, mapParams, replayPlanOf } from '../assets/js/app/history/r
 import { pathTo, valuesAt } from '../assets/js/app/history/tree.js';
 import { CATEGORY_FIELD, CATEGORY_LABEL } from '../assets/js/app/actions/definitions/params.js';
 import { schemaProblem } from '../assets/js/app/actions/schema.js';
+import { plainSentence } from '../assets/js/app/actions/targets/names.js';
 
 const KEYS = { filters: 'a', colors: 'b', analysis: 'c', camera: 'cam', layout: 'theme' };
 
@@ -87,7 +88,7 @@ async function makePage({ offDomains = () => [] } = {}) {
     newTrackerId: () => trackerId(++trackers), now: () => ++t * 1000, offDomains,
   });
   await history.startTracker();
-  // Every history action answers exactly as its catalogue result says.
+  // Every history action answers exactly as its catalog result says.
   const act = async (type, params = {}, meta = {}) => {
     const { outcome } = await dispatcher.dispatch(type, params, meta);
     const result = dispatcher.catalog.get(type).result;
@@ -172,8 +173,8 @@ test('detail switches: an off domain is not recorded, not moved by the history, 
   const { page, history, act, step } = await makePage({ offDomains: () => off });
   await act('cam.set', { v: 3 });
   assert.equal(history.active.steps.size, 1, 'a camera move alone makes no step');
-  const colour = await step('b.inc');
-  assert.equal(history.active.steps.get(colour.id).after.camera !== undefined, true, 'a step still captures the camera where it differs');
+  const color = await step('b.inc');
+  assert.equal(history.active.steps.get(color.id).after.camera !== undefined, true, 'a step still captures the camera where it differs');
   await act('cam.set', { v: 7 });
   await history.undo();
   assert.equal(page.state.cam, 7, 'undo leaves the camera as it is');
@@ -184,6 +185,33 @@ test('detail switches: an off domain is not recorded, not moved by the history, 
   await history.redo();
   await act('cam.set', { v: 9 });
   assert.equal(history.active.steps.size, 3, 'switched on, it records from the next change, with no squashed step');
+  valid(history);
+});
+
+test('a gesture brought back to where it began leaves no step: no Undo that does nothing', async () => {
+  // Found 2026-11-10 on Suo: the outlier filter moved 100 → 99 → 100 in one
+  // drag left "Showed every outlier of cell_type" (touching nothing) in the
+  // history; Undo then changed nothing on screen.
+  const { page, history, act, step } = await makePage();
+  const before = await step('a.set', { v: 1 });
+  await act('cam.set', { v: 5 });
+  const gesture = history.active.headId;
+  assert.notEqual(gesture, before.id);
+  await act('cam.set', { v: 6 });
+  await act('cam.set', { v: 0 });
+  assert.equal(page.state.cam, 0);
+  assert.equal(history.active.steps.has(gesture), false, 'the gesture that changed nothing is no step');
+  assert.equal(history.active.headId, before.id);
+  assert.equal(history.active.journal.length, 0, 'and nobody deleted it: Recently deleted holds nothing');
+  valid(history);
+  // The gesture going on afterwards is a step of its own.
+  const again = await step('cam.set', { v: 4 });
+  assert.equal(again.label, 'cam 4');
+  assert.equal(history.active.headId, again.id);
+  // Undo goes back to the step before, as if the round trip never happened.
+  await history.undo();
+  assert.equal(page.state.cam, 0);
+  assert.equal(page.state.a, 1);
   valid(history);
 });
 
@@ -217,6 +245,21 @@ test('a group holds whole turns: a run that splits one is refused, naming the ru
   await step('b.inc', {}, agent);
   await assert.rejects(act('history.group.create', { from: s1.id, to: s1.id, name: 'Half' }),
     error => error.code === 'splits-turn' && /"Tidy".*steps 1 to 2/.test(error.message));
+});
+
+// L21-8 (agent-loop lane, live sweep): a turn's step after its group joins the group by itself; extending the
+// group to that step was refused "Steps 2 to 4 are not consecutive steps of one branch", which they were.
+test('extending a group to a step it holds already (a turn\'s later step joins its group) says so, not "not consecutive"', async () => {
+  const { act, step } = await makePage();
+  const agent = { origin: 'agent', agent: 'Claude', turn: 'turn-1', turnLabel: 'Tidy' };
+  const s1 = await step('a.set', { v: 1 }, agent);
+  const s2 = await step('b.inc', {}, agent);
+  await act('history.group.create', { from: s1.id, to: s2.id, name: 'QC' });
+  const s3 = await step('a.set', { v: 2 }, agent);
+  await assert.rejects(act('history.group.extend', { group: 'QC', to: s3.id }),
+    error => error.code === 'already-in-group' && /^Step 3 is in the group .*QC.* already: a turn's later steps join its group; extend it to a step after it\.$/.test(error.message));
+  // Its last step and a step before it are the same answer; a step of another branch is still not consecutive.
+  await assert.rejects(act('history.group.extend', { group: 'QC', to: s1.id }), error => error.code === 'already-in-group');
 });
 
 test('squash: one step from the first one\'s state to the last one\'s, with the last id; notes and bookmarks carried', async () => {
@@ -366,12 +409,33 @@ test('notes: authored and undoable; an agent edits only its own', async () => {
   valid(history);
 });
 
+test('the summary gives every note on the tracker, a branch, a group and a turn in full: a received session\'s account is readable (L25-9)', async () => {
+  const { history, act, step } = await makePage();
+  const meta = { origin: 'agent', agent: 'Claude', turn: 'turn-9', turnLabel: 'Compare the tips' };
+  const s1 = await step('a.set', { v: 1 }, meta);
+  await act('history.note.add', { target: { turn: 'turn-9' }, text: 'Ran the tip comparison.' }, meta);
+  await act('history.note.add', { target: { turn: 'turn-9' }, text: 'Raw counts.' }, meta);
+  await act('history.note.add', { target: { branch: 'Main' }, text: 'Confound: early tip = 2 female donors.' }, meta);
+  await act('history.note.add', { target: { tracker: history.active.id }, text: 'Fetal lung, tip progenitors.' });
+  const summary = await act('history.summary');
+  assert.deepEqual(summary.notes.map(note => note.text), ['Fetal lung, tip progenitors.']);
+  assert.deepEqual(summary.branches.find(branch => branch.name === 'Main').notes.map(note => [note.text, note.by.agent]), [['Confound: early tip = 2 female donors.', 'Claude']]);
+  const turn = summary.turns.find(each => each.id === 'turn-9');
+  assert.deepEqual(turn.notes.map(note => note.text), ['Ran the tip comparison.', 'Raw counts.'], 'the first is its summary');
+  // Each note is named by its id, as history_note_edit and history_note_remove take it.
+  const branchNote = summary.branches[0].notes[0].id;
+  await act('history.note.edit', { note: branchNote, text: 'Confound: early tip = 2 female donors, age 5-6.' }, meta);
+  assert.equal((await act('history.summary')).branches[0].notes[0].text, 'Confound: early tip = 2 female donors, age 5-6.');
+  assert.equal(s1.branch, summary.branches[0].id);
+  valid(history);
+});
+
 test('turns: a record with the agent, model, conversation and message; the person moving branch refuses the agent (moved)', async () => {
   const { history, dispatcher, act, step } = await makePage();
-  const meta = { origin: 'agent', agent: 'Claude', model: 'claude-sonnet-4-6', turn: 'turn-3', turnLabel: 'Colour the cells', conversation: 'chat-1', message: 'turn-3' };
+  const meta = { origin: 'agent', agent: 'Claude', model: 'claude-sonnet-4-6', turn: 'turn-3', turnLabel: 'Color the cells', conversation: 'chat-1', message: 'turn-3' };
   await step('a.set', { v: 1 }, meta);
   const turn = history.active.turns.get('turn-3');
-  assert.deepEqual([turn.label, turn.by.model, turn.conversation, turn.message], ['Colour the cells', 'claude-sonnet-4-6', 'chat-1', 'turn-3']);
+  assert.deepEqual([turn.label, turn.by.model, turn.conversation, turn.message], ['Color the cells', 'claude-sonnet-4-6', 'chat-1', 'turn-3']);
   assert.equal(history.active.steps.get(history.active.headId).by.model, 'claude-sonnet-4-6');
   // The person makes another branch and stays there: the agent's next change is refused.
   await history.undo();
@@ -400,6 +464,45 @@ test('undo a turn others interleaved with: only its own steps go (to Recently de
   valid(history);
 });
 
+test('a change that makes no step says why (unrecorded): it was so already, a merge put back, a domain not recorded, recording paused, no history yet', async () => {
+  let off = [];
+  const { dispatcher, history, act } = await makePage({ offDomains: () => off });
+  const agent = { origin: 'agent', agent: 'Claude', turn: 'turn-8' };
+  const made = await dispatcher.dispatch('a.set', { v: 4 }, agent);
+  assert.equal(made.unrecorded, null, 'a step was made');
+  assert.deepEqual([(await dispatcher.dispatch('a.set', { v: 4 }, agent)).step, (await dispatcher.dispatch('a.set', { v: 4 }, agent)).unrecorded], [null, 'unchanged']);
+  // A merged gesture brought back where it began: its step is taken out.
+  await dispatcher.dispatch('cam.set', { v: 2 }, agent);
+  assert.equal((await dispatcher.dispatch('cam.set', { v: 0 }, agent)).unrecorded, 'retracted');
+  off = ['camera'];
+  assert.equal((await dispatcher.dispatch('cam.set', { v: 9 }, agent)).unrecorded, 'off');
+  off = [];
+  await act('history.recording.pause');
+  assert.equal((await dispatcher.dispatch('a.set', { v: 5 }, agent)).unrecorded, 'paused');
+  await act('history.recording.resume');
+  // A read is no change: nothing to say.
+  assert.equal((await dispatcher.dispatch('history.summary', {}, agent)).unrecorded, null);
+  history.destroy();
+  assert.equal((await dispatcher.dispatch('a.set', { v: 6 }, agent)).unrecorded, 'no-history');
+});
+
+test('a turn that made no step (it only read, or changed nothing) has no record: undoing it or noting it says so', async () => {
+  const { history, act, step } = await makePage();
+  const agent = { origin: 'agent', agent: 'Claude', turn: 'turn-6' };
+  await step('a.set', { v: 1 }, { origin: 'agent', agent: 'Claude', turn: 'turn-5' });
+  // The same value again: nothing changed, so no step and no record of turn-6.
+  await step('a.set', { v: 1 }, agent);
+  assert.equal(history.active.turns.has('turn-6'), false);
+  const head = history.active.headId;
+  const sentence = 'The tracker "Tracker 1" has no record of the turn "turn-6": a turn is recorded with its first step, so one that only read or changed nothing has nothing to undo; history_summary lists the turns it has.';
+  await assert.rejects(act('history.turn.undo', { turn: 'turn-6' }, agent), error => error instanceof ActionRefused && error.code === 'no-target' && plainSentence(error.message) === sentence);
+  await assert.rejects(history.undoTurn('turn-6'), error => error.code === 'no-target' && plainSentence(error.message) === sentence);
+  await assert.rejects(act('history.note.add', { target: { turn: 'turn-6' }, text: 'Why.' }, agent),
+    error => error.code === 'no-target' && /has no record of the turn "turn-6".*has no record to hold a note/.test(plainSentence(error.message)));
+  assert.equal(history.active.headId, head, 'nothing moved');
+  valid(history);
+});
+
 // ---------------------------------------------------------------------------
 // Provenance, search, reads
 
@@ -411,7 +514,7 @@ test('stale: a result whose inputs changed since, with the step that made it sta
   const cause = await step('b.inc');
   const { stale } = await act('history.stale');
   assert.deepEqual(stale.map(entry => [entry.step, entry.cause?.step]), [[derived.id, cause.id]]);
-  assert.match(stale[0].reasons[0], /Colors changed since step 3/);
+  assert.match(stale[0].reasons[0], /Colors changed at step 3 \("b \+ 1"\)\./);
   await step('c.derive');
   assert.deepEqual((await act('history.stale')).stale, [], 'computed again: not stale');
 });
@@ -493,8 +596,8 @@ test('the name mapping reaches every field, gene and category label the catalogu
   const mapping = { fields: [], categories: [{ field: 'cell_type', from: 'gamma', to: 'delta' }], genes: [{ from: 'CD3E', to: 'CD3D' }] };
   assert.deepEqual(mapParams(catalog.get('color.by'), { field: { source: 'var', key: 'CD3E' } }, mapping), { field: { source: 'var', key: 'CD3D' } });
   assert.deepEqual(mapParams(catalog.get('color.by'), { field: null }, mapping), { field: null });
-  assert.deepEqual(mapParams(catalog.get('highlight.category'), { field: { source: 'obs', key: 'cell_type' }, category: 'gamma' }, mapping),
-    { field: { source: 'obs', key: 'cell_type' }, category: 'delta' });
+  assert.deepEqual(mapParams(catalog.get('highlight.category'), { field: { source: 'obs', key: 'cell_type' }, categories: ['gamma'] }, mapping),
+    { field: { source: 'obs', key: 'cell_type' }, categories: ['delta'] });
 });
 
 test('Use instead: a name that did not match is mapped, and the steps replay again with it', async () => {

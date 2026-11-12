@@ -3,6 +3,7 @@
 // Uses RGBA uint8 normalized colors (same as main points)
 
 import { FULL_LIGHTING } from './high-perf-shaders.js';
+import { POINT_SPRITE_GLSL } from '../point-sprite.js';
 
 export const CENTROID_VS = `#version 300 es
 precision highp float;
@@ -13,35 +14,20 @@ layout(location = 1) in vec4 a_color; // RGBA packed as uint8, auto-normalized b
 uniform mat4 u_mvpMatrix;
 uniform mat4 u_viewMatrix;
 uniform mat4 u_modelMatrix;
-uniform float u_pointSize;
-// The largest sprite this pass may draw, in the pixels it is drawing into.
-// A figure export rasterises the same scene at a multiple of the screen
-// size, so a fixed cap would clamp a point at a different fraction of the
-// image than it occupies on screen, and the exported figure would stop
-// being the view it claims to reproduce. Zero means unset, and the floor
-// below keeps that behaving exactly as the fixed cap did.
-uniform float u_pointSizeMax;
-uniform float u_sizeAttenuation;
-uniform float u_viewportHeight;
-uniform float u_fov;
-
+${POINT_SPRITE_GLSL}
 out vec3 v_color;
 out float v_alpha;
 
 void main() {
   gl_Position = u_mvpMatrix * vec4(a_position, 1.0);
 
-  // Compute eye-space depth for perspective scaling (matches HP_VS_FULL)
+  // Eye-space depth for the sprite's size (as HP_VS_FULL)
   vec4 worldPos = u_modelMatrix * vec4(a_position, 1.0);
   vec4 eyePos = u_viewMatrix * worldPos;
   float eyeDepth = -eyePos.z;
 
-  // Perspective point size with attenuation
-  float projectionFactor = u_viewportHeight / (2.0 * tan(u_fov * 0.5));
-  float worldSize = u_pointSize * 0.01;
-  float perspectiveSize = (worldSize * projectionFactor) / max(eyeDepth, 0.001);
-  gl_PointSize = mix(u_pointSize, perspectiveSize, u_sizeAttenuation);
-  gl_PointSize = clamp(gl_PointSize, 0.5, max(u_pointSizeMax, 128.0));
+  // The sprite of every point shader (rendering/point-sprite.js), with its cap.
+  gl_PointSize = pointSpriteSize(eyeDepth);
 
   // Reject hidden centroids before rasterisation — see HP_VS_FULL. Zeroing the
   // size alone does not hide one: the driver clamps it back to a pixel.

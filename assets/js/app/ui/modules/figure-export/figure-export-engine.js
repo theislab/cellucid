@@ -15,8 +15,8 @@
 
 import { getNotificationCenter } from '../../../notification-center.js';
 import { loadAppCode } from '../../../app-code.js';
-import { buildExportFilename, formatTimestampForFilename } from './utils/export-helpers.js';
-import { downloadBlob } from '../../../utils/download.js';
+import { buildExportFilename } from './utils/export-helpers.js';
+import { downloadBlob, fileTimestamp } from '../../../utils/download.js';
 import { createFigureExportZip } from './utils/zip-archive.js';
 import { cloneCameraState } from '../../../../rendering/camera-state-contract.js';
 import {
@@ -35,8 +35,13 @@ import {
 } from './figure-export-contract.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
 import { describeSubsampleMethod } from '../../../../data/subsample.js';
+import { citationText } from '../../../../data/anndata-cellucid-metadata.js';
 import { allocateLargeArray } from '../../../../utils/large-arrays.js';
-import { failureText } from '../../../../utils/errors.js';
+import { setOwnDataProperty } from '../../../../utils/exact-record.js';
+import { failureDetails, sayFailure } from '../../../../utils/errors.js';
+import { computeFigureLayout } from './utils/layout.js';
+import { cellsFrameRect01, unionCellsFrames } from './utils/cells-frame.js';
+import { readShownVectorFieldOverlay } from './utils/overlay-fidelity.js';
 
 const LIVE_VIEW_ID = 'live';
 const userNotifiedFailures = new WeakSet();
@@ -56,13 +61,10 @@ export function reportFigureExportFailure(
 
   console.error('[FigureExport] Export failed:', error);
   const center = notifications ?? getNotificationCenter();
-  if (calculationId !== null) {
-    center.failCalculation(calculationId, error.message);
-  }
-  center.error(
-    `Export failed: ${failureText(error)}`,
-    { category: 'render', duration: 6000 }
-  );
+  // One card says it: the export's own progress card when it has one, else a new one.
+  const said = `Export failed: ${sayFailure(error)}`;
+  if (calculationId !== null) center.failCalculation(calculationId, said, failureDetails(error));
+  else center.error(said, { category: 'render', duration: 6000, ...failureDetails(error) });
   return error;
 }
 
@@ -86,7 +88,7 @@ function cloneOwnedLegendValue(value, context, seen = new Map()) {
   if (seen.has(value)) {
     throw new TypeError(`${context} must not contain cyclic state.`);
   }
-  // A categorical's colours and visibility are bytes (`utils/category-state.js`).
+  // A categorical's colors and visibility are bytes (`utils/category-state.js`).
   if (value instanceof Uint8Array) return value.slice();
   seen.set(value, true);
   if (Array.isArray(value)) {
@@ -129,11 +131,12 @@ function cloneOwnedLegendValue(value, context, seen = new Map()) {
         `${context} must contain only enumerable string data properties.`
       );
     }
-    clone[key] = cloneOwnedLegendValue(
+    // A key can be a category's name (`__proto__` too): an own property, never the prototype.
+    setOwnDataProperty(clone, key, cloneOwnedLegendValue(
       descriptor.value,
       `${context}.${key}`,
       seen
-    );
+    ));
   }
   seen.delete(value);
   return clone;
@@ -189,6 +192,7 @@ function cloneRenderState(renderState, antialias, context) {
     mvpMatrix: new Float32Array(renderState.mvpMatrix),
     near: renderState.near,
     pointSize: renderState.pointSize,
+    pointSizeMax: renderState.pointSizeMax,
     projectionMatrix: new Float32Array(renderState.projectionMatrix),
     shaderQuality: renderState.shaderQuality,
     sizeAttenuation: renderState.sizeAttenuation,
@@ -267,7 +271,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
    *   datasetBaseUrl: string|null,
    *   datasetSourceName: string|null,
    *   datasetSourceUrl: string|null,
-   *   datasetSourceCitation: string|null,
+   *   datasetCitation: string|null,
    *   datasetUserPath: string|null,
    *   datasetCells: {open: number, of: number, method: string, digest: string}|null
    * }}
@@ -298,7 +302,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         datasetBaseUrl: null,
         datasetSourceName: null,
         datasetSourceUrl: null,
-        datasetSourceCitation: null,
+        datasetCitation: null,
         datasetUserPath: null,
         datasetCells: openCellsOf(null, null),
       };
@@ -334,7 +338,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     const datasetBaseUrl = dataSourceManager.getCurrentBaseUrl();
     const datasetSourceName = meta?.source?.name ?? null;
     const datasetSourceUrl = meta?.source?.url ?? null;
-    const datasetSourceCitation = meta?.source?.citation ?? null;
+    const datasetCitation = citationText(meta?.citation);
     const datasetUserPath = dataSourceSnapshot.userPath ?? null;
     const datasetCells = openCellsOf(sourceType, datasetId);
 
@@ -345,7 +349,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       datasetBaseUrl,
       datasetSourceName,
       datasetSourceUrl,
-      datasetSourceCitation,
+      datasetCitation,
       datasetUserPath,
       datasetCells,
     };
@@ -379,6 +383,8 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
    * @param {boolean} captureLegend
    * @param {object} ownedCopies
    * @param {boolean} grantedAntialiasing
+   * @param {object|null} vectorField - the vector field the view shows
+   *   (`readFigureVectorFields`), drawn as arrows on a grid
    * @param {AbortSignal} signal
    */
   function getViewSnapshot(
@@ -387,6 +393,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     captureLegend,
     ownedCopies,
     grantedAntialiasing,
+    vectorField,
     signal
   ) {
     throwIfFigureExportAborted(signal);
@@ -573,6 +580,11 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       }
 
       const pointCount = borrowed.pointCount;
+      if (vectorField !== null && vectorField.vectors.length !== pointCount * stateDimensionLevel) {
+        throw new Error(
+          `Figure export view "${vid}" changed while its vector field was read.`
+        );
+      }
       const positions = cloneTypedOwner(
         borrowed.positions,
         ownedCopies.positions,
@@ -633,6 +645,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
             points: centroidFlags.points,
             labels: centroidFlags.labels,
           },
+          vectorField,
         },
         renderState: cloneRenderState(
           presented.renderState,
@@ -668,6 +681,43 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         },
       };
     });
+  }
+
+  /**
+   * The vector field each view shows, as a figure draws it
+   * (`components/vector-field-figure.js`): the field the overlay shows, for
+   * every view whose embedding it is bound to, with the overlay's color
+   * scheme. A view of another embedding draws none, as on screen.
+   *
+   * @param {string[]} viewIds
+   * @param {AbortSignal} signal
+   * @returns {Promise<Map<string, object>>}
+   */
+  async function readFigureVectorFields(viewIds, signal) {
+    const fields = new Map();
+    const shown = readShownVectorFieldOverlay(typeof document === 'undefined' ? null : document);
+    if (shown === null) return fields;
+    const field = state.getAvailableVectorFields().find(each => each.id === shown.fieldId);
+    if (field === undefined) {
+      throw new Error(`Figure export cannot find the vector field "${shown.fieldId}" the overlay shows.`);
+    }
+    const manager = state.getVectorFieldManager();
+    for (const vid of viewIds) {
+      const layoutKey = state.getViewLayoutKey(vid);
+      if (!field.layoutKeys.includes(layoutKey)) continue;
+      const data = await awaitFigureExportAbortable(signal, manager.loadField(field.id, layoutKey));
+      throwIfFigureExportAborted(signal);
+      const transform = state.dimensionManager.getNormTransform(layoutKey);
+      fields.set(vid, Object.freeze({
+        label: field.label,
+        colormapId: shown.colormapId,
+        vectors: data.vectors,
+        maxMagnitude: data.maxMagnitude,
+        // The embedding's own units: render space over its scale.
+        unitsPerRender: 1 / transform.scale,
+      }));
+    }
+    return fields;
   }
 
   /**
@@ -754,7 +804,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       datasetBaseUrl,
       datasetSourceName,
       datasetSourceUrl,
-      datasetSourceCitation,
+      datasetCitation,
       datasetUserPath,
       datasetCells,
     } = getDatasetIdentity();
@@ -780,8 +830,10 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
           `Figure export snapshot descriptor ${index} must publish exact id and label strings.`
         );
       }
-      return { id: view.id, label: view.label };
+      // The name it was given (`view.rename`): its panel's title.
+      return { id: view.id, label: view.label, name: viewer.getViewName(view.id) };
     });
+    const liveViewName = viewer.getViewName(LIVE_VIEW_ID);
     throwIfFigureExportAborted(signal);
     const activeSnapshot = viewId === LIVE_VIEW_ID
       ? null
@@ -792,6 +844,9 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     const viewLabel = viewId === LIVE_VIEW_ID
       ? liveViewLabel
       : activeSnapshot.label;
+    const viewName = viewId === LIVE_VIEW_ID
+      ? liveViewName
+      : activeSnapshot.name;
 
     const viewLayout = viewer.getViewLayout();
     throwIfFigureExportAborted(signal);
@@ -801,17 +856,18 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       ? [
           ...(viewLayout.liveViewHidden
             ? []
-            : [{ id: LIVE_VIEW_ID, label: liveViewLabel }]),
+            : [{ id: LIVE_VIEW_ID, label: liveViewLabel, name: liveViewName }]),
           ...snapshotViews,
         ]
-      : [{ id: viewId, label: viewLabel }];
+      : [{ id: viewId, label: viewLabel, name: viewName }];
     if (views.length === 0) {
       throw new Error('Figure export grid contains no published views.');
     }
 
     if (
       typeof state.getTotalHighlightedCellCount !== 'function' ||
-      typeof state.getHighlightedCellCount !== 'function'
+      typeof state.getHighlightedCellCount !== 'function' ||
+      typeof state.getActivePage !== 'function'
     ) {
       throw new TypeError(
         'Figure export state is missing exact highlight snapshot methods.'
@@ -847,9 +903,14 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       }
       highlightArray = new Uint8Array(highlightOwner);
     }
+    // The page whose cells are drawn highlighted: the figure's legend names
+    // it (`utils/highlight-legend.js`).
+    const highlightPageName = totalHighlighted > 0
+      ? String(state.getActivePage()?.name ?? '')
+      : null;
 
     // Multisampling is fixed when the browser creates the viewer's drawing
-    // buffer, and the user can turn it off. The figure must be rasterised with
+    // buffer, and the user can turn it off. The figure must be rasterized with
     // the value the viewer was *granted*, so it travels with the snapshot like
     // every other renderer input.
     if (typeof viewer.getAntialiasing !== 'function') {
@@ -872,18 +933,24 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       positions: new WeakMap(),
       transparency: new WeakMap(),
     };
+    // The vector field each panel shows, read before the synchronous
+    // snapshot (the reader's arrays are shared and fixed for these cells).
+    const vectorFields = await readFigureVectorFields(views.map(view => view.id), signal);
+    throwIfFigureExportAborted(signal);
     const payloadViews = [];
     for (const view of views) {
       throwIfFigureExportAborted(signal);
       payloadViews.push({
         id: view.id,
         label: view.label,
+        name: view.name,
         ...getViewSnapshot(
           view.id,
           datasetGeneration,
           options.includeLegend,
           ownedCopies,
           grantedAntialiasing,
+          vectorFields.get(view.id) ?? null,
           signal
         ),
       });
@@ -916,11 +983,13 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     const provenanceViews = payloadViews.map((view) => ({
       id: view.id,
       label: view.label,
+      name: view.name,
       fieldKey: view.scientificState.fieldKey,
       fieldKind: view.scientificState.fieldKind,
       filters: [...view.scientificState.filters],
+      vectorField: view.data.vectorField === null ? null : view.data.vectorField.label,
     }));
-    // The filename may name a colour field only when every panel carries it.
+    // The filename may name a color field only when every panel carries it.
     const exportedFieldKeys = new Set(
       provenanceViews.map((view) => view.fieldKey)
     );
@@ -928,9 +997,13 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
       ? provenanceViews[0].fieldKey
       : null;
 
+    // A grid figure keeps the arrangement the person sees (the viewer's
+    // rule for the area its panes are shown in, `getPresentedGridColumns`).
+    const gridColumns = views.length > 1 ? presentedGridColumns() : 1;
     const payloadBase = {
       width,
       height,
+      gridColumns,
       title: options.title,
       meta: {
         exportedAt: new Date().toISOString(),
@@ -944,13 +1017,14 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         datasetBaseUrl,
         datasetSourceName,
         datasetSourceUrl,
-        datasetSourceCitation,
+        datasetCitation,
         datasetUserPath,
         datasetCells,
         views: provenanceViews,
       },
       selection: {
         highlightArray,
+        pageName: highlightPageName,
         totalCount: totalHighlighted,
         visibleCount: visibleHighlighted,
       },
@@ -959,9 +1033,10 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
 
     throwIfFigureExportAborted(signal);
     progress?.start();
-    const ts = formatTimestampForFilename();
+    const ts = fileTimestamp();
     const needsMultiplePng = jobs.filter((j) => j.format === 'png').length > 1;
-    const fileViewLabel = wantsGrid ? 'multiview' : views[0].label;
+    // A named view's file is named by its name.
+    const fileViewLabel = wantsGrid ? 'multiview' : (views[0].name ?? views[0].label);
 
     /** @type {{ renderFigureToSvgBlob?: Function } | null} */
     let svgRenderer = null;
@@ -969,6 +1044,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
     let pngRenderer = null;
     /** @type {{ blob: Blob; filename: string; result: { format: FigureExportFormat; filename: string; metadata: any } }[]} */
     const staged = [];
+    let lastPayload = null;
 
     for (let idx = 0; idx < jobs.length; idx++) {
       const job = jobs[idx];
@@ -983,6 +1059,7 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         options: createFigureExportPayloadOptions(options, format),
       };
       assertFigureExportPayload(payload);
+      lastPayload = payload;
       throwIfFigureExportAborted(signal);
 
       if (format === 'svg') {
@@ -1050,7 +1127,28 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
         });
       }
     }
-    return { staged, datasetName, filenameFieldKey, viewLabel: fileViewLabel, timestamp: ts };
+    // A single view's plot as its layout lays it out (`utils/layout.js`, the
+    // one both renderers draw): within a box, or filling a width.
+    const laid = computeFigureLayout(lastPayload);
+    const plot = laid.single === null ? null : { width: laid.single.plotRect.width, height: laid.single.plotRect.height };
+    // A legend asked beside the plot that stands below it to keep the figure to its width.
+    const legendMovedBelow = laid.single !== null && laid.single.legendMovedBelow === true;
+    return { staged, plot, legendMovedBelow, datasetName, filenameFieldKey, viewLabel: fileViewLabel, timestamp: ts };
+  }
+
+  /**
+   * The columns of the grid on screen: what a grid figure is arranged in.
+   * @returns {number}
+   */
+  function presentedGridColumns() {
+    if (typeof viewer.getPresentedLayout !== 'function') {
+      throw new TypeError('A grid figure requires viewer.getPresentedLayout().');
+    }
+    const layout = viewer.getPresentedLayout();
+    if (layout === null || !layout.gridMultiview) {
+      throw new Error('A grid figure is drawn while the views are shown in a grid; the grid is not laid out.');
+    }
+    return layout.cols;
   }
 
   /** Render the jobs and download them: one file, or several in one ZIP archive. */
@@ -1141,17 +1239,74 @@ export function createFigureExportEngine({ state, viewer, dataSourceManager = nu
    *
    * @param {FigureExportOptions} options An exact single request
    * @param {{viewId?: string|null}} [how] The view to draw (default: the active one)
-   * @returns {Promise<{ blob: Blob; filename: string; metadata: any }>}
+   * @returns {Promise<{ blob: Blob; filename: string; metadata: any; plot: { width: number; height: number }|null, legendMovedBelow: boolean }>}
+   *   `plot`: a single view's plot size in the figure, in figure pixels
+   *   (1/96 inch); null for a grid. `legendMovedBelow`: the legend asked
+   *   beside the plot stands below it, to keep the figure to its width
    */
   async function renderFigure(options, { viewId = null } = {}) {
     const exactOptions = assertFigureExportSingleRequest(options);
-    const { staged } = await renderStaged(
+    const { staged, plot, legendMovedBelow } = await renderStaged(
       exactOptions,
       [{ format: exactOptions.format, dpi: exactOptions.dpi }],
       { viewId }
     );
-    return { blob: staged[0].blob, filename: staged[0].filename, metadata: staged[0].result.metadata };
+    return { blob: staged[0].blob, filename: staged[0].filename, metadata: staged[0].result.metadata, plot, legendMovedBelow };
   }
 
-  return { exportFigure, exportFigures, renderFigure };
+  /**
+   * The views a figure draws, as `renderStaged` takes them: the active one,
+   * or with `exportAllViews` in a grid every panel (the live view unless it
+   * is hidden, then the kept views).
+   *
+   * @param {{exportAllViews: boolean}} options
+   * @returns {string[]}
+   */
+  function figureViewIds({ exportAllViews }) {
+    const viewLayout = viewer.getViewLayout();
+    if (!(exportAllViews && viewLayout.mode === 'grid')) return [assertFigureExportViewId(state.getActiveViewId())];
+    return [
+      ...(viewLayout.liveViewHidden ? [] : [LIVE_VIEW_ID]),
+      ...viewer.getSnapshotViews().map(view => view.id),
+    ];
+  }
+
+  /**
+   * The frame that holds every cell the figure's views draw ("Fit the
+   * cells", `utils/cells-frame.js`): the active view's, or with
+   * `exportAllViews` in a grid every panel's, united. Null when no view
+   * draws a cell.
+   *
+   * @param {{exportAllViews: boolean}} options
+   * @returns {{x: number, y: number, width: number, height: number}|null}
+   */
+  function cellsFrame({ exportAllViews }) {
+    return unionCellsFrames(figureViewIds({ exportAllViews }).map((vid) => {
+      const presented = viewer.getPresentedViewState(vid);
+      const renderState = presented.renderState;
+      return viewer.withBorrowedViewData(vid, borrowed => cellsFrameRect01({
+        positions: borrowed.positions,
+        dimension: borrowed.dimensionLevel,
+        transparency: borrowed.transparency,
+        mvpMatrix: renderState.mvpMatrix,
+        viewportWidth: renderState.viewportWidth,
+        viewportHeight: renderState.viewportHeight,
+        pointRadius: (renderState.pointSize * presented.lodSizeMultiplier) / 2,
+      }));
+    }));
+  }
+
+  /**
+   * The vector field one view draws in a figure (its arrays, as
+   * `readFigureVectorFields` reads them), or null: what the preview draws.
+   *
+   * @param {string} viewId
+   * @returns {Promise<object|null>}
+   */
+  async function figureVectorField(viewId) {
+    const fields = await readFigureVectorFields([assertFigureExportViewId(viewId)], null);
+    return fields.get(viewId) ?? null;
+  }
+
+  return { exportFigure, exportFigures, renderFigure, cellsFrame, figureViewIds, figureVectorField };
 }

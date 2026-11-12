@@ -5,7 +5,7 @@
  * The enum is restated where a module cannot be imported — the
  * `#background-select` options and `<html data-viewer-background>` default in
  * `index.html`, the classic bootstrap script `theme-init.js`, and the page
- * colours in `assets/css` — and imported everywhere else. A background added
+ * colors in `assets/css` — and imported everywhere else. A background added
  * to one place only would be a menu entry the renderer rejects, a stored
  * preference the bootstrap refuses, a seam between the page and the canvas,
  * or an export that cannot say what the viewer drew. Each case fails here.
@@ -25,6 +25,7 @@ import {
   VIEWER_BACKGROUNDS,
   VIEWER_BACKGROUND_ERROR_MESSAGE,
   VIEWER_BACKGROUND_LABELS,
+  backgroundForTheme,
   isViewerBackground,
 } from '../assets/js/rendering/viewer-backgrounds.js';
 import { STUDIO_PALETTES, studioColor01 } from '../assets/js/rendering/studio-backdrop.js';
@@ -113,8 +114,8 @@ test('the #background-select options are the enum, in order, with its labels', a
 
 test('the bootstrap script accepts exactly the enum', async () => {
   const source = await read('assets/js/app/ui/core/theme-init.js');
-  const run = (stored) => {
-    const root = { dataset: { theme: 'light', viewerBackground: 'grid' } };
+  const run = (stored, declared = 'grid') => {
+    const root = { dataset: { theme: 'light', viewerBackground: declared } };
     const context = {
       document: { documentElement: root, body: { dataset: {} } },
       localStorage: {
@@ -130,7 +131,13 @@ test('the bootstrap script accepts exactly the enum', async () => {
     assert.equal(failure, undefined, `bootstrap rejected "${mode}"`);
     assert.equal(root.dataset.viewerBackground, mode);
   }
-  const { failure } = run('sepia');
+  // A stored value outside the enum (another version wrote it) is no choice:
+  // the page starts on the declared background.
+  const unknown = run('sepia');
+  assert.equal(unknown.failure, undefined);
+  assert.equal(unknown.root.dataset.viewerBackground, 'grid');
+  // A declared default outside it is the page's own error, naming the enum.
+  const { failure } = run(null, 'sepia');
   // The bootstrap runs in its own realm, so its TypeError is that realm's.
   assert.equal(failure?.name, 'TypeError');
   for (const mode of VIEWER_BACKGROUNDS) {
@@ -166,7 +173,7 @@ test('module owners import the enum instead of restating it', async () => {
   }
 });
 
-test('every background has a page colour, and studio pages match the canvas exactly', async () => {
+test('every background has a page color, and studio pages match the canvas exactly', async () => {
   const globalCss = await read('assets/css/base/_global.css');
   const tokens = await read('assets/css/tokens/_colors.css');
   const typings = await read('types/design-tokens.d.ts');
@@ -179,18 +186,18 @@ test('every background has a page colour, and studio pages match the canvas exac
     assert.match(
       globalCss,
       new RegExp(`:root\\[data-viewer-background="${mode}"\\] body \\{ background: var\\(--[a-z-]+\\); \\}`),
-      `no page colour for "${mode}"`
+      `no page color for "${mode}"`
     );
   }
   for (const mode of STUDIO_VIEWER_BACKGROUNDS) {
     const token = `viewer-bg-${mode}`;
     assert.match(globalCss, new RegExp(`data-viewer-background="${mode}"\\] body \\{ background: var\\(--${token}\\)`));
     // The canvas is cleared to the palette surface; the page must be the
-    // same 8-bit colour or a seam shows at the canvas edge while loading.
+    // same 8-bit color or a seam shows at the canvas edge while loading.
     assert.equal(tokenValue(token), hexOf(STUDIO_PALETTES[mode].surface));
     assert.match(typings, new RegExp(`'${token}'`));
   }
-  // A baked look clears to its surface; the page is the same colour.
+  // A baked look clears to its surface; the page is the same color.
   for (const mode of LOOK_VIEWER_BACKGROUNDS) {
     const token = `viewer-bg-${mode}`;
     assert.match(globalCss, new RegExp(`data-viewer-background="${mode}"\\] body \\{ background: var\\(--${token}\\)`));
@@ -235,9 +242,9 @@ test('the viewer clears to the studio surface it publishes', async () => {
   assert.match(studioCase, /studioPalette = STUDIO_PALETTES\[exactMode\];/);
   assert.match(studioCase, /setBackgroundClearColor\(surface\[0\], surface\[1\], surface\[2\]\);/);
   assert.match(studioCase, /bgColor = surface;/);
-  // The background's clear colour is the context's, opaque, and is set again
+  // The background's clear color is the context's, opaque, and is set again
   // on a context the browser restores (whose every value is back at its
-  // initial one, transparent black for the clear colour).
+  // initial one, transparent black for the clear color).
   const setter = viewerSource.slice(
     viewerSource.indexOf('function setBackgroundClearColor('),
     viewerSource.indexOf('let backdropLookId')
@@ -248,4 +255,48 @@ test('the viewer clears to the studio surface it publishes', async () => {
     viewerSource.indexOf('sceneMsaaTarget = createSceneMsaaTarget(gl);', viewerSource.indexOf('function restoreLostGraphics()'))
   );
   assert.match(restore, /primeGlState\(gl\);\s+applyViewerGlState\(\);/);
+});
+
+test('each background has one twin in the other theme, at the same place in its group', () => {
+  const [light, dark] = VIEWER_BACKGROUND_GROUPS.map((group) => group.backgrounds);
+  assert.equal(light.length, dark.length);
+  light.forEach((background, index) => {
+    assert.equal(backgroundForTheme(background, 'dark'), dark[index]);
+    assert.equal(backgroundForTheme(background, 'light'), background);
+    assert.equal(backgroundForTheme(dark[index], 'light'), background);
+    assert.equal(backgroundForTheme(dark[index], 'dark'), dark[index]);
+  });
+  assert.equal(backgroundForTheme('studio', 'dark'), 'studio-dark');
+  assert.equal(backgroundForTheme('atelier', 'dark'), 'nebula');
+  assert.equal(backgroundForTheme('white', 'dark'), 'black');
+});
+
+test('the bootstrap gives an unchosen background the theme\'s twin, and keeps a chosen one', async () => {
+  const source = await read('assets/js/app/ui/core/theme-init.js');
+  const run = ({ theme, background }) => {
+    const root = { dataset: { theme: 'light', viewerBackground: 'studio' } };
+    const stored = { cellucid_theme: theme, cellucid_viewer_background: background };
+    const context = {
+      document: { documentElement: root, body: { dataset: {} } },
+      localStorage: { getItem: (key) => stored[key] ?? null },
+    };
+    context.globalThis = context;
+    vm.runInNewContext(source, context);
+    assert.equal(context.__cellucidThemeBootstrapFailure, undefined);
+    return root.dataset.viewerBackground;
+  };
+  assert.equal(run({ theme: 'dark', background: null }), 'studio-dark');
+  assert.equal(run({ theme: 'light', background: null }), 'studio');
+  assert.equal(run({ theme: 'dark', background: 'atelier' }), 'atelier');
+  for (const [index, background] of VIEWER_BACKGROUNDS.entries()) {
+    // The bootstrap's own twin rule agrees with the module's for every background.
+    const root = { dataset: { theme: 'light', viewerBackground: background } };
+    const context = {
+      document: { documentElement: root, body: { dataset: {} } },
+      localStorage: { getItem: (key) => (key === 'cellucid_theme' ? 'dark' : null) },
+    };
+    context.globalThis = context;
+    vm.runInNewContext(source, context);
+    assert.equal(root.dataset.viewerBackground, backgroundForTheme(background, 'dark'), `at ${index}`);
+  }
 });

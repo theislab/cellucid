@@ -188,7 +188,7 @@ test('bytes written through segments are the bytes of one buffer, read back exac
     assert.throws(() => store.write(patch, 45), RangeError);
     // Re-allocated smaller: segments past the new layout are deleted.
     const buffers = store.segments.map(segment => segment.buffer);
-    store.allocate(10, 4, gl.STATIC_DRAW, run, 'colours');
+    store.allocate(10, 4, gl.STATIC_DRAW, run, 'colors');
     const kept = store.segments.map(segment => segment.buffer);
     assert.deepEqual(kept, buffers.slice(0, kept.length));
     for (const buffer of buffers.slice(kept.length)) assert.ok(gl._state.deleted.includes(buffer));
@@ -198,7 +198,7 @@ test('bytes written through segments are the bytes of one buffer, read back exac
 test('a refused segment leaves the buffers made so far in the store for its owner to retire', () => {
   const gl = createGl({ refuseAllocationAt: 3 });
   const store = new PointStore(gl, 4);
-  assert.throws(() => store.allocate(20, 4, gl.STATIC_DRAW, run, 'colours'), /refused/);
+  assert.throws(() => store.allocate(20, 4, gl.STATIC_DRAW, run, 'colors'), /refused/);
   assert.equal(store.pointCount, 0);
   assert.equal(store.segments.length, 3);
   assert.equal(isGlObjectAlive(gl, 'isBuffer', store), true);
@@ -210,7 +210,7 @@ test('a refused segment leaves the buffers made so far in the store for its owne
 test('a deletion that throws leaves the segments not yet deleted, and a retry deletes exactly those', () => {
   const gl = createGl();
   const store = new PointStore(gl, 4);
-  store.allocate(12, 4, gl.STATIC_DRAW, run, 'colours');
+  store.allocate(12, 4, gl.STATIC_DRAW, run, 'colors');
   const buffers = store.segments.map(segment => segment.buffer);
   gl.failDeleteBuffer = true;
   assert.throws(() => deleteGlObject(gl, 'deleteBuffer', store), /synthetic/);
@@ -221,12 +221,12 @@ test('a deletion that throws leaves the segments not yet deleted, and a retry de
   assert.deepEqual([...gl._state.deleted].sort((a, b) => a.id - b.id), buffers);
 });
 
-test('the vertex arrays bind each segment\'s positions and colours, and draw a range one segment at a time', () => {
+test('the vertex arrays bind each segment\'s positions and colors, and draw a range one segment at a time', () => {
   const gl = createGl();
   const positions = new PointStore(gl, 4);
   positions.allocate(10, 8, gl.STATIC_DRAW, run, 'positions');
   const colors = new PointStore(gl, 4);
-  colors.allocate(10, 4, gl.STATIC_DRAW, run, 'colours');
+  colors.allocate(10, 4, gl.STATIC_DRAW, run, 'colors');
   const arrays = new SegmentedVertexArray(gl);
   arrays.setStores(positions, colors, 2);
   assert.equal(arrays.vaos.length, 3);
@@ -246,21 +246,21 @@ test('the vertex arrays bind each segment\'s positions and colours, and draw a r
   assert.equal(calls, 3);
   assert.deepEqual(draws, [[arrays.vaos[0], 3, 1], [arrays.vaos[1], 0, 4], [arrays.vaos[2], 0, 1]]);
   assert.deepEqual(bases, [0, 4, 8]);
-  // Colours detached: the VAO keeps no reference to a store being deleted.
+  // Colors detached: the VAO keeps no reference to a store being deleted.
   // The attribute reads the VAO's own position buffer, disabled: pointed at
-  // no buffer, Chromium would leave it holding the colour store.
+  // no buffer, Chromium would leave it holding the color store.
   arrays.setColors(null);
   arrays.vaos.forEach((vao, index) => {
-    const colour = gl._state.attributes.get(vao).get(1);
-    assert.equal(colour.buffer, positions.segments[index].buffer);
-    assert.equal(colour.enabled, false);
+    const color = gl._state.attributes.get(vao).get(1);
+    assert.equal(color.buffer, positions.segments[index].buffer);
+    assert.equal(color.enabled, false);
   });
   assert.equal(gl._state.bound, null, 'no ARRAY_BUFFER is left bound');
   for (const segment of colors.segments) {
     assert.ok(arrays.vaos.every(vao => gl._state.attributes.get(vao).get(1).buffer !== segment.buffer));
   }
   const mismatched = new PointStore(gl, 5);
-  mismatched.allocate(10, 4, gl.STATIC_DRAW, run, 'colours');
+  mismatched.allocate(10, 4, gl.STATIC_DRAW, run, 'colors');
   assert.throws(() => arrays.setStores(positions, mismatched, 2), RangeError);
   const vaos = [...arrays.vaos];
   deleteGlObject(gl, 'deleteVertexArray', arrays);
@@ -271,7 +271,7 @@ test('the vertex arrays bind each segment\'s positions and colours, and draw a r
 test('a gather target is a store, its segments, or one buffer', () => {
   const gl = createGl();
   const store = new PointStore(gl, 4);
-  store.allocate(9, 4, gl.STATIC_DRAW, run, 'colours');
+  store.allocate(9, 4, gl.STATIC_DRAW, run, 'colors');
   assert.equal(requireStoreSegments(store, 9), store.segments);
   const buffer = gl.createBuffer();
   assert.deepEqual(requireStoreSegments(buffer, 9), [{ buffer, first: 0, count: 9 }]);

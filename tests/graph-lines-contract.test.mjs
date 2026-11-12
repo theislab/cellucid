@@ -1,12 +1,12 @@
 /**
- * A neighbour graph reaches its edges line by line (`graph-lines.js`),
+ * A neighbor graph reaches its edges line by line (`graph-lines.js`),
  * from every place a graph comes from: an `obsp` CSR or CSC group read a
  * slab of lines at a time (never whole), a dense `obsp`, a Loom graph's
  * coordinate list (built in streamed passes: checked through the loompy
  * corpus, `formats-corpus-conformance`), and a MuData modality's graph
  * placed on the store's cells. Each gives exactly the edges of the graph
  * held whole; 64-bit positions are converted through their words; Seurat's
- * unit diagonal (a cell is its own neighbour in `RNA_snn`) is no edge.
+ * unit diagonal (a cell is its own neighbor in `RNA_snn`) is no edge.
  */
 import './helpers/anndata-reader-in-process.mjs';
 import assert from 'node:assert/strict';
@@ -138,7 +138,7 @@ test('the k-NN tool\'s rows are read by cell from every kind of stored graph: CS
   const wide = { ...graph, indices: BigInt64Array.from(graph.indices, BigInt), indptr: BigInt64Array.from(graph.indptr, BigInt) };
   const values = new Float32Array(n * n);
   for (let row = 0; row < n; row++) for (let at = graph.indptr[row]; at < graph.indptr[row + 1]; at++) values[row * n + graph.indices[at]] = graph.data[at];
-  // One stored zero: no neighbour, as it is no edge.
+  // One stored zero: no neighbor, as it is no edge.
   values[0 * n + 1] = 0;
   values[1 * n + 0] = 0;
   const { reader } = await openReader(minimalAnnData({ nObs: n, extra: { obsp: mapping({

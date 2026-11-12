@@ -23,6 +23,7 @@ import {
 import { adaptiveMinimumLevel, lodSizeMultiplier, selectLodLevel } from './lod-levels.js';
 import { DEFAULT_CELL_PRIORITY, buildPriorityOrder, requireCellPriority } from '../../data/cell-priority.js';
 import { formatCountOf, formatCount } from '../../utils/format-units.js';
+import { InternalError } from '../../utils/errors.js';
 
 
 // ============================================================================
@@ -313,7 +314,7 @@ export class SpatialIndex {
   writeDrawRanges(runs, runCount, lastBand, starts, counts, maxRanges = Infinity, scratch = {}) {
     const order = this.drawOrder;
     if (order === null) {
-      throw new Error('SpatialIndex draw ranges require a published draw order.');
+      throw new InternalError('SpatialIndex draw ranges require a published draw order.');
     }
     if (!Number.isInteger(lastBand) || lastBand < 0 || lastBand >= order.bandCount) {
       throw new RangeError(`SpatialIndex draw band ${String(lastBand)} is outside [0, ${order.bandCount - 1}].`);
@@ -428,7 +429,7 @@ export class SpatialIndex {
       !Array.isArray(this.lodLevels) ||
       this.lodLevels.length < 1
     ) {
-      throw new Error(
+      throw new InternalError(
         'SpatialIndex LOD membership requires a published LOD inventory.'
       );
     }
@@ -444,7 +445,7 @@ export class SpatialIndex {
       fullDetail?.isFullDetail !== true ||
       fullDetail.pointCount !== this.pointCount
     ) {
-      throw new Error(
+      throw new InternalError(
         'SpatialIndex LOD membership requires one exact terminal full-detail level.'
       );
     }
@@ -454,7 +455,7 @@ export class SpatialIndex {
       !(hierarchy instanceof Uint32Array) ||
       hierarchy.length !== this.pointCount
     ) {
-      throw new Error(
+      throw new InternalError(
         'SpatialIndex LOD membership requires one exact full point hierarchy.'
       );
     }
@@ -477,7 +478,7 @@ export class SpatialIndex {
         level.pointCount < previousCount ||
         level.pointCount > this.pointCount
       ) {
-        throw new Error(
+        throw new InternalError(
           `SpatialIndex LOD ${lodLevel} is not one exact monotonic reduced prefix.`
         );
       }
@@ -485,7 +486,7 @@ export class SpatialIndex {
         indices.buffer !== hierarchy.buffer ||
         indices.byteOffset !== hierarchy.byteOffset
       ) {
-        throw new Error(
+        throw new InternalError(
           `SpatialIndex LOD ${lodLevel} does not share the exact hierarchical prefix owner.`
         );
       }
@@ -505,7 +506,7 @@ export class SpatialIndex {
           admissionLevels[originalId] !==
           LOD_FULL_DETAIL_ADMISSION_LEVEL
         ) {
-          throw new Error(
+          throw new InternalError(
             `SpatialIndex LOD hierarchy repeats source ID ${originalId}.`
           );
         }
@@ -546,7 +547,7 @@ export class SpatialIndex {
           admissionLevels[originalId] !==
           LOD_FULL_DETAIL_ADMISSION_LEVEL
         ) {
-          throw new Error(
+          throw new InternalError(
             `SpatialIndex LOD hierarchy repeats source ID ${originalId} in its full-detail tail.`
           );
         }
@@ -595,7 +596,7 @@ export class SpatialIndex {
     const owner = this._ensureLodMembershipOwner();
     const descriptor = owner.descriptorsByLevel[lodLevel];
     if (descriptor === null || descriptor === undefined) {
-      throw new Error(
+      throw new InternalError(
         `SpatialIndex LOD ${lodLevel} has no exact membership descriptor.`
       );
     }

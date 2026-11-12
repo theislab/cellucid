@@ -198,7 +198,7 @@ test('four views of four representations pick, highlight, build LOD, label, expo
     umap2d: await layoutOf(page, 'UMAP', 2),
     tsne: await layoutOf(page, 't-SNE', 2),
   };
-  // Colour by cell type first, with its labels shown (a label is made only
+  // Color by cell type first, with its labels shown (a label is made only
   // while its view shows labels): kept views copy it.
   await page.locator('#categorical-field').selectOption('cell_type');
   await page.locator('#toggle-centroid-labels').check();

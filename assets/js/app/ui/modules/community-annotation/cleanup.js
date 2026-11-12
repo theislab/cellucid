@@ -2,9 +2,7 @@
  * @fileoverview Exact teardown helpers for the community annotation UI.
  *
  * Community annotation teardown must never swallow a failure: every cleanup
- * entry runs, and the collected errors are rethrown as one. Modal document
- * layers additionally get one retry, because losing the layer owner leaves the
- * page permanently covered.
+ * entry runs, and the collected errors are rethrown as one.
  *
  * @module ui/modules/community-annotation/cleanup
  */
@@ -29,29 +27,5 @@ export function runExactCleanup(context, entries) {
       errors,
       `${context} failed in ${errors.length} cleanup operations`
     );
-  }
-}
-
-export function releaseExactModalDocumentLayer(release, label) {
-  if (typeof release !== 'function') {
-    throw new TypeError(`${label} release owner must be a function`);
-  }
-  try {
-    if (release() !== true) {
-      throw new Error(`${label} lost its exact document-layer owner`);
-    }
-    return true;
-  } catch (primaryError) {
-    try {
-      if (release() !== true) {
-        throw new Error(`${label} document-layer retry lost ownership`);
-      }
-      return true;
-    } catch (retryError) {
-      throw new AggregateError(
-        [primaryError, retryError],
-        `${label} document-layer release failed twice`
-      );
-    }
   }
 }

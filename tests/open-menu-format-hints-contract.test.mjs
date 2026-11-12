@@ -4,7 +4,7 @@
  * opens as, the Folder… item every folder format, and the drop overlay names
  * no format list that the registry can outgrow. The hints were written by
  * hand and fell behind it (no .rda; the overlay named three of eleven), and
- * then named h5Seurat, which the registry recognises only to refuse.
+ * then named h5Seurat, which the registry recognizes only to refuse.
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -30,7 +30,7 @@ test('File… names every single-file format Cellucid opens, and none it refuses
   const hint = hintOf('user-data-file-item');
   for (const format of INPUT_FORMATS.filter(item => item.names.file)) {
     const named = names(format, 'file').some(word => hint.includes(word.replace(/\.gz$/, '')));
-    // A format the registry recognises only to refuse (h5Seurat) is not
+    // A format the registry recognizes only to refuse (h5Seurat) is not
     // offered as something that opens: the hint listed it while every such
     // file was refused.
     if (format.refusal === undefined) assert.ok(named, `${format.id}: ${hint}`);

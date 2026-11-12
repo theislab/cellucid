@@ -1,5 +1,5 @@
 /**
- * What a layout view says when the file it recognises is one Cellucid does
+ * What a layout view says when the file it recognizes is one Cellucid does
  * not show: a 10x molecule table, a MuData with shared features, a count
  * matrix with no cell embedding. `open.js` (`explainFormatError`) shows the
  * message as it is, with what to do; it names both languages' commands where
@@ -9,7 +9,7 @@
  */
 
 /**
- * A refusal of a recognised file, its message written for the person who
+ * A refusal of a recognized file, its message written for the person who
  * opened it.
  */
 export class LayoutRefusal extends Error {

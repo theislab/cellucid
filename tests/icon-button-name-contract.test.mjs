@@ -52,7 +52,7 @@ const buttons = Array.from(
   text: content.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim()
 }));
 
-/** A control the user can only recognise by its icon. */
+/** A control the user can only recognize by its icon. */
 const iconOnly = buttons.filter(button => !/[A-Za-z0-9]/.test(button.text));
 
 test('index.html still has icon-only buttons to check', () => {

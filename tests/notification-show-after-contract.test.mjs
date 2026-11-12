@@ -142,3 +142,13 @@ test('every publisher of progress waits the same, and none keeps a threshold of 
     assert.doesNotMatch(source, /SHOW_AFTER_MS|NOTIFY_AFTER_MS|QUICK_CALCULATION_MS|= 700;|= 250;/, file);
   }
 });
+
+test('work that completes a notice the person already closed changes nothing; an id never made is refused', t => {
+  const { center } = createCenter(t);
+  const id = center.loading('Reading field: cell_type', { category: 'data' });
+  center.dismiss(id);
+  // The field read ends after its notice was closed: it must not fail the read.
+  assert.doesNotThrow(() => center.complete(id, 'Loaded field: cell_type'));
+  assert.equal(center.hasNotification(id), false, 'the closed notice is not shown again');
+  assert.throws(() => center.complete('notif-never-made', 'Loaded'), /does not exist/);
+});

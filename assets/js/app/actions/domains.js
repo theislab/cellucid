@@ -29,12 +29,13 @@
 export const DOMAINS = Object.freeze([
   ['cells', 'Open cells', 'Which cells are open (every cell, or a subsample) and how many of them genes are read for.'],
   ['mapping', 'Data mapping', 'Which stored arrays are plotted and read (the data mapping).'],
+  ['expression', 'Expression values', 'The values the genes are shown and analyzed in: normalized to 10,000 counts per cell, log1p, or as stored.'],
   ['field-overlays', 'Fields and labels', 'Field and category renames, deleted fields, user-defined fields with their values.'],
   ['gene-sets', 'Gene sets', 'Gene sets pushed by a notebook or made in the app.'],
   ['views', 'Views', 'Kept views, their layout, the focused view, camera lock, the representation each view shows.'],
-  ['active-field', 'Active field', 'What each view is coloured by (a field or a gene).'],
+  ['active-field', 'Active field', 'What each view is colored by (a field or a gene).'],
   ['filters', 'Filters', 'Category visibility, continuous ranges, outlier and missing-value filters, per view.'],
-  ['colors', 'Colors', 'Category colours, colour maps, colour ranges, log scale, zero grey, per view.'],
+  ['colors', 'Colors', 'Category colors, color maps, color ranges, log scale, zero gray, per view.'],
   ['visibility', 'Hidden cells', 'Cells hidden one by one (the cell visibility mask), per view.'],
   ['highlights', 'Highlights', 'Highlight pages and their groups of cells.'],
   ['camera', 'Camera', 'The camera of each view and the navigation mode.'],
@@ -103,9 +104,23 @@ export function domainDescription(id) {
  * those renamed in order and dropped, so the same steps applied again
  * compare equal. Verify and a delete's "did this input change" compare
  * canonical forms (`history.js`); a restore always puts the value itself back.
+ *
+ * An owner whose domain means one value when a saved state does not hold it
+ * (a file written before the domain, or by hand) gives `absent()`: that
+ * value. A saved state restored onto the open dataset puts it back with the
+ * rest (`history.js` `readSaved`), so one file restores one state whatever
+ * was shown before (the Expression values: as stored, plan §3). Without
+ * `absent`, a saved state that does not hold the domain keeps its value
+ * shown.
+ *
+ * An owner whose value is held per view (`{views: [...]}`, one entry per
+ * view by position) gives `readPart(value, views)`: the part a step that
+ * acted in one view read, `views` being the `views` value it ran with (its
+ * `focus`). A step whose input differs only outside that part (another view
+ * kept, another view's filters) is not stale (`provenance.js`, F156).
  * @returns {{
- *   provide: (id: string, owner: {capture: Function, restore: Function, describe?: Function, canonical?: Function}) => () => void,
- *   owner: (id: string) => {capture: Function, restore: Function, describe?: Function, canonical?: Function},
+ *   provide: (id: string, owner: {capture: Function, restore: Function, describe?: Function, canonical?: Function, absent?: Function, readPart?: Function}) => () => void,
+ *   owner: (id: string) => {capture: Function, restore: Function, describe?: Function, canonical?: Function, absent?: Function, readPart?: Function},
  *   missing: () => string[],
  * }}
  */
@@ -121,6 +136,12 @@ export function createDomainRegistry() {
       }
       if (owner.canonical !== undefined && typeof owner.canonical !== 'function') {
         throw new TypeError(`State domain "${id}" owner's canonical must be a function of a value`);
+      }
+      if (owner.absent !== undefined && typeof owner.absent !== 'function') {
+        throw new TypeError(`State domain "${id}" owner's absent must be a function giving the value a saved state without the domain means`);
+      }
+      if (owner.readPart !== undefined && typeof owner.readPart !== 'function') {
+        throw new TypeError(`State domain "${id}" owner's readPart must be a function of a value and the views value, giving the part one view reads`);
       }
       owners.set(id, owner);
       return () => { if (owners.get(id) === owner) owners.delete(id); };

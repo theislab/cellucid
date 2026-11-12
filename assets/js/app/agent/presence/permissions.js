@@ -9,16 +9,20 @@
  *
  * | Kind | What it is |
  * | --- | --- |
- * | `change` | any change in the tab: what the history can undo (colour, filter, highlight, views, a new field, an analysis…), and another dataset opened (the open one's history stays kept) |
+ * | `change` | any change in the tab: what the history can undo (color, filter, highlight, views, a new field, an analysis…), and another dataset opened (the open one's history stays kept) |
  * | `heavy` | work estimated to take longer than `HEAVY_MS` on this device and link (`estimate.ms`, from what the page measured) |
  * | `writes-file`, `deletes-saved`, `large-download`, `publishes` | what the history cannot take back (the action's `confirm`) |
  * | `pauses-recording` | pausing the history, after which a change cannot be undone on its own (`history.recording.pause`) |
+ * | `unseen-link` | fetching an address the person has not seen in this tab (an action with `opensLinks`: a dataset opened by a link): an agent misled by text it read could otherwise send what it read to any host (F121) |
  *
  * The dispatcher asks at the start of every change of an agent: of its
  * `confirm` kind when that is asked before it runs, else of `change`, and
  * also `heavy` when its estimate says so; an action whose implementation
  * asks once it knows the cost (`confirmAt: 'handler'`, a download) is asked
- * again then, of its `confirm` kind alone. The strictest setting of its kinds
+ * again then, of its `confirm` kind alone; heavy work an implementation
+ * finds only while it runs (`ctx.heavy`: the cells' totals a matrix needs,
+ * what a saved state restores) is asked then as `heavy`, unless its start
+ * was judged heavy already. The strictest setting of its kinds
  * decides: Deny refuses it, Ask asks the person (the agent waits), Allow
  * runs it. A grant the person gives for one chat or connection ("Allow in
  * this chat") allows that kind there until the page closes, unless the kind
@@ -33,6 +37,8 @@
  */
 
 import { formatDuration } from '../../../utils/format-units.js';
+import { webStorage } from '../../../utils/web-storage.js';
+import { createListenerSet } from '../../../utils/listener-set.js';
 
 /**
  * How long work may take before it counts as heavy: about ten seconds, the
@@ -43,8 +49,11 @@ import { formatDuration } from '../../../utils/format-units.js';
  */
 export const HEAVY_MS = 10_000;
 
-export const PERMISSION_KINDS = Object.freeze(['change', 'heavy', 'writes-file', 'deletes-saved', 'large-download', 'publishes', 'pauses-recording']);
+export const PERMISSION_KINDS = Object.freeze(['change', 'heavy', 'writes-file', 'deletes-saved', 'large-download', 'publishes', 'pauses-recording', 'unseen-link', 'replaces-unkept']);
 export const PERMISSION_CHOICES = Object.freeze(['ask', 'allow', 'deny']);
+
+/** Each choice as the settings' menus show it (a value is not a label). */
+export const CHOICE_LABELS = Object.freeze({ ask: 'Ask', allow: 'Allow', deny: 'Deny' });
 
 /** Each kind as the settings and the card name it. */
 export const KIND_LABELS = Object.freeze({
@@ -55,6 +64,8 @@ export const KIND_LABELS = Object.freeze({
   'large-download': 'Large downloads',
   publishes: 'Publishing',
   'pauses-recording': 'Pausing the history',
+  'unseen-link': 'Opening links not seen in this tab',
+  'replaces-unkept': 'Replacing work that is not kept',
 });
 
 /** What an agent is refused to do, in the sentence it reads. */
@@ -66,10 +77,16 @@ const KIND_DOINGS = Object.freeze({
   'large-download': 'start large downloads',
   publishes: 'publish',
   'pauses-recording': 'pause the history',
+  'unseen-link': 'open a link the person has not seen in this tab',
+  'replaces-unkept': 'replace a dataset whose work is not kept',
 });
 
 const IRREVERSIBLE = Object.freeze({
   'writes-file': 'ask', 'deletes-saved': 'ask', 'large-download': 'ask', publishes: 'ask', 'pauses-recording': 'ask',
+  // Not irreversible, but outbound: a request to an address only the agent named is asked in every preset that runs anything.
+  'unseen-link': 'ask',
+  // The person's steps on the dataset shown would be gone for good (`app/unkept-work-guard.js`).
+  'replaces-unkept': 'ask',
 });
 
 export const PERMISSION_MODES = Object.freeze({
@@ -124,11 +141,17 @@ export function isHeavy(estimate) {
 /**
  * The kinds one question of the dispatcher is about (`confirm`: the kind of
  * what the history cannot undo asked now, or null; `stage`: `start`, or
- * `handler` when the implementation asks once it knows the cost).
- * @param {{confirm?: string|null, estimate?: object|null, stage?: 'start'|'handler'}} question
+ * `handler` when the implementation asks once it knows the cost). At the
+ * handler, a question without `confirm` is about heavy work found while it
+ * runs (`ctx.heavy`): `heavy` when its estimate is, unless the start was
+ * already judged heavy (`started`, the start's estimate); none otherwise.
+ * @param {{confirm?: string|null, estimate?: object|null, stage?: 'start'|'handler', started?: object|null}} question
  */
-export function kindsOf({ confirm = null, estimate = null, stage = 'start' }) {
-  if (stage === 'handler') return [confirm];
+export function kindsOf({ confirm = null, estimate = null, stage = 'start', started = null }) {
+  if (stage === 'handler') {
+    if (confirm !== null) return [confirm];
+    return isHeavy(estimate) && !isHeavy(started) ? ['heavy'] : [];
+  }
   const kinds = [confirm ?? 'change'];
   if (isHeavy(estimate)) kinds.push('heavy');
   return kinds;
@@ -144,13 +167,13 @@ export function grantKey(meta, kind) {
 /**
  * The decision for one question of the dispatcher about an agent's action.
  *
- * @param {{meta: object, estimate?: object|null, confirm?: string|null, stage?: 'start'|'handler'}} question
+ * @param {{meta: object, estimate?: object|null, confirm?: string|null, stage?: 'start'|'handler', started?: object|null}} question
  * @param {{kinds: Record<string, string>}} settings
  * @param {Set<string>} grants - kinds allowed for a chat or connection (`grantKey`)
  * @returns {{decision: 'allow'|'ask'|'deny', kinds: string[], asking: string[], denied: string|null}}
  */
-export function decide({ meta, estimate = null, confirm = null, stage = 'start' }, settings, grants = new Set()) {
-  const kinds = kindsOf({ confirm, estimate, stage });
+export function decide({ meta, estimate = null, confirm = null, stage = 'start', started = null }, settings, grants = new Set()) {
+  const kinds = kindsOf({ confirm, estimate, stage, started });
   // A grant answers what the settings ask about; a kind set to Deny since stays refused.
   const choices = kinds.map(kind => {
     const choice = settings.kinds[kind];
@@ -163,9 +186,9 @@ export function decide({ meta, estimate = null, confirm = null, stage = 'start' 
 }
 
 /**
- * What the settings make of one kind for one connection, as the tool list
- * of that connection says it (`bridge/mcp-tools.js` `permissionOf`): a
- * kind allowed there for this page is `allow`.
+ * What the settings make of one kind for one connection, as its agent is
+ * told it (`bridge/agent-calls.js`, `../settings-told.js`): a kind allowed
+ * there for this page is `allow`.
  * @param {{kind: string, connection: {id: string, kind: string}}} question
  * @param {{kinds: Record<string, string>}} settings
  * @param {Set<string>} grants
@@ -211,20 +234,14 @@ export function permissionsForAgent(settings) {
  * @param {{storage?: Storage|null}} [options]
  */
 export function createPermissionStore({ storage } = {}) {
-  const store = () => {
-    try {
-      return storage === undefined ? globalThis.localStorage ?? null : storage;
-    } catch {
-      return null;
-    }
-  };
+  const store = () => (storage === undefined ? webStorage('localStorage') : storage);
   let current;
   try {
     current = normalizePermissions(JSON.parse(store()?.getItem(PERMISSIONS_STORAGE_KEY) ?? 'null'));
   } catch {
     current = normalizePermissions(null);
   }
-  const listeners = new Set();
+  const listeners = createListenerSet('the agent permissions');
   return Object.freeze({
     get: () => current,
     /** Set kinds (`{kind: choice}`) or a whole mode (`mode`). */
@@ -240,12 +257,11 @@ export function createPermissionStore({ storage } = {}) {
       } catch {
         // A browser that keeps no site data: the settings last for this page.
       }
-      for (const listener of [...listeners]) listener(current);
+      listeners.notify(current);
       return current;
     },
     subscribe(listener) {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
+      return listeners.add(listener);
     },
   });
 }

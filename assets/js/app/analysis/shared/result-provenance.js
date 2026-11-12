@@ -11,6 +11,14 @@
  * - `genesReadFor`: for a result that read genes for a sample of the open
  *   cells (Genes read for), that sample's size, else null;
  * - `mapping`: a digest of the data mapping (which stored arrays are read);
+ * - `values`: the expression values its genes were read in, as the
+ *   analysis declares them (`form-based-analysis.js` `_valuesRead`): the
+ *   transform the matrix it reads is shown in (Data mapping › Expression
+ *   values: `raw`, `normalized`, `log1p`, `normalized-log1p`,
+ *   `data/expression-transform.js` `transformKey`), `raw` for one that reads
+ *   raw counts whatever the setting (pseudobulk sums them, UCell ranks), or
+ *   null for one that reads no gene values: a result goes stale only when
+ *   the values it read would change;
  * - `pages`: the highlight pages it was computed on, by name, with their
  *   cell count and a digest of their cells;
  * - `visible`: for an analysis of the visible cells, a digest of which cells
@@ -45,6 +53,12 @@
  */
 
 import { formatCountOf } from '../../../utils/format-units.js';
+import { transformKey } from '../../../data/expression-transform.js';
+
+/** Each expression values key (`transformKey`) in a person's words. */
+const VALUES_WORDS = Object.freeze({
+  raw: 'raw values', normalized: 'normalized', log1p: 'log1p', 'normalized-log1p': 'normalized · log1p',
+});
 import { hashValue, typedArrayDigest } from '../../history/value-pool.js';
 import { isPlainRecord, requireExactKeys } from '../../../utils/exact-record.js';
 import {
@@ -54,7 +68,7 @@ import {
   parseSamplePageId,
 } from './page-derivation-utils.js';
 
-export const PROVENANCE_KEYS = Object.freeze(['cells', 'dataset', 'genesReadFor', 'mapping', 'options', 'pages', 'visible']);
+export const PROVENANCE_KEYS = Object.freeze(['cells', 'dataset', 'genesReadFor', 'mapping', 'options', 'pages', 'values', 'visible']);
 
 const VISIBLE = new WeakMap();
 
@@ -68,7 +82,7 @@ function sameBytes(a, b) {
  * Which cells the view in focus shows now (its transparency, one byte a
  * cell) as an array never changed after it is returned, and a `revision`
  * that moves exactly when the set changes, not on every visibility pass (a
- * recolour runs one). Kept once per state, shared by every analysis of it:
+ * recolor runs one). Kept once per state, shared by every analysis of it:
  * a pass that left the set as it was costs one comparison, a change one copy.
  * Null without a transparency.
  *
@@ -135,9 +149,12 @@ function describePages(state, pageIds) {
  * @param {object} inputs.options - The settings that decide the result
  * @param {{cells: number, of: number}|null} inputs.genesReadFor - The gene sample genes were read for
  * @param {Uint8Array|null} inputs.visible - The visible cells (`visibleCellsNow`), for an analysis of them
+ * @param {import('../../../data/expression-transform.js').ExpressionTransform|null} inputs.values - The
+ *   expression values its genes are read in, as the analysis declares them; null: it reads no gene values
  * @returns {Promise<object>}
  */
-export async function captureProvenance({ state, dataset, pageIds, options, genesReadFor, visible }) {
+export async function captureProvenance({ state, dataset, pageIds, options, genesReadFor, visible, values }) {
+  if (values === undefined) throw new TypeError('A provenance names the expression values its genes are read in (null: none)');
   const identity = state?.cellIdentity ?? null;
   const mapping = state?.getDataMapping?.() ?? null;
   const pages = describePages(state, pageIds);
@@ -151,6 +168,7 @@ export async function captureProvenance({ state, dataset, pageIds, options, gene
       seed: identity.isSubset ? (dataset?.seed ?? null) : null,
     },
     genesReadFor: genesReadFor === null ? null : { cells: genesReadFor.cells, of: genesReadFor.of },
+    values: values === null ? null : transformKey(values),
     options: structuredClone(options),
   };
   const mappingTaken = mapping === null || typeof mapping !== 'object' ? null : structuredClone(mapping);
@@ -204,6 +222,10 @@ export function staleReasons(recorded, current) {
   if (recorded.mapping !== current.mapping) {
     reasons.push('The data mapping changed since this result.');
   }
+  if (recorded.values !== current.values) {
+    const words = key => (key === null ? 'no gene values' : VALUES_WORDS[key] ?? key);
+    reasons.push(`The expression values changed since this result (${words(recorded.values)} then, ${words(current.values)} now).`);
+  }
   const thenPages = recorded.pages.map(page => page.name);
   const nowPages = current.pages.map(page => page.name);
   if (!sameJson(thenPages, nowPages)) {
@@ -232,7 +254,7 @@ export function staleReasons(recorded, current) {
  */
 export function requireProvenance(value, label = 'Analysis result provenance') {
   requireExactKeys(value, PROVENANCE_KEYS, label);
-  const { dataset, cells, genesReadFor, mapping, pages, visible, options } = value;
+  const { dataset, cells, genesReadFor, mapping, pages, values, visible, options } = value;
   const text = (item, what) => {
     if (item !== null && typeof item !== 'string') throw new TypeError(`${label} ${what} must be text or null`);
   };
@@ -241,6 +263,7 @@ export function requireProvenance(value, label = 'Analysis result provenance') {
   };
   text(dataset, 'dataset');
   text(mapping, 'mapping');
+  if (values !== null && !Object.hasOwn(VALUES_WORDS, values)) throw new TypeError(`${label} values must be ${Object.keys(VALUES_WORDS).join(', ')} or null`);
   text(visible, 'visible');
   if (cells !== null) {
     requireExactKeys(cells, ['digest', 'method', 'of', 'open', 'seed'], `${label} cells`);
@@ -277,6 +300,7 @@ export function describeProvenance(provenance) {
     },
     genes_read_for: provenance.genesReadFor,
     mapping: provenance.mapping,
+    values: provenance.values === null ? null : VALUES_WORDS[provenance.values],
     pages: provenance.pages.map(page => ({ name: page.name, cells: page.cells })),
     visible_only: provenance.visible !== null,
   };

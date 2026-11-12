@@ -29,7 +29,7 @@ import {
  * user is looking at — `viewer.getAntialiasing()`. The app's own control
  * measures the difference at 18% of pixels at the default point size and 32%
  * with ultra-light square points (`index.html`, the antialiasing tooltip), so a
- * figure rasterised with multisampling the screen does not have is a different
+ * figure rasterized with multisampling the screen does not have is a different
  * picture of the same data, which is exactly what this module exists to
  * prevent.
  *
@@ -64,6 +64,8 @@ function renderState({ antialias = true } = {}) {
     },
     bgColor: Float32Array.from([1, 1, 1]),
     cameraDistance: 3,
+    // The sprite cap (rendering/point-sprite.js).
+    pointSizeMax: 160,
     cameraPosition: [0, 0, 3],
     far: 100,
     fogColor: Float32Array.from([1, 1, 1]),
@@ -120,6 +122,7 @@ function rasterizeWith(state, record) {
       renderState: state,
       outputWidthPx: 8,
       outputHeightPx: 8,
+      viewRect01: { x: 0, y: 0, width: 1, height: 1 },
       pointSizePx: 4,
     });
   } finally {
@@ -180,6 +183,7 @@ test('an exported view must publish the antialiasing it was drawn with', () => {
     data: {
       centroidColors: null,
       centroidFlags: { labels: false, points: false },
+      vectorField: null,
       centroidLabelTexts: [],
       centroidPositions: null,
       colors: Uint8Array.from([255, 255, 255, 255]),
@@ -189,6 +193,7 @@ test('an exported view must publish the antialiasing it was drawn with', () => {
     },
     id: 'live',
     label: 'Live',
+    name: null,
     renderState: renderState(),
     scientificState: {
       datasetGeneration: 7,
@@ -209,6 +214,7 @@ test('an exported view must publish the antialiasing it was drawn with', () => {
     dpi: null,
     format: 'svg',
     height: 100,
+    gridColumns: 1,
     meta: {
       views: [{
         fieldKey: null,
@@ -216,6 +222,8 @@ test('an exported view must publish the antialiasing it was drawn with', () => {
         filters: [],
         id: 'live',
         label: 'Live',
+        name: null,
+        vectorField: null,
       }],
     },
     options: {
@@ -245,7 +253,7 @@ test('an exported view must publish the antialiasing it was drawn with', () => {
       xLabel: 'X',
       yLabel: 'Y',
     },
-    selection: { highlightArray: null, totalCount: 0, visibleCount: 0 },
+    selection: { highlightArray: null, pageName: null, totalCount: 0, visibleCount: 0 },
     title: '',
     views: [structuredClone(view)],
     width: 100,
@@ -310,16 +318,6 @@ test('every export blocker names a control the shipped page carries', async () =
           'velocity-overlay-enabled': { checked: false },
         }),
         connectivityVisible: true,
-      }),
-    },
-    {
-      cause: 'velocity vector field drawn in the viewer',
-      label: 'Show overlay',
-      warnings: buildOverlayFidelityWarnings({
-        documentRef: documentWith({
-          'velocity-overlay-enabled': { checked: true },
-        }),
-        connectivityVisible: false,
       }),
     },
     {
@@ -445,9 +443,9 @@ test('an export blocked only by layers a switch turns off names the switch, so t
     documentRef: documentWith({ 'velocity-overlay-enabled': { checked: true } }),
     connectivityVisible: true,
   });
+  // The vector field is drawn (arrows on a grid, R9V-10): only the edges block.
   assert.deepEqual(edges.map(warning => warning.fix), [
     { label: 'edges', controlId: 'toggle-connectivity' },
-    { label: 'vector field', controlId: 'velocity-overlay-enabled' },
   ]);
   // A cause no switch turns off (an unreadable control) carries no fix: the dialog offers only Back.
   const unknown = buildOverlayFidelityWarnings({ documentRef: null, connectivityVisible: false });

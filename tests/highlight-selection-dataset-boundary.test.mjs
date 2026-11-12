@@ -42,7 +42,7 @@ function sliceSource(source, startNeedle, endNeedle) {
 
 /**
  * The exact viewer methods main.js invokes to retire an unconfirmed highlight
- * selection during dataset replacement. The behavioural fixture below replays
+ * selection during dataset replacement. The behavioral fixture below replays
  * this list, so a replacement path that retires nothing produces the stale
  * cross-dataset selection instead of silently passing.
  */
@@ -454,6 +454,8 @@ function createHighlightStateStub(pointCount) {
     getCellIndicesForRange() {
       return new Uint32Array(0);
     },
+    // What a field's values are in (an annotation group on a gene names them).
+    getLegendModel() { return { values: null }; },
     getFieldForView() {
       return null;
     },
@@ -540,7 +542,7 @@ test(
     // highlight group nobody selected is saved without a single rejection.
     assert.equal(state.savedGroups.length, 1);
     assert.deepEqual([...state.savedGroups[0].cellIndices], [1, 2, 3]);
-    assert.equal(state.savedGroups[0].label, 'Lasso (2 views) (3 cells)');
+    assert.equal(state.savedGroups[0].label, 'Lasso');
   }
 );
 
@@ -573,8 +575,8 @@ test(
     assert.equal(state.savedGroups[0].cellCount, 4);
     assert.equal(
       state.savedGroups[0].label,
-      'Lasso (4 cells)',
-      'a retired dataset-A step must not be counted as a second view'
+      'Lasso',
+      'named by its tool; the list shows its count'
     );
   }
 );

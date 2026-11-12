@@ -43,8 +43,11 @@ async function page() {
       catalog, version: '0.9.7', newTrackerId: () => 't-00000000-0000-4000-8000-0000000000ff', now: 1,
     }),
   };
+  const marked = [];
   const histories = {
     current: () => history,
+    // The whole history written down is no longer unkept (`dataset-history.js` `markSaved`).
+    markSaved: () => marked.push(history.active?.id ?? null),
     savedStates: {
       list: async () => [
         { id: 'a', kind: 'autosave', name: null, dataset: { id: 'demo', name: 'Demo' }, createdAt: 1, updatedAt: 2, steps: 3, trackers: [{ id: 't', name: 'T', steps: 3 }], bytes: 10, openable: true },
@@ -58,7 +61,7 @@ async function page() {
     dispatcher, histories, serializer, datasetFacts: () => ({ name: 'Demo', id: 'demo', cells: 1000, genes: 5 }),
     citation: async () => CITATION, download: (blob, file) => downloads.push({ blob, file }), version: () => '0.9.7',
   });
-  return { dispatcher, history, downloads, saves, removed, stop, shown };
+  return { dispatcher, history, downloads, saves, removed, stop, shown, marked };
 }
 
 test('before the history starts each is refused as unavailable', async () => {
@@ -109,7 +112,7 @@ test('a saved state deleted by its id, through the one way saved states are remo
 });
 
 test('Share writes what its parameters chose and downloads it; Save keeps it in this browser', async () => {
-  const { dispatcher, history, downloads, saves, stop } = await page();
+  const { dispatcher, history, downloads, saves, stop, marked } = await page();
   await history.startTracker();
   const shared = (await dispatcher.dispatch('history.share', { content: 'state', file: 'mine.cellucid-session' })).outcome;
   assert.equal(shared.content, 'state');
@@ -117,12 +120,15 @@ test('Share writes what its parameters chose and downloads it; Save keeps it in 
   assert.equal(shared.steps, 1);
   assert.equal(downloads[0].file, 'mine.cellucid-session');
   assert.equal(downloads[0].blob.size, shared.bytes);
+  assert.deepEqual(marked, [], 'a state written down leaves the history unkept');
   const read = await readHistoryFile(downloads[0].blob);
   assert.equal(read.manifest.scope.content, 'state');
   assert.equal(read.manifest.scope.times, 'none');
   const whole = (await dispatcher.dispatch('history.share', { include: [{ tracker: history.active.name, branches: ['Main'] }] })).outcome;
   assert.equal(whole.content, 'history');
   assert.equal(downloads[1].file, 'Demo.cellucid-session');
+  // Only the whole history written down marks it kept; a state alone leaves its steps unkept.
+  assert.deepEqual(marked, [history.active.id]);
   assert.deepEqual(whole.trackers, [{ id: history.active.id, name: history.active.name }]);
   const kept = (await dispatcher.dispatch('history.save', { name: 'Before reclustering', content: 'steps' })).outcome;
   assert.deepEqual(kept, { saved: 's1', name: 'Before reclustering', content: 'steps', bytes: 7, steps: 2 });

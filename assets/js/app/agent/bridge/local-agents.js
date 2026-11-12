@@ -15,7 +15,7 @@
  * while no viewer is open, the instructions, the status tool and the app
  * names -- is generated from here into `mcp-tools.json`
  * (`scripts/generate-action-catalog.mjs` writes it beside the action
- * catalogue, byte for byte in the three repositories, `mcpToolsDocument`).
+ * catalog, byte for byte in the three repositories, `mcpToolsDocument`).
  *
  * @module app/agent/bridge/local-agents
  */
@@ -60,10 +60,10 @@ export const LOCAL_AGENT_FALLBACK = 'Local agent';
 /**
  * The document the packages read (`mcp_tools.json`): the tools as a
  * connection with the person's default settings sees them (the relay's
- * bundled list too: the same function of the same catalogue), the local
+ * bundled list too: the same function of the same catalog), the local
  * instructions, the status tool and the app names.
  *
- * @param {{schema: number, actions: object[]}} catalog - a catalogue document (`action-catalog.json`)
+ * @param {{schema: number, actions: object[]}} catalog - a catalog document (`action-catalog.json`)
  * @param {string} catalogDigest - the SHA-256 (hex) of that document's canonical text
  */
 /**
@@ -91,7 +91,7 @@ export const LOCAL_DATA_RULE = Object.freeze({
 });
 
 export function mcpToolsDocument(catalog, catalogDigest) {
-  if (!/^[0-9a-f]{64}$/.test(catalogDigest)) throw new TypeError('The catalogue digest is a SHA-256 in hex');
+  if (!/^[0-9a-f]{64}$/.test(catalogDigest)) throw new TypeError('The catalog digest is a SHA-256 in hex');
   return {
     schema: MCP_TOOLS_SCHEMA,
     catalogDigest,

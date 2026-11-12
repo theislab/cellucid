@@ -9,8 +9,8 @@
  * Steps: `open` (for a stream format, R objects and MatrixMarket folders,
  * this is the one pass that reads and transcodes the whole file), `metadata`,
  * `embedding` (the default 2D embedding, as the first draw reads it), `obs
- * field` (the first categorical field, the first colouring), `first gene`
- * and `next gene` (`getMatrixColumn`, the first gene colouring). `firstViewMs`
+ * field` (the first categorical field, the first coloring), `first gene`
+ * and `next gene` (`getMatrixColumn`, the first gene coloring). `firstViewMs`
  * is open + metadata + embedding. `peakRssMB` is the process's peak resident
  * memory.
  *

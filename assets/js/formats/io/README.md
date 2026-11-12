@@ -48,6 +48,7 @@ picks a decoder per codec family by measuring them on the pool, kept by
 | `range-cache.js` | Worker side of the page's range cache (`data/byte-range-cache.js` is the page side). |
 | `activity.js` | `ReadActivity`: what one operation read (requests, bytes, chunks), for progress and the read activity log. |
 | `decode-pool.js`, `decode-worker.js`, `decoded-budget.js` | Decoding off the reader thread; one byte budget for decoded chunks of a store. |
+| `byte-cache.js` | The one least-recently-used cache of decoded pieces of a store (`ByteCache`): a Zarr store's decoded chunks and shard indexes, an HDF5 file's decoded chunks and global heap collections, charged to a `decoded-budget.js` budget. |
 | `decoder-choice.js`, `decoder-memory.js` | Measured decoder choice per family, kept in IndexedDB. |
 | `inflate.js`, `wasm-codecs.js`, `shuffle.js`, `lz-match.js`, `byte-order.js` | Codecs and byte-level primitives. |
 | `deflate-seek.js` | Random access into an unindexed DEFLATE stream (rapidgzip technique). Today imported only by `tests/text-matrix-stream-contract.test.mjs`; see the tidiness findings. |

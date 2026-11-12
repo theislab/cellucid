@@ -13,6 +13,18 @@ import {
 } from './browser-test-ports.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// `npm run serve` (`--published-catalog`): the app as a developer runs it on
+// this machine, the page naming the published sample catalog as deployed.
+// Without it, the browser tests' page, naming the suite's own catalog. Either
+// way every answer is `Cache-Control: no-store`, so an edited module is the
+// one the next reload runs (a server without cache headers, such as
+// `python -m http.server`, lets the browser keep a module it guessed fresh).
+const PUBLISHED_CATALOG_FLAG = '--published-catalog';
+const unknownArguments = process.argv.slice(2).filter(argument => argument !== PUBLISHED_CATALOG_FLAG);
+if (unknownArguments.length > 0) {
+  throw new TypeError(`serve-browser-tests.mjs takes only ${PUBLISHED_CATALOG_FLAG}; received ${unknownArguments.join(' ')}.`);
+}
+const publishedCatalog = process.argv.includes(PUBLISHED_CATALOG_FLAG);
 const { host, port, samplePort } = resolveBrowserTestPorts();
 const inventory = JSON.parse(
   await readFile(
@@ -98,12 +110,13 @@ function sendBytes(request, response, bytes, contentType, allowCors) {
   response.end(request.method === 'HEAD' ? undefined : bytes);
 }
 
-// The page as deployed names the published sample catalog. Here it names the
-// suite's own: a spec's page never depends on the published site by opening
+// The page as deployed names the published sample catalog, and so does
+// `npm run serve`. For the browser tests it names the suite's own: a spec's page never depends on the published site by opening
 // the app (`tests/browser/helpers/outside-requests.mjs`), whatever its
 // address, and a spec about another catalog still names it (`?sampleCatalog=`).
 async function servedIndexPage(request) {
   const html = await readFile(path.join(repositoryRoot, 'index.html'), 'utf8');
+  if (publishedCatalog) return Buffer.from(html);
   const catalog = `http://${request.headers.host}/tests/browser/fixtures/catalog/`;
   const page = html.replace(
     /(<meta name="cellucid-sample-catalog" content=")[^"]*(")/,
@@ -176,10 +189,15 @@ async function serve(request, response) {
   const portableRelative = relative.split(path.sep).join('/');
   // The keys of a Zarr store folder carry no extension (`.zgroup`, `X/0.0`,
   // `zarr.json`): every file below a `.zarr/` folder is served as bytes.
+  // The CORS port serves datasets opened by link: every file the site does not
+  // type (a .loom, an .rds, a MatrixMarket folder's matrix.mtx.gz, whatever the
+  // app reads now or later) is its bytes. The application port stays exact:
+  // an unknown type there is a site file the inventory has not typed.
   const contentType = pathname === '/_cellucid/health'
     ? 'text/plain; charset=utf-8'
     : inventoryContentTypes.get(portableRelative) ??
-      (/\.zarr\//.test(portableRelative) ? 'application/octet-stream' : contentTypes.get(extension));
+      (/\.zarr\//.test(portableRelative) ? 'application/octet-stream' : contentTypes.get(extension)) ??
+      (allowCors ? 'application/octet-stream' : undefined);
   if (contentType === undefined) {
     send(
       response,
@@ -363,7 +381,7 @@ listenOnce(
   `CORS sample server listening on http://${host}:${samplePort}\n`
 );
 
-// Last line of defence. Every path above is handled, but a static server that
+// Last line of defense. Every path above is handled, but a static server that
 // dies takes an entire batch with it and reports the death nowhere near its
 // cause, so an escape is logged and survived rather than fatal.
 process.on('uncaughtException', error => {

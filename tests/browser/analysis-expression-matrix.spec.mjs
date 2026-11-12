@@ -1,5 +1,5 @@
 /**
- * An analysis's "Expression matrix" and a result gene that colours the cells.
+ * An analysis's "Expression matrix" and a result gene that colors the cells.
  *
  * The fixture has X (four genes), layers['counts'] (X times ten) and raw with
  * its own genes (X's four and EXTRA). raw holds more genes than X, so the file
@@ -9,12 +9,14 @@
  * found. Nothing shown changes: the gene list keeps raw's genes. The same file
  * opened from disk lists the same matrices and reads the same values.
  *
- * Clicking a gene of a marker or DE result colours the cells by it through the
+ * Clicking a gene of a marker or DE result colors the cells by it through the
  * sidebar's gene selector, whose search box then names it; a gene the shown
- * list lacks is said in a notification and colours nothing.
+ * list lacks is said in a notification and colors nothing.
  *
  * Differential expression with Replicates set to the sample field is a
- * pseudobulk test: Welch's t across the per-sample means of the mapped matrix.
+ * pseudobulk fit: limma's moderated t across the samples of the mapped
+ * matrix (its numbers are pinned to edgeR/limma in
+ * `tests/analysis-pseudobulk-limma.test.mjs`).
  */
 import { expect, test } from './helpers/test.mjs';
 import { anndataZarrZip, fulfillFile } from './helpers/anndata-zarr-zip.mjs';
@@ -138,7 +140,9 @@ test('marker genes, DE and dot plot read the matrix chosen for them; nothing sho
   const matrices = await page.evaluate(() => window._comparisonModule.dataLayer.getExpressionMatrices());
   expect(matrices).toEqual({
     choices: [
-      { value: 'mapped', label: 'Mapped (raw)' },
+      // The mapped matrix named as the file names it (`expressionMatrixName`),
+      // and by its own value as well (`aliases`: `raw` picks the same choice).
+      { value: 'mapped', label: 'Mapped (raw.X)', aliases: ['raw'] },
       { value: 'X', label: 'X', counts: false },
       { value: 'layer:counts', label: "layers['counts']", counts: false },
     ],
@@ -150,7 +154,7 @@ test('marker genes, DE and dot plot read the matrix chosen for them; nothing sho
   await markers.locator('.analysis-more-options > .disclosure-header').click();
   await markers.locator('.analysis-options-group > .disclosure-header-row > .disclosure-header', { hasText: 'Test' }).click();
   const select = markers.getByLabel('Expression matrix', { exact: true });
-  await expect(select.locator('option')).toHaveText(['Mapped (raw)', 'X', "layers['counts']"]);
+  await expect(select.locator('option')).toHaveText(['Mapped (raw.X)', 'X', "layers['counts']"]);
   await select.selectOption('X');
   await run(page, markers, 'genesPanel', { groupBy: 'cluster' }, 'Run marker genes');
   const markerRun = await page.evaluate(() => {
@@ -206,7 +210,7 @@ test('marker genes, DE and dot plot read the matrix chosen for them; nothing sho
   expect(errors).toEqual([]);
 });
 
-test('a result gene colours the cells, and the sidebar gene search names it', async ({ page }) => {
+test('a result gene colors the cells, and the sidebar gene search names it', async ({ page }) => {
   const errors = observeProductErrors(page);
   await openFromLink(page, fixture());
   const markers = await openPanel(page, 'genesPanel');
@@ -222,7 +226,7 @@ test('a result gene colours the cells, and the sidebar gene search names it', as
     return state.activeFieldSource === 'var' ? state.varData.fields[state.activeVarFieldIndex].key : null;
   })).toBe(name);
 
-  // A gene the shown list lacks colours nothing and says so.
+  // A gene the shown list lacks colors nothing and says so.
   await page.evaluate(() => window._comparisonModule.colorByGene('NOPE'));
   await expect(page.locator('#gene-expression-search')).toHaveValue(name);
   expect(errors).toEqual([]);
@@ -274,7 +278,7 @@ test('differential expression with a sample field tests the samples, not the cel
   expect(result.method).toBe('pseudobulk');
   // Every sample holds 20 cells of each side: none under the minimum, every
   // gene measured in every sample.
-  expect(result.replicates).toEqual({
+  expect(result.replicates).toMatchObject({
     field: 'sample',
     samplesA: 4,
     samplesB: 4,
@@ -285,17 +289,21 @@ test('differential expression with a sample field tests the samples, not the cel
     cellsInSmallSamples: 0,
     genesWithUnmeasuredSamples: 0,
   });
+  expect(result.replicates.model).toMatchObject({ design: '~ group', samples: 8 });
   // The mapped matrix is raw.
   const unitMeans = group => SAMPLES.map((_, sample) => mean(cellsOf(group).filter(cell => sampleOf(cell) === sample).map(cell => rawValue(cell, 0))));
   const a = unitMeans(0);
   const b = unitMeans(1);
   expect(result.row.nA).toBe(4);
   expect(result.row.nB).toBe(4);
-  expect(result.row.meanA).toBeCloseTo(mean(a), 5);
-  expect(result.row.meanB).toBeCloseTo(mean(b), 5);
-  const variance = values => values.reduce((sum, value) => sum + (value - mean(values)) ** 2, 0) / (values.length - 1);
-  const t = (mean(a) - mean(b)) / Math.sqrt(variance(a) / a.length + variance(b) / b.length);
-  expect(result.row.score).toBeCloseTo(t, 4);
-  await expect(de.locator('.analysis-result-line')).toContainText('Pseudobulk t-test');
+  if (!result.replicates.model.counts) {
+    // Values as stored: each side's mean of the samples' means.
+    expect(result.row.meanA).toBeCloseTo(mean(a), 5);
+    expect(result.row.meanB).toBeCloseTo(mean(b), 5);
+  }
+  expect(Math.sign(result.row.score)).toBe(Math.sign(mean(a) - mean(b)));
+  expect(result.row.pValue).toBeGreaterThanOrEqual(0);
+  expect(result.row.pValue).toBeLessThanOrEqual(1);
+  await expect(de.locator('.analysis-result-line')).toContainText('Pseudobulk limma');
   expect(errors).toEqual([]);
 });

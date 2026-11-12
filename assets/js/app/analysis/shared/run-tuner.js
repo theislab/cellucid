@@ -42,7 +42,7 @@
  *   are fetched, `ceil(consumeRate × (latency + bytesPerTask / bytesPerMs))`,
  *   plus the tasks in flight in the workers; consumeRate = workers / task
  *   time. Until the first measurements arrive it is twice the compute in
- *   flight. It is held to what 30 % of the budget buffers at the measured
+ *   flight. It is held to what 30% of the budget buffers at the measured
  *   bytes per task (`bufferedTasks`, the memory gate).
  * - **Adaptation**, once per window of max(250 ms, 32 tasks): 250 ms is the
  *   rate floor the reader's activity reporting uses, 32 tasks one full round

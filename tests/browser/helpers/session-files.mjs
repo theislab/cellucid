@@ -8,6 +8,9 @@
  * (`published-default.js`, as `cellucid-datasets` publishes one).
  */
 import { hashValue } from '../../../assets/js/app/history/value-pool.js';
+import { readBundle } from '../../../assets/js/app/session/bundle/reader.js';
+import { writeBundle } from '../../../assets/js/app/session/bundle/writer.js';
+import { gzipCompress, gzipDecompress } from '../../../assets/js/app/session/codecs/gzip.js';
 import { trimToPublishedDefault } from '../../../assets/js/app/session/published-default.js';
 import {
   readHistoryFile, readHistoryFileManifest, sessionHeaderOf, valuesAtStep, writeHistoryFile,
@@ -103,4 +106,38 @@ export function cameraStatesIn(value) {
   };
   visit(value);
   return out;
+}
+
+/**
+ * The same session file as a newer Cellucid would write it with a part of
+ * the state this version does not have (`domain`): stamped `version`, the
+ * shown tracker's last step also changing that part (to a value the file
+ * holds already). What the app reads part by part (F164).
+ *
+ * @param {Uint8Array|Buffer} bytes
+ * @param {{domain?: string, version?: string}} [options]
+ * @returns {Promise<Buffer>}
+ */
+export async function withStatePartThisVersionLacks(bytes, { domain = 'holograms', version = '99.0.0' } = {}) {
+  const { manifest, chunkStream } = await readBundle(new Blob([bytes]), { signal: null, onProgress: null });
+  const chunks = [];
+  for await (const chunk of chunkStream) chunks.push(chunk.bytes);
+  const changed = structuredClone(manifest);
+  changed.app.version = version;
+  const tracker = changed.trackers.find(candidate => candidate.id === changed.activeTracker);
+  const id = tracker.steps.at(-1);
+  const index = changed.chunks.findIndex(chunk => chunk.id === id);
+  const meta = changed.chunks[index];
+  const raw = meta.codec === 'gzip' ? await gzipDecompress(chunks[index], { maxOutputBytes: meta.uncompressedBytes, signal: null }) : chunks[index];
+  const steps = JSON.parse(new TextDecoder().decode(raw));
+  const step = steps.findLast(candidate => candidate.parent !== null);
+  const held = step.after[step.touches[0]];
+  step.touches = [...step.touches, domain];
+  step.before[domain] = held;
+  step.after[domain] = held;
+  const payload = new TextEncoder().encode(JSON.stringify(steps));
+  const stored = await gzipCompress(payload, { signal: null });
+  changed.chunks[index] = { ...meta, codec: 'gzip', storedBytes: stored.byteLength, uncompressedBytes: payload.byteLength };
+  chunks[index] = stored;
+  return Buffer.from(await writeBundle({ manifest: changed, chunks }).arrayBuffer());
 }

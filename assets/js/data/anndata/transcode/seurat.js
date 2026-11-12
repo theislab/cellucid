@@ -190,7 +190,7 @@ async function readAssay5(name, assay, context, notes) {
       })), allCells.length, allFeatures.length, context),
     });
   }
-  // X: the log-normalised data, else counts; then the rest.
+  // X: the log-normalized data, else counts; then the rest.
   layersOut.sort((a, b) => rank(a.name) - rank(b.name));
   const frame = await dataFrameOf(attribute(assay, 'meta.data'), context);
   const variable = new Set();

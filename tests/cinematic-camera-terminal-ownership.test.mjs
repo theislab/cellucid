@@ -3,6 +3,8 @@ import test from 'node:test';
 
 import { initCinematicCamera } from '../assets/js/app/ui/modules/cinematic-camera/index.js';
 import { getActions } from '../assets/js/app/actions/index.js';
+import { representationName } from '../assets/js/data/representation-names.js';
+import { CINEMATIC_DOM_KEYS, createStubElement } from './helpers/cinematic-camera-harness.mjs';
 
 const CAMERA_PATH_ACTIONS = getActions().catalog.list()
   .map(definition => definition.type)
@@ -55,21 +57,7 @@ function createDom() {
     setAllDuration: { value: '' }
   };
   const dom = {};
-  for (const key of [
-    'saveBtn',
-    'keyframeList',
-    'clearBtn',
-    'timingActions',
-    'setAllDuration',
-    'setAllBtn',
-    'defaultSpeedInput',
-    'defaultSpeedDisplay',
-    'positionInterp',
-    'rotationInterp',
-    'easingSelect',
-    'loopCheckbox',
-    'autoplayCheckbox'
-  ]) {
+  for (const key of CINEMATIC_DOM_KEYS) {
     dom[key] = createControl(defaults[key]);
   }
   return dom;
@@ -92,14 +80,10 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
   };
   globalThis.document = {
     activeElement: null,
-    createElement() {
-      return {
-        innerHTML: '',
-        set textContent(value) {
-          this.innerHTML = value;
-        }
-      };
-    },
+    // The page's elements as every Camera Path test fakes them (the
+    // caption overlay is mounted on the body).
+    body: { appendChild() {} },
+    createElement: () => createStubElement(),
     removeEventListener() {}
   };
 
@@ -135,9 +119,10 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
       navigation,
       dataSourceManager,
       focusedRepresentation: () => null,
+      representationNameOf: layout => representationName(layout),
     });
     // Its actions are provided while it lives.
-    assert.equal(CAMERA_PATH_ACTIONS.length, 8);
+    assert.equal(CAMERA_PATH_ACTIONS.length, 12);
     for (const type of CAMERA_PATH_ACTIONS) {
       assert.equal(getActions().provided(type), true, `${type} is provided`);
     }
@@ -196,6 +181,7 @@ test('cinematic-camera destroy cancels and fences DOM and list-frame owners', ()
       navigation,
       dataSourceManager,
       focusedRepresentation: () => null,
+      representationNameOf: layout => representationName(layout),
     });
     for (const type of CAMERA_PATH_ACTIONS) {
       assert.equal(getActions().provided(type), true, `${type} is provided again`);

@@ -2,14 +2,21 @@
  * @fileoverview Keyframe data model for cinematic camera paths.
  *
  * Stores an ordered list of camera-state snapshots (keyframes), each with an
- * editable label and a per-segment transition duration.  Emits a single
- * `'changed'` event on every mutation so the UI can re-render.
+ * editable label, a per-segment transition duration and a hold (the seconds
+ * the camera rests there before moving on).  Emits a single `'changed'` event
+ * on every mutation so the UI can re-render.
+ *
+ * A hold of 0 is no `hold` key at all, and a keyframe with one holds a
+ * positive number of seconds: one value per path, so the `camera-path`
+ * domain compares, hashes and stores a path without holds exactly as a path
+ * of a Cellucid before holds (session format 4 is read unchanged).
  *
  * @module ui/modules/cinematic-camera/keyframe-store
  */
 
 import { isExactCameraState } from '../../../../rendering/camera-state-contract.js';
-import { createOpaqueId } from '../../../utils/opaque-id.js';
+import { createListenerSet } from '../../../../utils/listener-set.js';
+import { createOpaqueId } from '../../../../utils/opaque-id.js';
 
 /** The shortest transition a keyframe pair may declare; there is no longest. */
 export const MIN_TRANSITION_DURATION_SECONDS = 0.1;
@@ -23,6 +30,18 @@ const KEYFRAME_KEYS = [
   'representation',
   'transitionDuration'
 ];
+/** The keys of a keyframe that holds (`KEYFRAME_KEYS` and `hold`), sorted. */
+const HOLDING_KEYFRAME_KEYS = [...KEYFRAME_KEYS.slice(0, 5), 'hold', ...KEYFRAME_KEYS.slice(5)].sort();
+
+/** Whether `seconds` is a hold a keyframe can take: 0 (none) or any finite positive number. */
+export function isValidKeyframeHold(seconds) {
+  return Number.isFinite(seconds) && seconds >= 0;
+}
+
+/** The seconds the camera rests at `keyframe` before moving on (0 when it does not). */
+export function keyframeHold(keyframe) {
+  return Object.hasOwn(keyframe, 'hold') ? keyframe.hold : 0;
+}
 
 /**
  * The representation a keyframe was recorded on: the embedding reference of
@@ -83,9 +102,11 @@ function createStoredKeyframe({
   orbit,
   freefly,
   representation,
-  transitionDuration
+  transitionDuration,
+  hold = 0
 }) {
   return Object.freeze({
+    ...(hold > 0 ? { hold } : {}),
     id,
     label,
     navigationMode,
@@ -135,7 +156,8 @@ function cloneKeyframeForExport(keyframe) {
           ? null
           : [...keyframe.representation.columns]
       },
-    transitionDuration: keyframe.transitionDuration
+    transitionDuration: keyframe.transitionDuration,
+    ...(keyframeHold(keyframe) > 0 ? { hold: keyframe.hold } : {})
   };
 }
 
@@ -167,12 +189,15 @@ export function isValidCameraKeyframe(value) {
     return false;
   }
   const keys = Object.keys(value).sort();
+  const expected = Object.hasOwn(value, 'hold') ? HOLDING_KEYFRAME_KEYS : KEYFRAME_KEYS;
   if (
-    keys.length !== KEYFRAME_KEYS.length ||
-    keys.some((key, index) => key !== KEYFRAME_KEYS[index])
+    keys.length !== expected.length ||
+    keys.some((key, index) => key !== expected[index])
   ) {
     return false;
   }
+  // A hold is a positive number of seconds; none is no `hold` key.
+  if (Object.hasOwn(value, 'hold') && !(isValidKeyframeHold(value.hold) && value.hold > 0)) return false;
   if (!isExactCameraState({
     navigationMode: value.navigationMode,
     orbit: value.orbit,
@@ -225,6 +250,8 @@ export function isCameraPathReady(keyframes) {
  * @property {{key: string, columns: number[]|null}|null} representation
  *                                                The embedding it was recorded on.
  * @property {number|null}  transitionDuration  Seconds to next keyframe, or null for auto-pace.
+ * @property {number}       [hold]              Seconds the camera rests here before moving on
+ *                                                (positive; absent when it does not rest).
  */
 
 /**
@@ -233,19 +260,18 @@ export function isCameraPathReady(keyframes) {
  * kept as it is; a camera path action naming such a label is refused).
  *
  * @returns {{ add, remove, rename, reorder, setDuration, setAllDurations,
- *             getAll, getCount, getById, clear, on, off }}
+ *             setHold, setAllHolds, getAll, getCount, getById, clear, on, off }}
  */
 export function createKeyframeStore() {
   /** @type {Keyframe[]} */
   let keyframes = [];
   let nextIndex = 1;
 
-  // Minimal event emitter (single event type: 'changed')
-  /** @type {Set<() => void>} */
-  const listeners = new Set();
+  // One event type: 'changed'.
+  const listeners = createListenerSet('the camera keyframes');
 
   function emit() {
-    for (const fn of listeners) fn();
+    listeners.notify();
   }
 
   function assertChangedListener(event, fn) {
@@ -280,9 +306,10 @@ export function createKeyframeStore() {
    * @param {string|undefined} label  A custom label, or undefined for "KF n".
    * @param {{key: string, columns: number[]|null}|null} representation
    *   The embedding the view it was captured in shows.
+   * @param {number} [hold=0]  Seconds the camera rests there before moving on.
    * @returns {string}  The new keyframe's id.
    */
-  function add(cameraState, label, representation) {
+  function add(cameraState, label, representation, hold = 0) {
     if (!isValidCameraState(cameraState)) {
       throw new TypeError(
         'Camera path keyframes require an exact synchronized camera state.'
@@ -306,13 +333,14 @@ export function createKeyframeStore() {
       );
     }
     if (labelInUse(exactLabel, null)) {
-      throw new RangeError(`A camera path keyframe is labelled "${exactLabel}" already.`);
+      throw new RangeError(`A camera path keyframe is labeled "${exactLabel}" already.`);
     }
     if (!isValidKeyframeRepresentation(representation)) {
       throw new TypeError(
         'Camera path keyframes record the representation they were captured on, or null.'
       );
     }
+    assertHold(hold);
     const id = createOpaqueId();
     keyframes.push(createStoredKeyframe({
       id,
@@ -321,7 +349,8 @@ export function createKeyframeStore() {
       orbit: cameraState.orbit,
       freefly: cameraState.freefly,
       representation,
-      transitionDuration: null // auto-pace by default
+      transitionDuration: null, // auto-pace by default
+      hold
     }));
     if (usesDefaultLabel) nextIndex++;
     emit();
@@ -352,7 +381,7 @@ export function createKeyframeStore() {
       );
     }
     if (labelInUse(newLabel, id)) {
-      throw new RangeError(`A camera path keyframe is labelled "${newLabel}" already.`);
+      throw new RangeError(`A camera path keyframe is labeled "${newLabel}" already.`);
     }
     keyframes[index] = createStoredKeyframe({
       ...keyframes[index],
@@ -428,6 +457,35 @@ export function createKeyframeStore() {
         ...keyframes[i],
         transitionDuration: duration
       });
+    }
+    emit();
+  }
+
+  function assertHold(seconds) {
+    if (!isValidKeyframeHold(seconds)) {
+      throw new TypeError('Camera path hold must be a finite number of seconds, 0 or more.');
+    }
+  }
+
+  /**
+   * Set how long the camera rests at the keyframe at `index` before moving on.
+   * @param {number} index    Keyframe index (0-based).
+   * @param {number} seconds  0 for no rest.
+   */
+  function setHold(index, seconds) {
+    if (!Number.isInteger(index) || index < 0 || index >= keyframes.length) {
+      throw new RangeError(`Camera path keyframe index is out of range: ${String(index)}.`);
+    }
+    assertHold(seconds);
+    keyframes[index] = createStoredKeyframe({ ...keyframes[index], hold: seconds });
+    emit();
+  }
+
+  /** Set the same hold on every keyframe. */
+  function setAllHolds(seconds) {
+    assertHold(seconds);
+    for (let i = 0; i < keyframes.length; i++) {
+      keyframes[i] = createStoredKeyframe({ ...keyframes[i], hold: seconds });
     }
     emit();
   }
@@ -509,6 +567,8 @@ export function createKeyframeStore() {
     reorder,
     setDuration,
     setAllDurations,
+    setHold,
+    setAllHolds,
     getAll,
     getCount,
     getById,

@@ -9,6 +9,11 @@
  *   through the shared sign-in store (`data/sources/auth/token-store.js`;
  *   never `localStorage`): a reload keeps the sign-in until the token
  *   expires, then it is forgotten
+ * - Accepts a token only for a sign-in this tab started: `signIn()` keeps a
+ *   random state in the tab's `sessionStorage` and names it in the address
+ *   GitHub returns to (`#cellucid_github_state=…`, which the worker keeps);
+ *   a callback whose state is not that one is refused, so a link carrying
+ *   someone else's token cannot sign this tab in as them (login CSRF)
  * - Sign out revokes the token at GitHub through the worker
  *   (`${WORKER_ORIGIN}/auth/revoke`), then forgets it
  * - Fetches user identity from `${WORKER_ORIGIN}/auth/user`
@@ -24,14 +29,17 @@ import {
   readSignIn,
   removeSignIn,
   setSignInExpiry,
+  takeSignInPending,
   writeSignIn,
+  writeSignInPending,
 } from '../../data/sources/auth/token-store.js';
 import {
   isCanonicalGitHubAccount,
   isCanonicalGitHubRepositoryFullName,
 } from './github-reference.js';
 import { requireExactObjectKeys } from '../../utils/exact-record.js';
-import { isCancellation, cancelled, onAbort } from '../../utils/abort.js';
+import { randomHex } from '../../utils/byte-text.js';
+import { isCancellation, cancelled, onAbort, requireSignalOrNull } from '../../utils/abort.js';
 import {
   AUTH_ERROR_PARAM,
   AUTH_FLAG_PARAM,
@@ -55,26 +63,46 @@ const DEFAULT_WORKER_ORIGIN = 'https://api.cellucid.com';
 /** The sign-in's name in the shared store: `cellucid:github-app-auth:session`. */
 const SIGN_IN_NAME = 'github-app';
 
-function assertAbortSignalOrNull(signal) {
-  if (
-    signal !== null &&
-    (
-      typeof signal !== 'object' ||
-      typeof signal.aborted !== 'boolean' ||
-      typeof signal.addEventListener !== 'function' ||
-      typeof signal.removeEventListener !== 'function'
-    )
-  ) {
-    throw new TypeError(
-      'GitHub authentication request signal must be an AbortSignal or exact null'
-    );
+/**
+ * The state of the sign-in this tab started (`signIn`), in the tab's
+ * `sessionStorage` until GitHub's answer comes back, and the fragment field
+ * that carries it there and back (the worker keeps every field of the
+ * return address that is not one of its own).
+ */
+export const SIGN_IN_STATE_STORAGE_KEY = 'cellucid:github-app-auth:pending';
+export const SIGN_IN_STATE_PARAM = 'cellucid_github_state';
+
+/** A new state (128 random bits) for the sign-in this tab starts, kept in the tab's sign-in store. */
+function beginSignInState() {
+  const state = randomHex(16);
+  try {
+    writeSignInPending(SIGN_IN_NAME, state);
+  } catch (cause) {
+    throw storageFailure('keep the state of', cause);
   }
-  return signal;
+  return state;
+}
+
+/** The state of the sign-in this tab started, taken (one answer per sign-in), or null. */
+function takeSignInState() {
+  return takeSignInPending(SIGN_IN_NAME);
+}
+
+/** A fragment (no `#`) without its state field: what is left, and the state when it was there exactly once. */
+function takeStateField(hash) {
+  const kept = [];
+  const states = [];
+  for (const segment of hash.split('&')) {
+    const [name, value] = [...new URLSearchParams(segment).entries()][0] ?? [null, null];
+    if (name === SIGN_IN_STATE_PARAM) states.push(value);
+    else kept.push(segment);
+  }
+  return { hash: kept.join('&'), kept: kept.length, state: states.length === 1 ? states[0] : null };
 }
 
 /** The caller stopped a GitHub authentication request: a cancellation naming its address. */
 function requestCancelled(url, cause = undefined) {
-  const error = cancelled('user', 'GitHub authentication request was cancelled.', cause);
+  const error = cancelled('user', 'GitHub authentication request was canceled.', cause);
   if (url !== null) error.url = url;
   return error;
 }
@@ -86,35 +114,6 @@ function createAuthSupersededError(cause = undefined) {
   error.code = 'GITHUB_AUTH_SUPERSEDED';
   if (cause !== undefined) error.cause = cause;
   return error;
-}
-
-function reportAuthListenerFailures(errors) {
-  if (errors.length === 0) return;
-  let failure = errors.length === 1
-    ? errors[0]
-    : new AggregateError(
-      errors,
-      'Multiple GitHub authentication change listeners failed'
-    );
-  if (typeof globalThis.reportError === 'function') {
-    try {
-      globalThis.reportError(failure);
-      return;
-    } catch (reportingFailure) {
-      failure = new AggregateError(
-        [failure, reportingFailure],
-        'GitHub authentication listener and error reporting both failed'
-      );
-    }
-  }
-  if (typeof globalThis.console?.error === 'function') {
-    globalThis.console.error(
-      '[Cellucid] GitHub authentication change listener failed',
-      failure
-    );
-    return;
-  }
-  throw failure;
 }
 
 function assertExactHttpOrigin(raw, label) {
@@ -580,15 +579,17 @@ function readAuthResultFromUrl(urlString) {
   if (!ownsFragment) return null;
 
   const params = new URLSearchParams(hash);
+  const retained = hasRetainedSegments ? takeStateField(cleanedHash) : { hash: '', kept: 0, state: null };
+  // Every other segment is kept byte for byte (an empty one too); a fragment that held only the state goes.
   const cleanedUrl =
     `${url.origin}${url.pathname}${url.search}` +
-    `${hasRetainedSegments ? `#${cleanedHash}` : ''}`;
+    `${retained.kept > 0 ? `#${retained.hash}` : ''}`;
 
   try {
     const { token, expiresIn, error } = validateAuthFragment(params);
-    return { token, expiresIn, error, cleanedUrl, validationError: null };
+    return { token, expiresIn, error, state: retained.state, cleanedUrl, validationError: null };
   } catch (validationError) {
-    return { token: null, expiresIn: null, error: null, cleanedUrl, validationError };
+    return { token: null, expiresIn: null, error: null, state: null, cleanedUrl, validationError };
   }
 }
 
@@ -633,7 +634,7 @@ export class GitHubAuthSession extends EventEmitter {
     token = this._token,
     { candidate = false } = {}
   ) {
-    const callerSignal = assertAbortSignalOrNull(signal);
+    const callerSignal = requireSignalOrNull(signal, 'GitHub authentication request signal');
     const sessionSignal = this._generationAbort.signal;
     const owner = {
       candidate,
@@ -692,36 +693,23 @@ export class GitHubAuthSession extends EventEmitter {
     }
   }
 
+  /**
+   * Tell the `changed` listeners who is signed in. A listener that changes
+   * it (signs out) has the newer news told; the rest do not hear the older.
+   * Returns whether what was told is still current.
+   */
   _emitChanged() {
     const generation = this._requestGeneration;
     const token = this._token;
     const user = this._user;
-    const listeners = this._listeners.get('changed');
-    if (listeners === undefined) return true;
-
-    const errors = [];
-    for (const callback of [...listeners]) {
-      try {
-        callback({
-          token,
-          user: user === null ? null : { ...user },
-        });
-      } catch (error) {
-        errors.push(error);
-      }
-      if (
-        generation !== this._requestGeneration ||
-        token !== this._token ||
-        user !== this._user
-      ) {
-        break;
-      }
-    }
-    reportAuthListenerFailures(errors);
-    return (
-      generation === this._requestGeneration &&
-      token === this._token &&
-      user === this._user
+    return this.emitWhile(
+      'changed',
+      Object.freeze({ token, user: user === null ? null : Object.freeze({ ...user }) }),
+      () => (
+        generation === this._requestGeneration &&
+        token === this._token &&
+        user === this._user
+      ),
     );
   }
 
@@ -974,6 +962,8 @@ export class GitHubAuthSession extends EventEmitter {
     }
     const result = readAuthResultFromUrl(callbackUrl);
     if (!result) return null;
+    // One answer per sign-in started: the state is taken whatever the answer.
+    const started = takeSignInState();
 
     if (result.cleanedUrl) {
       if (typeof window.history?.replaceState !== 'function') {
@@ -1002,12 +992,21 @@ export class GitHubAuthSession extends EventEmitter {
       throw err;
     }
 
+    if (started === null || result.state !== started) {
+      const err = new Error(
+        'This GitHub sign-in was not started in this tab, so it was not used: a link can carry ' +
+        'someone else\'s sign-in. Sign in again from Community annotation.'
+      );
+      err.code = 'GITHUB_AUTH_NOT_STARTED_HERE';
+      throw err;
+    }
+
     return this._acceptToken(result.token, result.expiresIn);
   }
 
   async signIn({ returnTo = null, signal = null } = {}) {
     if (typeof window === 'undefined') throw new Error('GitHub login requires a browser context');
-    const ownerSignal = assertAbortSignalOrNull(signal);
+    const ownerSignal = requireSignalOrNull(signal, 'GitHub authentication request signal');
     const workerOrigin = this.getWorkerOrigin();
     const rawHash = String(window.location.hash || '').replace(/^#/, '');
     const retainedFragment = rawHash
@@ -1027,7 +1026,6 @@ export class GitHubAuthSession extends EventEmitter {
       throw new Error('GitHub sign-in returnTo must be an exact nonblank URL');
     }
     const url = new URL(getGitHubLoginUrl(workerOrigin));
-    url.searchParams.set('return_to', rt);
     if (typeof window.location.assign !== 'function') {
       throw new Error('GitHub sign-in requires location.assign()');
     }
@@ -1040,6 +1038,12 @@ export class GitHubAuthSession extends EventEmitter {
     try {
       await this._verifyWorkerForOwner(owner);
       this._assertRequestOwnerCurrent(owner);
+      // The return address names a fresh state in its fragment (every other
+      // part of it kept byte for byte); the answer is taken only with it.
+      const state = beginSignInState();
+      const cut = rt.indexOf('#');
+      const kept = cut === -1 ? '' : takeStateField(rt.slice(cut + 1)).hash;
+      url.searchParams.set('return_to', `${cut === -1 ? rt : rt.slice(0, cut)}#${kept === '' ? '' : `${kept}&`}${SIGN_IN_STATE_PARAM}=${state}`);
       window.location.assign(url.toString());
       return url.toString();
     } finally {

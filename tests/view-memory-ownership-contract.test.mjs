@@ -118,7 +118,7 @@ test('colors handed to a snapshot are frozen even when no other context holds th
   assert.deepEqual(Array.from(writable), [1, 2, 3, 255]);
 });
 
-test('every colours write is counted on the array written, a copy starting its own count', () => {
+test('every colors write is counted on the array written, a copy starting its own count', () => {
   const state = twoViewState();
   const shared = state.colorsArray;
   const written = writableColors(state);

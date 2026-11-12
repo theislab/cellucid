@@ -398,6 +398,9 @@ test('public retirement repairs hidden-live focus to a surviving snapshot', asyn
     const viewer = window._cellucidViewer;
     const state = window._cellucidState;
     const ui = window._cellucidUi;
+    // The fixture opens colored by its cell types (`first-coloring.js`):
+    // the views are kept uncolored, so the survivor shows no field.
+    state.clearActiveField();
     const payload = state.getSnapshotPayload();
     const makeConfig = label => ({
       label,

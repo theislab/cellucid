@@ -24,7 +24,7 @@
  * Before a download starts (nothing of it kept), the page's download gate
  * is asked (`setWholeDownloadGate`): the app asks the person there when an
  * agent opened the dataset (`app/ui/modules/dataset-open-action.js`), and a
- * refusal ends the opening as cancelled, so what was open stays open.
+ * refusal ends the opening as canceled, so what was open stays open.
  *
  * @module data/whole-download
  */

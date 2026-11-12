@@ -49,12 +49,20 @@ export const PAGE_BUNDLE_FILE = /^([a-z0-9-]+)\.([A-Z2-7]{8})\.js(\.map)?$/;
  *   relative to itself (`build-worker-bundles.mjs`).
  * - `assets/js/workers/worker-script.js` holds the listeners of worker start
  *   failures; `scripts.js` imports it, so the page shares that one instance.
+ * - `assets/js/utils/listener-set.js`, which `worker-script.js` imports (its
+ *   failure listeners are a listener set).
  * - `assets/js/app/asset-url.js` resolves a shipped file through the page's
  *   import map (`import.meta.resolve`).
+ *
+ * An external imports nothing but other externals (`externalImports`; the
+ * build refuses one that does): a module it imported from the sources would
+ * be asked for by a deployed page beside its copy in the bundle, a second
+ * instance (round 9: `worker-script.js` came to import `listener-set.js`).
  */
 export const PAGE_EXTERNALS = Object.freeze([
   WORKER_SCRIPTS_PATH,
   'assets/js/workers/worker-script.js',
+  'assets/js/utils/listener-set.js',
   'assets/js/app/asset-url.js',
 ]);
 
@@ -86,6 +94,15 @@ export async function buildPageBundle({ rootDir, externalBytes = new Map() }) {
   for (const path of PAGE_EXTERNALS) {
     const bytes = externalBytes.get(path) ?? await readFile(join(exactRoot, ...path.split('/')));
     externals.set(resolve(exactRoot, ...path.split('/')), externalSpecifier(path, versionOf(bytes)));
+    for (const imported of externalImports(path, bytes.toString('utf8'))) {
+      if (!PAGE_EXTERNALS.includes(imported)) {
+        throw new Error(
+          `${path} is imported at its own address (PAGE_EXTERNALS) and imports ${imported}, `
+            + 'which a deployed page would then ask for from the sources beside its copy in the bundle: '
+            + 'an external imports only other externals (add it to PAGE_EXTERNALS, or import nothing).'
+        );
+      }
+    }
   }
   const result = await esbuild.build({
     absWorkingDir: exactRoot,
@@ -158,6 +175,27 @@ export async function buildPageBundle({ rootDir, externalBytes = new Map() }) {
     }
   }
   return { files, entry, preload: [...preload].sort(), inputs };
+}
+
+/**
+ * The modules `path` imports (statically, re-exported or on demand), each as
+ * a path from the root: what `text`, its code, names relatively.
+ *
+ * @param {string} path
+ * @param {string} text
+ * @returns {string[]}
+ */
+export function externalImports(path, text) {
+  const code = text
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:\\])\/\/.*$/gm, '$1');
+  const found = [];
+  const pattern = /\b(?:import|export)\s*(?:[\w*{}\s,$]*?\bfrom\s*)?(['"])([^'"]+)\1|\bimport\s*\(\s*(['"])([^'"]+)\3\s*\)/g;
+  for (const match of code.matchAll(pattern)) {
+    const specifier = match[2] ?? match[4];
+    found.push(posix.normalize(posix.join(posix.dirname(path), specifier.split('?')[0])));
+  }
+  return found;
 }
 
 /** The code of a module with its comments and string contents blanked. */

@@ -18,12 +18,12 @@
  * @module ui/modules/dataset-controls
  */
 
+import { setControlAvailability } from '../core/control-availability.js';
 import {
   describeHostFault,
   validateDatasetIdentity,
   validateDatasetSummary
 } from '../../../data/data-source.js';
-import { formatCompactCount } from '../components/display-format.js';
 import { DATA_LOAD_METHODS } from '../../data-load-methods.js';
 import { debug } from '../../../utils/debug.js';
 import {
@@ -33,8 +33,9 @@ import {
   initDatasetConnections
 } from './dataset-connections.js';
 import { isPlainRecord, requireExactKeys, requireKeys, requirePlainRecord } from '../../../utils/exact-record.js';
-import { formatOpenCells } from '../../../utils/format-units.js';
-import { isCancellation } from '../../../utils/abort.js';
+import { formatOpenCells, formatCompactCount } from '../../../utils/format-units.js';
+import { awaitWithSignal, isCancellation, onAbort, settleInBackground } from '../../../utils/abort.js';
+import { NO_DATASET_OPEN } from '../no-dataset.js';
 
 export const NONE_DATASET_VALUE = '__none__';
 /** What the dropdown shows while the open dataset is not one of its choices. */
@@ -327,6 +328,7 @@ export function initDatasetControls(options) {
     datasetChanges === null ||
     typeof datasetChanges !== 'object' ||
     typeof datasetChanges.begin !== 'function' ||
+    typeof datasetChanges.beginStartup !== 'function' ||
     typeof datasetChanges.beginIfNoActionSince !== 'function' ||
     typeof datasetChanges.whenSettled !== 'function' ||
     typeof datasetChanges.settled !== 'boolean' ||
@@ -393,7 +395,7 @@ export function initDatasetControls(options) {
   /**
    * The name each dataset gives itself, by `datasetSelectionValue`: what the
    * Dataset box shows for it (a file's name, a record's title, a server's
-   * name for it), learnt from every listing of every source, from the
+   * name for it), learned from every listing of every source, from the
    * startup selection and from every dataset shown. Whatever names a dataset
    * to the person (an opening's label, a failure) names it so, never by its
    * id: a link's id is its encoded address ("url:https%3A%2F%2F…").
@@ -410,6 +412,8 @@ export function initDatasetControls(options) {
   let pendingDatasetOption = null;
   // The catalog option of the dataset being opened: its label says so.
   let openingDatasetOption = null;
+  /** Whether the picker is reached for (pointer down or focus, until it is left or chosen in). */
+  let pickerReachedFor = false;
   let datasetConnections = null;
   let catalogRetryInFlight = false;
   // Whether the samples' files are read for the picker (their names and
@@ -538,7 +542,7 @@ export function initDatasetControls(options) {
         ? ensureNoneDatasetOption()
         : datasetOptionsByKey.get(intent.pending.value);
     if (option !== undefined) {
-      datasetSelect.value = option.value;
+      chooseDatasetValue(option.value);
       markOpeningOption(option === noneDatasetOption ? null : option);
     } else {
       markOpeningOption(null);
@@ -550,6 +554,7 @@ export function initDatasetControls(options) {
       pendingDatasetOption.textContent = UNLISTED_DATASET_LABEL;
       datasetSelect.appendChild(pendingDatasetOption);
       pendingDatasetOption.selected = true;
+      showOptionTexts();
     }
   }
 
@@ -566,7 +571,11 @@ export function initDatasetControls(options) {
     markOpeningOption(null);
     const pendingWasShown = removePendingDatasetOption();
     if (catalogIsPopulating()) return;
-    if (!intent.transaction.isLatest() || pendingWasShown) {
+    // A change stopped while still the newest (the opening's Cancel, the
+    // person keeping a dataset whose work is not kept, an agent's opening
+    // they denied) leaves the dataset shown: the select and the Dataset box,
+    // which said "Loading …", show it again.
+    if (!intent.transaction.isLatest() || pendingWasShown || intent.transaction.signal.aborted) {
       synchronizeDatasetSelectToCurrent();
     }
   }
@@ -670,7 +679,7 @@ export function initDatasetControls(options) {
     const value = datasetSelectionValue(sourceType, datasetId);
     if (datasetOptionsByKey.has(value)) {
       retireUnlistedDatasetOption();
-      datasetSelect.value = value;
+      chooseDatasetValue(value);
       if (datasetSelect.value !== value) {
         throw new Error(
           `Dataset select could not represent "${sourceType}/${datasetId}".`
@@ -679,7 +688,7 @@ export function initDatasetControls(options) {
       return;
     }
     ensureUnlistedDatasetOption();
-    datasetSelect.value = UNLISTED_DATASET_VALUE;
+    chooseDatasetValue(UNLISTED_DATASET_VALUE);
     if (datasetSelect.value !== UNLISTED_DATASET_VALUE) {
       throw new Error(
         `Dataset select could not represent "${sourceType}/${datasetId}" as unlisted.`
@@ -730,8 +739,35 @@ export function initDatasetControls(options) {
         option.dataset.sourceType
       );
       option.dataset.label = label;
-      option.textContent = option === openingDatasetOption ? `${label} ${OPENING_OPTION_SUFFIX}` : label;
+      showOptionText(option);
     }
+  }
+
+  /**
+   * What a listed option says: its label (name and cells), or, the one
+   * chosen while the picker is at rest, its name alone (the Dataset card
+   * above says its cells: bug hunt F8, owner 2026-11-10); the dataset being
+   * opened says so after it. A native select's closed label is its chosen
+   * option's text, so the text follows the picker: full while it is reached
+   * for (pointer, focus), short once it is left or a choice is made.
+   */
+  function showOptionText(option) {
+    if (option.dataset.label === undefined) return;
+    const atRest = option.selected && !pickerReachedFor;
+    const base = atRest ? (option.dataset.datasetName ?? option.dataset.label) : option.dataset.label;
+    const text = option === openingDatasetOption ? `${base} ${OPENING_OPTION_SUFFIX}` : base;
+    if (option.textContent !== text) option.textContent = text;
+  }
+
+  /** Every listed option's text, after the picker was reached for or left, or its choice changed. */
+  function showOptionTexts() {
+    for (const option of datasetOptionsByKey.values()) showOptionText(option);
+  }
+
+  /** Choose `value` in the picker, its options' texts following (`showOptionText`). */
+  function chooseDatasetValue(value) {
+    datasetSelect.value = value;
+    showOptionTexts();
   }
 
   /**
@@ -760,21 +796,18 @@ export function initDatasetControls(options) {
     // without the cell count the dropdown appends.
     option.dataset.datasetName = name;
     option.dataset.label = label;
-    option.textContent = label;
     datasetOptionsByKey.set(value, option);
+    showOptionText(option);
     return option;
   }
 
   /** Label `option` (or none) as the dataset being opened. */
   function markOpeningOption(option) {
     if (openingDatasetOption === option) return;
-    if (openingDatasetOption !== null) {
-      openingDatasetOption.textContent = openingDatasetOption.dataset.label;
-    }
+    const before = openingDatasetOption;
     openingDatasetOption = option;
-    if (option !== null) {
-      option.textContent = `${option.dataset.label} ${OPENING_OPTION_SUFFIX}`;
-    }
+    if (before !== null) showOptionText(before);
+    if (option !== null) showOptionText(option);
   }
 
   /** The select's options are being replaced: forget the ones it held. */
@@ -802,8 +835,9 @@ export function initDatasetControls(options) {
     const samples = dataSourceManager.getSource('local-demo');
     if (typeof samples?.listCatalogEntries !== 'function') return null;
     try {
-      if (!(await samples.isAvailable())) return null;
-      return { sourceType: 'local-demo', datasets: [...await samples.listCatalogEntries()], error: null };
+      const ended = lifecycleController.signal;
+      if (!(await awaitWithSignal(samples.isAvailable(), ended))) return null;
+      return { sourceType: 'local-demo', datasets: [...await awaitWithSignal(samples.listCatalogEntries(), ended)], error: null };
     } catch (error) {
       return { sourceType: 'local-demo', datasets: [], error: errorFromUnknown(error, 'Sample catalog') };
     }
@@ -823,7 +857,8 @@ export function initDatasetControls(options) {
     const samples = dataSourceManager.getSource('local-demo');
     let datasets;
     try {
-      datasets = await samples.listDatasets();
+      // A listing never holds the teardown: it ends with these controls (a stalled link).
+      datasets = await awaitWithSignal(samples.listDatasets(), lifecycleController.signal);
     } catch (error) {
       if (!ownsCatalogGeneration(generation)) return;
       setCatalogNotice(
@@ -843,7 +878,7 @@ export function initDatasetControls(options) {
       option.dataset.datasetName = metadata.name;
       option.dataset.cells = String(metadata.stats.n_cells);
       option.dataset.label = label;
-      option.textContent = option === openingDatasetOption ? `${label} ${OPENING_OPTION_SUFFIX}` : label;
+      showOptionText(option);
     }
   }
 
@@ -858,11 +893,11 @@ export function initDatasetControls(options) {
     if (typeof samples?.listCatalogEntries !== 'function') return;
     let entries;
     try {
-      entries = await samples.listCatalogEntries();
+      entries = await awaitWithSignal(samples.listCatalogEntries(), lifecycleController.signal);
       // A connected catalog takes the picker (pickerSourcesOf).
       for (const sourceType of CONNECTION_SOURCE_TYPES) {
         const source = dataSourceManager.getSource(sourceType);
-        if (typeof source?.isAvailable === 'function' && await source.isAvailable()) {
+        if (typeof source?.isAvailable === 'function' && await awaitWithSignal(source.isAvailable(), lifecycleController.signal)) {
           return;
         }
       }
@@ -888,11 +923,11 @@ export function initDatasetControls(options) {
     const currentId = dataSourceManager.getCurrentDatasetId();
     const currentSourceType = dataSourceManager.getCurrentSourceType();
     if (currentId === null) {
-      datasetSelect.value = NONE_DATASET_VALUE;
+      chooseDatasetValue(NONE_DATASET_VALUE);
     } else {
       selectDatasetOption(currentSourceType, currentId);
     }
-    datasetSelect.disabled = false;
+    setControlAvailability(datasetSelect, null);
     presentPendingSelection();
   }
 
@@ -949,6 +984,17 @@ export function initDatasetControls(options) {
     catalogRetryButton.disabled = false;
     catalogRetryButton.textContent = CATALOG_RETRY_LABEL;
     catalogNotice.hidden = false;
+  }
+
+  /**
+   * A listing retires only a failure of its own (the notice whose retry is
+   * the listing's). A failed dataset opening is retired by the next dataset
+   * on screen or None: a listing that was still reading when the person
+   * picked a dataset, and settles after that dataset failed, must not take
+   * the failure's explanation and retry off the screen (F71).
+   */
+  function clearListingNotice() {
+    if (noticeRetry === null || noticeRetry === retryCatalog) clearCatalogNotice();
   }
 
   function clearCatalogNotice() {
@@ -1074,7 +1120,7 @@ function showLoadedConnectivityEdges(edges) {
 }
 
 /**
- * The data mapping changed what the dataset uses (its neighbour graph, gene
+ * The data mapping changed what the dataset uses (its neighbor graph, gene
  * list, latent space or vector fields): the Dataset box says so.
  */
 function updateMappedDatasetFacts() {
@@ -1105,7 +1151,11 @@ function refreshDatasetUI(metadata) {
   renderFieldSelects();
   renderDeletedFieldsSection();
   initGeneExpressionDropdown();
-  clearGeneSelection();
+  // A gene no longer chosen; nothing waits for it: a newer choice (the new
+  // dataset's first coloring) supersedes it quietly, and only a failure is said.
+  settleInBackground(clearGeneSelection(), (error) => {
+    console.error('[DatasetControls] The gene selection could not be cleared for the new dataset.', error);
+  });
   refreshUIForActiveView();
   const currentMetadata = metadata === undefined
     ? dataSourceManager.getCurrentMetadata()
@@ -1152,14 +1202,15 @@ async function populateDatasetDropdown(options = {}) {
   loadingOption.value = LOADING_DATASET_VALUE;
   loadingOption.disabled = true;
   loadingOption.selected = true;
+  showOptionTexts();
   loadingOption.textContent = 'Loading datasets…';
   datasetSelect.replaceChildren(loadingOption);
   forgetDatasetOptions();
-  datasetSelect.disabled = true;
+  setControlAvailability(datasetSelect, 'the list of datasets is being read; choose once it is shown');
   if (refresh) {
     markCatalogNoticeRetrying();
   } else {
-    clearCatalogNotice();
+    clearListingNotice();
   }
 
   try {
@@ -1168,9 +1219,11 @@ async function populateDatasetDropdown(options = {}) {
     const deferSamples = !samplesWanted && !refresh &&
       dataSourceManager.getCurrentSourceType() !== 'local-demo' && hasConnection();
     debug.log('[UI] Calling getAllDatasets...');
-    const listing = trackWork(dataSourceManager.getAllDatasets(
+    // A listing is a read the teardown cannot stop at its source (a stalled link): these controls
+    // stop waiting for it when they end, so it never holds the teardown.
+    const listing = trackWork(awaitWithSignal(dataSourceManager.getAllDatasets(
       deferSamples ? { refresh, skip: ['local-demo'] } : { refresh }
-    ));
+    ), lifecycleController.signal));
     if (!deferSamples) {
       void trackWork(presentCatalogEntries(generation)).catch(error => {
         console.error('[UI] Listing the catalog entries failed:', error);
@@ -1202,7 +1255,7 @@ async function populateDatasetDropdown(options = {}) {
     // from. It never blocks the sources that answered.
     const failureMessage = describeFailedSources(allSourceDatasets);
     if (failureMessage === null) {
-      clearCatalogNotice();
+      clearListingNotice();
       if (refresh) showSessionStatus('Dataset list reloaded', false);
     } else {
       setCatalogNotice(failureMessage, retryCatalog);
@@ -1281,13 +1334,13 @@ async function populateDatasetDropdown(options = {}) {
       selectDatasetOption(currentSourceType, currentId);
       updateDatasetInfo(currentMetadata, currentSourceType);
     } else {
-      datasetSelect.value = NONE_DATASET_VALUE;
+      chooseDatasetValue(NONE_DATASET_VALUE);
       if (datasetSelect.value !== NONE_DATASET_VALUE) {
         throw new Error('Dataset select could not represent the None state.');
       }
       updateDatasetInfo(null);
     }
-    datasetSelect.disabled = false;
+    setControlAvailability(datasetSelect, null);
     // A choice still loading is what the select shows, not the dataset it is
     // about to replace.
     presentPendingSelection();
@@ -1301,10 +1354,11 @@ async function populateDatasetDropdown(options = {}) {
     errorOption.value = CATALOG_ERROR_VALUE;
     errorOption.disabled = true;
     errorOption.selected = true;
+    showOptionTexts();
     errorOption.textContent = 'Dataset list unavailable';
     datasetSelect.replaceChildren(errorOption);
     forgetDatasetOptions();
-    datasetSelect.disabled = true;
+    setControlAvailability(datasetSelect, 'the list of datasets could not be read; use Try again in its notice');
     // The whole enumeration failed, so the selector is empty and the only way
     // back used to be a page reload. The notice carries the retry instead;
     // the notification is one sentence, its raw error under Details.
@@ -1601,7 +1655,9 @@ async function loadStartupDataset(selection) {
   const { datasetId, loadMethod, sourceType, name = null } = selection;
   // The name its source listed it under, where startup listed it.
   if (name !== null) rememberDatasetName(sourceType, datasetId, requireNonEmptyString(name, 'Startup dataset name'));
-  const intent = beginDatasetSelectionIntent({
+  // Not a choice of the person's: a connection asked for before it began
+  // still replaces it when its server answers (`beginStartup`).
+  const intent = adoptDatasetSelectionIntent(datasetChanges.beginStartup(), {
     label: openingLabel(sourceType, datasetId),
     value: datasetSelectionValue(sourceType, datasetId)
   });
@@ -1667,15 +1723,15 @@ async function handleNoneDatasetSelectionForIntent(intentOwner) {
     refreshDatasetUI(null);
     ensureNoneDatasetOption();
     retireUnlistedDatasetOption();
-    datasetSelect.value = NONE_DATASET_VALUE;
+    chooseDatasetValue(NONE_DATASET_VALUE);
     if (datasetSelect.value !== NONE_DATASET_VALUE) {
       throw new Error('Dataset select could not represent the None state.');
     }
-    datasetSelect.disabled = false;
+    setControlAvailability(datasetSelect, null);
     // The user asked for no dataset and got it, so a failed switch they walked
     // away from is no longer something to retry.
     clearCatalogNotice();
-    showSessionStatus('No dataset selected', false);
+    showSessionStatus(NO_DATASET_OPEN, false);
     return true;
   } catch (error) {
     if (isCancellation(error)) {
@@ -1721,7 +1777,7 @@ function synchronizeDatasetEvent(rawEvent) {
   if (event.datasetId === null) {
     ensureNoneDatasetOption();
     retireUnlistedDatasetOption();
-    datasetSelect.value = NONE_DATASET_VALUE;
+    chooseDatasetValue(NONE_DATASET_VALUE);
     if (datasetSelect.value !== NONE_DATASET_VALUE) {
       throw new Error('Dataset select could not represent the None state.');
     }
@@ -1732,7 +1788,7 @@ function synchronizeDatasetEvent(rawEvent) {
   // A listing in progress selects the dataset itself when it finishes.
   if (!catalogIsPopulating()) {
     selectDatasetOption(event.sourceType, event.datasetId);
-    datasetSelect.disabled = false;
+    setControlAvailability(datasetSelect, null);
   }
   updateDatasetInfo(event.metadata, event.sourceType);
 }
@@ -1771,14 +1827,14 @@ function synchronizeDatasetSelectToCurrent() {
     ensureNoneDatasetOption();
     retireUnlistedDatasetOption();
     updateDatasetInfo(null);
-    datasetSelect.value = NONE_DATASET_VALUE;
+    chooseDatasetValue(NONE_DATASET_VALUE);
     if (datasetSelect.value !== NONE_DATASET_VALUE) {
       throw new Error(
         'Dataset select cannot represent the active None state after reload.'
       );
     }
   }
-  datasetSelect.disabled = false;
+  setControlAvailability(datasetSelect, null);
 }
 
 function synchronizeTerminalDatasetSelectionFailure() {
@@ -1884,12 +1940,12 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
     if (!ownsDatasetSelectionIntent(intentOwner)) {
       return;
     }
+    // Still this choice's (a newer one would own the selection now): the
+    // person stopped it themselves — the opening's Cancel, or keeping the
+    // dataset shown when its work is not kept (`app/unkept-work-guard.js`).
+    // The select shows the dataset shown again; nothing more is said.
     if (isCancellation(error)) {
       synchronizeDatasetSelectToCurrent();
-      showSessionStatus(
-        'A newer dataset selection is now active.',
-        false
-      );
       return;
     }
     const exactError = errorFromUnknown(error, 'Dataset selection event');
@@ -1940,19 +1996,29 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
   dataSourceManager.onDatasetChange(synchronizeDatasetEvent);
   function handleDatasetSelectDomEvent(event) {
     if (destroyed) return;
+    reachForPicker(false);
     void invokeTracked(() => handleDatasetSelectEvent(event));
+  }
+  /** The picker reached for (pointer down, focus) or left (a choice, blur): its options' texts follow. */
+  function reachForPicker(reached) {
+    if (destroyed || pickerReachedFor === reached) return;
+    pickerReachedFor = reached;
+    showOptionTexts();
   }
   datasetSelect.addEventListener(
     'change',
     handleDatasetSelectDomEvent,
     { signal: lifecycleController.signal }
   );
+  // The chosen option's text follows the picker (`showOptionText`): left.
+  datasetSelect.addEventListener('blur', () => reachForPicker(false), { signal: lifecycleController.signal });
   // Reaching for the picker (pointer, focus, keyboard) is what asks for the
   // samples' files while a link or a server holds the dataset on screen.
   for (const type of ['pointerdown', 'focus', 'keydown']) {
     datasetSelect.addEventListener(
       type,
       () => {
+        if (type !== 'keydown') reachForPicker(true);
         if (destroyed || samplesWanted) return;
         void invokeTracked(() => describeListedSamples()).catch(error => {
           console.error('[UI] Describing the sample datasets failed:', error);
@@ -2098,7 +2164,7 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
     if (!connected) return { shown: false, problem: null };
     if (dataSourceManager.getCurrentSourceType() === sourceType) return { shown: true, problem: null };
     const source = dataSourceManager.getSource(sourceType);
-    const datasets = await source.listDatasets();
+    const datasets = await awaitWithSignal(source.listDatasets(), lifecycleController.signal);
     const defaultId = source.getConnectionInfo?.()?.defaultDatasetId ?? datasets[0]?.id ?? null;
     if (defaultId === null) return { shown: false, problem: `${route.value} holds no dataset.` };
     try {
@@ -2120,13 +2186,18 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
    * analysis windows stay. Other cells are shown as a dataset change: its
    * source has read them (`AnnDataFileSource.reopenCells`) and the change
    * stages and publishes them like any other. The dataset on screen stays
-   * until the new reading is shown; Cancel keeps it.
+   * until the new reading is shown; Cancel keeps it, and so does `signal`
+   * (the action or the history move that asked for the reading, stopped):
+   * the reading is canceled as Cancel cancels it, so the one who asked is
+   * answered promptly with the cells open before still open (F147).
    *
    * @param {Object} cellSubset
-   * @returns {Promise<{shown: boolean, inPlace: boolean}>} Whether the
-   *   dataset was shown again, and whether in place (what was shown stayed)
+   * @param {{signal?: AbortSignal|null}} [how]
+   * @returns {Promise<{shown: boolean, inPlace: boolean, failure?: string}>} Whether the
+   *   dataset was shown again, and whether in place (what was shown stayed);
+   *   `failure`: why not, as the person was told, when the reading failed
    */
-  async function reopenOpenDataset(cellSubset) {
+  async function reopenOpenDataset(cellSubset, { signal = null } = {}) {
     const datasetId = dataSourceManager.getCurrentDatasetId();
     const sourceType = dataSourceManager.getCurrentSourceType();
     if (typeof datasetId !== 'string' || typeof sourceType !== 'string') {
@@ -2142,44 +2213,50 @@ async function handleDatasetSelectEventForIntent(event, intentOwner) {
       value: datasetSelectionValue(sourceType, datasetId)
     });
     return await runDatasetSelectionIntent(intent, async owner => {
-      let outcome;
+      // Registered once the reading exists (a stopped signal cancels it at once).
+      const stopWithCaller = onAbort(signal, () => owner.transaction.cancel());
       try {
-        outcome = await trackWork(resizeOpenCells({ annData, cellSubset, signal: owner.transaction.signal }));
-      } catch (error) {
-        if (isCancellation(error)) return { shown: false, inPlace: false };
-        // The cells open before stay open (`app/open-cells-resize.js`
-        // reads them back): said once, with the raw error under Details,
-        // never only to the console (Web contracts run 41269083996, Linux
-        // WebKit: the picked file read back failed, and Apply did nothing
-        // the person could see).
-        debug.error('[UI] The open cells could not be read again:', error);
-        const name = datasetDisplayName(sourceType, datasetId);
-        showSessionStatus(
-          describeDataSourceFailure(
+        let outcome;
+        try {
+          outcome = await trackWork(resizeOpenCells({ annData, cellSubset, signal: owner.transaction.signal }));
+        } catch (error) {
+          if (isCancellation(error)) return { shown: false, inPlace: false };
+          // The cells open before stay open (`app/open-cells-resize.js`
+          // reads them back): said once, with the raw error under Details,
+          // never only to the console (Web contracts run 41269083996, Linux
+          // WebKit: the picked file read back failed, and Apply did nothing
+          // the person could see).
+          debug.error('[UI] The open cells could not be read again:', error);
+          const name = datasetDisplayName(sourceType, datasetId);
+          // One sentence, by the one classification of read failures
+          // (`describeDataSourceFailure`): the person's notice, and the
+          // answer of the action or move that asked (`failure`).
+          const failure = describeDataSourceFailure(
             name === null ? 'The dataset' : `"${name}"`,
             'could not be read again with these cells',
             error
-          ) + ' The cells open before are still open.',
-          true,
-          dataSourceFailureDetails(error)
-        );
-        return { shown: false, inPlace: false };
-      }
-      if (outcome.inPlace === true) return { shown: true, inPlace: true };
-      try {
-        const shown = await handleDatasetChangeForIntent(datasetId, sourceType, DATA_LOAD_METHODS.SUBSAMPLE, source, owner);
-        return { shown: shown === true, inPlace: false };
-      } catch (error) {
-        if (isCancellation(error)) return { shown: false, inPlace: false };
-        throw error;
+          ) + ' The cells open before are still open.';
+          showSessionStatus(failure, true, dataSourceFailureDetails(error));
+          return { shown: false, inPlace: false, failure };
+        }
+        if (outcome.inPlace === true) return { shown: true, inPlace: true };
+        try {
+          const shown = await handleDatasetChangeForIntent(datasetId, sourceType, DATA_LOAD_METHODS.SUBSAMPLE, source, owner);
+          return { shown: shown === true, inPlace: false };
+        } catch (error) {
+          if (isCancellation(error)) return { shown: false, inPlace: false };
+          throw error;
+        }
+      } finally {
+        stopWithCaller();
       }
     });
   }
 
   return {
     catalogReady,
-    reopenOpenDataset: cellSubset =>
-      invokeTracked(() => reopenOpenDataset(cellSubset)),
+    reopenOpenDataset: (cellSubset, how) =>
+      invokeTracked(() => reopenOpenDataset(cellSubset, how)),
     clearDataset: () =>
       invokeTracked(() => handleNoneDatasetSelection()),
     destroy,

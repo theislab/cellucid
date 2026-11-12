@@ -30,9 +30,11 @@ import {
 const VERSION_FILES = Object.freeze({
   'analysis.close@1.json': '5b2d435ea7d226c9951864d8f09a173b20dd8e2f83d06dcc7d905a94c4c5160f',
   'analysis.composition.set@1.json': '0be67264386cd8c1f7c87459f8bd9f62b9253a89676e22b0469ff211dbbd7b00',
+  'analysis.composition.set@2.json': 'ed944002e302f2d8daca2e4060d43a6ebb6228dc49b86d8758e1f5b7289433f5',
   'analysis.correlation.set@1.json': 'dedc00605a94d9d0c7a13f33c7af3f2b3dd84fe947a09cca3fe0168e07aa11b8',
   'analysis.detailed.set@1.json': 'b81ade25c5203c32fc7a36c6558e1622848991e53c121572fb4754aede04aecc',
   'analysis.differential.set@1.json': 'da423c2c0b536b7b13cc673cd3a84aebc3d80ab05e85000732e40ac8d55374f1',
+  'analysis.differential.set@2.json': 'e084d91a7daa4f30862b746b80e411f3bd12f1e463d48f7066e2d06a91d62a02',
   'analysis.dotplot.set@1.json': 'bfc7a029f71373aacbdcacbcdf0c40c761c1af4d0d0b185b4f16509d79efe6ca',
   'analysis.markers.set@1.json': '0f1adb5bffece61d2f39c2aa36cc1b108c79e8969a77b86fdd86ad01e50eb227',
   'analysis.open@1.json': '51e6731fd34c3b2da9034beac7f4d6bc19fba210c30f3a07e1fa54f191544770',
@@ -40,6 +42,7 @@ const VERSION_FILES = Object.freeze({
   'analysis.quick.set@1.json': '1a5320ba9dff44c7e152a513b3fc936406c3f048d5057ce263663149e58c5453',
   'analysis.run@1.json': 'b1564e9263b6b034df437b90484accb7ed7e64536ee90197c7f3b7b5d5fd0548',
   'analysis.signature.set@1.json': '6b06a4523465fb7e5371a515363b669e1ef5ba46e3de341ca2aca876e7605a20',
+  'analysis.signature.set@2.json': '55a11aedfef1bd0d0dca8c8e0b087118b7be95d0b6dbe132e3c451ba4abf148a',
   'analysis.size.set@1.json': '1c502bbc25034e495fe896d7a5db0112787e495da1e888890d0304d2dc175da7',
   'analysis.view.set@1.json': 'd8b8dbbbbd05daad2d382f65bacd99bc41bb99abc60312b54950850c345fb8ce',
   'analysis.window.close@1.json': '2bf6b053430391fcf73c04bc60f258cb21b7ca14fb8bc4024ea85ba0539e50b2',
@@ -48,19 +51,26 @@ const VERSION_FILES = Object.freeze({
   'analysis.window.place@1.json': '6abfc36a83af4e965fca297bf4180ebe2a8f79143a5e8a82cf344122311367b8',
   'camera-path.clear@1.json': '86e4432aa5a9c104aeb6c60820cc4229dd420012d373170e2617b749a966877a',
   'camera-path.duration.set@1.json': '6e90aa498a050aedf59f5e2ba3ca2b0d8b67800ed30ca9763dfb0c04070ca8dd',
+  'camera-path.hold.set@1.json': 'f190a585c0ea05b2dcc8491e9f6bb1d51053d7aff53c4c553dcf005bb762dc1a',
   'camera-path.keyframe.add@1.json': '8c8a0d4e2b69e60661f7a882564008107b6b214c55c7bbfb8083c78c14fea05d',
+  'camera-path.keyframe.add@2.json': 'b87b448f0e7f1ac6d2024df96360c2356b4ba1edfffcc40169139fdc2ea27b72',
   'camera-path.keyframe.move@1.json': '8c840cbed2a1622c948980c51ce58da39ebb69ce07b9a638f1d8abd4d50a9cdb',
   'camera-path.keyframe.remove@1.json': '35a242846ef2f57d0ae1d063c66e630a7a52fc71b1f7cd49f95fe7c636885c24',
   'camera-path.keyframe.rename@1.json': '6bbd553af7e67995b45808315d09ba00daca890473ae07e866d5e767a9b91774',
   'camera-path.loop-back.set@1.json': '7c58a2fc6dd8a8c3405e3bb343feaacf214efea48511ab8692900c4550339591',
+  'camera-path.play@1.json': '84bc1376c17c548484c3b8147c9ac98002b5b328bea1c604b8481492fc94b7f0',
   'camera-path.playback.set@1.json': '8cd0d38f7545f973bbf080791a250bed32feac1eb78ad9bf3ff12f8deaaeea39',
+  'camera-path.playback.set@2.json': '31ce96736d0c591df2786f1fdfbf25b239f217f94c2a0ffa44d496727a7d4c66',
   'camera.navigation.set@1.json': '19b7c62b66ac5d81161e7f8ef0940357b8657e5fcb4d7f1b7a41c76103df15d8',
   'camera.reset@1.json': 'f23bcf94059af34e6c70f18e412e388aa2405f48304708d620e01b042e1f9b5b',
   'camera.set@1.json': '1d7f99caa8913402598fd210488a467c3de807506a1235a9973cccdfc52ec6cf',
   'category.delete@1.json': '9975b4f99a05aac47f42192cc2ad6986c312b2921b32f2c98958fecc2e14c7ca',
+  'category.delete@2.json': '6c51ebe0a112e10a1569be2099908816a88cf4ac771be95aabfa67c598a45dca',
   'category.merge@1.json': 'c4ed1a32af2b66b22c1c278974f179cbdcbd0216c7742f9d9736b498f700f29a',
+  'category.merge@2.json': '189439a4031e170f7caa93eba92e97afab122a33387fae4ca383ee614b45dfae',
   'category.rename@1.json': '23cc3b276471a79182dde818a7f43508563f1c1a21edd1a90a22f90384fa10e0',
   'cells.open@1.json': '6e28351e2245a3a6e06a29aed5904c10e87acc6a926f0ae764bde08f922663b2',
+  'cells.open@2.json': '2b80701b7e043cd5c5819b1a8823010be44e29b09944d210edd2bc6998fc6b17',
   'cells.read-genes@1.json': '4495e5c1739f8cc8b5e462e09d537c1ff280fbb2f7c008249626c388f3756ac9',
   'cells.visibility.set@1.json': '83d8a5cc3b6465a842677c302423cfe1209e864e025da914e5404f89ca93bf5b',
   'color.by@1.json': 'fa14cc74de7f73fe8342a56807d69769005086f2667ec55ac65a2f9a9170e7e0',
@@ -71,17 +81,25 @@ const VERSION_FILES = Object.freeze({
   'color.continuous.rescale@1.json': 'e35a736fcac9e9e8f64d8a531ed8c677bb0432587d051a16ec1759c08b1ac03d',
   'color.continuous.zero-gray@1.json': '84b91a2b976be227d8d99da1bc8771e30c9005002bb864228ba1becb953e6f78',
   'display.reset@1.json': '5a13a8ac5dbde0743318ca79c050a1ed9a8fac20b1404c47f8853a0faa104f59',
+  'expression.transform.set@1.json': 'e5447fe1a6db5049f4d3630e1fac61f11b77954a8344b1bbf336be7e0c353b4b',
+  'expression.transform.set@2.json': '45dce4c0a62b5b311e862206ebb0ed1f2a1b31f8bebdacfb76f0fa843a4cf029',
   'field.consensus@1.json': '184ebff2e38828b09e689f663dabff23ce24e925ba6a206cad87b6f632f19ebd',
   'field.consensus@2.json': '46dab8cd5fa6d2ec3e9f36fcff07342c2e9469cf2cb4ea00c0b18fc20d2643db',
   'field.create-from-pages@1.json': '3ff9a0679fc767da863d77366cf105b293989499d987ddf91463670b4917d260',
+  'field.create-from-pages@2.json': 'ff6a05a34182bce7cd86e32cfc8c543359b1d4e3f6a294dc0cedb607652be0c1',
   'field.delete@1.json': '9485f15a7e54172dad01c7dce398fa2640dd80427e597f2a1db843122e1a4ab4',
   'field.duplicate@1.json': '83126d388a41d5d8620968f6780a453b8f78a49a8e1ed3a061385bcc675006e2',
+  'field.group@1.json': 'ad0b377b6618c24eeffa92264ff97bc7247f5543de2d81459148f035d6587b1c',
   'field.purge@1.json': 'a14401b2a3762e6faebdddf75f521500f3770a3fb1fb8fd7face53f86eb16e17',
+  'field.purge@2.json': '54e2240255940b0fb140e7b394d41a33b7ab0e77ad48bfbf260c22d25b487545',
   'field.push@1.json': '1ee11c2a437e9911d6a6b9068edca4c36760ebad4b9afbc66e27a1b80cc67663',
   'field.rename@1.json': 'c8f2c6c6c1e7914811ce695e764c58b0356fb109c6229f018b837988ac6a1e9f',
   'field.restore@1.json': '92f9ac9c419959842883a8e01eebc13b50adf0c2fcc3420aecfda201898e4710',
+  'field.restore@2.json': '08c43a2b9b136f528cc5f7d2f64e634629a5cff3a80eb5895783de5219fa1d3a',
   'field.revert-name@1.json': 'bcabd65edb1e9abfa4b64c420b998c63793ec3ff36dbf8851abd9dcffad72690',
   'figure-export.set@1.json': '59e04f98442cc2cde9a320c6595f3650ac7cb21e97835385943f49a49debbed3',
+  'figure-export.set@2.json': 'aa0874b976bd890646dadf8ec222dbac702858d56d434ea2364a9319353bd5fc',
+  'figure-export.set@3.json': '23a0335f153aa6ff1358f676a8233c88b37be2112ea227173a580165e643e191',
   'filter.category.all@1.json': '0162abcadcdfe7253e5a59399b192b1e86191b910ca4f988389f41d1a882bec3',
   'filter.category.cell-count@1.json': '46e635d5d401112ded2d131da93df1a3fc088995620afd3c1604140d75e6299d',
   'filter.category.missing@1.json': '7c1a0b61b91ac3038802f45bc2d7ba256120e44251cbfcf4b43f0b13186d5835',
@@ -93,6 +111,7 @@ const VERSION_FILES = Object.freeze({
   'filter.remove@1.json': '502d6f168933ffc742a65cfcb1cacbd29dd7cf4eaa3bf3438d272e36ca12a48f',
   'gene-set.save@1.json': '5a82b0533cf273a0829374a59db4e6d3541bb269b060afdfce57df92b4be635e',
   'highlight.category@1.json': '438a346b7361ef08f5b399190441601ad1f6d06c6ef3e9f87b381d2c5338c714',
+  'highlight.category@2.json': '8d0e020c87931f7f6d0bac2d3392f56b3ffbd5d35a160cc0b25b7a1d3c2965b7',
   'highlight.cells@1.json': 'd7c049a98c8b4f5930d795935fdaddd4b9555d010a61c0f6b8ba9eaae1208c9e',
   'highlight.clear-all@1.json': '1544e498501476821bc213d2cf788a8679ec8e8145ab70024cd76abfb14636e0',
   'highlight.group.remove@1.json': '7c082b51a9aa043e16e6375bf72edf2111931301d189188bf999bde6776dbb51',
@@ -101,11 +120,13 @@ const VERSION_FILES = Object.freeze({
   'highlight.page.combine@1.json': '6fb3347d62fdbeebe83983de0fca8ef3984fb595ece2b8b68072e9ebd6906cdb',
   'highlight.page.create@1.json': 'dfc29f1385940b2c22c5146f5569440f75b4ade2d3c41838d6924d7cb43b6985',
   'highlight.page.delete@1.json': '58d145bce59b611b41ea10fa34e1a03926d83fd8ec3264201a4010e83ea0f65f',
+  'highlight.page.delete@2.json': '456818265f45e9ae1e056056916a2bae74d579aad66b0c40470f10c4bdaf8284',
   'highlight.page.recolor@1.json': '40952950a0a1ef298919ef57c0c28c89f3cc6fbfcbfb5ab7cac6986d04a6d395',
   'highlight.page.rename@1.json': 'c43f30cfeaf0bc942451e100f62863fb520109bc3f86d0436da759a0c9111567',
   'highlight.page.switch@1.json': 'd2ff3d9a78321a62fbc14e130810618888cdb6a6c6e5d73cde12f798c8aa7a9b',
   'highlight.range@1.json': 'bbbf5d3527f12e14ea0b6d263311673343e8cd1274f7b8da60e32be823bb1768',
   'history.step.revert@1.json': '1e7dd9125c9a99c62562426836dec2b0e1bef885ee40c0971e799819192dca47',
+  'layout.panel.dock-all@1.json': 'aa92ed16a6c7e669bca74a2b5cfe0fe2053a37d7c01d3979b51d74b8888c1c16',
   'layout.panel.dock@1.json': '6a1098d593a050b2e2cb16d00f0439b6e68082c673fb050b09e7449151373061',
   'layout.panel.float@1.json': 'cb0757e971196a572f1c718deac5b9f123bc6c81b3cecf46e61148c2356ad041',
   'layout.panel.place@1.json': '40338f5deb3d83f69258ceda9b8fc081a3ffdeeb700ef3916e87f69480d4985b',
@@ -122,8 +143,10 @@ const VERSION_FILES = Object.freeze({
   'view.embedding.set@1.json': '1cd92419ffe3fbbee90fbfd8f40e51a83205a1e5c8bb90bed1454ee36eea086d',
   'view.focus@1.json': '215915d0f062244b7cd83cc62d2bf58b2d47ae8d57436163e93aeb97ca5ec3b6',
   'view.keep@1.json': '9542a41df7420dbe8f96a81e8e041c876e99d58c25dcd1acb0f4ee127977a606',
+  'view.keep@2.json': 'e0a5fca98bc0e032d3b3607be2ca7272c96610647a708365d2a711badc6d0a1e',
   'view.layout.set@1.json': '813c28056013e02df5b66efcd8ae98f3cc0cebcd9c467e56a566342380bd4aba',
   'view.remove@1.json': '3b1980d709a8a7f9b8a90761c1f6a2d4a4eca2d5bb091bf2f35dff291825dd1d',
+  'view.rename@1.json': 'e3598ea2a056ad7c81b5a41a2843a4842b68e91b182f63bacd06a1cfd98e1ca4',
 });
 
 test('every version of every action keeps its example, and the parameters now are the current version\'s', () => {
@@ -140,9 +163,9 @@ test('every version of every action keeps its example, and the parameters now ar
 });
 
 const BASE = Object.freeze({
-  type: 'test.color', title: 'Colour', summary: 'Colour by a field.', group: 'Test',
+  type: 'test.color', title: 'Color', summary: 'Color by a field.', group: 'Test',
   params: { type: 'object', additionalProperties: false, required: ['field'], properties: { field: { type: 'string', minLength: 1 } } },
-  touches: ['active-field'], reads: [], effect: 'view', describe: () => 'Coloured', code: () => 'color()',
+  touches: ['active-field'], reads: [], effect: 'view', describe: () => 'Colored', code: () => 'color()',
 });
 
 /** The same action, its `field` now `{source, key}`: version 2, with the upgrader from 1. */
@@ -190,7 +213,7 @@ test('a params schema changed without a version bump and an upgrader fails, nami
   assert.match(versionProblems([wrong], [...kept, keptFile(v2)])[0], /^test\.color@1\.json: example 0 upgraded to version 2 is not valid now: /);
   // Files of an action that is gone, or of a version ahead of it, are named.
   assert.deepEqual(versionProblems([v1], [...kept, keptFile(v2)]), ['test.color@2.json is newer than "test.color" (version 1)']);
-  assert.match(versionProblems([], kept)[0], /names an action whose steps the catalogue does not record/);
+  assert.match(versionProblems([], kept)[0], /names an action whose steps the catalog does not record/);
 });
 
 test('an optional parameter renamed without its upgrader fails on the kept examples, which use every property and branch', () => {
@@ -248,7 +271,16 @@ test('defineAction: version and upgrade, checked; upgradeParams runs the upgrade
   upgradeParams(mutating, 1, kept);
   assert.deepEqual(kept, { field: 'x' }, 'even by an upgrader that writes in place');
   assert.deepEqual(upgradeParams(three, 3, { field: { source: 'var', key: 'X' } }), { field: { source: 'var', key: 'X' } });
-  assert.throws(() => upgradeParams(three, 4, {}), { message: '"test.color" was recorded with version 4 of its parameters, newer than this catalogue\'s 3' });
+  assert.throws(() => upgradeParams(three, 4, {}), { message: '"test.color" was recorded with version 4 of its parameters, newer than this catalog\'s 3' });
   assert.throws(() => upgradeParams(three, 0, {}), { message: 'An action version is a whole number from 1, not 0' });
   assert.equal(catalogDocument(createActionCatalog([three])).actions[0].version, 3, 'the catalogue (and its Python and R mirrors) carry the version');
+});
+
+test('a parameter renamed to its US spelling: a step recorded with the British name replays under the new one (F149)', () => {
+  const transform = ACTION_DEFINITIONS.find(definition => definition.type === 'expression.transform.set');
+  assert.equal(transform.version, 2);
+  assert.deepEqual(upgradeParams(transform, 1, { normalise: true, log1p: false }), { normalize: true, log1p: false });
+  assert.deepEqual(upgradeParams(transform, 1, { log1p: true }), { log1p: true }, 'a step that named log1p alone is the same step');
+  assert.deepEqual(upgradeParams(transform, 2, { normalize: false }), { normalize: false });
+  assert.equal(transform.params.properties.normalise, undefined, 'the current schema holds no British name');
 });

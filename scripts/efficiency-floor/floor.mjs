@@ -10,7 +10,7 @@
  *   stored as their values' bytes (`rawChunks`: an unfiltered HDF5 chunk, an
  *   uncompressed Zarr chunk, as a served store answers), exactly the needed
  *   elements' bytes. Metadata and chunk indexes are reported as measured
- *   beside it (`classifyReads`), not modelled.
+ *   beside it (`classifyReads`), not modeled.
  * - **Requests**: the runs of those bytes: chunks next to each other in one
  *   file are one request; every chunk file of a Zarr folder is its own.
  * - **Round trips**: the dependent steps (an HDF5 chunk index not read
@@ -22,7 +22,7 @@
  *   plus the bytes over the bandwidth -- a response's first byte arrives a
  *   round trip after it is asked, and each dependent step waits for the one
  *   before it (`(levels + 1) x latency + bytes / bandwidth`): the least the
- *   link (`link.mjs`) can deliver. Minimised over fetching the gaps between
+ *   link (`link.mjs`) can deliver. Minimized over fetching the gaps between
  *   runs (a gap fetched saves a request and costs its bytes), plus decoding
  *   every needed chunk at the measured throughput of its codec in this
  *   runtime (`codecs.mjs`).

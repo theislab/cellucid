@@ -14,6 +14,7 @@
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
 import { fieldCategoryCss } from '../../../utils/category-state.js';
+import { categoryDisplayName } from '../../../actions/targets/names.js';
 
 /**
  * @param {object} options
@@ -49,9 +50,10 @@ export function createFieldGroups({ dataLayer, onReady, onError }) {
     if (at !== generation) return;
     const state = dataLayer.state.obsData.fields.find(candidate => candidate.key === fieldKey);
     byField.set(fieldKey, {
-      groups: categories.map((name, index) => ({
-        id: name,
-        name,
+      groups: categories.map((id, index) => ({
+        id,
+        // Shown by its display name (`(empty)`, `(blank)` for a category with no name).
+        name: categoryDisplayName(field.categories[index]),
         count: counted.counts[index],
         color: fieldCategoryCss(state, index)
       })),

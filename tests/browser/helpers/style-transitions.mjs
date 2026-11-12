@@ -15,7 +15,7 @@
  * `getAnimations()` flushes pending style first, which is what starts a
  * transition for a style change made just before this call. The check repeats
  * on every animation frame rather than awaiting `finished`: a transition that
- * is cancelled or superseded mid-flight is no longer running, but engines do
+ * is canceled or superseded mid-flight is no longer running, but engines do
  * not reliably settle its `finished` promise. Elements that are not rendered
  * (inside a closed accordion) are skipped: Firefox leaves their transitions
  * pending until they are shown. Infinite animations (spinners) never settle;

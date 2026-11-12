@@ -17,7 +17,7 @@ import { pathTo } from '../assets/js/app/history/tree.js';
 import { historyActions } from '../assets/js/app/actions/definitions/history.js';
 import { stateFingerprint } from '../assets/js/app/state/domains/fingerprint.js';
 
-/** A page with three domains: labels (a map), a colour, a camera number; plus the rest as constants. */
+/** A page with three domains: labels (a map), a color, a camera number; plus the rest as constants. */
 function fakePage() {
   const state = { labels: { a: 'A', b: 'B' }, color: 'red', camera: 0, settings: { size: 1 } };
   const domains = createDomainRegistry();
@@ -45,13 +45,13 @@ const definitions = [
     describe: p => `Renamed ${p.from} to ${p.to}`, code: p => `rename_category(${JSON.stringify(p.from)}, ${JSON.stringify(p.to)})`,
   }),
   defineAction({
-    type: 'color.set', title: 'Set the colour', summary: 'Colour everything one colour.', group: 'Colours',
+    type: 'color.set', title: 'Set the color', summary: 'Color everything one color.', group: 'Colors',
     params: {
       type: 'object', additionalProperties: false, required: ['color'],
       properties: { color: { type: 'string', enum: ['red', 'green', 'blue'] }, slow: { type: 'boolean', default: false } },
     },
     touches: ['colors'], reads: [], effect: 'view', coalesce: () => 'one',
-    describe: p => `Coloured ${p.color}`, code: p => `set_color(${JSON.stringify(p.color)})`,
+    describe: p => `Colored ${p.color}`, code: p => `set_color(${JSON.stringify(p.color)})`,
   }),
   defineAction({
     type: 'camera.set', title: 'Move the camera', summary: 'Place the camera.', group: 'Camera',
@@ -138,7 +138,7 @@ test('definitions: dotted names, known domains, reads touch nothing', () => {
   // A move of the history shows another step and records none: it touches no domain.
   assert.throws(() => defineAction({ ...base, type: 'a.b', touches: ['colors'], reads: [], effect: 'history' }), /a read or a history move touches no domain/);
   assert.equal(defineAction({ ...base, type: 'a.b', reads: [], effect: 'history' }).touches.length, 0);
-  assert.throws(() => defineAction({ ...base, type: 'a.b', reads: [], effect: 'undo' }), /effect must be one of state, view, layout, read, history/);
+  assert.throws(() => defineAction({ ...base, type: 'a.b', reads: [], effect: 'undo' }), /effect must be one of state, view, layout, read, control, history, dataset, outside/);
   assert.throws(() => defineAction({ ...base, type: 'a.b', touches: ['colors'], reads: [], effect: 'view', extra: 1 }), /unknown field "extra"/);
   assert.throws(() => createActionCatalog([definitions[0], definitions[0]]), /defined twice/);
   assert.equal(toolNameOf('filter.category-visibility'), 'filter_category_visibility');
@@ -196,10 +196,10 @@ test('dispatch records one step per change, with origin; undo and redo restore e
 test('a no-op is no step; a read is no step and returns its result', async () => {
   const { dispatcher, history } = setup();
   await history.startTracker();
-  const { step } = await dispatcher.dispatch('color.set', { color: 'red' });
-  assert.equal(step, null);
+  const { step, unrecorded } = await dispatcher.dispatch('color.set', { color: 'red' });
+  assert.deepEqual([step, unrecorded], [null, 'unchanged'], 'a no-op says why it made no step');
   const read = await dispatcher.dispatch('labels.read', {});
-  assert.deepEqual(read, { outcome: { labels: { a: 'A', b: 'B' } }, step: null });
+  assert.deepEqual(read, { outcome: { labels: { a: 'A', b: 'B' } }, step: null, unrecorded: null });
   assert.equal(history.active.steps.size, 1);
 });
 
@@ -216,6 +216,24 @@ test('consecutive coalescing steps merge into one; another action in between end
   await history.undo();
   await history.undo();
   assert.equal(page.state.camera, 0);
+});
+
+test('a merge is shared by its author: a turn parts an agent\'s or a notebook\'s changes, never a person\'s', async () => {
+  const { page, dispatcher, history } = setup();
+  await history.startTracker();
+  // A person's `turn` is not recorded (`byOfMeta`): their gestures on one view are one step.
+  for (const at of [1, 2, 3]) await dispatcher.dispatch('camera.set', { at }, { turn: `cell-${at}` });
+  assert.equal(history.active.steps.size, 2);
+  // Each notebook cell is a turn of its own: one step each.
+  for (const at of [4, 5]) await dispatcher.dispatch('camera.set', { at }, { origin: 'host', host: 'python', turn: `cell-${at}` });
+  assert.equal(history.active.steps.size, 4);
+  // A host naming a language the history cannot record is refused before its handler runs (F165).
+  await assert.rejects(dispatcher.dispatch('camera.set', { at: 6 }, { origin: 'host', host: 'julia', turn: 'cell-6' }),
+    /^TypeError: A host action names its language: one of python, r$/);
+  await assert.rejects(dispatcher.dispatch('camera.set', { at: 6 }, { origin: 'host', turn: 'cell-6' }),
+    /^TypeError: A host action names its language: one of python, r$/);
+  assert.equal(page.state.camera, 5);
+  assert.equal(history.active.steps.size, 4);
 });
 
 test('a handler that fails after changing something leaves no half-state and no step', async () => {
@@ -334,7 +352,7 @@ test('deleting a step re-applies what came after; a step that depended on it is 
 test('deleting the last step of the branch shown (the head, the tip) shows the step before it; the branch ends there', async () => {
   const { page, dispatcher, history } = setup();
   await history.startTracker();
-  const colourBefore = page.state.color;
+  const colorBefore = page.state.color;
   await dispatcher.dispatch('category.rename', { from: 'A', to: 'T' });
   const renamed = history.active.headId;
   await dispatcher.dispatch('color.set', { color: 'blue' });
@@ -342,7 +360,7 @@ test('deleting the last step of the branch shown (the head, the tip) shows the s
   assert.deepEqual((await history.deleteStep(blue)).flagged, []);
   assert.equal(history.active.headId, renamed);
   assert.equal(history.active.branches.get(history.active.activeBranch).tip, renamed);
-  assert.equal(page.state.color, colourBefore);
+  assert.equal(page.state.color, colorBefore);
   // Another branch below the step shown: the branch shown keeps being shown, ending at its parent.
   await history.undo();
   await dispatcher.dispatch('color.set', { color: 'red' });
@@ -360,7 +378,7 @@ test('changes made outside an action are kept as their own step, so undo still l
   page.state.color = 'green';
   await dispatcher.dispatch('color.set', { color: 'blue' });
   const labels = pathTo(history.active, history.active.headId).map(s => s.label);
-  assert.deepEqual(labels, ['Opened', 'Changed outside the history', 'Coloured blue']);
+  assert.deepEqual(labels, ['Opened', 'Changed outside the history', 'Colored blue']);
   await history.undo();
   assert.equal(page.state.color, 'green');
 });
@@ -466,10 +484,10 @@ test('a change observed while an action on the same domain applies is part of th
   await history.startTracker();
   const running = dispatcher.dispatch('broken.half', {});
   await applying;
-  // A camera-settled the action itself caused (not a colour action: another domain) is still its own step.
+  // A camera-settled the action itself caused (not a color action: another domain) is still its own step.
   page.state.camera = 2;
   assert.notEqual(await dispatcher.recordObserved('camera.set', { at: 2 }), null);
-  // A colour change seen while the colour action applies is the action's.
+  // A color change seen while the color action applies is the action's.
   page.state.color = 'blue';
   assert.equal(await dispatcher.recordObserved('color.set', { color: 'blue' }), null);
   release();
@@ -513,24 +531,24 @@ test('undo, redo and jumps are actions: no step, the head moves and the state fo
   const { page, dispatcher, history } = setup({ withHistoryActions: true });
   const host = { origin: 'host', host: 'python' };
   // Before the dataset's first tracker there is nothing to move.
-  await assert.rejects(dispatcher.dispatch('history.undo', {}, host), /^ActionRefused: The history starts once the dataset is open\.$/);
+  await assert.rejects(dispatcher.dispatch('history.undo', {}, host), /^ActionRefused: The history starts once a dataset is open\.$/);
   await history.startTracker();
   await dispatcher.dispatch('category.rename', { from: 'A', to: 'T cells' });
   await dispatcher.dispatch('camera.set', { at: 2 });
   const tree = history.active;
   assert.equal(tree.headId, 's2');
 
-  assert.deepEqual(await dispatcher.dispatch('history.undo', {}, host), { outcome: { moved: true, head: 's1' }, step: null });
+  assert.deepEqual(await dispatcher.dispatch('history.undo', {}, host), { outcome: { moved: true, head: 's1' }, step: null, unrecorded: null });
   assert.deepEqual(page.state, { labels: { a: 'T cells', b: 'B' }, color: 'red', camera: 0, settings: { size: 1 } });
   assert.equal(tree.steps.size, 3, 'a move of the history records no step');
-  assert.deepEqual(await dispatcher.dispatch('history.redo', {}, host), { outcome: { moved: true, head: 's2' }, step: null });
+  assert.deepEqual(await dispatcher.dispatch('history.redo', {}, host), { outcome: { moved: true, head: 's2' }, step: null, unrecorded: null });
   assert.equal(page.state.camera, 2);
-  assert.deepEqual(await dispatcher.dispatch('history.redo', {}), { outcome: { moved: false, head: 's2' }, step: null });
+  assert.deepEqual(await dispatcher.dispatch('history.redo', {}), { outcome: { moved: false, head: 's2' }, step: null, unrecorded: null });
 
-  assert.deepEqual(await dispatcher.dispatch('history.jump', { step: 's0' }, host), { outcome: { head: 's0' }, step: null });
+  assert.deepEqual(await dispatcher.dispatch('history.jump', { step: 's0' }, host), { outcome: { head: 's0' }, step: null, unrecorded: null });
   assert.deepEqual(page.state.labels, { a: 'A', b: 'B' });
   assert.equal(page.state.camera, 0);
-  assert.deepEqual(await dispatcher.dispatch('history.undo', {}), { outcome: { moved: false, head: 's0' }, step: null });
+  assert.deepEqual(await dispatcher.dispatch('history.undo', {}), { outcome: { moved: false, head: 's0' }, step: null, unrecorded: null });
   // A jump keeps the branch: redo walks it again.
   assert.deepEqual((await dispatcher.dispatch('history.redo', {})).outcome, { moved: true, head: 's1' });
   assert.equal(tree.steps.size, 3);
@@ -549,7 +567,7 @@ test('undo, redo and jumps are actions: no step, the head moves and the state fo
   await slow;
   assert.deepEqual(back.outcome, { moved: true, head: 's1' });
   assert.equal(page.state.color, 'red');
-  assert.equal(tree.steps.size, 4, 'the colour step stays, to redo');
+  assert.equal(tree.steps.size, 4, 'the color step stays, to redo');
 
   history.destroy();
   for (const type of ['history.get', 'history.undo', 'history.redo', 'history.jump']) {
@@ -582,7 +600,7 @@ test('actions on overlapping domains run in order; a jump waits for running acti
   const undo = history.undo();
   const during = dispatcher.dispatch('camera.set', { at: 4 });
   await Promise.all([undo, during]);
-  // The two colour steps coalesced into one, so undo returns to the colour before both.
+  // The two color steps coalesced into one, so undo returns to the color before both.
   assert.equal(page.state.color, 'red');
   assert.equal(history.active.steps.size, 3);
   assert.equal(page.state.camera, 4);

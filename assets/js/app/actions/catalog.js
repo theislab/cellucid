@@ -1,11 +1,11 @@
 /**
- * @fileoverview The action catalogue: what can be done to the open dataset,
+ * @fileoverview The action catalog: what can be done to the open dataset,
  * each thing once.
  *
  * An action is a named, parameterised change (or read) that the person, an
  * agent, a Python or R host, a session and a replay all perform the same way.
  * Its definition here is pure data plus small pure functions, importable in
- * Node, so the catalogue document (`catalogDocument`) that Python, R, the
+ * Node, so the catalog document (`catalogDocument`) that Python, R, the
  * agent tools and the docs are generated from is made by the same code the
  * page runs. The implementation of an action is provided by the module that
  * owns the state it changes (`provide` in `dispatcher.js`).
@@ -14,7 +14,7 @@
  * - `type`: dotted name, `<group>.<verb>` or deeper (`filter.category.visibility`).
  *   It is the agent's tool name (dots become underscores), Python's method
  *   name and R's function name, so it is stable: renaming one is a breaking
- *   change for every generated surface and is caught by the catalogue digest.
+ *   change for every generated surface and is caught by the catalog digest.
  * - `title`, `summary`: one line each, written for a person and an agent.
  * - `group`: the heading it is listed under (docs, tool listing, timeline filter).
  * - `params`: the parameter schema (`schema.js`). Targets are named, never
@@ -23,7 +23,7 @@
  * - `touches`: the state domains it changes (`domains.js`). The history keeps
  *   their values before and after the step; undo puts back the before-values.
  * - `effect`: `state` (the data's meaning: fields, labels, filters, highlights,
- *   results), `view` (how it is shown: colouring, camera, render settings,
+ *   results), `view` (how it is shown: coloring, camera, render settings,
  *   views), `layout` (panels, theme), `read` (changes nothing, records no
  *   step), `history` (moves or edits the history itself: undo, redo, a
  *   jump, a branch's name, a note, a delete; it records no step and touches
@@ -46,6 +46,10 @@
  *   each as it was (`app/history/model.js` `Step.reads`): when one differs
  *   later on the path, the step's result is **stale** (`provenance.js`),
  *   whatever the action.
+ * - `captures`: optional (none by default). The inputs of `reads` its
+ *   result holds the value of itself (a keyframe holds the camera it was
+ *   saved at): replay still knows the step read them, but a later change of
+ *   one never makes the step stale (`provenance.js`).
  * - `context`: optional (none by default). The **name context**: the state
  *   its parameters' names resolve in, which its result does not follow (a
  *   field's name in `field-overlays`, the view in focus in `views`, a gene's
@@ -61,6 +65,13 @@
  *   `pauses-recording` (while the history is paused, an agent's change
  *   cannot be undone on its own). Anything the history can undo needs no
  *   confirmation.
+ * - `opensLinks`: true for an action that may fetch an address its
+ *   parameters name (a dataset's link, an accession, a server): its
+ *   implementation asks the person first (`ctx.confirmLink(address)`, of the
+ *   permission kind `unseen-link`) when an agent names an address the person
+ *   has not seen in this tab (`ui/modules/seen-addresses.js`), before
+ *   anything is requested, so an agent misled by text it read cannot make
+ *   the tab send what it read to any host (F121). False by default.
  * - `confirmAt`: when the person is asked: `start` (before the action runs,
  *   the default) or `handler` (its implementation asks, with
  *   `ctx.confirm(detail)`, once it knows what the cost is: a download's
@@ -70,6 +81,13 @@
  *   into one (a slider drag, a camera gesture).
  * - `supersede`: a newer dispatch of the same type cancels an unfinished one
  *   (choosing another field while the first is still read).
+ * - `keepsWhenStopped`: stopped while it runs (the person's Stop of an agent
+ *   turn), it keeps what it did and records it, where any other change is put
+ *   back (false by default): a film stopped stays at the frame it stopped on
+ *   (F104, owner 2026-11-11: `camera-path.play`, whose camera stays where the
+ *   path stopped, as a pause and `camera-path.stop` leave it). Its
+ *   implementation hears the signal, ends where it is and answers. Only for
+ *   an action that records a step.
  * - `rerun`: whether the same params dispatched again bring a step's own
  *   result up to date with its inputs (false by default): the analysis run
  *   again, a category or range group given the cells the view shows now.
@@ -136,20 +154,30 @@ export function outsideActOf(definition, params, outcome) {
   }
 }
 
-export const ACTION_EFFECTS = Object.freeze(['state', 'view', 'layout', 'read', 'history', 'dataset', 'outside']);
+export const ACTION_EFFECTS = Object.freeze(['state', 'view', 'layout', 'read', 'control', 'history', 'dataset', 'outside']);
 
 /**
- * Whether an action of this effect records no step: a read, a move of the
- * history itself, opening another dataset (whose history starts anew; the
- * open one's stays kept in this browser), or an act outside the state (a
- * file written, a publication, what this browser keeps removed). Such an
- * action touches no domain, is run without the recorder and the history's
- * gate (`dispatcher.js`), and answers with its result rather than a step.
+ * Whether an action of this effect records no step: a read, a control of
+ * work under way (`control`: it stops a playing camera path or a running
+ * analysis, whose own step records what it changed), a move of the history
+ * itself, opening another dataset (whose history starts anew; the open
+ * one's stays kept in this browser while Autosave keeps it, and steps it
+ * does not keep are asked about first: `app/unkept-work-guard.js`), or an
+ * act outside the state (a file
+ * written, a publication, what this browser keeps removed). Such an action
+ * touches no domain, is run without the recorder and the history's gate
+ * (`dispatcher.js`), and answers with its result rather than a step.
+ *
+ * A control must be stepless: touching the domain of the work it stops, it
+ * would wait in order behind that work and run only once there was nothing
+ * left to stop (F96, 2026-11-11: `camera-path.stop`, a view change on the
+ * camera, waited for the `camera-path.play` it was sent to stop, then was
+ * refused "not playing").
  *
  * @param {string} effect
  */
 export function isSteplessEffect(effect) {
-  return effect === 'read' || effect === 'history' || effect === 'dataset' || effect === 'outside';
+  return effect === 'read' || effect === 'control' || effect === 'history' || effect === 'dataset' || effect === 'outside';
 }
 
 export const ACTION_CONFIRMS = Object.freeze(['writes-file', 'deletes-saved', 'large-download', 'publishes', 'pauses-recording']);
@@ -170,8 +198,8 @@ export const ACTION_CONFIRM_TIMES = Object.freeze(['start', 'handler']);
  */
 export const ACTION_TYPE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*)+$/;
 const DEFINITION_KEYS = new Set([
-  'type', 'title', 'summary', 'group', 'params', 'touches', 'reads', 'context', 'effect', 'confirm', 'confirmAt',
-  'coalesce', 'supersede', 'rerun', 'describe', 'code', 'result', 'version', 'upgrade', 'acts',
+  'type', 'title', 'summary', 'group', 'params', 'touches', 'reads', 'captures', 'context', 'effect', 'confirm', 'confirmAt', 'opensLinks',
+  'coalesce', 'supersede', 'keepsWhenStopped', 'rerun', 'describe', 'code', 'result', 'version', 'upgrade', 'acts',
 ]);
 
 function requireLine(value, label, type) {
@@ -220,6 +248,10 @@ export function defineAction(definition) {
   if (isSteplessEffect(definition.effect) && reads.length > 0) {
     throw new TypeError(`Action "${type}" records no step, so it records no inputs (reads is empty)`);
   }
+  const captures = definition.captures ?? [];
+  if (!Array.isArray(captures) || new Set(captures).size !== captures.length || captures.some(input => !reads.includes(input))) {
+    throw new TypeError(`Action "${type}" captures must list distinct inputs it reads`);
+  }
   const context = definition.context ?? [];
   if (!Array.isArray(context) || new Set(context).size !== context.length) {
     throw new TypeError(`Action "${type}" context must list distinct inputs`);
@@ -244,6 +276,12 @@ export function defineAction(definition) {
   if (definition.confirmAt !== undefined && confirm === null) {
     throw new TypeError(`Action "${type}" says when to ask (confirmAt) but asks about nothing (confirm is null)`);
   }
+  if (definition.opensLinks !== undefined && typeof definition.opensLinks !== 'boolean') {
+    throw new TypeError(`Action "${type}" opensLinks must be a boolean`);
+  }
+  if (definition.opensLinks === true && definition.effect === 'read') {
+    throw new TypeError(`Action "${type}" is a read, which fetches nothing an agent names (opensLinks)`);
+  }
   for (const key of ['describe', 'code']) {
     if (typeof definition[key] !== 'function') throw new TypeError(`Action "${type}" needs ${key}(params)`);
   }
@@ -252,6 +290,12 @@ export function defineAction(definition) {
   }
   if (definition.supersede !== undefined && typeof definition.supersede !== 'boolean') {
     throw new TypeError(`Action "${type}" supersede must be a boolean`);
+  }
+  if (definition.keepsWhenStopped !== undefined && typeof definition.keepsWhenStopped !== 'boolean') {
+    throw new TypeError(`Action "${type}" keepsWhenStopped must be a boolean`);
+  }
+  if (definition.keepsWhenStopped === true && isSteplessEffect(definition.effect)) {
+    throw new TypeError(`Action "${type}" records no step, so there is nothing a Stop could keep (keepsWhenStopped)`);
   }
   if (definition.rerun !== undefined && typeof definition.rerun !== 'boolean') {
     throw new TypeError(`Action "${type}" rerun must be a boolean`);
@@ -295,10 +339,13 @@ export function defineAction(definition) {
     ...definition,
     touches: Object.freeze([...touches]),
     reads: Object.freeze([...reads]),
+    captures: Object.freeze([...captures]),
     context: Object.freeze([...context]),
     confirm,
     confirmAt,
+    opensLinks: definition.opensLinks === true,
     supersede: definition.supersede === true,
+    keepsWhenStopped: definition.keepsWhenStopped === true,
     rerun: definition.rerun === true,
     coalesce: definition.coalesce ?? null,
     result: definition.result ?? null,
@@ -350,7 +397,7 @@ export function upgradeParams(definition, from, params) {
   if (definition.version === null) throw new RangeError(`"${definition.type}" records no step, so its parameters have no version`);
   if (!Number.isSafeInteger(from) || from < 1) throw new RangeError(`An action version is a whole number from 1, not ${from}`);
   if (from > definition.version) {
-    throw new RangeError(`"${definition.type}" was recorded with version ${from} of its parameters, newer than this catalogue's ${definition.version}`);
+    throw new RangeError(`"${definition.type}" was recorded with version ${from} of its parameters, newer than this catalog's ${definition.version}`);
   }
   let upgraded = structuredClone(params);
   for (let version = from; version < definition.version; version++) upgraded = definition.upgrade[String(version)](upgraded);
@@ -386,7 +433,7 @@ export function valuesOnlyUpgrade(reason) {
 }
 
 /**
- * A catalogue over action definitions: unique types, looked up by type.
+ * A catalog over action definitions: unique types, looked up by type.
  * @param {Iterable<object>} definitions frozen results of `defineAction`
  */
 export function createActionCatalog(definitions) {
@@ -426,9 +473,9 @@ export function toolNameOf(type) {
 }
 
 /**
- * The language-neutral catalogue document: Python and R generate their
+ * The language-neutral catalog document: Python and R generate their
  * methods from it, the agent tools are built from it, the docs reference
- * lists it. Byte-stable for a given catalogue (sorted, no functions).
+ * lists it. Byte-stable for a given catalog (sorted, no functions).
  * @param {ReturnType<typeof createActionCatalog>} catalog
  */
 export function catalogDocument(catalog) {
@@ -443,8 +490,10 @@ export function catalogDocument(catalog) {
       version: definition.version,
       effect: definition.effect,
       confirm: definition.confirm,
+      opensLinks: definition.opensLinks,
       touches: [...definition.touches],
       reads: [...definition.reads],
+      captures: [...definition.captures],
       context: [...definition.context],
       params: definition.params,
       result: definition.result,

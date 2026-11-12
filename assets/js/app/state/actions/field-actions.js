@@ -1,12 +1,12 @@
 /**
- * @fileoverview The implementations of the field, label, colour, filter,
+ * @fileoverview The implementations of the field, label, color, filter,
  * cell-visibility, gene-set and data-mapping actions that need nothing but
  * the state (`app/actions/definitions/{fields,coloring,filters,mapping}.js`):
  * each resolves the names its parameters give (`app/actions/targets/`) and calls the
  * `DataState` method the sidebar called before it dispatched.
  *
  * The actions whose implementation is an orchestration of a control live
- * with that control: colouring by a field or gene and duplicating a field
+ * with that control: coloring by a field or gene and duplicating a field
  * (`ui/modules/field-selector.js`), opening a share of the cells
  * (`subsample-control.js`), reading genes for more cells
  * (`gene-read-control.js`).
@@ -23,29 +23,23 @@ import { ActionRefused } from '../../actions/dispatcher.js';
 import { mappingChangesOf } from '../../actions/definitions/mapping.js';
 import { StateValidator } from '../../utils/state-validator.js';
 import { FieldSource, OverlapStrategy } from '../../utils/field-constants.js';
-import { categoricalStorageForCount } from '../../../data/categorical-storage-contract.js';
+import { categoricalStorageForCodes, categoricalStorageForCount } from '../../../data/categorical-storage-contract.js';
 import { NOTEBOOK_PUSH_OPERATION } from '../../viewer-host/results.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { transformWords } from '../../../data/expression-transform.js';
 import { throwIfAborted, onAbort } from '../../../utils/abort.js';
 import { categoryCellLimitAt } from '../managers/category-cell-sample.js';
 import { consensusColumnOf } from '../../community-annotations/consensus-codes.js';
 import { annotationCategories, annotationFieldKey } from '../../community-annotations/field-names.js';
 import { categoryLabel, listNames, quoteName } from '../../actions/targets/names.js';
 import {
-  requireNewName, resolveCategory, resolveDeletedField, resolveField, resolveLoadedField, resolveShownField,
+  requireNewCategoryLabel, requireNewName, resolveCategory, resolveDeletedField, resolveField, resolveLoadedField, resolveShownField,
 } from '../../actions/targets/fields.js';
 import { resolvePage } from '../../actions/targets/pages.js';
-
-/** `#rrggbb` as the state's RGB in [0, 1]. */
-export function hexToRgb01(hex) {
-  const value = Number.parseInt(hex.slice(1), 16);
-  return [((value >> 16) & 255) / 255, ((value >> 8) & 255) / 255, (value & 255) / 255];
-}
-
-/** The state's RGB in [0, 1] as `#rrggbb`. */
-export function rgb01ToHex(rgb) {
-  return `#${rgb.map(channel => Math.round(channel * 255).toString(16).padStart(2, '0')).join('')}`;
-}
+import { intersectionKey } from '../../utils/page-membership.js';
+import { makeUniqueLabel } from '../../utils/label-utils.js';
+import { hexOfRgb01, rgb01OfHex } from '../../../utils/hex-color.js';
+import { NO_DATASET_OPEN } from '../../ui/no-dataset.js';
 
 /**
  * Refuse a column of another dataset by its cell count. The count cannot
@@ -93,12 +87,12 @@ function isExactNonblank(text) {
 
 function requireDataset(state) {
   if (!Array.isArray(state.getFields?.()) || state.pointCount === 0) {
-    throw new ActionRefused('No dataset is open.', { code: 'no-dataset' });
+    throw new ActionRefused(NO_DATASET_OPEN, { code: 'no-dataset' });
   }
 }
 
 /**
- * Install every state-only field, colour, filter and mapping action.
+ * Install every state-only field, color, filter and mapping action.
  *
  * @param {{
  *   state: object,
@@ -146,8 +140,8 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
       state.deleteField(target.source, target.index);
       return { name: ref.key };
     },
-    'field.restore': ({ field: ref }) => {
-      const target = resolveDeletedField(state, ref);
+    'field.restore': ({ field: ref, which }) => {
+      const target = resolveDeletedField(state, ref, which);
       if (StateValidator.isDuplicateKey(ref.key, target.source === FieldSource.VAR ? state.getVarFields() : state.getFields())) {
         throw new ActionRefused(
           `A field named ${quoteName(ref.key)} is shown already; rename it before restoring the deleted one.`,
@@ -159,21 +153,26 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
         : state.restoreUserDefinedField(target.userDefinedId, target.source);
       return { name: result.key };
     },
-    'field.purge': ({ field: ref }) => {
-      const target = resolveDeletedField(state, ref);
+    'field.purge': ({ field: ref, which }) => {
+      const target = resolveDeletedField(state, ref, which);
       if (target.index >= 0) state.purgeDeletedField(target.source, target.index);
       else state.purgeUserDefinedField(target.userDefinedId, target.source);
       return { name: ref.key };
     },
-    'field.create-from-pages': params => {
+    'field.create-from-pages': async (params, { signal } = {}) => {
       requireDataset(state);
       requireNewName(state, FieldSource.OBS, params.key);
+      for (const entry of params.pages) requireNewCategoryLabel(entry.label);
+      // Empty: cells on no page are left without a category.
+      if (params.uncovered_label !== '') requireNewCategoryLabel(params.uncovered_label);
+      if (params.overlap === OverlapStrategy.OVERLAP_LABEL) requireNewCategoryLabel(params.overlap_label);
+      for (const combination of params.intersection_labels) requireNewCategoryLabel(combination.label);
       const pages = params.pages.map(entry => ({ pageId: resolvePage(state, entry.page).id, label: entry.label }));
       const order = new Map(params.pages.map((entry, position) => [entry.page, position]));
       const intersectionLabels = {};
       if (params.overlap === OverlapStrategy.INTERSECTIONS) {
         for (const combination of params.intersection_labels) {
-          let mask = 0;
+          const positions = new Set();
           for (const name of combination.pages) {
             if (!order.has(name)) {
               throw new ActionRefused(
@@ -181,12 +180,29 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
                 { code: 'no-such-page' },
               );
             }
-            mask |= 1 << order.get(name);
+            positions.add(order.get(name));
           }
-          intersectionLabels[String(mask)] = combination.label;
+          const key = intersectionKey([...positions].sort((left, right) => left - right));
+          if (Object.hasOwn(intersectionLabels, key)) {
+            throw new ActionRefused(
+              `Two labels are given for the cells on ${listNames(combination.pages)}; give each combination of pages one label.`,
+              { code: 'bad-params' },
+            );
+          }
+          intersectionLabels[key] = combination.label;
         }
       } else if (params.intersection_labels.length > 0) {
         throw new ActionRefused('Intersection labels are given only with overlap "intersections".', { code: 'bad-params' });
+      }
+      // The cells on no page keep their category of `rest` (L25-3): its labels and each open cell's code.
+      let rest = null;
+      if (params.rest !== undefined) {
+        const target = await resolveLoadedField(state, params.rest, { kind: 'category', signal });
+        const { codes, categories } = target.field;
+        if (!ArrayBuffer.isView(codes) || !Array.isArray(categories)) {
+          throw new ActionRefused(`${quoteName(target.field.key)} has no categories to keep for the cells on no page.`, { code: 'refused' });
+        }
+        rest = { categories: categories.map(categoryLabel), codes, missing: categoricalStorageForCodes(codes, 'The kept field').missingValue };
       }
       let result;
       try {
@@ -197,6 +213,7 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
           overlapStrategy: params.overlap,
           overlapLabel: params.overlap === OverlapStrategy.OVERLAP_LABEL ? params.overlap_label : '',
           intersectionLabels,
+          ...(rest === null ? {} : { rest }),
         });
       } catch (error) {
         throw new ActionRefused(`The field ${quoteName(params.key)} cannot be made: ${error.message}`, { code: 'refused' });
@@ -266,7 +283,7 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
         categories: column.categories,
         codes: column.codes,
         meta: {
-          // A category-for-category function of its source: newly opened cells are labelled from it.
+          // A category-for-category function of its source: newly opened cells are labeled from it.
           _sourceField: { kind: 'community-annotation', sourceKey: fieldKey, sourceIndex: source.index },
           _operation: {
             type: 'community-consensus',
@@ -288,22 +305,65 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
       requireUnlocked(target);
       const index = resolveCategory(target.field, category);
       if (category === name) return null;
+      requireNewCategoryLabel(name);
       if (target.field.categories.some((label, at) => at !== index && categoryLabel(label) === name)) {
         throw new ActionRefused(`${quoteName(ref.key)} has a category ${quoteName(name)} already; choose another label.`, { code: 'name-taken' });
       }
       state.renameCategory(FieldSource.OBS, target.index, index, name);
       return { name };
     },
-    'category.merge': async ({ field: ref, category, into }, { signal }) => {
+    'category.merge': async ({ field: ref, category, into, label }, { signal }) => {
       const target = await resolveLoadedField(state, ref, { kind: 'category', signal });
       requireUnlocked(target);
       const from = resolveCategory(target.field, category);
       const to = resolveCategory(target.field, into);
       if (from === to) throw new ActionRefused(`${quoteName(category)} cannot be merged into itself.`, { code: 'bad-params' });
+      if (label !== undefined) requireNewCategoryLabel(label);
+      if (label !== undefined && target.field.categories.some((name, at) => at !== from && at !== to && categoryLabel(name) === label)) {
+        throw new ActionRefused(`${quoteName(ref.key)} has a category ${quoteName(label)} already; choose another label.`, { code: 'name-taken' });
+      }
       const result = state.mergeCategoriesToNewField(target.index, from, to, {
         editInPlace: target.field._isUserDefined === true,
+        ...(label === undefined ? {} : { mergedLabel: label }),
       });
       return { name: result.newKey, merged: result.mergedCategoryLabel, in_place: result.updatedInPlace };
+    },
+    'field.group': async ({ field: ref, groups, rest, name }, { signal }) => {
+      const target = await resolveLoadedField(state, ref, { kind: 'category', signal });
+      const labels = new Set();
+      const listedIn = new Map();
+      const resolved = groups.map(group => {
+        requireNewCategoryLabel(group.label);
+        if (labels.has(group.label)) throw new ActionRefused(`Two groups are called ${quoteName(group.label)}; give each its own label.`, { code: 'bad-params' });
+        labels.add(group.label);
+        const members = group.categories.map(category => {
+          const index = resolveCategory(target.field, category);
+          if (listedIn.has(index)) {
+            throw new ActionRefused(`${quoteName(category)} is listed in ${quoteName(listedIn.get(index))} and ${quoteName(group.label)}; a category joins one group.`, { code: 'bad-params' });
+          }
+          listedIn.set(index, group.label);
+          return index;
+        });
+        return { label: group.label, members };
+      });
+      if (rest !== null) requireNewCategoryLabel(rest);
+      const unlisted = target.field.categories.map((category, index) => index).filter(index => !listedIn.has(index));
+      if (rest === null) {
+        // A category kept as it is keeps its label, which no group may take.
+        const clash = unlisted.find(index => labels.has(categoryLabel(target.field.categories[index])));
+        if (clash !== undefined) {
+          const label = categoryLabel(target.field.categories[clash]);
+          throw new ActionRefused(`${quoteName(label)} is kept as it is (no group lists it), and a group is called ${quoteName(label)}: list it in that group, or call the group otherwise.`, { code: 'name-taken' });
+        }
+      }
+      if (name !== undefined) requireNewName(state, FieldSource.OBS, name);
+      const existing = state.getFields().filter(field => field && field._isDeleted !== true).map(field => field.key);
+      const result = state.groupCategoriesToNewField(target.index, {
+        groups: resolved,
+        restLabel: rest,
+        newKey: name ?? makeUniqueLabel(`${ref.key} (grouped)`, existing),
+      });
+      return { name: result.newKey, categories: result.categories, kept: rest === null ? unlisted.length : 0 };
     },
     'category.delete': async ({ field: ref, category, unassigned_label: unassignedLabel }, { signal }) => {
       const target = await resolveLoadedField(state, ref, { kind: 'category', signal });
@@ -324,12 +384,12 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
       return { id: entry.id, name, genes: genes.length };
     },
 
-    // ---- Colours -----------------------------------------------------------
+    // ---- Colors -----------------------------------------------------------
     'color.category': async ({ field: ref, category, color }, { signal }) => {
       const target = await resolveLoadedField(state, ref, { kind: 'category', signal });
       const index = resolveCategory(target.field, category);
-      const rgb = hexToRgb01(color);
-      if (rgb01ToHex(state.getColorForCategory(target.field, index)) === color.toLowerCase()) return null;
+      const rgb = rgb01OfHex(color);
+      if (hexOfRgb01(state.getColorForCategory(target.field, index)) === color.toLowerCase()) return null;
       state.setColorForCategory(target.field, index, rgb);
       return { color: color.toLowerCase() };
     },
@@ -352,7 +412,7 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
       const target = resolveShownField(state, ref, { kind: 'continuous' });
       const index = continuousIndex(target);
       state.setContinuousColorRescale(index, enabled);
-      // Rescaled, the colours span the visible range from then on.
+      // Rescaled, the colors span the visible range from then on.
       if (enabled) {
         const filter = state.getLegendModel(target.field).filter;
         state.setContinuousColorRange(index, filter.min, filter.max);
@@ -407,7 +467,7 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
       const range = clampedRange(target.field, min, max);
       const index = continuousIndex(target);
       state.applyContinuousFilter(index, range.min, range.max);
-      // Rescaled to the range, the colours follow it.
+      // Rescaled to the range, the colors follow it.
       if (target.field._useFilterColorRange === true) state.setContinuousColorRange(index, range.min, range.max);
       return range;
     },
@@ -454,16 +514,39 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
     },
 
     // ---- Data mapping ------------------------------------------------------
-    'mapping.set': async (params, { meta }) => {
+    'mapping.set': async (params, { meta, heavy, signal }) => {
       const current = state.getDataMapping();
       if (current === null) throw new ActionRefused('No dataset is open, so it has no data mapping.', { code: 'no-dataset' });
       const changes = mappingChangesOf(params);
       if (Object.keys(changes).length === 0) return null;
-      const next = { ...current, ...changes };
+      // Groups not named follow a named modality or matrix, as the panel's menus do.
+      const next = state.followMappingChanges(current, changes);
       if (JSON.stringify(next) === JSON.stringify(current)) return null;
       const origin = meta.origin === 'host' ? 'notebook' : meta.origin === 'session' ? 'session' : 'user';
-      await state.applyDataMapping(next, { origin });
+      // Normalized values of another counts matrix sum its cells' totals: asked as heavy work.
+      // Stopped, it ends at once and puts back what it had published (F147).
+      await state.applyDataMapping(next, { origin, heavy, signal });
       return { groups: Object.keys(changes).length };
+    },
+    // ---- Expression values ---------------------------------------------------
+    'expression.transform.set': async (params, { signal, heavy }) => {
+      if (!Object.hasOwn(params, 'normalize') && !Object.hasOwn(params, 'log1p')) {
+        throw new ActionRefused('Name `normalize`, `log1p` or both: the expression values to show the genes in.', { code: 'refused' });
+      }
+      if (state.getDataMapping() === null) throw new ActionRefused('No dataset is open, so it has no expression values.', { code: 'no-dataset' });
+      const asked = { ...state.getExpressionTransform(), ...params };
+      let outcome;
+      try {
+        outcome = await state.setExpressionTransform(asked, { signal, requireOffered: true, heavy });
+      } catch (error) {
+        if (error instanceof RangeError) throw new ActionRefused(error.message, { code: 'refused' });
+        throw error;
+      }
+      if (!outcome.changed) return null;
+      return {
+        shown: transformWords(outcome.shown).toLowerCase(),
+        ...(outcome.dropped.length === 0 ? {} : { dropped: outcome.dropped.join(', ') }),
+      };
     },
   };
 
@@ -485,6 +568,22 @@ export function installFieldActions({ state, fieldLock = () => null, actions = g
   }
 
   const removers = Object.entries(handlers).map(([type, handler]) => actions.provide(type, handler));
+  // What normalizing would read, priced at the link as measured now: an
+  // agent is asked before a pass over every gene (heavy work).
+  removers.push(actions.provideEstimate('expression.transform.set', async params => {
+    const cost = await state.expressionTransformCost({ ...state.getExpressionTransform(), ...params }).catch(() => null);
+    return cost === null ? null : { ms: cost.ms, bytes: cost.bytes, what: cost.what };
+  }));
+  // The same for a mapping onto another counts matrix while the values are
+  // normalized: its cells' totals are summed (heavy work, asked first).
+  removers.push(actions.provideEstimate('mapping.set', async params => {
+    const current = state.getDataMapping();
+    if (current === null) return null;
+    const changes = mappingChangesOf(params);
+    if (Object.keys(changes).length === 0) return null;
+    const cost = await state.mappingTotalsCost(state.followMappingChanges(current, changes)).catch(() => null);
+    return cost === null ? null : { ms: cost.ms, bytes: cost.bytes, what: cost.what };
+  }));
   return () => {
     for (const remove of removers) remove();
   };

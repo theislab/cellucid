@@ -15,14 +15,15 @@
  *   by item (a vote, a suggestion, a comment, a deletion, the profile), and,
  *   for an author, the repository settings and merges against what the last
  *   Pull read. The panel says it in one line ("3 changes not published ·
- *   Publish"), and an agent's vote says it in its question (only the vote is
- *   published; the rest stays here).
+ *   Publish"), and an agent's `annotation.publish` says it in its question
+ *   (only its votes and suggestions are published; the rest stays here).
  *
  * @module ui/modules/community-annotation/published-baseline
  */
 
 import { toPublishedViewKey } from '../../../community-annotations/cache-scope.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
+import { webStorage } from '../../../../utils/web-storage.js';
 
 /** The person's own file path in the repository. */
 export function ownUserFilePath(githubUserId) {
@@ -30,11 +31,7 @@ export function ownUserFilePath(githubUserId) {
 }
 
 function storage() {
-  try {
-    return globalThis.localStorage ?? null;
-  } catch {
-    return null;
-  }
+  return webStorage('localStorage');
 }
 
 /**
@@ -197,16 +194,22 @@ export function pendingDetail(counts) {
 }
 
 /**
- * The person's view of the open dataset with one vote changed and nothing
- * else: what an agent's vote publishes (`pushMyUserFile` composes it with
- * the file as published now). The view as published comes back unchanged
- * when the vote is already so, so nothing is written.
+ * The person's view of the open dataset as published now plus the given
+ * votes and suggestions of theirs and nothing else: what an agent's
+ * `annotation.publish` writes, in one commit (`pushMyUserFile` composes it
+ * with the file as published now). Each suggestion comes with the person's
+ * upvote, as the voting dialog adds one; then each vote is set (`null`
+ * takes it back). The view as published comes back unchanged (the same
+ * object) when nothing changes, so nothing is written.
  *
  * @param {object|null} published - the view published now, null when the person has no file
- * @param {{githubUserId: number, login: string, suggestionId: string, direction: 'up'|'down'|null, now?: string}} vote
+ * @param {{githubUserId: number, login: string,
+ *   votes?: Array<{suggestionId: string, direction: 'up'|'down'|null}>,
+ *   suggestions?: Array<{bucket: string, suggestion: object}>, now?: string}} changes -
+ *   `bucket`: a suggestion's bucket key; `suggestion`: as the user file holds it
  * @returns {object} a user-document view (`assertUserDocument`)
  */
-export function withOneVote(published, { githubUserId, login, suggestionId, direction, now = new Date().toISOString() }) {
+export function withChanges(published, { githubUserId, login, votes = [], suggestions = [], now = new Date().toISOString() }) {
   const base = published ?? {
     version: 1,
     username: `ghid_${githubUserId}`,
@@ -216,39 +219,22 @@ export function withOneVote(published, { githubUserId, login, suggestionId, dire
     suggestions: {},
     votes: {},
   };
-  if ((base.votes?.[suggestionId] ?? null) === direction) return base;
-  const votes = { ...base.votes };
-  if (direction === null) delete votes[suggestionId];
-  else votes[suggestionId] = direction;
-  return { ...base, updatedAt: now, votes };
-}
-
-/**
- * The person's view of the open dataset with one suggestion of theirs added
- * (and their upvote of it, as the voting dialog adds one) and nothing else:
- * what an agent's suggestion publishes. Already there: the view as published.
- *
- * @param {object|null} published - the view published now, null when the person has no file
- * @param {{githubUserId: number, login: string, bucket: string, suggestion: object, now?: string}} change -
- *   `bucket`: the suggestion's bucket key; `suggestion`: as the user file holds it
- * @returns {object} a user-document view (`assertUserDocument`)
- */
-export function withOneSuggestion(published, { githubUserId, login, bucket, suggestion, now = new Date().toISOString() }) {
-  const base = published ?? {
-    version: 1,
-    username: `ghid_${githubUserId}`,
-    githubUserId,
-    ...(login ? { login } : {}),
-    updatedAt: now,
-    suggestions: {},
-    votes: {},
-  };
-  const list = base.suggestions?.[bucket] ?? [];
-  if (list.some(entry => entry.id === suggestion.id)) return base;
-  return {
-    ...base,
-    updatedAt: now,
-    suggestions: { ...base.suggestions, [bucket]: [...list, suggestion] },
-    votes: { ...base.votes, [suggestion.id]: 'up' },
-  };
+  const nextSuggestions = { ...base.suggestions };
+  const nextVotes = { ...base.votes };
+  let changed = false;
+  for (const { bucket, suggestion } of suggestions) {
+    const list = nextSuggestions[bucket] ?? [];
+    if (list.some(entry => entry.id === suggestion.id)) continue;
+    nextSuggestions[bucket] = [...list, suggestion];
+    nextVotes[suggestion.id] = 'up';
+    changed = true;
+  }
+  for (const { suggestionId, direction } of votes) {
+    if ((nextVotes[suggestionId] ?? null) === direction) continue;
+    if (direction === null) delete nextVotes[suggestionId];
+    else nextVotes[suggestionId] = direction;
+    changed = true;
+  }
+  if (!changed) return base;
+  return { ...base, updatedAt: now, suggestions: nextSuggestions, votes: nextVotes };
 }

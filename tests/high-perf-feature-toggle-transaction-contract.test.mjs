@@ -480,7 +480,8 @@ test('bottleneck frame sampler rejects synchronous scheduling failures', async (
   assert.equal(renderCalls, 0);
 });
 
-test('bottleneck default render parameters satisfy the exact renderer contract', () => {
+test('bottleneck default render parameters satisfy the exact renderer contract', async () => {
+  const { requireRenderContract } = await import('../assets/js/rendering/high-perf/renderer-contracts.js');
   const analyzer = Object.assign(
     Object.create(BottleneckAnalyzer.prototype),
     {
@@ -492,9 +493,15 @@ test('bottleneck default render parameters satisfy the exact renderer contract',
           return 2;
         },
       },
+      // The sprite the panel hands it (app/main.js: pointSpriteCap).
+      sprite: { pointSizeMax: 160 },
     },
   );
   const params = analyzer._getDefaultRenderParams();
+  assert.doesNotThrow(() => requireRenderContract(params));
+  assert.equal(params.pointSizeMax, 160);
+  // Without the viewer's sprite it refuses to draw, saying what it needs.
+  assert.throws(() => Object.assign(Object.create(BottleneckAnalyzer.prototype), { ...analyzer, sprite: null })._getDefaultRenderParams(), /sprite/);
   assert.equal(params.quality, 'light');
   assert.equal(
     params.dimensionLevel,

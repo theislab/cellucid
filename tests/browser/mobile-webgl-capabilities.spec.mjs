@@ -23,7 +23,7 @@ const DATASET_URL =
 
 const SMOKE_UNAVAILABLE_MESSAGE =
   "Volumetric smoke isn't available on this device: its graphics driver can't "
-  + 'blend high-precision colour, which the smoke cloud needs to add up the '
+  + 'blend high-precision color, which the smoke cloud needs to add up the '
   + 'cells. Points rendering works as usual.';
 
 function observeProductErrors(page) {
@@ -194,8 +194,8 @@ test('points, highlights and figure export work on an iPhone-class device', asyn
     const field = state.obsData.fields[state.activeFieldIndex];
     return field?.key === 'cell_type' && field.codes != null;
   })).toBe(true);
-  const coloured = await captureCanvas(page);
-  expect(foregroundPixels(coloured)).toBeGreaterThan(200);
+  const colored = await captureCanvas(page);
+  expect(foregroundPixels(colored)).toBeGreaterThan(200);
 
   const highlighted = await page.evaluate(() => {
     const state = window._cellucidState;
@@ -204,7 +204,7 @@ test('points, highlights and figure export work on an iPhone-class device', asyn
   });
   expect(highlighted).toBeGreaterThan(0);
   const withHighlight = await captureCanvas(page);
-  expect(differingPixels(coloured, withHighlight)).toBeGreaterThan(20);
+  expect(differingPixels(colored, withHighlight)).toBeGreaterThan(20);
 
   await page.locator('#figure-export-section > summary').click();
   await expect(page.locator('#figure-export-section')).toHaveAttribute('open', '');

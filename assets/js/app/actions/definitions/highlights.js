@@ -1,15 +1,15 @@
 /**
  * @fileoverview Highlight actions: highlight pages (make, show, rename,
- * recolour, delete, combine, clear) and the groups of cells on them (a
+ * recolor, delete, combine, clear) and the groups of cells on them (a
  * confirmed selection, a category, a range of values; show or hide one,
  * remove one).
  *
  * A page and a group are named by their names as the Highlighting panel
  * shows them; cells by original position (their row of `obs`), so a step
  * replays on a subsample or on another dataset with the same names. A page's
- * colour is the colour the page has everywhere it is drawn (its tab, the
+ * color is the color the page has everywhere it is drawn (its tab, the
  * analyses that compare pages, the category builder); a highlight never
- * recolours a page it did not make (`highlight.cells` `color`).
+ * recolors a page it did not make (`highlight.cells` `color`).
  *
  * The implementation is `app/ui/modules/highlight/highlight-actions.js`.
  *
@@ -18,8 +18,8 @@
 
 import { defineAction } from '../catalog.js';
 import { formatCountOf } from '../../../utils/format-units.js';
-import { PLAIN_QUOTE } from '../targets/names.js';
-import { CATEGORY_LABEL, CELLS, COLOR, FIELD, PAGE, TRIMMED_NAME, VISIBLE_CELLS_READS } from './params.js';
+import { PLAIN_QUOTE, categoryLabel } from '../targets/names.js';
+import { CATEGORY_LABEL, CELLS, COLOR, FIELD, PAGE, TRIMMED_NAME, VISIBLE_CELLS_READS, categoriesWords } from './params.js';
 
 const GROUP = 'Highlights';
 const TOUCHES = Object.freeze(['highlights']);
@@ -32,11 +32,11 @@ const TOUCHES = Object.freeze(['highlights']);
 const TARGET_PROPERTIES = Object.freeze({
   page: {
     ...PAGE,
-    description: 'The page the group goes on, by name; a page of that name is made when there is none. Omitted: the page shown, or with `color`, a page of that colour.',
+    description: 'The page the group goes on, by name; a page of that name is made when there is none. Omitted: the page shown, or with `color`, a page of that color.',
   },
   color: {
     ...COLOR,
-    description: 'The colour of the page the group goes on. With `page`, the colour of the page made (an existing page must already have it). Without, the page shown when it has this colour, else the first page that has it, else a new page of it.',
+    description: 'The color of the page the group goes on. With `page`, the color of the page made (an existing page must already have it). Without, the page shown when it has this color, else the first page that has it, else a new page of it.',
   },
 });
 
@@ -48,6 +48,12 @@ const GROUP_PARAM = Object.freeze({
 /** The page part of a sentence: "" for the page shown, ` on page "X"` otherwise. */
 function onPage(params, quote) {
   return params.page === undefined ? '' : ` on page ${quote(params.page)}`;
+}
+
+/** Page names for a step's label: the first three, then how many more. */
+function pageNames(pages, quote) {
+  const shown = pages.slice(0, 3).map(name => quote(name)).join(', ');
+  return pages.length > 3 ? `${shown} and ${pages.length - 3} more` : shown;
 }
 
 function quoted(text) {
@@ -68,7 +74,7 @@ export const highlightActions = Object.freeze([
       type: 'object', additionalProperties: false,
       properties: {
         name: { ...PAGE, description: 'The new page\'s name; omitted, the first free "Page N".' },
-        color: { ...COLOR, description: 'The new page\'s colour; omitted, the next colour of the page palette.' },
+        color: { ...COLOR, description: 'The new page\'s color; omitted, the next color of the page palette.' },
       },
     },
     touches: TOUCHES,
@@ -99,7 +105,7 @@ export const highlightActions = Object.freeze([
     group: GROUP,
     params: {
       type: 'object', additionalProperties: false, required: ['page', 'name'],
-      properties: { page: PAGE, name: { ...PAGE, description: 'The new name.' } },
+      properties: { page: PAGE, name: { ...PAGE, examples: ['Progenitors'], description: 'The new name.' } },
     },
     touches: TOUCHES,
     reads: [],
@@ -109,8 +115,8 @@ export const highlightActions = Object.freeze([
   }),
   defineAction({
     type: 'highlight.page.recolor',
-    title: 'Recolour a highlight page',
-    summary: 'Set the colour a highlight page has in its tab, the analyses and the category builder.',
+    title: 'Recolor a highlight page',
+    summary: 'Set the color a highlight page has in its tab, the analyses and the category builder.',
     group: GROUP,
     params: {
       type: 'object', additionalProperties: false, required: ['page', 'color'],
@@ -119,25 +125,37 @@ export const highlightActions = Object.freeze([
     touches: TOUCHES,
     reads: [],
     effect: 'state',
-    // A colour picker drag is one step per page.
+    // A color picker drag is one step per page.
     coalesce: params => params.page,
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Recoloured highlight page ${quote(params.page)} ${params.color}`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => `Recolored highlight page ${quote(params.page)} ${params.color}`,
     code: params => `set_highlight_page_color(${quoted(params.page)}, ${quoted(params.color)})`,
   }),
   defineAction({
     type: 'highlight.page.delete',
-    title: 'Delete a highlight page',
-    summary: 'Delete a highlight page and its groups; the last page cannot be deleted.',
+    title: 'Delete highlight pages',
+    summary: 'Delete one or several highlight pages and their groups, as one step; at least one page stays.',
     group: GROUP,
+    // Version 2 deletes several pages at once (bug hunt L25-3: 56 calls to clear the pages an
+    // agent had made); a version-1 step named one page.
+    version: 2,
+    upgrade: { 1: ({ page }) => ({ pages: [page] }) },
     params: {
-      type: 'object', additionalProperties: false, required: ['page'],
-      properties: { page: PAGE },
+      type: 'object', additionalProperties: false, required: ['pages'],
+      properties: {
+        pages: {
+          type: 'array', items: PAGE, minItems: 1, uniqueItems: true,
+          description: 'The pages to delete, by name; at least one page stays (clear the last one instead).',
+          examples: [['Page 2'], ['tmp 1', 'tmp 2']],
+        },
+      },
     },
     touches: TOUCHES,
     reads: [],
     effect: 'state',
-    describe: (params, outcome, quote = PLAIN_QUOTE) => `Deleted highlight page ${quote(params.page)}`,
-    code: params => `delete_highlight_page(${quoted(params.page)})`,
+    describe: (params, outcome, quote = PLAIN_QUOTE) => (params.pages.length === 1
+      ? `Deleted highlight page ${quote(params.pages[0])}`
+      : `Deleted ${formatCountOf(params.pages.length, 'highlight page')}: ${pageNames(params.pages, quote)}`),
+    code: params => `delete_highlight_pages([${params.pages.map(quoted).join(', ')}])`,
   }),
   defineAction({
     type: 'highlight.page.combine',
@@ -207,7 +225,7 @@ export const highlightActions = Object.freeze([
       type: 'object', additionalProperties: false, required: ['cells'],
       properties: {
         cells: CELLS,
-        label: { ...GROUP_PARAM, description: 'The group\'s label; omitted, "Highlight (N cells)". A label already on the page gets " (2)", " (3)", ….' },
+        label: { ...GROUP_PARAM, description: 'The group\'s label; omitted, "Highlight" (the list shows its cell count). A label already on the page gets " (2)", " (3)", ….' },
         tool: {
           enum: ['annotation', 'lasso', 'proximity', 'knn'],
           default: 'annotation',
@@ -235,18 +253,26 @@ export const highlightActions = Object.freeze([
   }),
   defineAction({
     type: 'highlight.category',
-    title: 'Highlight a category',
-    summary: 'Add the cells of one category of a field, as the selected view shows them, as a group.',
+    title: 'Highlight categories',
+    summary: 'Add the cells of one or more categories of a field, as the selected view shows them, each category as a group of its own, in one step.',
     group: GROUP,
+    // Version 2 names several categories (`categories`) where version 1 named
+    // one (`category`): one act, one step, one undo for a page of ten donors.
+    // Version 1 took a number or a boolean too (the legend sent a category's
+    // raw value, and a boolean or numeric field's was refused: L14-6); a label
+    // is the text the legend shows.
+    version: 2,
+    upgrade: { 1: ({ category, ...rest }) => ({ ...rest, categories: [categoryLabel(category)] }) },
     params: {
-      type: 'object', additionalProperties: false, required: ['field', 'category'],
+      type: 'object', additionalProperties: false, required: ['field', 'categories'],
       properties: {
         field: { ...FIELD, description: 'A categorical field, by name.' },
-        // A category label (`CATEGORY_LABEL`'s examples: a replay's name mapping finds it, `replay.js`).
-        category: {
-          type: ['string', 'number', 'boolean'],
-          description: 'The category, by its label as the legend shows it.',
-          examples: CATEGORY_LABEL.examples,
+        categories: {
+          type: 'array', minItems: 1, uniqueItems: true,
+          // A category label (`CATEGORY_LABEL`, whose examples a replay's name mapping finds, `replay.js`).
+          items: { ...CATEGORY_LABEL, description: 'A category, by its label as the legend shows it (a number or a boolean category as its text: "3", "true").' },
+          description: 'The categories, by their labels as the legend shows them: each becomes a group of the page, all in one step. One already on the page is brought up to the cells the view shows now.',
+          examples: [['T cells'], ['donor 1', 'donor 2', 'donor 3']],
         },
         ...TARGET_PROPERTIES,
       },
@@ -255,11 +281,22 @@ export const highlightActions = Object.freeze([
     reads: VISIBLE_CELLS_READS,
     rerun: true,
     effect: 'state',
-    describe: (params, outcome, quote = PLAIN_QUOTE) => (
-      `${outcome?.updated === true ? 'Updated the cells of' : 'Highlighted'} ${quote(params.category)} of ${quote.bare(params.field.key)}` +
-      `${outcome?.cells === undefined ? '' : ` (${formatCountOf(outcome.cells, 'cell')})`}${onPage(params, quote)}`
+    describe: (params, outcome, quote = PLAIN_QUOTE) => {
+      // What the step did: the categories it added or brought up to date (the
+      // outcome's), else, before it ran, the categories asked for.
+      const labels = outcome?.categories ?? params.categories;
+      const updated = outcome?.updated ?? 0;
+      const verb = updated > 0 && updated === labels.length ? 'Updated the cells of' : 'Highlighted';
+      const some = updated > 0 && updated < labels.length ? `, ${updated} of them brought up to date` : '';
+      // Each label in quotes, as one category was named ("T cells" of cell_type); past three, a count.
+      const inQuotes = Object.assign(name => quote(name), { bare: quote });
+      return `${verb} ${categoriesWords(labels, inQuotes)} of ${quote.bare(params.field.key)}` +
+        `${outcome?.cells === undefined ? '' : ` (${formatCountOf(outcome.cells, 'cell')})`}${onPage(params, quote)}${some}`;
+    },
+    code: params => (
+      `highlight_category(${quoted(params.field.key)}, [${params.categories.map(quoted).join(', ')}]` +
+      `${params.page === undefined ? '' : `, page=${quoted(params.page)}`})`
     ),
-    code: params => `highlight_category(${quoted(params.field.key)}, ${quoted(params.category)}${params.page === undefined ? '' : `, page=${quoted(params.page)}`})`,
   }),
   defineAction({
     type: 'highlight.range',

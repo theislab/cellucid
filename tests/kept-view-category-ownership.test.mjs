@@ -3,15 +3,15 @@
  *
  * A kept view's field objects are shallow copies of its source's
  * (`_cloneFieldState`): the category list, its originals, the centroid
- * tables and their records, the colour and visibility arrays are shared.
+ * tables and their records, the color and visibility arrays are shared.
  * That is sound only while none of them is written in place. A category
  * rename wrote the label into the shared list, and every relabel of centroids
  * (`_syncCentroidCategoryLabels`, run by a rename and by re-reading the
  * rename registry when a view is focused or a history step restores the
  * renames) wrote the shared centroid records. Restoring the renames in the
- * focused view then relabelled the other view's centroids under its
+ * focused view then relabeled the other view's centroids under its
  * unchanged categories, and focusing that view failed: "Category centroids
- * of layout ... reference an unknown category identity". Colour by a field,
+ * of layout ... reference an unknown category identity". Color by a field,
  * keep a view, rename a category, undo past the kept view (or the same with
  * the rename before the kept view and one jump back) failed every time.
  *
@@ -19,7 +19,7 @@
  * (kept before or after the change), restores the values from before
  * through the domain owners from either view, focuses every view, and
  * compares the fingerprint (every restored domain and each view's fields as
- * drawn: categories, originals, centroid labels and positions, colours,
+ * drawn: categories, originals, centroid labels and positions, colors,
  * visibility) exactly; then restores the changed values and compares again.
  */
 
@@ -50,7 +50,7 @@ function rawPositions() {
 }
 
 /**
- * A real DataState on a real DimensionManager, coloured by the dataset's
+ * A real DataState on a real DimensionManager, colored by the dataset's
  * categorical `cell_type`, with the domain owners a field change and its
  * undo go through.
  */
@@ -172,7 +172,7 @@ const CHANGES = {
     const { newFieldIndex } = state.deleteCategoryToUnassigned(CELL_TYPE, 2, { editInPlace: false, unassignedLabel: 'unassigned' });
     state.setActiveField(newFieldIndex);
   },
-  'recolour a category': ({ state }) => state.setColorForCategory(state.obsData.fields[CELL_TYPE], 0, RED),
+  'recolor a category': ({ state }) => state.setColorForCategory(state.obsData.fields[CELL_TYPE], 0, RED),
   'rename a category of an annotation': ({ state }) => {
     const { newFieldIndex } = state.mergeCategoriesToNewField(CELL_TYPE, 0, 1, { editInPlace: false });
     state.setActiveField(newFieldIndex);

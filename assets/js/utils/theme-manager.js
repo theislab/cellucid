@@ -1,10 +1,12 @@
+import { InternalError } from './errors.js';
+import { webStorage } from './web-storage.js';
 // @ts-check
 
 /**
  * ThemeManager
  *
  * - Only supports `light` and `dark`
- * - Persists to `localStorage` under `cellucid_theme`
+ * - Persists to `localStorage` under `cellucid_theme` where the browser keeps it
  * - Applies theme via `document.documentElement.dataset.theme`
  * - Emits `cellucid:theme-change` with `{ detail: { theme } }`
  *
@@ -33,7 +35,7 @@ function requireTheme(value) {
  */
 function requireDocumentRoot() {
   if (typeof document === 'undefined' || !(document.documentElement instanceof Object)) {
-    throw new Error('ThemeManager requires the current document element.');
+    throw new InternalError('ThemeManager requires the current document element.');
   }
   return document.documentElement;
 }
@@ -119,7 +121,7 @@ export const ThemeManager = {
    */
   getTheme() {
     if (currentTheme === null) {
-      throw new Error('ThemeManager is not initialized.');
+      throw new InternalError('ThemeManager is not initialized.');
     }
     return currentTheme;
   },
@@ -136,12 +138,6 @@ export const ThemeManager = {
     const appliedTheme = requireTheme(root.dataset.theme);
     const alreadyApplied = appliedTheme === nextTheme;
 
-    if (persist && (
-      typeof localStorage === 'undefined'
-      || typeof localStorage.setItem !== 'function'
-    )) {
-      throw new Error('Theme persistence requires the current localStorage owner.');
-    }
     if (!alreadyApplied && doTransition && (
       typeof window === 'undefined'
       || typeof window.setTimeout !== 'function'
@@ -156,7 +152,15 @@ export const ThemeManager = {
       throw new Error('Theme changes require the current browser event owner.');
     }
 
-    if (persist) localStorage.setItem(STORAGE_KEY, nextTheme);
+    if (persist) {
+      // Kept for the next visit where this browser keeps anything for the
+      // site; elsewhere the theme holds for this page (`utils/web-storage.js`).
+      try {
+        webStorage('localStorage')?.setItem(STORAGE_KEY, nextTheme);
+      } catch {
+        // A full or refusing store: this page keeps the theme.
+      }
+    }
 
     currentTheme = nextTheme;
 

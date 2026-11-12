@@ -150,7 +150,7 @@ test('range sliders paint a keyboard focus ring and accept pointer input across 
 
   await page.locator('#theme-select').selectOption('light');
 
-  /* Behavioural proof for CEL-AUDIT-0084: before the fix a click at the bottom
+  /* Behavioral proof for CEL-AUDIT-0084: before the fix a click at the bottom
      edge of the painted thumb landed on the parent container and moved
      nothing. */
   const slider = page.locator('#point-size');

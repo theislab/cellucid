@@ -1,7 +1,7 @@
 /**
  * @fileoverview The point markup of a Full Vector or Optimized Vector SVG.
  *
- * One `<circle>` per drawn point (and one ring per highlighted point) is the
+ * One `<circle>` per drawn point (and a dot and a ring per highlighted point) is the
  * bulk of a vector figure: 562k cells write about 65 MB. It is written in the
  * figure-export worker (`figure-export-worker.js`) and leaves as one Blob, so
  * the page's main thread never projects, shades or formats a point, and never
@@ -19,6 +19,14 @@
 
 import { forEachProjectedPoint } from '../utils/point-projector.js';
 import { reducePointsByDensity } from '../utils/density-reducer.js';
+import { HIGHLIGHT_RGB } from '../utils/highlight-legend.js';
+import {
+  HIGHLIGHT_RING_COLOR,
+  HIGHLIGHT_STYLES_BY_QUALITY,
+  highlightRingRadii,
+} from '../../../../../rendering/shaders/high-perf-shaders.js';
+import { createPlotPlacement } from '../utils/plot-fit.js';
+import { createViewportPointDiameter } from '../utils/point-size.js';
 import { BENEATH_ALPHA_BYTE, UNREAD_ALPHA_BYTE, colorLayersOf } from '../../../../../rendering/alpha-visibility.js';
 import { requireFigurePointLayers } from '../utils/lod-membership.js';
 import {
@@ -30,25 +38,36 @@ import {
   applyFogChannel,
   createFogEvaluator,
 } from '../utils/fog.js';
+import { fogOpacityAt } from '../../../../../rendering/shaders/fog-shaders.js';
 
-const DEFAULT_HIGHLIGHT_RGB = { r: 102, g: 217, b: 255 }; // ~[0.4, 0.85, 1.0]
-const DEFAULT_HIGHLIGHT_SCALE = 1.75;
+/**
+ * A highlighted point is drawn as the screen's flat highlight draws it: a dot
+ * of the highlight's color out to the ring's inner edge, inside a ring of the
+ * ring's color (`highlightRingColorFor`: black around the light dot, so it
+ * reads against any coloring, F162), at the radii of the shader's flat circle
+ * style (`highlightRingRadii`).
+ */
+const HIGHLIGHT_RING_RADII = highlightRingRadii(HIGHLIGHT_STYLES_BY_QUALITY.light);
+const HIGHLIGHT_FILL = `rgb(${HIGHLIGHT_RGB[0]},${HIGHLIGHT_RGB[1]},${HIGHLIGHT_RGB[2]})`;
+const HIGHLIGHT_RING_STROKE = `rgb(${HIGHLIGHT_RING_COLOR.map(channel => Math.round(channel * 255)).join(',')})`;
 
-/** Selection muting paints non-selected points this flat grey, as `packBuffers` does. */
+/** Selection muting paints non-selected points this flat gray, as `packBuffers` does. */
 const SELECTION_MUTED_RGB = 160;
 
 /** Bytes of markup encoded before they are copied into a Blob part. */
 const MARKUP_BUFFER_BYTES = 1024 * 1024;
 
 /**
- * The colour a vector circle must carry to match the shader.
+ * The color a vector circle must carry to match the shader.
  *
  * Both transformations happen on screen in this order: the export mutes
  * non-selected points before rasterization, and the shader then fogs whatever
- * colour reached it. Reversing them would fog the original colour and mute the
+ * color reached it. Reversing them would fog the original color and mute the
  * result, which is a different image.
  *
- * Returns a reused 4-slot buffer so a 200k-point figure allocates nothing.
+ * Returns a reused 5-slot buffer so a 200k-point figure allocates nothing:
+ * the color and alpha, then the opacity fog leaves the point's highlight (its
+ * dot and ring thin with fog in every quality, as HP_FS_HIGHLIGHT's do).
  *
  * @param {object} options
  * @returns {(index: number, r: number, g: number, b: number, a: number) => Float64Array}
@@ -61,12 +80,13 @@ function createVectorPointShader({
   emphasizeSelection,
   selectionMutedOpacity,
 }) {
-  const shaded = new Float64Array(4);
+  const shaded = new Float64Array(5);
   return function shadeVectorPoint(index, r, g, b, a) {
     let rr = r;
     let gg = g;
     let bb = b;
     let aa = a;
+    let highlightFog = 1;
     if (
       emphasizeSelection &&
       highlightArray &&
@@ -84,6 +104,7 @@ function createVectorPointShader({
         dimension > 1 ? positions[base + 1] : 0,
         dimension > 2 ? positions[base + 2] : 0
       );
+      highlightFog = fogOpacityAt(transmittance);
       if (fog.fadesAlpha) {
         aa = applyFogAlpha(transmittance, aa);
       } else {
@@ -96,6 +117,7 @@ function createVectorPointShader({
     shaded[1] = gg;
     shaded[2] = bb;
     shaded[3] = aa;
+    shaded[4] = highlightFog;
     return shaded;
   };
 }
@@ -156,15 +178,19 @@ function writeCircle(sink, x, y, radius, shaded, highlightArray, index) {
     sink.write(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${r},${g},${b})" fill-opacity="${a.toFixed(3)}"/>`);
   }
 
-  const h = highlightArray ? highlightValueToAlpha01(highlightArray[index] ?? 0) : 0;
+  const h = highlightArray ? highlightValueToAlpha01(highlightArray[index] ?? 0) * shaded[4] : 0;
   if (h > 0) {
-    const ringR = radius * DEFAULT_HIGHLIGHT_SCALE;
-    const sw = Math.max(0.75, radius * 0.45);
-    const op = Math.max(0.25, 0.85 * h);
+    // The dot and its ring at the shader's alphas: the intensity (thinned by
+    // fog), and 0.95 of it.
+    const dotR = radius * HIGHLIGHT_RING_RADII.inner;
+    const ringR = radius * (HIGHLIGHT_RING_RADII.inner + HIGHLIGHT_RING_RADII.outer) / 2;
+    const ringWidth = radius * (HIGHLIGHT_RING_RADII.outer - HIGHLIGHT_RING_RADII.inner);
+    const dotOpacity = h >= 0.999 ? '' : ` fill-opacity="${h.toFixed(3)}"`;
     sink.write(
+      `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${dotR.toFixed(2)}" fill="${HIGHLIGHT_FILL}"${dotOpacity}/>` +
       `<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${ringR.toFixed(2)}" ` +
-      `fill="none" stroke="rgb(${DEFAULT_HIGHLIGHT_RGB.r},${DEFAULT_HIGHLIGHT_RGB.g},${DEFAULT_HIGHLIGHT_RGB.b})" ` +
-      `stroke-width="${sw.toFixed(2)}" stroke-opacity="${op.toFixed(3)}"/>`
+      `fill="none" stroke="${HIGHLIGHT_RING_STROKE}" ` +
+      `stroke-width="${ringWidth.toFixed(2)}" stroke-opacity="${(0.95 * h).toFixed(3)}"/>`
     );
   }
 }
@@ -188,13 +214,14 @@ function writeCircle(sink, x, y, radius, shaded, highlightArray, index) {
  * @param {number} options.selectionMutedOpacity
  * @param {{x: number, y: number, width: number, height: number}} options.plotRect
  * @param {object|null} options.crop
- * @param {number} options.pointRadiusViewportPx
- * @param {number} [options.radiusPx] - Full Vector: the circle radius in plot units
+ * @param {number} options.pointDiameterViewportPx - the points' `u_pointSize`
+ *   (the pane's point size times its level's multiplier): each circle is the
+ *   sprite the viewer draws at its depth (`createViewportPointDiameter`)
  * @param {boolean} [options.sortByDepth] - Full Vector: draw back to front
  * @param {number} [options.targetCount] - Optimized Vector: the exact point count
  * @param {number} [options.seed] - Optimized Vector: the reduction's seed
  * @param {import('../utils/lod-membership.js').FigurePointLayers|null} [options.pointLayers] -
- *   While some cells are not read: their colour, and the cells read drawn
+ *   While some cells are not read: their color, and the cells read drawn
  *   larger (`readScale`) and whatever the level when the pane drew them so
  * @returns {Blob}
  */
@@ -213,8 +240,7 @@ export function writeSvgPointMarkup({
   selectionMutedOpacity,
   plotRect,
   crop,
-  pointRadiusViewportPx,
-  radiusPx,
+  pointDiameterViewportPx,
   sortByDepth,
   targetCount,
   seed,
@@ -266,22 +292,31 @@ export function writeSvgPointMarkup({
       const rest = targetCount - read.x.length;
       reductions = rest > 0 ? [reduce(unreadMask, lodMembership, rest), read] : [read];
     }
-    const { viewportWidth, viewportHeight } = reductions[0];
-    const scale = Math.min(
-      plotRect.width / viewportWidth,
-      plotRect.height / viewportHeight
-    );
-    const offsetX = plotRect.x + (plotRect.width - viewportWidth * scale) / 2;
-    const offsetY = plotRect.y + (plotRect.height - viewportHeight * scale) / 2;
-    const pointRadiusPx = pointRadiusViewportPx * scale;
+    // The reduced points are source-local viewport pixels; the source fills
+    // the plot (`createPlotPlacement`).
+    const { source, scale, viewportToPlot } = createPlotPlacement({ renderState, plotRect, crop });
+    const origin = viewportToPlot(source.x, source.y);
+    const offsetX = origin.x;
+    const offsetY = origin.y;
+    // Each circle is the sprite the viewer draws the cell as, at its depth.
+    const diameterAt = createViewportPointDiameter(renderState);
+    const radiusOf = (cell, pointSize) => {
+      const at = cell * dimension;
+      return diameterAt(
+        positions[at],
+        dimension > 1 ? positions[at + 1] : 0,
+        dimension > 2 ? positions[at + 2] : 0,
+        pointSize
+      ) * scale * 0.5;
+    };
 
     // The layers are written bottom first, as the pane draws them: cells not
-    // read (in their own colour, at the normal size), the grey beneath, the
-    // coloured cells (the cells read larger while some are not read).
+    // read (in their own color, at the normal size), the gray beneath, the
+    // colored cells (the cells read larger while some are not read).
     const layered = colors !== null && colorLayersOf(colors).layered;
     const unreadRgb = layers === null ? null : layers.unreadColor.map(channel => Math.round(channel * 255));
     const zeroRgb = layers === null ? null : layers.zeroColor.map(channel => Math.round(channel * 255));
-    const readRadiusPx = pointRadiusPx * (layers === null ? 1 : layers.readScale);
+    const readDiameter = pointDiameterViewportPx * (layers === null ? 1 : layers.readScale);
     const passBytes = [UNREAD_ALPHA_BYTE, BENEATH_ALPHA_BYTE, 255];
     for (let pass = layered ? 0 : 2; pass < 3; pass++) {
       for (const reduced of reductions) {
@@ -293,7 +328,7 @@ export function writeSvgPointMarkup({
           const x = offsetX + reduced.x[i] * scale;
           const y = offsetY + reduced.y[i] * scale;
           const j = i * 4;
-          // The lower layers in the figure's own colours (`cellLayerColors`).
+          // The lower layers in the figure's own colors (`cellLayerColors`).
           const own = layer === 0 ? unreadRgb : layer === 1 ? zeroRgb : null;
           const shaded = shadeVectorPoint(
             srcIndex,
@@ -302,7 +337,7 @@ export function writeSvgPointMarkup({
             own !== null ? own[2] : reduced.rgba[j + 2],
             reduced.alpha[i] ?? 1.0
           );
-          writeCircle(sink, x, y, layer === 0 ? pointRadiusPx : readRadiusPx, shaded, highlightArray, srcIndex);
+          writeCircle(sink, x, y, radiusOf(srcIndex, layer === 0 ? pointDiameterViewportPx : readDiameter), shaded, highlightArray, srcIndex);
         }
       }
     }
@@ -318,14 +353,14 @@ export function writeSvgPointMarkup({
     positions,
     dimension,
     colors,
-    // The cells' colours: the alpha byte is their layer.
+    // The cells' colors: the alpha byte is their layer.
     colorAlpha: 'layer',
     transparency,
     lodMembership,
     drawOrder,
     renderState,
     plotRect,
-    radiusPx,
+    pointDiameterViewportPx,
     crop,
     sortByDepth,
     pointLayers: layers,

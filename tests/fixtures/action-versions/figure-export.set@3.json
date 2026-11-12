@@ -1,0 +1,328 @@
+{
+  "examples": [
+    {
+      "auto_text_size": false,
+      "background": "viewer",
+      "background_color": "#ffffff",
+      "depth_sort": false,
+      "download": "svg",
+      "dpi": 150,
+      "emphasize_selection": false,
+      "export_all_views": false,
+      "font_family": "Arial, Helvetica, sans-serif",
+      "font_sizes": {
+        "axis_label": 1,
+        "base": 1,
+        "centroid_label": 1,
+        "legend": 1,
+        "ticks": 1,
+        "title": 1
+      },
+      "frame": {
+        "lock_aspect": false,
+        "rect": {
+          "height": 0,
+          "width": 0,
+          "x": 0,
+          "y": 0
+        }
+      },
+      "include_axes": false,
+      "include_legend": false,
+      "legend_position": "right",
+      "optimized_target_count": 1000,
+      "preview": {
+        "colorblind_mode": "none",
+        "enabled": false
+      },
+      "reference_grid": false,
+      "selection_muted_opacity": 0,
+      "show_orientation": false,
+      "size_preset": "single-column",
+      "svg_strategy": "full-vector",
+      "title": "x",
+      "title_follows_dataset": false,
+      "width": 10,
+      "x_label": "x",
+      "y_label": "x"
+    },
+    {
+      "auto_text_size": false,
+      "background": "viewer",
+      "background_color": "#ffffff",
+      "depth_sort": false,
+      "download": "svg",
+      "dpi": 150,
+      "emphasize_selection": false,
+      "export_all_views": false,
+      "font_family": "Arial, Helvetica, sans-serif",
+      "font_sizes": {
+        "axis_label": 1,
+        "base": 1,
+        "centroid_label": 1,
+        "legend": 1,
+        "ticks": 1,
+        "title": 1
+      },
+      "frame": "cells",
+      "include_axes": false,
+      "include_legend": false,
+      "legend_position": "right",
+      "optimized_target_count": 1000,
+      "preview": {
+        "colorblind_mode": "none",
+        "enabled": false
+      },
+      "reference_grid": false,
+      "selection_muted_opacity": 0,
+      "show_orientation": false,
+      "size_preset": "single-column",
+      "svg_strategy": "full-vector",
+      "title": "x",
+      "title_follows_dataset": false,
+      "width": 10,
+      "x_label": "x",
+      "y_label": "x"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "auto_text_size": {
+        "type": "boolean"
+      },
+      "background": {
+        "enum": [
+          "viewer",
+          "white",
+          "transparent",
+          "custom"
+        ]
+      },
+      "background_color": {
+        "pattern": "^#[0-9a-f]{6}$",
+        "type": "string"
+      },
+      "depth_sort": {
+        "type": "boolean"
+      },
+      "download": {
+        "enum": [
+          "svg",
+          "png",
+          "svg+png",
+          "png-multi",
+          "all"
+        ]
+      },
+      "dpi": {
+        "enum": [
+          150,
+          300,
+          600
+        ]
+      },
+      "emphasize_selection": {
+        "type": "boolean"
+      },
+      "export_all_views": {
+        "type": "boolean"
+      },
+      "font_family": {
+        "enum": [
+          "Arial, Helvetica, sans-serif",
+          "Helvetica, Arial, sans-serif",
+          "\"Times New Roman\", Times, serif"
+        ]
+      },
+      "font_sizes": {
+        "additionalProperties": false,
+        "properties": {
+          "axis_label": {
+            "maximum": 375,
+            "minimum": 1,
+            "type": "number"
+          },
+          "base": {
+            "maximum": 375,
+            "minimum": 1,
+            "type": "number"
+          },
+          "centroid_label": {
+            "maximum": 375,
+            "minimum": 1,
+            "type": "number"
+          },
+          "legend": {
+            "maximum": 375,
+            "minimum": 1,
+            "type": "number"
+          },
+          "ticks": {
+            "maximum": 375,
+            "minimum": 1,
+            "type": "number"
+          },
+          "title": {
+            "maximum": 375,
+            "minimum": 1,
+            "type": "number"
+          }
+        },
+        "required": [
+          "base",
+          "legend",
+          "ticks",
+          "axis_label",
+          "title",
+          "centroid_label"
+        ],
+        "type": [
+          "object",
+          "null"
+        ]
+      },
+      "frame": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "lock_aspect": {
+                "type": "boolean"
+              },
+              "rect": {
+                "additionalProperties": false,
+                "properties": {
+                  "height": {
+                    "maximum": 1,
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "width": {
+                    "maximum": 1,
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "x": {
+                    "maximum": 1,
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "y": {
+                    "maximum": 1,
+                    "minimum": 0,
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y",
+                  "width",
+                  "height"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "lock_aspect",
+              "rect"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          {
+            "const": "cells"
+          }
+        ]
+      },
+      "include_axes": {
+        "type": "boolean"
+      },
+      "include_legend": {
+        "type": "boolean"
+      },
+      "legend_position": {
+        "enum": [
+          "right",
+          "bottom"
+        ]
+      },
+      "optimized_target_count": {
+        "maximum": 5000000,
+        "minimum": 1000,
+        "type": "integer"
+      },
+      "preview": {
+        "additionalProperties": false,
+        "properties": {
+          "colorblind_mode": {
+            "enum": [
+              "none",
+              "deuteranopia",
+              "protanopia",
+              "tritanopia"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled",
+          "colorblind_mode"
+        ],
+        "type": "object"
+      },
+      "reference_grid": {
+        "type": "boolean"
+      },
+      "selection_muted_opacity": {
+        "maximum": 1,
+        "minimum": 0,
+        "type": "number"
+      },
+      "show_orientation": {
+        "type": "boolean"
+      },
+      "size_preset": {
+        "enum": [
+          "single-column",
+          "one-and-half-column",
+          "double-column",
+          "custom"
+        ]
+      },
+      "svg_strategy": {
+        "enum": [
+          "full-vector",
+          "optimized-vector",
+          "hybrid"
+        ]
+      },
+      "title": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "title_follows_dataset": {
+        "type": "boolean"
+      },
+      "width": {
+        "minimum": 10,
+        "type": "number"
+      },
+      "x_label": {
+        "type": "string"
+      },
+      "y_label": {
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "type": "figure-export.set",
+  "version": 3
+}

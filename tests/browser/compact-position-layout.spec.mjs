@@ -60,6 +60,8 @@ test('a 1D or 2D position stream draws and splats exactly what its zero-padded X
     const params = dimensionLevel => ({
       autoFog: false,
       cameraDistance: 3,
+      // The sprite cap (rendering/point-sprite.js).
+      pointSizeMax: 160,
       cameraPosition: Float32Array.from([0, 0, 3]),
       dimensionLevel,
       fogColor: Float32Array.from([0, 0, 0]),

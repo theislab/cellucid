@@ -27,6 +27,8 @@
  * @module data/anndata/write/element-writer
  */
 
+import { requireDistinctElementKeys, requireElementKey } from './names.js';
+
 const encoding = (type, version) => ({ 'encoding-type': type, 'encoding-version': version });
 
 /** anndata's encoding attributes of `type` at `version`. */
@@ -146,27 +148,20 @@ export class AnnDataElementWriter {
   }
 
   /**
-   * A dataframe: an index and columns (the kinds `column()` writes). A
-   * column whose name is taken, empty or holds `/` is left out.
+   * A dataframe: an index and columns (the kinds `column()` writes), each
+   * named as a store element must be (`names.js`): a caller writing names it
+   * did not choose gives each its `portableElementName` first, and says so.
    *
    * @param {string} path
    * @param {{index: Array<string>, columns: Array<{name: string, column: Object}>}} frame
    * @param {{role?: string}} [options] - `cell` for obs (one value per cell), `whole` for var
    */
   async dataframe(path, { index, columns }, { role = 'whole' } = {}) {
-    const names = [];
-    const taken = new Set(['_index']);
-    for (const { name } of columns) {
-      if (taken.has(name) || name.includes('/') || name === '') continue;
-      taken.add(name);
-      names.push(name);
-    }
+    const names = columns.map(({ name }) => requireElementKey(name, `The ${path} column`));
+    requireDistinctElementKeys(['_index', ...names], `The ${path} column`);
     this.group(path, { '_index': '_index', 'column-order': names, ...encoding('dataframe', '0.2.0') });
     await this.stringArray(`${path}/_index`, index, role);
-    for (const { name, column } of columns) {
-      if (!names.includes(name)) continue;
-      await this.column(`${path}/${name}`, column, role);
-    }
+    for (const { name, column } of columns) await this.column(`${path}/${name}`, column, role);
   }
 
   /**

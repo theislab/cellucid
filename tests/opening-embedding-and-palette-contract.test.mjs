@@ -1,7 +1,7 @@
 /**
- * What a file without Cellucid metadata opens on, and in which colours: the
+ * What a file without Cellucid metadata opens on, and in which colors: the
  * dimension a view starts in (`openingSlot`), and the Scanpy palette a
- * categorical field is coloured with (`scanpyCategoryPalette`,
+ * categorical field is colored with (`scanpyCategoryPalette`,
  * `defaultCategoryColor`, the `palette` of an obs field descriptor).
  *
  * The shapes are those of a segmentation export: three 2-column
@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { openingSlot } from '../assets/js/data/data-mapping-candidates.js';
-import { resolveEmbeddingSlots } from '../assets/js/data/data-mapping.js';
+import { opensOnBestGuess, resolveEmbeddingSlots } from '../assets/js/data/data-mapping.js';
 import {
   defaultCategoryColor,
   getCategoryColor,
@@ -92,11 +92,11 @@ test('a Scanpy palette is read as Scanpy reads it', () => {
     scanpyCategoryPalette(['#ff0000', '#00FF00', '#0000ff80'], 3),
     [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
   );
-  // Short hex, and a longer palette gives its first colours.
+  // Short hex, and a longer palette gives its first colors.
   assert.deepEqual(scanpyCategoryPalette(['#f00', '#0f0', '#00f'], 2), [[1, 0, 0], [0, 1, 0]]);
-  // Shorter than the categories: Scanpy draws its own colours, so none is used.
+  // Shorter than the categories: Scanpy draws its own colors, so none is used.
   assert.equal(scanpyCategoryPalette(['#ff0000'], 2), null);
-  // Anything but a hex colour among the ones used: none is used.
+  // Anything but a hex color among the ones used: none is used.
   assert.equal(scanpyCategoryPalette(['#ff0000', 'grey'], 2), null);
   assert.equal(scanpyCategoryPalette(['#ff0000', 'grey'], 1).length, 1);
   assert.equal(scanpyCategoryPalette(null, 2), null);
@@ -104,7 +104,7 @@ test('a Scanpy palette is read as Scanpy reads it', () => {
   assert.throws(() => scanpyCategoryPalette(['#ff0000'], -1), RangeError);
 });
 
-test('a field opens in its file\'s palette while it has one colour per category', () => {
+test('a field opens in its file\'s palette while it has one color per category', () => {
   const palette = [[1, 0, 0], [0, 1, 0]];
   const field = { categories: ['a', 'b'], palette };
   assert.deepEqual(defaultCategoryColor(field, 0), [1, 0, 0]);
@@ -113,7 +113,7 @@ test('a field opens in its file\'s palette while it has one colour per category'
   defaultCategoryColor(field, 0)[0] = 0.5;
   assert.deepEqual(palette[0], [1, 0, 0]);
   // Without a palette, or once merging changed the category count, the
-  // colours are Cellucid's own.
+  // colors are Cellucid's own.
   assert.deepEqual(defaultCategoryColor({ categories: ['a', 'b'], palette: null }, 1), [...getCategoryColor(1)]);
   assert.deepEqual(defaultCategoryColor({ categories: ['a', 'b'] }, 1), [...getCategoryColor(1)]);
   assert.deepEqual(defaultCategoryColor({ categories: ['ab'], palette }, 0), [...getCategoryColor(0)]);
@@ -140,7 +140,7 @@ function fieldList(field) {
   };
 }
 
-test('an obs field descriptor carries one palette colour per category, or none', () => {
+test('an obs field descriptor carries one palette color per category, or none', () => {
   assert.deepEqual(
     checkObsFields(fieldList({ palette: [[1, 0, 0], [0, 0.5, 1]] })).fields[0].palette,
     [[1, 0, 0], [0, 0.5, 1]],
@@ -153,7 +153,7 @@ test('an obs field descriptor carries one palette colour per category, or none',
     [[1, 0, 0], '#00ff00'],
     'auto',
   ]) {
-    assert.throws(() => checkObsFields(fieldList({ palette })), /palette must be null or one RGB colour/);
+    assert.throws(() => checkObsFields(fieldList({ palette })), /palette must be null or one RGB color/);
   }
   // A field whose categories are found on load has no palette.
   assert.throws(
@@ -165,4 +165,24 @@ test('an obs field descriptor carries one palette colour per category, or none',
     delete list.fields[0].palette;
     checkObsFields(list);
   }, /\(missing: palette\)/);
+});
+
+test('every width is treated alike: the UMAP names its width, the others are guessed, and only a file naming none opens on a guess (R9M-11)', () => {
+  // X_umap beside X_umap_3d: the dimensional key names 3D, X_umap 2D (guessed).
+  const both = resolveEmbeddingSlots([entry('X_umap', 2), entry('X_umap_3d', 3)], { latentKey: null });
+  assert.deepEqual(both.slots, { '1d': null, '2d': { key: 'X_umap', columns: [0, 1] }, '3d': { key: 'X_umap_3d', columns: [0, 1, 2] } });
+  assert.deepEqual(both.guessed, ['embeddings.2d']);
+  assert.equal(openingSlot(both.slots), '3d');
+  // A file whose own UMAP fills one slot opens on it: no best-guess notice.
+  assert.equal(opensOnBestGuess(both.slots, both.guessed), false);
+  // X_umap beside a 3-column PHATE and a 1-column pseudotime: every width has its default.
+  const scanpy = resolveEmbeddingSlots([entry('X_umap', 2), entry('X_phate', 3), entry('pseudotime', 1)], { latentKey: null });
+  assert.deepEqual(Object.values(scanpy.slots).map(ref => ref?.key ?? null), ['pseudotime', 'X_umap', 'X_phate']);
+  assert.deepEqual(scanpy.guessed, ['embeddings.1d', 'embeddings.3d']);
+  assert.equal(openingSlot(scanpy.slots), '2d');
+  assert.equal(opensOnBestGuess(scanpy.slots, scanpy.guessed), false);
+  // A file with no UMAP at all opens on the guess, and says so.
+  const none = resolveEmbeddingSlots([entry('X_tsne', 2), entry('X_pca', 50)], { latentKey: null });
+  assert.equal(opensOnBestGuess(none.slots, none.guessed), true);
+  assert.equal(opensOnBestGuess({ '1d': null, '2d': null, '3d': null }, []), false);
 });

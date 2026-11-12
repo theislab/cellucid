@@ -2,7 +2,7 @@
  * The sculpted point pass changes blend state for its own draw and only for
  * it.
  *
- * Its depth pass replaces colour instead of blending it and, with antialiasing
+ * Its depth pass replaces color instead of blending it and, with antialiasing
  * on, turns each fragment's disc coverage into a multisample coverage mask
  * (SAMPLE_ALPHA_TO_COVERAGE). Every later pass of the frame — highlight rings,
  * connectivity, centroids, the orbit anchor — assumes the straight-alpha

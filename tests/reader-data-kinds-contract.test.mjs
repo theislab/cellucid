@@ -1,7 +1,7 @@
 /**
  * Data kinds through the reader: a continuous column with no value among the
  * open cells loads (every cell missing), and a MuData modality's column
- * pulled to the cells (`<modality>:<column>`) keeps the colours Scanpy run on
+ * pulled to the cells (`<modality>:<column>`) keeps the colors Scanpy run on
  * the modality stored in that modality's `uns`.
  */
 import './helpers/anndata-reader-in-process.mjs';
@@ -25,7 +25,7 @@ test('a continuous column with no finite value loads, every cell missing', async
   assert.ok(Array.from(new Float32Array(field.data)).every(Number.isNaN));
 });
 
-test('a MuData modality column takes its colours from the modality\'s own uns', async () => {
+test('a MuData modality column takes its colors from the modality\'s own uns', async () => {
   const cells = ['c0', 'c1', 'c2'];
   const rna = annData({
     obs: stringFrame(cells, { leiden: categorical(new Int8Array([0, 1, 0]), ['0', '1']) }),

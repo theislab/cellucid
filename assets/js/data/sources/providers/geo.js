@@ -30,7 +30,7 @@ import {
   fetchWhenNotBusy,
   hostFaultFailure,
 } from '../../data-source.js';
-import { hostFaultOfStatus } from '../../../formats/io/byte-source.js';
+import { fetchOnce, hostFaultOfStatus } from '../../../formats/io/byte-source.js';
 import { describeRemoteFile, describeRemoteFileSet } from '../remote-file.js';
 import { fileFormatOfName, titleOfName } from '../../input-formats.js';
 import { cellTablesBySet, isMatrixMarketMatrix, matrixMarketFileSets } from '../../matrix-market-files.js';
@@ -178,7 +178,13 @@ async function geoFailing(accession, archiveStatus, missing, signal) {
   }
   let status;
   try {
-    status = (await fetch(`${GEO_FTP}README.txt`, { headers: { Range: 'bytes=0-0' }, cache: 'no-store', credentials: 'omit', signal })).status;
+    // Asked once through the one transport: within NCBI's request budget,
+    // and a host that does not answer ends it as stalled (null: not known).
+    status = (await fetchOnce(`${GEO_FTP}README.txt`, { headers: { Range: 'bytes=0-0' }, cache: 'no-store', credentials: 'omit' }, {
+      fetchImpl: globalThis.fetch,
+      signal,
+      wantsBody: () => false,
+    })).response.status;
   } catch (error) {
     if (signal?.aborted) throw error;
     return null;

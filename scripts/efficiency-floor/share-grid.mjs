@@ -2,7 +2,7 @@
  * The share grid: every downstream a person reaches (open, first picture,
  * every cell of the share on the map, genes, analyses, the graph, filters,
  * highlights, exports, sessions, figures, frames, a revisit) measured at
- * shares of 1, 10 and 50 % (uniform and blocks) and at every cell, on each
+ * shares of 1, 10 and 50% (uniform and blocks) and at every cell, on each
  * store or public link given, in the whole app on the machine's GPU
  * (`scale-app.mjs`, one browser per share). Then each cell of the grid as
  * its ratio to every cell's: the rule is that no share costs more than every
@@ -123,7 +123,7 @@ export function ratioTable(rows) {
 
 /**
  * The other half of the rule: a share never costs more than a larger share
- * of the same kind (1 % ≤ 10 % ≤ 50 %, uniform with uniform, blocks with
+ * of the same kind (1% ≤ 10% ≤ 50%, uniform with uniform, blocks with
  * blocks), metric by metric beyond the noise floor; a step that failed
  * where a larger share's finished is a break too.
  */

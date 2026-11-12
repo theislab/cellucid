@@ -23,7 +23,7 @@
     opacity var(--duration-normal) var(--easing-standard);
   /* Isolate layout calculations for better drag performance */
   contain: layout style;
-  /* The paper colour. The scroll area paints it; the phone layout's
+  /* The paper color. The scroll area paints it; the phone layout's
      close-control strip, which lies outside the scroll area, paints it too. */
   --menu-paper: color-mix(in srgb, var(--color-surface-sunken) 94%, var(--black));
 }
@@ -98,7 +98,7 @@
 }
 
 /* Only a pointer that hovers: a touch screen keeps :hover on the last element
-   tapped, which left the toggle grey and pressed after every open or close. */
+   tapped, which left the toggle gray and pressed after every open or close. */
 @media (hover: hover) {
   #sidebar-toggle:hover {
     background: var(--color-surface-tertiary);
@@ -178,7 +178,7 @@
   display: block;
 }
 
-/* The wordmark is grey-scale ink drawn for a light surface. In the dark theme
+/* The wordmark is gray-scale ink drawn for a light surface. In the dark theme
    it is inverted (the hue rotation keeps any tint where it was), so the brand
    card follows the theme like every other surface instead of staying a white
    block. The brand card's wordmark does the same (components/_welcome.css). */
@@ -206,7 +206,7 @@
   margin: var(--space-1-5) 0;
 }
 
-/* The (i) beside "Link cameras" sits centred on the row, far enough from the
+/* The (i) beside "Link cameras" sits centered on the row, far enough from the
    button that its hit ring (widest on touch) never covers it. */
 .split-view-row > .info-btn {
   align-self: center;
@@ -290,6 +290,47 @@
   white-space: nowrap;
 }
 
+/* A named view's row: its name first (the full name is the row's title), what
+   it shows after it in the secondary text color (the row's inverse color on
+   the selected row). */
+.split-badge-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-weight: var(--font-weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.split-badge-label-after-name {
+  flex: 1 1 auto;
+  color: var(--color-text-secondary);
+}
+
+.split-badge.active .split-badge-label-after-name {
+  color: inherit;
+}
+
+/* Naming a view in its row (double-click or F2): the field takes the first
+   line's place. */
+.split-badge-name-input {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 0 var(--space-0-5);
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: none;
+  border-bottom: var(--border-width-1) solid currentColor;
+  border-radius: 0;
+}
+
+.split-badge-name-input:focus-visible {
+  outline: var(--border-width-2) solid var(--color-border-focus);
+  outline-offset: var(--space-px);
+}
+
 .split-badge-meta {
   display: flex;
   align-items: center;
@@ -349,21 +390,37 @@
   cursor: help;
 }
 
+/* A view's removal sits inside its row: the chip's quiet glyph (as a highlight
+   page's ×, `_filters.css`), named "Remove View 2" — no bordered pill, no fill.
+   Quiet by the secondary text color (a quiet button's), never by opacity:
+   faded to 50% it read at 3.22:1, and the tertiary token at 3.90:1 on the
+   view row (lens-a11y LF-10); on the selected row it takes the row's inverse
+   color. */
 .split-badge-remove {
-  background: transparent;
-  border-radius: var(--radius-full);
-  border: var(--border-width-1) solid color-mix(in srgb, var(--color-border-strong) 35%, transparent);
+  background: none;
+  border: none;
   cursor: pointer;
+  color: var(--color-text-secondary);
   font-size: var(--type-control);
-  line-height: 1;
-  padding: 0 var(--space-1);
+  line-height: var(--leading-none);
+  padding: 0 var(--space-0-5);
+  min-width: var(--control-target-min);
+  min-height: var(--control-target-min);
   margin-left: var(--space-3);
+  transition: var(--transition-colors);
 }
 
-.split-badge-remove:hover {
-  background: var(--color-danger-dark);
-  color: var(--color-text-inverse);
-  border-color: var(--color-danger-dark);
+.split-badge-remove:hover,
+.split-badge-remove:focus-visible {
+  color: var(--color-text-primary);
+}
+
+.split-badge.active .split-badge-remove {
+  color: inherit;
+}
+
+.split-badge:not(.active) .split-badge-remove:hover {
+  color: var(--color-danger-text);
 }
 
 .split-badge.active {
@@ -372,16 +429,11 @@
   border-color: var(--color-interactive-primary);
 }
 
-/* The selected row keeps its number's circle, drawn in the inverse colour. */
+/* The selected row keeps its number's circle, drawn in the inverse color. */
 .split-badge.active .split-badge-pill {
   background: transparent;
   color: var(--color-text-inverse);
   border-color: color-mix(in srgb, var(--color-text-inverse) 70%, transparent);
-}
-
-.split-badge.active .split-badge-remove {
-  border-color: color-mix(in srgb, var(--color-text-inverse) 60%, transparent);
-  color: var(--color-text-inverse);
 }
 
 .split-badge.active-camera,
@@ -418,7 +470,7 @@
 }
 
 /* The navigation-mode indicator on each view row: every view navigates by
-   its own mode. It is always shown, so its text is a text colour (AA on the
+   its own mode. It is always shown, so its text is a text color (AA on the
    row); only its outline is faint. */
 .split-badge-nav {
   font-family: inherit;

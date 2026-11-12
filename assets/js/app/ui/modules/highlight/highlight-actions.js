@@ -24,7 +24,7 @@ import { resolveGroup, resolvePage } from '../../../actions/targets/pages.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
 import { cellListsEqual } from '../../../utils/cell-set.js';
 import { PLACES, placePath } from '../../place-names.js';
-import { quoteName } from '../../../actions/targets/names.js';
+import { categoryDisplayName, listNames, quoteName } from '../../../actions/targets/names.js';
 
 function refuse(message) {
   return new ActionRefused(message, { code: 'no-target' });
@@ -65,10 +65,10 @@ function requireFreePageName(state, name, except = null) {
  * first, made and shown by `commit` (so a refusal changes nothing).
  *
  * - `page` named: that page, or a page of that name made with `color`; an
- *   existing page must already have `color` (a highlight never recolours a
+ *   existing page must already have `color` (a highlight never recolors a
  *   page).
- * - `color` only: the page shown when it has that colour, else the first
- *   page that has it, else a new page of that colour.
+ * - `color` only: the page shown when it has that color, else the first
+ *   page that has it, else a new page of that color.
  * - neither: the page shown.
  */
 function planTargetPage(state, { page: name, color }) {
@@ -81,7 +81,7 @@ function planTargetPage(state, { page: name, color }) {
     if (existing !== undefined) {
       if (color !== undefined && !sameColor(existing.color, color)) {
         throw refuse(
-          `Highlight page ${quoteName(name)} is ${existing.color}, not ${color}; name another page, or leave the colour out.`
+          `Highlight page ${quoteName(name)} is ${existing.color}, not ${color}; name another page, or leave the color out.`
         );
       }
       return { existing, name, color };
@@ -104,7 +104,7 @@ function commitTargetPage(state, plan) {
   if (page === null) {
     page = state.createHighlightPage(plan.name);
     if (plan.color !== undefined && !state.setHighlightPageColor(page.id, plan.color)) {
-      throw new Error(`The new highlight page could not take the colour ${plan.color}.`);
+      throw new Error(`The new highlight page could not take the color ${plan.color}.`);
     }
   }
   if (!state.switchToPage(page.id)) throw new Error(`Highlight page "${page.name}" could not be shown.`);
@@ -112,10 +112,10 @@ function commitTargetPage(state, plan) {
 }
 
 /**
- * A category or range group the target page has already: brought up to the
- * cells the selected view shows now (`highlight.category` and
- * `highlight.range` asked again, the history's Run again of a stale step,
- * `rerun` in the catalogue), in its place, shown. The same cells change
+ * A range group the target page has already: brought up to the cells the
+ * selected view shows now (`highlight.range` asked again, the history's Run
+ * again of a stale step, `rerun` in the catalog), in its place, shown
+ * (`highlight.category` does the same for each of its categories). The same cells change
  * nothing (null: no step); no cell visible now is refused, the group keeping
  * its cells.
  *
@@ -218,7 +218,7 @@ export function provideHighlightActions({ state, actions = getActions() }) {
       if (name !== undefined) requireFreePageName(state, name);
       const page = state.createHighlightPage(name ?? null);
       if (color !== undefined && !state.setHighlightPageColor(page.id, color)) {
-        throw new Error(`The new highlight page could not take the colour ${color}.`);
+        throw new Error(`The new highlight page could not take the color ${color}.`);
       }
       if (!state.switchToPage(page.id)) throw new Error(`Highlight page "${page.name}" could not be shown.`);
       return { page: page.name };
@@ -244,13 +244,20 @@ export function provideHighlightActions({ state, actions = getActions() }) {
       return { page: page.name };
     },
 
-    'highlight.page.delete'({ page: name }) {
-      const page = resolvePage(state, name);
-      if (state.getHighlightPages().length <= 1) {
-        throw refuse(`${quoteName(name)} is the only highlight page and cannot be deleted; clear it instead.`);
+    'highlight.page.delete'({ pages: names }) {
+      // Every page is found before any goes: a name that is none deletes nothing.
+      const pages = names.map(name => resolvePage(state, name));
+      const total = state.getHighlightPages().length;
+      if (total <= 1) {
+        throw refuse(`${quoteName(names[0])} is the only highlight page and cannot be deleted; clear it instead.`);
       }
-      if (!state.deleteHighlightPage(page.id)) throw new Error(`Highlight page "${name}" could not be deleted.`);
-      return { page: name };
+      if (pages.length >= total) {
+        throw refuse(`Deleting all ${total} highlight pages would leave none; one page always stays, so leave one out (and clear it instead).`);
+      }
+      for (const page of pages) {
+        if (!state.deleteHighlightPage(page.id)) throw new Error(`Highlight page "${page.name}" could not be deleted.`);
+      }
+      return { pages: pages.map(page => page.name), deleted: pages.length };
     },
 
     'highlight.page.combine'({ pages: [first, second], operation, name }) {
@@ -285,7 +292,7 @@ export function provideHighlightActions({ state, actions = getActions() }) {
       }
       const plan = planTargetPage(state, params);
       const page = commitTargetPage(state, plan);
-      const label = freeGroupLabel(page, params.label ?? `Highlight (${formatCountOf(positions.length, 'cell')})`);
+      const label = freeGroupLabel(page, params.label ?? 'Highlight');
       const group = state.addHighlightDirect({ type: params.tool, label, cellIndices: positions });
       // Highlight membership is scientific data (it is counted, exported and
       // compared): the group holds exactly the cells asked for, or the step
@@ -309,20 +316,50 @@ export function provideHighlightActions({ state, actions = getActions() }) {
       if (field.kind !== 'category') {
         throw refuse(`${params.field.key} is not categorical; highlight a range of its values instead.`);
       }
-      const categoryIndex = resolveCategory(field, params.category);
       const plan = planTargetPage(state, params);
-      const label = `${field.key}: ${field.categories[categoryIndex]}`;
-      const cells = state.getCellIndicesForCategory(field, categoryIndex, state.categoryTransparency);
-      const onPage = plan.existing === null ? undefined : plan.existing.highlightedGroups.find(group => (
-        group.type === 'category' && group.fieldKey === field.key && group.categoryIndex === categoryIndex
-      ));
-      if (onPage !== undefined) return bringUpToDate(state, plan, onPage, cells, `No cell of ${quoteName(label)} is visible in the selected view`);
-      if (cells.length === 0) {
-        throw refuse(`No cell of ${quoteName(label)} is visible in the selected view; show the category first.`);
+      // Every category checked before anything changes: the step adds all of
+      // them or none (one act of the person, one step, one undo). The labels
+      // are distinct (`uniqueItems`), so each names a category of its own; one
+      // already on the page is brought up to date in its place, as
+      // `bringUpToDate` does for a range.
+      const entries = params.categories.map(asked => {
+        const categoryIndex = resolveCategory(field, asked);
+        const label = `${field.key}: ${categoryDisplayName(field.categories[categoryIndex])}`;
+        const cells = state.getCellIndicesForCategory(field, categoryIndex, state.categoryTransparency);
+        const onPage = plan.existing === null ? undefined : plan.existing.highlightedGroups.find(group => (
+          group.type === 'category' && group.fieldKey === field.key && group.categoryIndex === categoryIndex
+        ));
+        return { categoryIndex, category: asked, label, cells, onPage };
+      });
+      const hidden = entries.filter(entry => entry.cells.length === 0);
+      if (hidden.length > 0) {
+        const names = listNames(hidden.map(entry => entry.label));
+        const kept = hidden.filter(entry => entry.onPage !== undefined);
+        const onName = kept.length === 0 ? '' : ` on page ${quoteName(plan.existing.name)}`;
+        const keeps = kept.length === 0 ? ''
+          : kept.length === 1 ? `; ${quoteName(kept[0].onPage.label)}${onName} keeps its ${formatCountOf(kept[0].onPage.cellCount, 'cell')}`
+            : `; ${listNames(kept.map(entry => entry.onPage.label))}${onName} keep their cells`;
+        throw refuse(
+          `No cell of ${names} is visible in the selected view${keeps}; show ${hidden.length === 1 ? 'the category' : 'those categories'} first, or leave ${hidden.length === 1 ? 'it' : 'them'} out.`
+        );
       }
+      // A category already on the page with the same cells changes nothing.
+      const changing = entries.filter(entry => entry.onPage === undefined || !cellListsEqual(entry.onPage.cellIndices, entry.cells));
+      if (changing.length === 0) return null;
       const page = commitTargetPage(state, plan);
-      const group = state.addHighlightFromCategory(fieldIndex, categoryIndex, 'obs');
-      return { page: page.name, group: group.label, cells: group.cellCount };
+      const groups = [];
+      let cells = 0;
+      let updated = 0;
+      for (const entry of changing) {
+        const group = entry.onPage === undefined
+          ? state.addHighlightFromCategory(fieldIndex, entry.categoryIndex, 'obs')
+          : state.replaceHighlightGroupCells(entry.onPage.id, entry.cells, page.id);
+        if (group === null) throw new Error(`Highlight "${entry.label}" could not be ${entry.onPage === undefined ? 'made' : 'brought up to date'}.`);
+        if (entry.onPage !== undefined) updated++;
+        groups.push(group.label);
+        cells += group.cellCount;
+      }
+      return { page: page.name, groups, categories: changing.map(entry => entry.category), cells, updated };
     },
 
     async 'highlight.range'(params, { signal }) {

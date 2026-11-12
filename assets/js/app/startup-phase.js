@@ -49,6 +49,7 @@
 
 import { onAbort } from '../utils/abort.js';
 import { createDeadline } from '../utils/deadline.js';
+import { createListenerSet } from '../utils/listener-set.js';
 import { onWaitingOnPerson } from '../utils/person-wait.js';
 
 /**
@@ -74,16 +75,10 @@ export const STARTUP_STALL_CODE = 'CELLUCID_STARTUP_STALLED';
 
 /** Startup steps whose deadline is measuring the page's wait now. */
 let measuringSteps = 0;
-const measuringListeners = new Set();
+const measuringListeners = createListenerSet('a startup step\'s deadline');
 
 function publishMeasuring(measuring) {
-  for (const listener of measuringListeners) {
-    try {
-      listener(measuring);
-    } catch (error) {
-      console.error('[cellucid:startup] A step-deadline listener failed:', error);
-    }
-  }
+  measuringListeners.notify(measuring);
 }
 
 /**
@@ -97,10 +92,9 @@ function publishMeasuring(measuring) {
  * @returns {() => void} Stops listening
  */
 export function onStartupStepDeadline(listener) {
-  if (typeof listener !== 'function') throw new TypeError('A step-deadline listener is a function.');
-  measuringListeners.add(listener);
+  const stop = measuringListeners.add(listener);
   listener(measuringSteps > 0);
-  return () => measuringListeners.delete(listener);
+  return stop;
 }
 
 const PHASE_DESCRIPTIONS = Object.freeze({

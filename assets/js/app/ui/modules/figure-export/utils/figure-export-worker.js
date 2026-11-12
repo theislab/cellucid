@@ -5,7 +5,8 @@
  * The page composes a figure (title, legends, axes, reference layer) on a 2D
  * canvas and writes the SVG's annotations; this worker does the rest:
  *
- * - `visibleBounds`: the axis bounds of the drawn points (one pass over N);
+ * - `drawnCells`: whether a figure of the pane draws any cell (one pass over
+ *   N, stopping at the first; `sourceHasDrawnCells`);
  * - `webgl2`: whether this thread can draw a point pass (an OffscreenCanvas
  *   WebGL2 context);
  * - `rasterizePoints`: the shader-accurate point pass, on an OffscreenCanvas
@@ -42,17 +43,14 @@
  * @module ui/modules/figure-export/utils/figure-export-worker
  */
 
-import {
-  computeVisibleCameraBounds,
-  computeVisibleRealBounds,
-} from './coordinate-mapper.js';
+import { sourceHasDrawnCells } from './coordinate-mapper.js';
 import {
   describeRasterContext,
   exportSpriteZoomLimit,
   rasterizePointsWebgl,
   webgl2RasterAvailable,
 } from './webgl-point-rasterizer.js';
-import { embedPngTextChunks } from './png-metadata.js';
+import { embedPngMetadata } from './png-metadata.js';
 import { PieceReceiver } from '../../../../../utils/large-arrays.js';
 import { writeSvgPointMarkup } from '../renderers/svg-point-markup.js';
 import { toWire } from '../../../../../utils/error-wire.js';
@@ -128,20 +126,16 @@ function blobToDataUrl(blob) {
 }
 
 /**
- * Place a point raster where the Hybrid crop puts it inside the plot raster,
- * one to one unless it was zoomed past the GPU's sprite range.
+ * Scale a Hybrid point raster zoomed past the GPU's sprite range
+ * (`planPlotRaster`) up to the plot raster it covers.
  */
 function placeRaster(pixels, placement) {
-  const canvas = new OffscreenCanvas(placement.canvasWidth, placement.canvasHeight);
+  const canvas = new OffscreenCanvas(placement.width, placement.height);
   const context = canvas.getContext('2d', { alpha: true });
   if (context === null) {
-    throw new Error('SVG Hybrid crop encoding requires a Canvas 2D context');
+    throw new Error('SVG Hybrid raster scaling requires a Canvas 2D context');
   }
-  if (placement.exact) {
-    context.putImageData(pixels, placement.x, placement.y);
-  } else {
-    context.drawImage(pixelCanvas(pixels), placement.x, placement.y, placement.width, placement.height);
-  }
+  context.drawImage(pixelCanvas(pixels), 0, 0, placement.width, placement.height);
   return canvas;
 }
 
@@ -152,14 +146,9 @@ const operations = {
 
   rasterContext: ({ antialias }) => ({ result: describeRasterContext(antialias) }),
 
-  visibleBounds: (args) => {
-    const options = { ...args, lodMembership: reviveLodMembership(args.lodMembership) };
-    return {
-      result: args.camera
-        ? computeVisibleCameraBounds(options)
-        : computeVisibleRealBounds(options),
-    };
-  },
+  drawnCells: (args) => ({
+    result: sourceHasDrawnCells({ ...args, lodMembership: reviveLodMembership(args.lodMembership) }),
+  }),
 
   rasterizePoints: (args) => {
     const frame = rasterizePointsWebgl(reviveRasterOptions(args));
@@ -172,7 +161,7 @@ const operations = {
       canvas,
       placement === null
         ? 'SVG Hybrid point-pass PNG encoding failed'
-        : 'SVG Hybrid cropped point-pass PNG encoding failed'
+        : 'SVG Hybrid scaled point-pass PNG encoding failed'
     );
     return { result: blobToDataUrl(blob) };
   },
@@ -184,9 +173,9 @@ const operations = {
     }),
   }),
 
-  encodePng: async ({ pixels, textMap }) => {
+  encodePng: async ({ pixels, text, dpi }) => {
     const blob = await encodeCanvasPng(pixelCanvas(pixels), 'PNG encoding failed.');
-    return { result: await embedPngTextChunks(blob, textMap) };
+    return { result: await embedPngMetadata(blob, { text, dpi }) };
   },
 
   encodePngDataUrl: async ({ pixels }) => {
@@ -237,7 +226,7 @@ export function createFigureExportWorkerHandler() {
       return null;
     }
     if (cancelledSessions.has(session)) {
-      return { reply: { id, error: toWire(cancelled('user', 'The figure export was cancelled.')) }, transfer: [] };
+      return { reply: { id, error: toWire(cancelled('user', 'The figure export was canceled.')) }, transfer: [] };
     }
     try {
       let arrays = sessions.get(session);

@@ -2,7 +2,8 @@
  * @fileoverview Transport bar overlay for cinematic camera playback.
  *
  * Creates a fixed-position bar at the top of the 3D viewport with play/pause,
- * stop, a scrubable timeline with keyframe markers, and a time readout.
+ * stop, a scrubable timeline with keyframe markers (and, after a keyframe that
+ * holds, its rest span), and a time readout.
  * Auto-hides after inactivity and reappears on any pointer or Tab activity —
  * including activity inside the sidebar, where the Camera Path accordion that
  * feeds this bar lives.
@@ -12,12 +13,14 @@
 
 import {
   assertCameraPathOptions,
-  resolveSegmentDurations
+  resolvePathTiming
 } from './interpolation-engine.js';
 import { isCameraPathReady } from './keyframe-store.js';
+import { setControlAvailability } from '../../core/control-availability.js';
 import { readCameraBooleanOption } from '../camera-input-contract.js';
 import { parseIntegerInput } from '../../core/numeric-input-contract.js';
 import { coalesceToFrame } from '../../components/controls.js';
+import { debounce } from '../../../../utils/debounce.js';
 
 /* Idle time before the bar fades out. Long enough to survive a pause while
    composing a keyframe in the sidebar; playback additionally suppresses the
@@ -71,7 +74,8 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
   /** @type {HTMLElement|null} */
   let innerEl = null;
 
-  let hideTimeout = null;
+  // The bar hides once the pointer rested this long away from it.
+  const hideSoon = debounce(() => hide({ force: false }), TRANSPORT_BAR_HIDE_DELAY_MS);
   let isPointerOverBar = false;
   let isScrubbing = false;
   let seekFrame = null;
@@ -193,13 +197,13 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     // target; the outer track is transparent to the pointer.
     innerEl.addEventListener('mouseenter', () => {
       isPointerOverBar = true;
-      clearTimeout(hideTimeout);
+      hideSoon.cancel();
     });
     innerEl.addEventListener('mouseleave', () => {
       isPointerOverBar = false;
       scheduleHide();
     });
-    barEl.addEventListener('focusin', () => { clearTimeout(hideTimeout); });
+    barEl.addEventListener('focusin', () => { hideSoon.cancel(); });
     barEl.addEventListener('focusout', () => {
       setTimeout(scheduleHide, 0);
     });
@@ -238,7 +242,7 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     barEl.setAttribute('aria-hidden', interactive ? 'false' : 'true');
     barEl.inert = !interactive;
     for (const control of barEl.querySelectorAll('button, input')) {
-      control.disabled = !interactive;
+      setControlAvailability(control, interactive ? null : 'the camera path bar is hidden; move the pointer or press a key to show it');
     }
   }
 
@@ -272,14 +276,14 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
   }
 
   function scheduleHide() {
-    clearTimeout(hideTimeout);
+    hideSoon.cancel();
     if (!barEl) return;
     if (barEl.contains(document.activeElement)) return;
     // A pointer resting on the bar is the strongest "still in use" signal
     // there is. Clearing the timer on mouseenter alone is not enough: the
     // mousemove that lands the pointer on the bar re-arms it immediately.
     if (isPointerOverBar) return;
-    hideTimeout = setTimeout(() => hide({ force: false }), TRANSPORT_BAR_HIDE_DELAY_MS);
+    hideSoon();
   }
 
   function onMouseActivity() {
@@ -323,21 +327,48 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
     if (!isCameraPathReady(keyframes)) return;
 
     const opts = assertCameraPathOptions(getInterpolationOptions());
-    const durations = resolveSegmentDurations(keyframes, opts.autoPaceSpeed);
-    const total = durations.reduce((s, d) => s + d, 0);
+    const timing = resolvePathTiming(keyframes, opts.autoPaceSpeed);
+    const total = timing.total;
     if (!Number.isFinite(total) || total <= 0) {
       throw new Error('Camera transport requires a positive finite path duration.');
     }
 
-    let cum = 0;
+    // Each keyframe where the camera reaches it; a hold, the span it rests there.
     for (let i = 0; i < keyframes.length; i++) {
-      const pct = (cum / total) * 100;
+      const pct = (timing.arrivals[i] / total) * 100;
+      if (timing.holds[i] > 0) {
+        const rest = document.createElement('div');
+        rest.className = 'cinematic-timeline-hold';
+        rest.style.left = `${pct}%`;
+        rest.style.width = `${(timing.holds[i] / total) * 100}%`;
+        markersEl.appendChild(rest);
+      }
       const marker = document.createElement('div');
       marker.className = 'cinematic-timeline-marker';
       marker.style.left = `${pct}%`;
       markersEl.appendChild(marker);
-      if (i < durations.length) cum += durations[i];
     }
+    // Stopped, the readout says the path's length from the moment it is ready (found 2026-11-10:
+    // "0:00 / 0:00" until the first Play), and where the film stopped (R9R-7).
+    if (playbackController.getState() === 'STOPPED') showStoppedPosition(total);
+  }
+
+  /**
+   * Stopped: where the film stopped (the camera stays there; Play goes on
+   * from it), 0 after the bar's own Stop or a change of the path (R9R-7).
+   */
+  function showStoppedPosition(total) {
+    const progress = playbackController.getProgress();
+    updateProgress(progress);
+    updateTimeReadout(progress * total, total);
+  }
+
+  /** The ready path's length in seconds, 0 when there is no ready path. */
+  function readyPathSeconds() {
+    const keyframes = keyframeStore.getAll();
+    if (!isCameraPathReady(keyframes)) return 0;
+    const opts = assertCameraPathOptions(getInterpolationOptions());
+    return resolvePathTiming(keyframes, opts.autoPaceSpeed).total;
   }
 
   // ---- Progress updates ----
@@ -392,15 +423,12 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
       playBtn.title = 'Pause';
       playBtn.setAttribute('aria-label', 'Pause');
       show();
-      clearTimeout(hideTimeout);
+      hideSoon.cancel();
     } else {
       playBtn.innerHTML = ICON_PLAY;
       playBtn.title = 'Play';
       playBtn.setAttribute('aria-label', 'Play');
-      if (playbackState === 'STOPPED') {
-        updateProgress(0);
-        updateTimeReadout(0, 0);
-      }
+      if (playbackState === 'STOPPED') showStoppedPosition(readyPathSeconds());
       scheduleHide();
     }
   }
@@ -413,7 +441,7 @@ export function createTransportBar({ playbackController, keyframeStore, getInter
   // ---- Cleanup ----
 
   function unmount() {
-    clearTimeout(hideTimeout);
+    hideSoon.cancel();
     seekFrame?.cancel();
     seekFrame = null;
     document.removeEventListener('mousemove', onMouseActivity);

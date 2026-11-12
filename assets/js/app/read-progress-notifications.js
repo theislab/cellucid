@@ -1,7 +1,7 @@
 /**
  * Progress of the reads a person waits for that nothing else shows: one
  * notification for all of them, in plain words ("Reading field cell_type and
- * the neighbour graph · 4.1 MB of 9.3 MB · ~3 s left"), on screen once the
+ * the neighbor graph · 4.1 MB of 9.3 MB · ~3 s left"), on screen once the
  * reads have run `NOTICE_AFTER_MS` (`notification-center.js`), and gone when
  * they end: the view changing is their answer. A read that fails leaves the
  * card and says nothing here: what asked for it (the opening, the field or
@@ -19,6 +19,9 @@
  *   read a running job owns, a copy of the dataset's; and a read a job
  *   joined after something else started it): the job's own notification,
  *   which can cancel it (`jobs/cancellable-job.js`);
+ * - a gene's reads that its own loading notification shows, with Cancel and
+ *   any wait (offline, a host's budget): adopted by it (`adoptedBy`), so a
+ *   wait is said once (bug hunt R9W-4);
  * - work nobody waits for (`background`: an index built ahead of need).
  *
  * The reader's own words for each read (`obsm['X_umap'] columns 0, 1, open
@@ -40,7 +43,7 @@ function isGrowthRead(activity) {
 
 /**
  * What one read is, in the words of what the person asked for: `field
- * cell_type`, `the embedding X_umap`, `genes`, `the neighbour graph`.
+ * cell_type`, `the embedding X_umap`, `genes`, `the neighbor graph`.
  *
  * @param {{kind: string, label: string}} activity
  * @returns {string}
@@ -64,7 +67,7 @@ function describeReadPurpose(activity) {
     case 'names':
       return /obs names/.test(activity.label) ? 'cell names' : 'gene names';
     case 'graph':
-      return 'the neighbour graph';
+      return 'the neighbor graph';
     case 'transcode':
       return 'the file, once, whole';
     case 'transpose':

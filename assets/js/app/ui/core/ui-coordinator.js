@@ -18,7 +18,9 @@ import { initVelocityOverlayControls } from '../modules/velocity-overlay-control
 import { initCameraControls } from '../modules/camera-controls.js';
 import { initCellInfo } from '../modules/cell-info.js';
 import { initCiteDialog } from '../modules/cite-dialog.js';
+import { initLicenseDialog } from '../modules/license-dialog.js';
 import { initShareDialog } from '../modules/share-dialog.js';
+import { initGroupCategoriesDialog } from '../modules/group-categories-dialog.js';
 import { initLegendRenderer } from '../modules/legend-renderer.js';
 import { initFilterControls } from '../modules/filter-controls.js';
 import { initHighlightControls } from '../modules/highlight-controls.js';
@@ -53,6 +55,7 @@ import { initAgents } from '../../agent/index.js';
 import { createBranchComparison } from '../modules/state/compare.js';
 import { datasetFactsOf } from '../modules/state/dataset-facts.js';
 import { initInfoPopovers } from '../components/info-popovers.js';
+import { initFullTextReveal } from '../components/full-text-reveal.js';
 import { bindDisclosure } from '../components/controls.js';
 import {
   clearPublishedSnapshotViews,
@@ -63,6 +66,7 @@ import { debug } from '../../../utils/debug.js';
 import { installFieldActions } from '../../state/actions/field-actions.js';
 import { getActions } from '../../actions/index.js';
 import { openCellsKey } from '../../state/domains/cells.js';
+import { visitingViews } from '../../state/domains/view-list.js';
 
 /**
  * Build one terminal cleanup owner whose Promise identity is stable even when
@@ -260,11 +264,12 @@ export function initUI({
 
   const dom = collectDOMReferences(document);
   const infoPopovers = initInfoPopovers({ root: document });
+  const fullTextReveal = initFullTextReveal({ root: document });
   // The Session panel's collapsible sections (Subsampling, Data mapping):
   // collapsed by default, each a one-line summary while collapsed.
   const sessionSections = initSessionSections(document);
   // Collapsible sub-sections written in index.html share the builder's
-  // behaviour: aria-expanded on the header, `hidden` on the region.
+  // behavior: aria-expanded on the header, `hidden` on the region.
   const staticDisclosures = new AbortController();
   for (const header of document.querySelectorAll(
     '[data-static-disclosure] > .disclosure-header'
@@ -367,9 +372,15 @@ export function initUI({
 
   function scheduleVisibilityUiUpdate() {
     if (destroyed || visibilityUiFrame !== null) return;
-    visibilityUiFrame = scheduleFrame(() => {
+    visibilityUiFrame = scheduleFrame(function update() {
       visibilityUiFrame = null;
       if (destroyed) return;
+      // A restore visiting the views one by one (`visitingViews`): the
+      // focused view is its cursor, not the person's; redrawn once it ends.
+      if (visitingViews()) {
+        visibilityUiFrame = scheduleFrame(update);
+        return;
+      }
       // Field activation publishes visibility before the selector can commit
       // the replacement legend. Refreshing counts in the same frame keeps the
       // DOM and active model in one completed UI generation.
@@ -388,7 +399,7 @@ export function initUI({
     // renderer all do. `state.centroidCount` is a cached scalar that
     // `setActiveView` does not carry with the rest of a view's context, so it
     // reported whatever was last built rather than what this view holds: after
-    // colouring another view by a continuous field it read zero, and the line
+    // coloring another view by a continuous field it read zero, and the line
     // dropped the centroid count for a view that still had three.
     const centroids = state.centroidPositions;
     const centroidCount = centroids ? centroids.length / 3 : 0;
@@ -411,7 +422,7 @@ export function initUI({
    * it: a stale line misinforms screen-reader users and nobody else notices.
    * It therefore follows the signals it depends on instead of being republished
    * from refresh lists, because a list that every caller must remember is what
-   * left it reading "Field: None" over a fully coloured plot.
+   * left it reading "Field: None" over a fully colored plot.
    *
    * DataState announces no "the active field changed", but `setActiveField`,
    * `setActiveVarField` and `clearActiveField` all end in
@@ -496,6 +507,8 @@ export function initUI({
     // The buttons' exports as actions (`cells.export`, `field.export`).
     actions: getActions(),
   });
+  // Group categories (the categorical toolbar's Group): a new field of groups of its categories.
+  const groupCategoriesDialog = initGroupCategoriesDialog({ ownerDocument: document, state, actions: getActions() });
   const fieldSelector = initFieldSelector({
     state,
     dom: dom.fieldSelector,
@@ -503,7 +516,8 @@ export function initUI({
     callbacks: {
       onActiveFieldChanged: handleActiveFieldChanged,
       // A gene search that finds nothing offers the gene names column (Data mapping).
-      onChooseGeneNames: () => dataMappingControls?.reveal({ openSidebar: true, focusGroup: 'geneNames' })
+      onChooseGeneNames: () => dataMappingControls?.reveal({ openSidebar: true, focusGroup: 'geneNames' }),
+      onGroupCategories: (fieldIndex, opener) => groupCategoriesDialog.open(fieldIndex, opener)
     }
   });
   if (sessionSerializer !== null) {
@@ -517,7 +531,7 @@ export function initUI({
     }
     // A dataset just shown reads its genes after its first view
     // (`DataState.listPublishedGenes`): a session records them (its
-    // mapping's gene names, its gene count, its gene colourings), so a
+    // mapping's gene names, its gene count, its gene colorings), so a
     // capture or a restore waits for them before it holds the fields.
     sessionSerializer.setCaptureSettlement(async () => {
       await state.whenGenesListed();
@@ -545,7 +559,7 @@ export function initUI({
   viewer.setSmokeRenderFailureHandler((error) => {
     renderControls.settleSmokeRenderFailure(error);
   });
-  // Recolouring (a colormap, a category colour) and dimension switches reach
+  // Recoloring (a colormap, a category color) and dimension switches reach
   // the viewer without a visibility change; the smoke volume carries both.
   viewer.setSmokeSourceChangeHandler(() => {
     renderControls.markSmokeDirty();
@@ -604,7 +618,9 @@ export function initUI({
     // Saved states (the autosave, named saves) open like a session file: their dataset first.
     savedStates: datasetHistories === null
       ? null
-      : { read: id => datasetHistories.savedStates.read(id), load: source => datasetHistories.loadSaved(source) },
+      : { read: id => datasetHistories.savedStates.read(id), load: (source, options) => datasetHistories.loadSaved(source, options) },
+    // A session load opens its dataset without offering to continue another history there.
+    holdHistoryOffers: datasetHistories === null ? null : task => datasetHistories.holdOffersUntil(task),
     onAfterLoad: refreshUiAfterStateLoad
   });
 
@@ -764,6 +780,7 @@ export function initUI({
       permissionFor: question => agents.presence.permissionFor(question),
     });
   const citeDialog = initCiteDialog({ ownerDocument: document });
+  const licenseDialog = initLicenseDialog({ ownerDocument: document });
   const shareDialog = dataSourceManager === null
     ? null
     : initShareDialog({ ownerDocument: document, dataSourceManager, actions: getActions() });
@@ -772,7 +789,7 @@ export function initUI({
     dom: dom.subsample,
     state,
     getCellSubset: () => activeAnnDataSource()?.getCellSubset?.() ?? null,
-    reopen: cellSubset => datasetControls.reopenOpenDataset(cellSubset),
+    reopen: (cellSubset, how) => datasetControls.reopenOpenDataset(cellSubset, how),
     notify: text => getNotificationCenter().info(text, { category: 'data' }),
     representation: key => activeAnnDataSource()?.subsampleRepresentation?.(key) ?? Promise.resolve(null),
     // What a gene of the matrix genes are read from costs now (Details): its first gene's read plan.
@@ -788,7 +805,7 @@ export function initUI({
       : {
           capture: () => viewCarry.capture(),
           // The dataset read again lists its genes after its first view: a
-          // view coloured by a gene is given back once they are listed.
+          // view colored by a gene is given back once they are listed.
           restore: async carry => {
             await state.whenGenesListed();
             return viewCarry.restore(carry);
@@ -809,20 +826,25 @@ export function initUI({
     geneSample: () => state.getGeneSample?.() ?? null,
     genesAsked: () => geneReadControl.genesAsked(),
     setGenesAsked: cells => geneReadControl.setGenesAsked(cells),
-    reopen: request => subsampleControl.reopenKeeping(request),
-    readGenes: cells => readGenesForMoreCellsSaid(state, cells, null, 'the cells of the step shown'),
+    reopen: (request, { heavy = null, signal = null } = {}) => subsampleControl.reopenKeeping(request, { heavy, signal }),
+    readGenes: (cells, { heavy = null, signal = null } = {}) => readGenesForMoreCellsSaid(state, cells, null, 'the cells of the step shown', { heavy, signal }),
   });
-  // The field, label, colour, filter and mapping actions the state alone
+  // The field, label, color, filter and mapping actions the state alone
   // implements (`state/actions/field-actions.js`), refused while community
   // annotation voting locks a field.
   const uninstallFieldActions = installFieldActions({ state, fieldLock: fieldSelector.fieldLock });
-  // Subsampling's header, collapsed: the cells open and the share genes are read for.
+  // A progressive opening growing in place (`{cells, target}`), or null.
+  let openingGrowth = null;
+  // Subsampling's header, collapsed: the cells open (or, while an opening
+  // grows, the share it grows to and the cells read so far) and the share
+  // genes are read for.
   function refreshSubsamplingSummary() {
     if (destroyed) return;
     sessionSections.setSummary('subsampling', subsamplingSummary(
       activeAnnDataSource()?.getCellSubset?.() ?? null,
       state.getGeneSample?.() ?? null,
-      state.getGeneSampleGrowth?.() ?? null
+      state.getGeneSampleGrowth?.() ?? null,
+      openingGrowth
     ));
   }
   const stopSubsamplingSummary = state.on('gene-sample:changed', refreshSubsamplingSummary);
@@ -862,9 +884,18 @@ export function initUI({
       const shown = state.describeViewEmbedding(viewId);
       if (shown === null || state.getDataMapping() === null) return null;
       return { ref: state.getViewEmbeddingRef(viewId), name: `${shown.name} ${shown.dimension}D` };
-    }
+    },
+    representationNameOf: layout => state.representationNameOf(layout),
   });
   syncNavigationUiForView(state.getActiveViewId());
+  // While a camera path plays, the chat over the plot's foot folds to its
+  // button and comes back when the path stops (app/agent/chat, dock.js).
+  // While it plays, the path moves the camera, not a gesture of the person's
+  // (camera-controls.js `setCameraPathPlaying`).
+  cinematicCamera.getPlaybackController().on('stateChange', playbackState => {
+    cameraControls.setCameraPathPlaying(playbackState === 'PLAYING');
+    agents.chat?.setFilmPlaying(playbackState === 'PLAYING');
+  });
 
   const visualizationReset = initVisualizationReset({
     viewer,
@@ -1095,7 +1126,9 @@ export function initUI({
       () => cameraControls.destroy(),
       () => cellInfo.destroy(),
       () => citeDialog.destroy(),
+      () => licenseDialog.destroy(),
       () => shareDialog?.destroy(),
+      () => groupCategoriesDialog.destroy(),
       () => legend.destroy(),
       () => filterControls.destroy(),
       () => highlightControls.destroy(),
@@ -1155,6 +1188,7 @@ export function initUI({
       () => cinematicCamera?.destroy?.(),
       () => communityAnnotationControls.destroy?.(),
       () => infoPopovers.destroy(),
+      () => fullTextReveal.destroy(),
       () => fieldSelector.destroy(),
     ],
     failureMessage: 'Application UI teardown was incomplete.',
@@ -1210,6 +1244,7 @@ export function initUI({
     applyDatasetRenderDefaults,
     // A progressive opening's growth: `{cells, target}`, or null when done.
     showOpenCellsGrowth: progress => {
+      openingGrowth = progress;
       subsampleControl.showGrowth(progress);
       refreshSubsamplingSummary();
     },

@@ -12,7 +12,7 @@
  * loads nothing until a view shows it. Apply dispatches the action
  * `mapping.set` naming the groups it changes (`DataState.applyDataMapping`,
  * one transaction, an undoable step); Revert drops the staged choices. The other groups the
- * dataset can change -- genes, neighbour graph, latent space, vector fields
+ * dataset can change -- genes, neighbor graph, latent space, vector fields
  * -- follow as their own disclosures (`data-mapping/groups.js`), staged with
  * the embeddings and applied in the same transaction.
  *
@@ -38,9 +38,8 @@ import {
 } from '../../../data/data-mapping.js';
 import { EmbeddingLoadError, MappingLoadError, obsmWidth } from '../../../data/data-mapping-candidates.js';
 import { LOG1P_AS_STORED, describeLog1pRefuted, log1pChoiceOf, withLog1pChoice } from '../../../data/dataset-mapping.js';
-import { representationName } from '../../../data/representation-names.js';
-import { formatCount, formatCountOf } from '../../../utils/format-units.js';
-import { revealSidebar } from './sidebar-controls.js';
+import { formatBytes, formatCount, formatCountOf, formatRemaining } from '../../../utils/format-units.js';
+import { revealInSidebar } from './sidebar-controls.js';
 import { expandSessionSection } from './session-sections.js';
 import {
   buildDataMappingPanel,
@@ -60,21 +59,33 @@ import {
   renderVectorSection,
   VECTOR_SECTION,
 } from './data-mapping/groups.js';
+import { buildExpressionValuesSection } from './data-mapping/expression-values.js';
+import { dispatchFromControl } from '../../actions/control-dispatch.js';
+import { transformWords } from '../../../data/expression-transform.js';
 import { sameJson } from '../../utils/same-json.js';
 import { PLACES, placePath } from '../place-names.js';
 import { getActions } from '../../actions/index.js';
 import { mappingParamsOf } from '../../actions/definitions/mapping.js';
+import { lowerFirst } from '../../../utils/text-case.js';
 
 /** Why genes are read from `raw` (`defaultExpression`'s reason), as the genes line says it. */
 const RAW_REASON_TEXT = Object.freeze({
-  'raw-more-genes': 'Expression: raw, as Scanpy reads genes: it holds more genes than X.',
-  'x-scaled': 'Expression: raw, as Scanpy reads genes: X holds scaled values.',
+  'raw-more-genes': 'Expression: raw.X, as Scanpy reads genes: it holds more genes than X.',
+  'x-scaled': 'Expression: raw.X, as Scanpy reads genes: X holds scaled values.',
 });
 
 const REQUIRED_STATE_METHODS = Object.freeze([
+  'cellTotalsPlan',
+  'expressionTransformCost',
+  'expressionTransformOffer',
+  'mappingTotalsCost',
+  'getExpressionTransform',
+  'getShownExpressionTransform',
   'canChangeMappingGroup',
   'canMapAnyEmbedding',
   'describeDataMappingRefusal',
+  'followMappingChanges',
+  'representationNameOf',
   'getDataMapping',
   'getDataMappingOrigin',
   'getDimensionManager',
@@ -168,7 +179,7 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
   // and the load-time refusal each one last met.
   const stagedGroups = new Map();
   const groupErrors = new Map();
-  // Genes the last gene-list change dropped from a view's colouring.
+  // Genes the last gene-list change dropped from a view's coloring.
   let droppedGenes = [];
   // How many datasets were published here (`datasetPublished`).
   let publications = 0;
@@ -202,12 +213,26 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
     buildGroupSection(ownerDocument, section),
   ]));
   const vectorNode = buildVectorSection(ownerDocument);
+  // Expression values: a change made at once, right after Genes (the values
+  // its matrix is shown in), never staged with Apply.
+  const expressionNode = buildExpressionValuesSection({ onChange: change => void onExpressionChange(change) });
+  let expressionBusy = false;
+  let expressionStatus = null;
+  // What summing every gene would read, priced for one loader at a time.
+  let expressionCost = { loader: undefined, text: '', detail: '' };
+  // What Apply would sum for the cells' totals of normalized values (the
+  // staged mapping onto another counts matrix), priced once per staged
+  // mapping and setting: the person's price before they act, as an agent's
+  // `mapping.set` is asked with it (`mappingTotalsCost`).
+  let mappingCost = { key: null, text: null };
+  const groupRoots = [...groupNodes.values(), vectorNode].map(node => node.root);
+  groupRoots.splice(GROUP_SECTIONS.findIndex(section => section.id === 'genes') + 1, 0, expressionNode.root);
   const panel = buildDataMappingPanel(ownerDocument, {
     expanded,
     onToggle: next => {
       expanded = next;
     },
-    groupSections: [...groupNodes.values(), vectorNode].map(node => node.root),
+    groupSections: groupRoots,
   });
   root.replaceChildren(panel.root);
 
@@ -277,7 +302,7 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
 
   function nameOf(row) {
     if (row.ref.columns === null || row.width === null) return row.name;
-    return representationName({
+    return state.representationNameOf({
       layoutKey: row.ref.key,
       label: row.ref.key,
       provenance: { key: row.ref.key, columns: row.ref.columns },
@@ -434,21 +459,44 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
     const names = dropped.slice(0, 3).map(name => `'${name}'`).join(', ')
       + (dropped.length > 3 ? ` and ${dropped.length - 3} more` : '');
     return `Applied. ${names} ${dropped.length === 1 ? 'is' : 'are'} not on the new gene list; `
-      + `${dropped.length === 1 ? 'its' : 'their'} colouring was removed.`;
+      + `${dropped.length === 1 ? 'its' : 'their'} coloring was removed.`;
+  }
+
+  /**
+   * What Apply reads for the cells' totals of normalized values, one
+   * sentence ("Apply sums all 20,000 genes of layers['counts'] once for each
+   * cell's total (normalized values): ~74 MB, ~12 s."), or null: none, or
+   * not priced yet (the panel is drawn again once it is).
+   */
+  function describeMappingCost(next) {
+    const key = JSON.stringify([next, state.getExpressionTransform()]);
+    if (mappingCost.key !== key) {
+      mappingCost = { key, text: null };
+      void Promise.resolve(state.mappingTotalsCost(next)).then(cost => {
+        if (destroyed || mappingCost.key !== key || cost === null) return;
+        const reads = [
+          cost.bytes === null ? null : `~${formatBytes(cost.bytes)}`,
+          cost.ms === null ? null : formatRemaining(cost.ms),
+        ].filter(Boolean).join(', ');
+        mappingCost = { key, text: `Apply ${lowerFirst(cost.what)}${reads === '' ? '' : `: ${reads}`}.` };
+        render();
+      }, () => {});
+    }
+    return mappingCost.text;
   }
 
   /** What Apply changes in the other groups, in short sentences. */
   function describeGroupConsequences(next, groupsChanged) {
     const parts = [];
     if (groupsChanged.includes('expression') || groupsChanged.includes('geneNames') || groupsChanged.includes('modality')) {
-      parts.push('Apply keeps each coloured gene it finds and closes analysis windows.');
+      parts.push('Apply keeps each colored gene it finds and closes analysis windows.');
     } else if (groupsChanged.includes('log1p') || groupsChanged.includes('highlyVariable')) {
       parts.push('Apply closes analysis windows, which read these.');
     }
     if (groupsChanged.includes('knn')) {
       parts.push(next.knn === null
-        ? 'Apply removes the neighbour graph.'
-        : 'Apply replaces the neighbour graph.');
+        ? 'Apply removes the neighbor graph.'
+        : 'Apply replaces the neighbor graph.');
     }
     if (groupsChanged.includes('latent')) {
       parts.push(next.latent === null
@@ -461,17 +509,42 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
     return parts;
   }
 
-  /** Keep each dimension's default on an enabled row of that dimension. */
+  /**
+   * Keep each named default on an enabled row of its dimension: one turned
+   * off passes to the first other row of that dimension that is on, as
+   * listed, and the first embedding turned on in a dimension the mapping
+   * shows none of becomes its default. A dimension the mapping already
+   * shows with none named stays so: its first enabled embedding in the
+   * mapping's order is shown first (`shownDefault`), and an edit of another
+   * row never writes a default nobody chose (R9M-5).
+   */
   function settleDefaults() {
+    const applied = state.getDataMapping()?.embeddings.enabled ?? [];
     for (const slot of DIMENSION_SLOTS) {
       const dimension = slotDimension(slot);
       const current = staged.defaults[slot];
+      if (current === null && applied.some(ref => ref.columns?.length === dimension)) continue;
       const rowsOfDimension = staged.rows.filter(
         row => row.usable && row.enabled && dimensionOf(row) === dimension
       );
       if (current !== null && rowsOfDimension.some(row => sameRef(row.ref, current))) continue;
       staged.defaults[slot] = rowsOfDimension.length === 0 ? null : cloneRef(rowsOfDimension[0].ref);
     }
+  }
+
+  /**
+   * The embedding a view switched to one dimension shows first, as staged:
+   * its named default, else its first enabled embedding in the mapping's
+   * (canonical) order, as keys 1, 2 and 3 and a view moved off a removed
+   * embedding take it (`DimensionManager.getOpeningLayout`).
+   */
+  function shownDefault(slot) {
+    if (staged.defaults[slot] !== null) return staged.defaults[slot];
+    const dimension = slotDimension(slot);
+    return staged.rows
+      .filter(row => row.usable && row.enabled && dimensionOf(row) === dimension)
+      .map(row => row.ref)
+      .sort(compareEmbeddingRefs)[0] ?? null;
   }
 
   /**
@@ -523,7 +596,7 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
       .map(slot => {
         const ref = mapping.embeddings.defaults[slot];
         const layout = dimensionManager.getLayout(dimensionManager.resolveRepresentation(ref));
-        return `${representationName(layout)} ${slot.toUpperCase()}`;
+        return `${state.representationNameOf(layout)} ${slot.toUpperCase()}`;
       });
     const parts = [`${count} on`, ...defaults];
     // The embeddings' own guesses; the other groups say theirs in their sections.
@@ -543,7 +616,7 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
     for (const slot of [...DIMENSION_SLOTS].reverse()) {
       const ref = mapping.embeddings.defaults[slot];
       if (ref === null) continue;
-      const name = representationName(dimensionManager.getLayout(dimensionManager.resolveRepresentation(ref)));
+      const name = state.representationNameOf(dimensionManager.getLayout(dimensionManager.resolveRepresentation(ref)));
       byName.set(name, [...(byName.get(name) ?? []), slot.toUpperCase()]);
     }
     const parts = [formatCountOf(mapping.embeddings.enabled.length, 'embedding'), ...[...byName].map(([name, slots]) => `${name} ${slots.join('/')}`)];
@@ -551,8 +624,86 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
     return parts.join(' · ');
   }
 
+  /**
+   * Where each cell's total comes from, as the section's line says it: an
+   * obs column, or every gene summed (what that reads, priced at the link
+   * once per loader, `expressionTransformCost`).
+   */
+  function expressionSource() {
+    const plan = state.cellTotalsPlan();
+    if (plan.field !== null) {
+      return {
+        text: `Cell totals from obs['${plan.field}']${plan.over === null ? '' : ` (${plan.over})`}`,
+        detail: plan.over === 'stored genes'
+          ? 'The file sums the genes it stores: a gene panel\'s totals, not the whole transcriptome.'
+          : plan.over === 'all genes' ? 'The file records each cell\'s total over every gene, before any was left out.'
+            : plan.over === 'source panel' ? 'The file records each cell\'s total over its source\'s gene panel: more genes than it stores, not the whole transcriptome.'
+              : 'A column named like a cell\'s total count.',
+      };
+    }
+    const loader = state.varFieldLoader ?? null;
+    if (expressionCost.loader !== loader) {
+      expressionCost = { loader, text: `Cell totals: every gene summed (${formatCountOf(plan.genes, 'gene')})`, detail: '' };
+      void state.expressionTransformCost({ normalize: true, log1p: false }).then(cost => {
+        if (destroyed || expressionCost.loader !== loader) return;
+        const reads = cost === null ? 'read already' : [
+          cost.bytes === null ? null : `reads ~${formatBytes(cost.bytes)}`,
+          // `formatRemaining` says "~" itself.
+          cost.ms === null ? null : formatRemaining(cost.ms),
+        ].filter(Boolean).join(', ');
+        expressionCost = {
+          loader,
+          text: `Cell totals: every gene summed${reads === '' ? '' : ` (${reads})`}`,
+          detail: 'No obs column holds each cell\'s total count: switching normalization on reads every gene once and sums it per cell. prepare() writes obs[\'total_counts\'] so this is free.',
+        };
+        renderExpression();
+      }, () => {});
+    }
+    return { text: expressionCost.text, detail: expressionCost.detail };
+  }
+
+  /** The Expression values section, from the state. */
+  function renderExpression() {
+    const mapping = state.getDataMapping();
+    const shown = mapping !== null && mapping.expression !== null && (state.getVarAxisGeneCount?.() ?? 0) > 0;
+    if (!shown) {
+      expressionNode.render({ shown: false });
+      return;
+    }
+    const offer = state.expressionTransformOffer();
+    const source = offer.offered ? expressionSource() : { text: '', detail: '' };
+    expressionNode.render({
+      shown: true,
+      summary: transformWords(state.getShownExpressionTransform()),
+      asked: state.getExpressionTransform(),
+      offered: offer.offered,
+      reason: offer.reason,
+      source: source.text,
+      sourceDetail: source.detail,
+      busy: expressionBusy,
+      status: expressionStatus,
+    });
+  }
+
+  /** A switch turned: the change, made at once (`expression.transform.set`). */
+  async function onExpressionChange(change) {
+    if (expressionBusy) return;
+    expressionBusy = true;
+    expressionStatus = { text: change.normalize === true ? 'Reading each cell\'s total…' : 'Showing the genes again…', tone: 'muted' };
+    renderExpression();
+    try {
+      const done = await dispatchFromControl('expression.transform.set', change, { failure: 'Could not change the expression values', category: 'data' });
+      const dropped = done?.outcome?.dropped ?? null;
+      expressionStatus = done === null ? null : dropped === null ? null : { text: `Color ranges and filters of ${dropped} dropped: they were in the other units.`, tone: 'muted' };
+    } finally {
+      expressionBusy = false;
+      renderExpression();
+    }
+  }
+
   function render() {
     if (destroyed) return;
+    renderExpression();
     const focused = ownerDocument.activeElement;
     const focusedId = focused?.id ?? '';
     const mapping = state.getDataMapping();
@@ -580,7 +731,7 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
     const nodes = staged.rows.map((row, index) => {
       const dimension = dimensionOf(row);
       const slot = dimension === null ? null : dimensionSlot(dimension);
-      const isDefault = slot !== null && sameRef(staged.defaults[slot], row.ref);
+      const isDefault = slot !== null && row.enabled && sameRef(shownDefault(slot), row.ref);
       let lockedReason = null;
       if (row.enabled && bound.some(ref => sameRef(ref, row.ref))) {
         lockedReason = 'A vector field is drawn on this embedding, so it stays on.';
@@ -615,7 +766,7 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
         add: configurable && canAddColumns && row.width > 3
           ? {
               key: row.ref.key,
-              name: representationName({ layoutKey: row.ref.key, label: row.ref.key, provenance: null }),
+              name: state.representationNameOf({ layoutKey: row.ref.key, label: row.ref.key, provenance: null }),
             }
           : null,
       };
@@ -665,6 +816,8 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
               : `Apply also switches ${moves === 1 ? '1 view' : `${formatCountOf(moves, 'view')}`} to the new default.`);
           }
           parts.push(...describeGroupConsequences(next, groupsChanged));
+          const cost = groupsChanged.length > 0 ? describeMappingCost(next) : null;
+          if (cost !== null) parts.push(cost);
           panel.status.set(parts.join(' '), 'muted');
         }
       }
@@ -811,34 +964,24 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
       return;
     }
     const value = decodeChoice(target.value);
-    stagedGroups.set(group, value);
-    if (group === 'modality') {
-      // Another modality is read with its own matrices and columns: back to
-      // the mapping's when it is the mapping's, else to its defaults.
-      for (const [key, groupValue] of Object.entries(
-        value === mapping.modality
-          ? { expression: mapping.expression, geneNames: mapping.geneNames, log1p: mapping.log1p, highlyVariable: mapping.highlyVariable }
-          : state.defaultModalityGroups(value)
-      )) {
-        stagedGroups.set(key, groupValue);
+    if (group === 'modality' && value === mapping.modality) {
+      // Back to the mapping's modality: back to its own matrix and columns.
+      for (const key of ['modality', 'expression', 'geneNames', 'log1p', 'highlyVariable']) stagedGroups.set(key, mapping[key]);
+      render();
+      return;
+    }
+    if (group === 'modality' || group === 'expression') {
+      // The groups that follow another modality or matrix move with it, by
+      // the rule `mapping.set` applies too (`followMappingChanges`).
+      const shown = nextMapping(mapping);
+      const followed = state.followMappingChanges(shown, { [group]: value });
+      for (const key of [group, 'expression', 'geneNames', 'log1p', 'highlyVariable']) {
+        if (key === group || !sameJson(followed[key], shown[key])) stagedGroups.set(key, followed[key]);
       }
       render();
       return;
     }
-    if (group === 'expression') {
-      // Another axis keeps a gene-name column only if it has one of that
-      // name (raw has its own var); otherwise the names come from its index.
-      state.withMappingModality(shownGroupValue(mapping, 'modality') ?? null, () => {
-        const names = shownGroupValue(mapping, 'geneNames');
-        const available = state.getGeneNameChoices(value).some(choice => choice.value === names);
-        if (!available) stagedGroups.set('geneNames', 'index');
-        // Likewise the highly variable column, which is otherwise none.
-        const marked = shownGroupValue(mapping, 'highlyVariable');
-        if (!state.getHighlyVariableChoices(value).some(choice => choice.value === marked)) {
-          stagedGroups.set('highlyVariable', null);
-        }
-      });
-    }
+    stagedGroups.set(group, value);
     render();
   }
 
@@ -921,22 +1064,28 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
    */
   function reveal({ openSidebar = false, focusGroup = null } = {}) {
     if (destroyed) return;
-    if (openSidebar) revealSidebar(ownerDocument);
-    expandSessionSection(ownerDocument, 'dataMapping');
-    setExpanded(true);
     // The group's choice, by the id its field is drawn with (`data-mapping-gene-names` for `geneNames`).
     const groupSection = focusGroup === null ? undefined : GROUP_SECTIONS.find(entry => entry.fields.some(field => field.group === focusGroup));
     const fieldId = groupSection?.fields.find(field => field.group === focusGroup).id ?? null;
     const target = fieldId === null ? null : ownerDocument.getElementById(fieldId);
-    if (target !== null) {
+    const bringIntoView = () => {
+      if (destroyed) return;
+      expandSessionSection(ownerDocument, 'dataMapping');
+      setExpanded(true);
       // The group's own disclosure opens too.
-      groupNodes.get(groupSection.id)?.disclosure.setExpanded(true);
-      target.scrollIntoView({ block: 'center' });
-      target.focus({ preventScroll: true });
-      return;
-    }
-    panel.disclosure.root.scrollIntoView({ block: 'nearest' });
-    if (openSidebar) panel.disclosure.header.focus({ preventScroll: true });
+      if (target !== null) groupNodes.get(groupSection.id)?.disclosure.setExpanded(true);
+      if (target !== null) {
+        target.scrollIntoView({ block: 'center' });
+        target.focus({ preventScroll: true });
+        return;
+      }
+      panel.disclosure.root.scrollIntoView({ block: 'nearest' });
+      if (openSidebar) panel.disclosure.header.focus({ preventScroll: true });
+    };
+    // The sidebar first, then the sections and the focus (while hidden it is
+    // inert): the one order of `revealInSidebar` (R9K-2).
+    if (openSidebar) void revealInSidebar(ownerDocument, bringIntoView);
+    else bringIntoView();
   }
 
   function announceBestGuess(mapping) {
@@ -983,7 +1132,8 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
     // Every dataset starts collapsed: the notification's Show opens it.
     setExpanded(false);
     panel.more.setExpanded(false);
-    for (const node of [...groupNodes.values(), vectorNode]) node.disclosure.setExpanded(false);
+    for (const node of [...groupNodes.values(), vectorNode, expressionNode]) node.disclosure.setExpanded(false);
+    expressionStatus = null;
     staged = null;
     previousRows = [];
     stagedGroups.clear();
@@ -1014,6 +1164,8 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
   // The gene list of a dataset just shown, read after its first view: the
   // gene-name hint reads it.
   const unsubscribeGenesListed = state.on('genes:listed', () => render());
+  // The expression values changed (here, by an agent, a session or a step).
+  const unsubscribeExpression = state.on('expression:changed', () => renderExpression());
 
   datasetPublished();
 
@@ -1027,6 +1179,7 @@ export function initDataMappingControls({ state, root, onSummary = () => {} }) {
       lifecycle.abort();
       unsubscribeMapping();
       unsubscribeGenesListed();
+      unsubscribeExpression();
       unsubscribeChoices();
       unsubscribeVarAxis();
       root.replaceChildren();

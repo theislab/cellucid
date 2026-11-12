@@ -144,7 +144,7 @@ a clear message naming the feature, never a wrong value.
 | `obs_object_timedelta` | timedelta64 column. | ~~h5ad~~ ~~v2~~ ~~v3~~ |  |  |  |  |  |  | n/a: every writer refused |
 | `obs_string_nul` | String column containing an embedded NUL character. | ~~h5ad~~ v2 v3 |  |  |  |  |  |  | read exactly |
 | `obs_strings` | String obs/var columns: all values distinct (stay strings), including unicode. | h5ad v2 v3 |  |  |  |  |  |  | read exactly |
-| `obs_strings_converted` | Repeated strings that anndata converts to a categorical on write (default behaviour). | h5ad v2 v3 |  |  |  |  | h5ad | h5ad | read exactly; 0.6.22.post1 h5ad: current anndata differs at `uns/` |
+| `obs_strings_converted` | Repeated strings that anndata converts to a categorical on write (default behavior). | h5ad v2 v3 |  |  |  |  | h5ad | h5ad | read exactly; 0.6.22.post1 h5ad: current anndata differs at `uns/` |
 | `obs_strings_edge` | String column edge cases: empty string, 10 000-character string, emoji, combining marks, RTL, whitespace. | h5ad v2 v3 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad ~~v2~~ | read exactly |
 | `obs_strings_not_categorical` | Repeated strings written with convert_strings_to_categoricals=False, so they stay a string array. | h5ad v2 v3 |  |  |  |  |  |  | read exactly |
 | `obsm_1d` | A 1-D array assigned to obsm (anndata stores it as an n x 1 matrix). | h5ad v2 v3 |  |  |  |  |  |  | read exactly |
@@ -159,7 +159,7 @@ a clear message naming the feature, never a wrong value.
 | `shape_0_obs_csr` | Zero cells with CSR X (0 x 20, indptr = [0]). | h5ad v2 v3 |  |  |  |  |  |  | read exactly |
 | `shape_0_vars` | Zero genes: var has 0 rows, X dense 30 x 0. | h5ad v2 v3 |  |  |  |  | h5ad | h5ad | read exactly |
 | `shape_0_vars_csc` | Zero genes with CSC X (30 x 0). | h5ad v2 v3 |  |  |  |  |  |  | read exactly |
-| `uns_basic` | uns: title, nested dicts, numeric scalars, string array, numeric arrays, colours list, empty dict. | h5ad v2 v3 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad ~~v2~~ | read exactly; 0.6.22.post1 h5ad: current anndata differs at `uns/` |
+| `uns_basic` | uns: title, nested dicts, numeric scalars, string array, numeric arrays, colors list, empty dict. | h5ad v2 v3 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad ~~v2~~ | read exactly; 0.6.22.post1 h5ad: current anndata differs at `uns/` |
 | `uns_bool` | uns: bool scalars (Python and numpy). | h5ad v2 v3 |  |  |  |  |  |  | read exactly |
 | `uns_dataframe` | uns: a dataframe and a sparse matrix. | h5ad v2 v3 | h5ad |  |  | h5ad | h5ad | h5ad | read exactly; 0.6.22.post1 h5ad: current anndata differs at `uns/` |
 | `uns_recarray` | uns: rank_genes_groups-style structured (record) arrays. | h5ad v2 v3 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad v2 | h5ad v2 | read exactly; 0.6.22.post1 v2: read exactly, or refuse naming zarr v2 object codec 'json2' (anndata 0.6 structured obs/var) |
@@ -261,7 +261,7 @@ Emulated layouts (`emulated/`, made from real writer output by `postprocess.py`)
 
 | File | What it is | Reader must |
 |---|---|---|
-| `h5sparse_markers.h5ad` | anndata 0.7.8 CSR X relabelled the h5sparse way (h5sparse_format='csr', h5sparse_shape). | read exactly |
+| `h5sparse_markers.h5ad` | anndata 0.7.8 CSR X relabeled the h5sparse way (h5sparse_format='csr', h5sparse_shape). | read exactly |
 | `libver_latest_scanpy_like.h5ad` | anndata 0.12.19 file re-created object by object with h5py libver='latest': the Scanpy-like object. | read exactly |
 | `libver_latest_x_csr_h5_chunked_gzip.h5ad` | anndata 0.12.19 file re-created object by object with h5py libver='latest': gzip CSR X with resizable 1-D arrays (extensible-array chunk index). | read exactly |
 | `libver_latest_x_dense_h5_chunk_square.h5ad` | anndata 0.12.19 file re-created object by object with h5py libver='latest': dense X in 16x16 chunks (fixed-array chunk index). | read exactly |

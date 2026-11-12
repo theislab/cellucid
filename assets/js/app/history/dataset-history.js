@@ -39,7 +39,7 @@ import {
 } from './autosave.js';
 import { defaultHistoryStore } from './autosave-store.js';
 import { historySettings, offDomainsOf, onHistorySettingsChange } from './history-settings.js';
-import { createOpaqueId } from '../utils/opaque-id.js';
+import { createOpaqueId } from '../../utils/opaque-id.js';
 import { SAVE_DEFAULTS, shareHistory } from '../session/share-scope.js';
 import { NO_PAGE_CHROME } from '../session/history-file.js';
 import { appStamp } from '../session/app-stamp.js';
@@ -47,6 +47,8 @@ import { pageVersion } from '../utils/page-version.js';
 import { getActionCatalog } from '../actions/index.js';
 import { PLACES, placePath } from '../ui/place-names.js';
 import { setWorkingSet } from '../../data/memory-budget.js';
+import { afterWelcome } from '../../utils/startup-sequence.js';
+import { NO_DATASET_OPEN, noDatasetOpenTo } from '../ui/no-dataset.js';
 
 /**
  * @param {{
@@ -55,7 +57,7 @@ import { setWorkingSet } from '../../data/memory-budget.js';
  *   notifications: {show: Function, warning: Function},
  *   header: () => Promise<object>,
  *   loadSavedHistory: (open: () => Promise<object>, options: {label: string}) => Promise<void>,
- *   openSavedState: (id: string) => Promise<boolean>,
+ *   openSavedState: (id: string, options?: {heavy?: Function|null, signal?: AbortSignal|null}) => Promise<{opened: boolean, problem: string|null, code: string|null}>,
  *   store?: ReturnType<typeof import('./autosave-store.js').createHistoryStore>|null,
  *   now?: () => number,
  *   chrome?: {capture: () => {pressed: Record<string, string>}},
@@ -67,12 +69,39 @@ import { setWorkingSet } from '../../data/memory-budget.js';
  *   `openSavedState`: open a saved state from the lists, its dataset first
  *   (the session controls)
  */
+/**
+ * The steps of `tracker` that are work a person would lose: every step but
+ * the opening, except one that only arranged the page (a panel opened,
+ * moved or docked, a section folded: the `layout` domain alone). Opening the
+ * Agents section is a step, but leaving it unkept is no loss to ask about
+ * ("Your work is not kept" before another dataset opened, for nothing).
+ *
+ * @param {{steps: Map<string, {parent: string|null, after?: Object}>}} tracker
+ * @returns {number}
+ */
+export function workStepsOf(tracker) {
+  let count = 0;
+  for (const step of tracker.steps.values()) {
+    if (step.parent === null) continue;
+    if (Object.keys(step.after ?? {}).some(domain => domain !== 'layout')) count += 1;
+  }
+  return count;
+}
+
+/**
+ * The history events that change what only this page holds: a step, an edit,
+ * a replay, a tracker, a conversation, a turn, changes while paused. Not a
+ * head moved by undo or redo (nothing is lost), nor a load (what it brought
+ * is kept where it came from).
+ */
+const CONTENT_EVENTS = new Set(['step', 'edited', 'replayed', 'tracker', 'chat', 'turn', 'recording']);
+
 export function createDatasetHistories({
   dispatcher, domains, notifications, header, loadSavedHistory, openSavedState: openFromList,
   store = defaultHistoryStore(), now = () => Date.now(), chrome = null, version = () => pageVersion(),
 }) {
   const pageChrome = () => chrome?.capture() ?? NO_PAGE_CHROME;
-  /** What wrote a saved state: this page's version and catalogue (null where the page names no version). */
+  /** What wrote a saved state: this page's version and catalog (null where the page names no version). */
   const stamp = async () => {
     const named = version();
     return named === null ? null : appStamp({ catalog: getActionCatalog(), version: named });
@@ -81,6 +110,13 @@ export function createDatasetHistories({
   let current = null;
   let collected = false;
   let quotaSaid = false;
+  /**
+   * Session loads under way (`holdOffersUntil`): a dataset opened for one is
+   * offered nothing to continue until it has settled, and nothing when it
+   * loaded a history.
+   * @type {Set<Promise<unknown>>}
+   */
+  const offerHolds = new Set();
 
   function accountMemory(history) {
     setWorkingSet('history', history.destroyed ? 0 : history.pool.byteLength());
@@ -100,11 +136,81 @@ export function createDatasetHistories({
     );
   }
 
+  /**
+   * Offer to continue the dataset's latest autosave, unless a session load
+   * holds offers (`holdOffersUntil`): then once it settled, and only if it
+   * loaded no history and the dataset is still shown. Never awaited by the
+   * opening: a session load waits for the opening it caused.
+   */
+  async function offerToContinue(owned) {
+    if (offerHolds.size > 0) {
+      let loaded = false;
+      const stopWatching = owned.history.subscribe(event => {
+        if (event.kind === 'loaded') loaded = true;
+      });
+      try {
+        while (offerHolds.size > 0) await Promise.all([...offerHolds]);
+      } finally {
+        stopWatching();
+      }
+      if (loaded || current !== owned || owned.autosave === null) return;
+    }
+    // After the welcome, never on top of it (`utils/startup-sequence.js`, R9U-14).
+    await afterWelcome();
+    if (current !== owned || owned.autosave === null) return;
+    await owned.autosave.offerContinue({
+      notifications,
+      onContinue: saved => {
+        void openFromList(saved.id).catch(error => {
+          console.error('[history] Continuing a saved state failed:', error);
+        });
+      },
+    });
+  }
+
   const api = {
+    /**
+     * A session (a file, a saved state) is being loaded, which may open its
+     * dataset first: no "Continue where you left off?" is offered until
+     * `settled` settles, and none when the load put a history in place — the
+     * person chose which history to show (found 2026-11-10: the offer showed
+     * mid-load and went once the session landed).
+     *
+     * @param {Promise<unknown>} settled
+     */
+    holdOffersUntil(settled) {
+      if (typeof settled?.then !== 'function') throw new TypeError('holdOffersUntil needs a promise.');
+      const held = Promise.resolve(settled).then(() => {}, () => {});
+      offerHolds.add(held);
+      void held.then(() => offerHolds.delete(held));
+    },
     /** The history of the dataset shown, or null while none is. */
     current: () => current?.history ?? null,
     /** The autosave of the dataset shown, or null. */
     currentAutosave: () => current?.autosave ?? null,
+    /**
+     * The work on the dataset shown that would be lost if it were replaced or
+     * the page left, or null when there is none: steps (and notes,
+     * conversations, changes while paused) made since the history was last
+     * saved, while this browser is not keeping them — the autosave switched
+     * off, no storage, or no room left. Opening another dataset asks first,
+     * and so does leaving the page (`app/unkept-work-guard.js`).
+     *
+     * @returns {{dataset: string|null, steps: number, why: 'off'|'unavailable'|'room'}|null}
+     */
+    unkept() {
+      const owned = current;
+      if (owned === null || owned.history.active === null || owned.history.destroyed) return null;
+      if (owned.autosave?.keeping === true || owned.changes === owned.savedAt) return null;
+      const steps = owned.history.trackers().reduce((sum, tracker) => sum + workStepsOf(tracker), 0);
+      if (steps === 0) return null;
+      const why = !historySettings().autosave ? 'off' : owned.autosave?.paused === true ? 'room' : 'unavailable';
+      return { dataset: owned.dataset.name ?? null, steps, why };
+    },
+    /** The history shown was written down as it is now (a session file, a saved state): nothing of it is unkept. */
+    markSaved() {
+      if (current !== null) current.savedAt = current.changes;
+    },
     /**
      * A dataset was published: make its history (no tracker yet).
      *
@@ -132,7 +238,13 @@ export function createDatasetHistories({
         });
       });
       // Each replay's source by the tracker it made, while the dataset is shown ("Replay again with these names").
-      current = { history, autosave: null, dataset, stop, replays: new Map() };
+      // `changes` counts what changed the history's content; `savedAt` the count a save covered (`unkept`).
+      current = { history, autosave: null, dataset, stop, replays: new Map(), changes: 0, savedAt: 0 };
+      const stopCounting = history.subscribe(event => {
+        if (CONTENT_EVENTS.has(event?.kind) && current?.history === history) current.changes += 1;
+      });
+      const stopAccounting = current.stop;
+      current.stop = () => { stopCounting(); stopAccounting(); };
       return history;
     },
     /**
@@ -161,14 +273,7 @@ export function createDatasetHistories({
         collected = true;
         void collectSavedStates(store);
       }
-      void owned.autosave.offerContinue({
-        notifications,
-        onContinue: saved => {
-          void openFromList(saved.id).catch(error => {
-            console.error('[history] Continuing a saved state failed:', error);
-          });
-        },
-      });
+      void offerToContinue(owned);
     },
     /** Another dataset (or none) is about to be shown: stop recording now; the autosave finishes writing. */
     retire() {
@@ -189,11 +294,17 @@ export function createDatasetHistories({
      * stays as it was and the history is kept as a new autosave.
      *
      * @param {Awaited<ReturnType<typeof openSavedState>>} source
+     * @param {{heavy?: ((estimate: Object) => Promise<void>)|null, signal?: AbortSignal|null}} [options] - An action's `ctx.heavy`
+     *   (an agent's `history.saved.open`): asked before restoring sums cells' totals; `signal`: its Stop, which stops
+     *   the restore (what was shown comes back)
      */
-    async loadSaved(source) {
+    async loadSaved(source, { heavy = null, signal = null } = {}) {
       const owned = current;
       if (owned === null) throw new Error('No dataset is open. Open the dataset the saved state was made on first.');
-      const load = () => loadSavedHistory(() => Promise.resolve(source), { label: 'Saved state' });
+      let loaded = null;
+      const load = async () => {
+        loaded = await loadSavedHistory(() => Promise.resolve(source), { label: 'Saved state', heavy, signal });
+      };
       if (source.entry.kind === 'autosave' && owned.autosave !== null) {
         const continued = await owned.autosave.continueFrom({ id: source.entry.id, createdAt: source.entry.createdAt }, load);
         if (!continued) {
@@ -205,6 +316,8 @@ export function createDatasetHistories({
       } else {
         await load();
       }
+      // What the load could not restore (`SessionSerializer` `_restore`: `{notRestored}`), or null.
+      return loaded ?? null;
     },
     /**
      * Replay a saved history on the dataset shown: `open` gives its source (a
@@ -225,7 +338,7 @@ export function createDatasetHistories({
     async replay(open, { signal = null, onStep = null, mapping = null, choice = {} } = {}) {
       const owned = current;
       if (owned === null || owned.history.active === null) {
-        throw new Error('Open a dataset first: a history is replayed on the dataset shown.');
+        throw new Error(noDatasetOpenTo('replay a history on it'));
       }
       const plan = await readReplayPlan(await open(), { signal, ...choice });
       if (current !== owned) throw new Error('Another dataset was opened while the history was read; replay it again there.');
@@ -275,8 +388,13 @@ export function createDatasetHistories({
         const own = current?.autosave?.entryId ?? null;
         return states.map(state => ({ ...state, current: state.id === own }));
       },
-      /** Open one: its dataset first, then its history (resolves whether it was opened). */
-      open: id => openFromList(id),
+      /**
+       * Open one to continue it: its dataset first, then its history (the
+       * session controls' `openSavedState`). Resolves `{opened, problem,
+       * code}`: when it was not opened, why, unless that was said where it
+       * happened.
+       */
+      open: (id, { heavy = null, signal = null } = {}) => openFromList(id, { heavy, signal }),
       /** The source of one saved state, for the opener (`openSavedState`). */
       read: id => openSavedState(id, store),
       /** Replay one on the dataset shown, in a new tracker linked to it (`replay`). */
@@ -297,7 +415,7 @@ export function createDatasetHistories({
        */
       async saveAs(name, { content = 'history', results = 'include' } = {}) {
         const owned = current;
-        if (owned === null || owned.history.active === null) throw new Error('Open a dataset first: a saved state is of a dataset\'s history.');
+        if (owned === null || owned.history.active === null) throw new Error(`${NO_DATASET_OPEN} A saved state is of a dataset's history: open its dataset first.`);
         const { history } = owned;
         await history.settlePaused({ origin: 'user' });
         await history.reconcile();
@@ -321,6 +439,7 @@ export function createDatasetHistories({
             dataset: { id: owned.dataset.id, name: owned.dataset.name }, name: exact, createdAt: at, updatedAt: at,
             chrome: pageChrome(), app: await stamp(),
           }, store);
+          if (shared.scope.content === 'history' && current === owned) api.markSaved();
           return { ...saved, name: exact, content: shared.scope.content };
         } finally {
           unhold();

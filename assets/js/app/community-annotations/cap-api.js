@@ -16,7 +16,7 @@ import { WORKER_CONTRACT_VERSION } from './worker-contract.js';
 import { defaultWorkerTransport, requestWorker } from './worker-request.js';
 import { requireExactObjectKeys, requireObjectKeys } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
-import { cancelled, isCancellation } from '../../utils/abort.js';
+import { cancelled, isCancellation, requireSignalOrNull } from '../../utils/abort.js';
 import { toCleanString } from '../../utils/clean-string.js';
 
 const CAP_REQUEST_BODY_MAX_BYTES = 4 * 1024;
@@ -99,24 +99,9 @@ function assertExactStringArray(value, label) {
   ));
 }
 
-function assertAbortSignalOrNull(signal) {
-  if (
-    signal !== null &&
-    (
-      typeof signal !== 'object' ||
-      typeof signal.aborted !== 'boolean' ||
-      typeof signal.addEventListener !== 'function' ||
-      typeof signal.removeEventListener !== 'function'
-    )
-  ) {
-    throw new TypeError('CAP request signal must be an AbortSignal or exact null');
-  }
-  return signal;
-}
-
 function ownerAbortReason(signal, defaultCause = undefined) {
   if (signal?.reason instanceof Error || isCancellation(signal?.reason)) return signal.reason;
-  return cancelled('user', 'CAP request was cancelled.', defaultCause);
+  return cancelled('user', 'CAP request was canceled.', defaultCause);
 }
 
 /** The worker's one CAP route: a fixed persisted cell-type lookup. */
@@ -158,7 +143,7 @@ function createCapError(message, code, cause = undefined) {
  */
 async function executeLookupProxy(body, { signal = null, transport = null } = {}) {
   requireExactObjectKeys(body, ['kind', 'term', 'limit'], 'CAP proxy request body');
-  const ownerSignal = assertAbortSignalOrNull(signal);
+  const ownerSignal = requireSignalOrNull(signal, 'CAP request signal');
   if (ownerSignal?.aborted) throw ownerAbortReason(ownerSignal);
   const requestBody = JSON.stringify(body);
   if (new TextEncoder().encode(requestBody).byteLength > CAP_REQUEST_BODY_MAX_BYTES) {

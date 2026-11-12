@@ -28,22 +28,25 @@ const PLURAL_NOUNS = [
   'pages', 'items', 'fields', 'characters', 'edges', 'operations', 'elements', 'datasets',
   'views', 'codes', 'groups', 'pixels', 'indices', 'stores', 'positions', 'frames', 'samples',
   'records', 'triangles', 'lists', 'comments', 'candidates', 'exports', 'files', 'workers',
-  'results', 'conflicts', 'channels', 'arrays', 'vertices', 'clusters', 'colours', 'colors',
+  'results', 'conflicts', 'channels', 'arrays', 'vertices', 'clusters', 'colors', 'colors',
   'parameters', 'layers', 'features', 'upvotes', 'downvotes', 'suggestions', 'controls',
   'requests', 'steps', 'keyframes', 'objects', 'modalities', 'embeddings', 'annotators',
   'voters', 'votes', 'chunks', 'parts', 'matrices', 'sets', 'nodes', 'neighbours', 'neighbors',
   'repositories', 'users', 'members', 'labels', 'matches', 'lines', 'words', 'failures',
   'errors', 'warnings', 'retries', 'attempts', 'threads', 'tiles', 'batches', 'levels', 'bytes',
   'digits', 'dimensions', 'axes', 'keys', 'components', 'messages', 'times', 'reads',
+  'repos', 'notes', 'bookmarks', 'branches', 'genes', 'states', 'sessions', 'histories',
 ];
 
 const COUNT_TEMPLATE = new RegExp(
-  String.raw`\$\{([^{}]+)\}\s+(${PLURAL_NOUNS.join('|')})(?![\w/-])`,
+  // A count, then its noun, maybe after a word that counts it again ("3 more categories") or names its kind
+  // ("3 category labels").
+  String.raw`\$\{([^{}]+)\}\s+(?:(?:more|other|new|further|category|cell|gene|saved)\s+)?(${PLURAL_NOUNS.join('|')})(?![\w/-])`,
   'g'
 );
 /** Words that name what a value is, not how many there are. */
 const LABEL = /(label|name|context|\bid\b|Id\b|field|path|source|title|kind|owner|key|prefix|type|Type|method|mode|what|scope|role|section|header|\bgene\b|\bgroup\b|\bpage\b|dtype|codec|format|location|where|parent|base|tag|stage|\bstep\b|which|noun|unit|attribute|\bdataset\b|subject|\bitem\b|JSON\.stringify|escape|\.join\()/i;
-const COUNT_WORD = /length|count|Count|size|Size|total|Total|formatCount|toLocale|^n[A-Z_]|^n$|\bn_|Number\(|Math\./;
+const COUNT_WORD = /length|count|Count|size|Size|total|Total|Loaded|formatCount|toLocale|^n[A-Z_]|^n$|\bn_|Number\(|Math\./;
 const LIMIT_CONSTANT = /^[A-Z0-9_.]+(\.[a-zA-Z0-9_]+)*$/;
 const INDEX = /^(i|index|\w*Index|index \+ 1|module)$/;
 const HAND_ROLLED = /={2,3} ?1 ?\? ?'' ?: ?'s'|={2,3} ?1 ?\? ?'y' ?: ?'ies'|={2,3} ?1 ?\? ?'([a-z]+)' ?: ?'\1s'/g;

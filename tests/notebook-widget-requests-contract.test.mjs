@@ -20,9 +20,9 @@ import test from 'node:test';
 import { until } from './helpers/until.mjs';
 
 // Both shipped copies, each with the checkout it was read from. The
-// behaviour contracts below run on each copy, so when the two differ (a
+// behavior contracts below run on each copy, so when the two differ (a
 // sibling repository checked out before its push landed, in CI) the copy
-// that is behind is the one named by its failing behaviour tests.
+// that is behind is the one named by its failing behavior tests.
 // The checkouts are next to this one, or where CELLUCID_PYTHON_ROOT and
 // CELLUCID_R_ROOT say (a worktree, a CI checkout elsewhere).
 const here = path.dirname(fileURLToPath(import.meta.url));

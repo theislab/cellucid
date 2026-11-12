@@ -105,6 +105,9 @@ function createDEBoundaryProbe(pointCount = 6) {
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return [{ key: 'Gene A', name: 'Gene A' }];
@@ -219,7 +222,6 @@ function createDEExecutionHarness(computeResult, genes = ['Gene A']) {
   const calls = {
     compute: 0,
     expressionReads: [],
-    cleanup: 0,
   };
   const analysis = Object.create(MultiVariableAnalysis.prototype);
   analysis.dataLayer = {
@@ -227,6 +229,9 @@ function createDEExecutionHarness(computeResult, genes = ['Gene A']) {
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return genes.map(key => ({ key, name: key }));
@@ -238,10 +243,6 @@ function createDEExecutionHarness(computeResult, genes = ['Gene A']) {
         values: Float32Array.of(1, 2, 3, 4, 5, 6),
         owned: true,
       };
-    },
-    performCacheCleanup() {
-      calls.cleanup += 1;
-      return { cleaned: 0, remaining: 0 };
     },
   };
   analysis._getComputeManager = async () => ({
@@ -308,11 +309,10 @@ for (const malformedCase of [
     );
     assert.deepEqual(calls.expressionReads, ['Gene A']);
     assert.equal(calls.compute, 1);
-    assert.equal(calls.cleanup, 1);
   });
 }
 
-test('successful DE performs only expiry cleanup after heavy compute', async t => {
+test('successful DE clears no cache of the data source', async t => {
   const manager = getDataSourceManager();
   const previousSource = manager.activeSource;
   let sourceClears = 0;
@@ -334,7 +334,6 @@ test('successful DE performs only expiry cleanup after heavy compute', async t =
   });
 
   assert.equal(result.results.length, 1);
-  assert.equal(calls.cleanup, 1);
   assert.equal(sourceClears, 0);
 });
 
@@ -348,7 +347,6 @@ test('DE invalidation aborts streaming, dispatches no later gene, drains compute
   let cleanup = null;
   let current = true;
   let progressCountAtInvalidation = null;
-  let cleanupCalls = 0;
   let sourceClearCalls = 0;
   let executeCalls = 0;
   let runSettled = false;
@@ -367,6 +365,9 @@ test('DE invalidation aborts streaming, dispatches no later gene, drains compute
     resolveExpressionMatrix: () => ({ matrix: 'X', read: null, label: 'Mapped (X)' }),
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     async getGeneKeys() { return this.getAvailableVariables('gene_expression').map(gene => gene.key); },
     getAvailableVariables() {
       return ['Gene A', 'Gene B', 'Gene C'].map(key => ({ key, name: key }));
@@ -378,10 +379,6 @@ test('DE invalidation aborts streaming, dispatches no later gene, drains compute
         values: Float32Array.of(1, 2, 3, 4, 5, 6),
         owned: true,
       };
-    },
-    performCacheCleanup() {
-      cleanupCalls += 1;
-      return { cleaned: 0, remaining: 0 };
     },
   };
   analysis._getComputeManager = async () => ({
@@ -444,11 +441,10 @@ test('DE invalidation aborts streaming, dispatches no later gene, drains compute
   assert.equal(startedGenes[0], 'Gene A');
   assert.equal(executeCalls, 1);
   assert.equal(progress.length, progressCountAtInvalidation);
-  assert.equal(cleanupCalls, 1);
   assert.equal(sourceClearCalls, 0);
 });
 
-test('current and stale signature completion perform expiry cleanup without global cache clearing', async t => {
+test('current and stale signature completion clear no cache of the data source', async t => {
   const manager = getDataSourceManager();
   const previousSource = manager.activeSource;
   let sourceClears = 0;
@@ -461,7 +457,6 @@ test('current and stale signature completion perform expiry cleanup without glob
     manager.activeSource = previousSource;
   });
 
-  let expiryCleanups = 0;
   const gates = [];
   const dataLayer = {
     state: { pointCount: 3 },
@@ -473,12 +468,11 @@ test('current and stale signature completion perform expiry cleanup without glob
     },
     // Genes are read for every open cell (no gene sample).
     geneCellsOf: async () => null,
+    matrixHoldsCounts: () => false,
+    expressionTransformOf: () => ({ normalize: false, log1p: false }),
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     getPageCells(pageIds) {
       return pageIds.map(pageId => ({ pageId, pageName: pageId, cellIndices: Uint32Array.of(0, 1, 2) }));
-    },
-    performCacheCleanup() {
-      expiryCleanups += 1;
-      return { cleaned: 0, remaining: 0 };
     },
   };
   const analysis = Object.create(MultiVariableAnalysis.prototype);
@@ -507,7 +501,6 @@ test('current and stale signature completion perform expiry cleanup without glob
   staleGate.resolve([Float32Array.of(1, 2, 3)]);
   assert.equal(await staleRun, null);
 
-  assert.equal(expiryCleanups, 2);
   assert.equal(sourceClears, 0);
   assert.equal(invalidate, null, 'the run keeps no notification of its own to clean up');
 });

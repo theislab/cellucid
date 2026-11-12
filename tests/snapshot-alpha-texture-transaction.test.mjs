@@ -546,7 +546,7 @@ function createRenderer({
 /**
  * The R8 image a kept view's texture holds for its transparency: 255 for a
  * shown cell, 0 for a hidden one, 255 for every cell when it is null and for
- * the padding past the last cell. The colours' alpha byte is never read.
+ * the padding past the last cell. The colors' alpha byte is never read.
  */
 function expectedAlphaBytes(alphas, pointCount, texelCount) {
   const result = new Uint8Array(texelCount);
@@ -587,7 +587,7 @@ function heldImageSizedArrays(renderer) {
   return found;
 }
 
-/** A snapshot colour store holds its RGBA8 colours as they are, 4 bytes a point. */
+/** A snapshot color store holds its RGBA8 colors as they are, 4 bytes a point. */
 function expectedStoreBytes(colors) {
   return Uint8Array.from(colors);
 }
@@ -655,7 +655,7 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
   assert.deepEqual(
     gl._state.bufferBytes.get(bufferOf(snapshot.buffer)),
     expectedStoreBytes(colors),
-    'a snapshot colour store is RGBA8 on a 4-byte stride; its alpha is the one R8 owner, and the store\'s alpha byte is never read',
+    'a snapshot color store is RGBA8 on a 4-byte stride; its alpha is the one R8 owner, and the store\'s alpha byte is never read',
   );
   assert.equal(snapshot.bufferByteLength, renderer.pointCount * 4);
   const colorAttribute = gl._state.vertexAttribCalls
@@ -674,7 +674,7 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
       vao: vaoOf(snapshot.vao),
     },
   );
-  // In source order the colours are the store's bytes: one direct upload,
+  // In source order the colors are the store's bytes: one direct upload,
   // no permute pass and no point-sized scratch beside the snapshot.
   assert.equal(Object.hasOwn(renderer, '_snapshotColorStagingData'), false);
   assert.equal(renderer._permuter.wordWrites[1], 0);
@@ -695,7 +695,7 @@ test('snapshot creation publishes exact source-order R8 ownership and accounts 3
       inherited.snapshot.alphaTexWidth *
         inherited.snapshot.alphaTexHeight,
     ),
-    'null transparency shows every cell; the colours\' alpha byte is never read',
+    'null transparency shows every cell; the colors\' alpha byte is never read',
   );
   assert.deepEqual(
     inherited.gl._state.bufferBytes.get(
@@ -879,7 +879,7 @@ test('color-only and position-only updates preserve independent snapshot owners'
       renderer.updateSnapshotColors('snap_1', replacement),
       true,
     );
-    // The view alone owns its store: the colours are gathered into it in
+    // The view alone owns its store: the colors are gathered into it in
     // place, with no new buffer or vertex array.
     assert.strictEqual(snapshot.buffer, before.buffer);
     assert.strictEqual(snapshot.vao, before.vao);
@@ -905,7 +905,7 @@ test('color-only and position-only updates preserve independent snapshot owners'
     assert.equal(
       gl._state.bufferUploadCount,
       beforeBufferUploads,
-      'an in-place recolour allocates no store',
+      'an in-place recolor allocates no store',
     );
     assert.equal(
       gl._state.textureUploadCount,
@@ -1058,18 +1058,18 @@ test('failed alpha, color, and position publications preserve accepted owners an
     // arguments it rejects) and writes nothing.
     const bufferSubData = gl.bufferSubData;
     gl.bufferSubData = () => {
-      throw new TypeError('WebGL rejected the colour store write.');
+      throw new TypeError('WebGL rejected the color store write.');
     };
     assert.throws(
       () => renderer.updateSnapshotColors(
         'snap_1',
         new Uint8Array(renderer.pointCount * 4)
       ),
-      /rejected the colour store write/,
+      /rejected the color store write/,
     );
     gl.bufferSubData = bufferSubData;
     assert.deepEqual(snapshotIdentity(snapshot), colorBefore);
-    assert.strictEqual(snapshot.colors, colorsBefore, 'the accepted colours stay published');
+    assert.strictEqual(snapshot.colors, colorsBefore, 'the accepted colors stay published');
 
     gl._state.fail.bufferUploads.clear();
     const positionBefore = snapshotIdentity(snapshot);
@@ -1198,7 +1198,7 @@ test('snapshot alpha retirement survives hostile cleanup and disposal retry', as
         handle => handle === bufferOf(colorBuffer)
       ).length,
       1,
-      'the last retired VAO releases and deletes the shared colour VBO exactly once',
+      'the last retired VAO releases and deletes the shared color VBO exactly once',
     );
     assert.equal(
       gl._state.deleted.textures.filter(
@@ -1447,7 +1447,7 @@ test('a kept view adopts its own transparency owner, so a caller array rewritten
 
 test('a released kept view takes transparency updates by reference and rebuilds its texture from the accepted array', () => {
   const { gl, renderer, snapshot } = createRenderer();
-  // Releasing detaches the colour attribute from the view's vertex array.
+  // Releasing detaches the color attribute from the view's vertex array.
   gl.disableVertexAttribArray = () => {};
   renderer._presentedViewIds = ['live'];
   renderer._snapshotInOperation = null;

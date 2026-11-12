@@ -207,21 +207,30 @@ export function bibtex(citation) {
 }
 
 /**
+ * The deployed `CITATION.cff` as text, revalidated: the one reader of it (the
+ * Cite dialog, the methods paragraph). A file of this page's own server, so
+ * a plain fetch, not the transport of data hosts.
+ *
+ * @returns {Promise<string>}
+ */
+export async function readCitationFile() {
+  const response = await fetch(CITATION_PATH, { cache: 'no-cache' });
+  if (!response.ok) throw new Error(`${CITATION_PATH} answered HTTP ${response.status}.`);
+  return response.text();
+}
+
+/**
  * How Cellucid is cited (APA), read once from the deployed `CITATION.cff`:
  * what the methods paragraph names (`history.methods`). Answers null, and
  * says so once, when the file cannot be read.
  *
- * @param {(url: string) => Promise<string>} [fetchText]
+ * @param {() => Promise<string>} [fetchText]
  * @returns {() => Promise<string|null>}
  */
-export function cellucidCitationReader(fetchText = async url => {
-  const response = await fetch(url, { cache: 'no-cache' });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.text();
-}) {
+export function cellucidCitationReader(fetchText = readCitationFile) {
   let read = null;
   return () => {
-    read ??= fetchText(CITATION_PATH)
+    read ??= fetchText()
       .then(text => apa(parsePreferredCitation(text)))
       .catch(error => {
         console.warn('[citation] Cellucid\'s citation could not be read', error);

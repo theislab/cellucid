@@ -4,7 +4,7 @@
  * `.zarr.zip` (zarr's `ZipStore`) and every element equals what they read
  * from the source (obs and var frames, X and every layer and `raw.X` as
  * values, `obsm`, `obsp`, `varm`, `uns`); cellucid-python
- * (`CELLUCID_PYTHON_ROOT`, else the checkout beside this one) recognises
+ * (`CELLUCID_PYTHON_ROOT`, else the checkout beside this one) recognizes
  * the file as a Cellucid-ready AnnData Zarr archive, reads the same dataset
  * id and name, verifies a priority order the copy kept (`stored_order_of`)
  * and reads the history records a copy wrote (`history_applied`). Python's

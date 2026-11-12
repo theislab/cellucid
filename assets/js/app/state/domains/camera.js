@@ -20,7 +20,7 @@
  */
 
 import { cameraStatesHaveSamePose, cloneCameraState } from '../../../rendering/camera-state-contract.js';
-import { requireViewsFit, viewIdsOf } from './view-list.js';
+import { requireViewsFit, viewIdsOf, viewReadPart } from './view-list.js';
 import { viewNameInValue } from '../../actions/targets/views.js';
 
 const MODE_NAMES = Object.freeze({ orbit: 'orbit', planar: 'planar', free: 'free-fly' });
@@ -30,6 +30,8 @@ const MODE_NAMES = Object.freeze({ orbit: 'orbit', planar: 'planar', free: 'free
  */
 export function createCameraDomain({ viewer, refreshUi }) {
   return {
+    // A step read the view it acted in: staleness compares that view's part alone (F156).
+    readPart: viewReadPart,
     capture() {
       return { views: viewIdsOf(viewer).map(id => cloneCameraState(viewer.getViewCameraState(id), `Camera of view "${id}"`)) };
     },
@@ -61,15 +63,15 @@ export function createCameraDomain({ viewer, refreshUi }) {
         throw new Error(`The camera of ${missing.join(', ')} could not be put back where it was.`);
       }
     },
-    /** `context.liveHidden`: the live view is hidden at the later value (`views` domain), so the list numbers the kept views from 1. */
-    describe(a, b, { liveHidden = false } = {}) {
+    /** `context.liveHidden`: the live view is hidden at the later value (`views` domain), so the list numbers the kept views from 1; `context.viewLabels`: the views' names there (`viewLabelsInValue`). */
+    describe(a, b, { liveHidden = false, viewLabels = null } = {}) {
       const lines = [];
       const count = Math.max(a.views.length, b.views.length);
       for (let v = 0; v < count; v++) {
         const before = a.views[v];
         const after = b.views[v];
         if (before === undefined || after === undefined) continue;
-        const prefix = count > 1 ? `${viewNameInValue(v, liveHidden)}: ` : '';
+        const prefix = count > 1 ? `${viewNameInValue(v, liveHidden, viewLabels)}: ` : '';
         if (before.navigationMode !== after.navigationMode) {
           lines.push(`${prefix}${MODE_NAMES[after.navigationMode]} navigation`);
         } else if (!cameraStatesHaveSamePose(before, after)) {

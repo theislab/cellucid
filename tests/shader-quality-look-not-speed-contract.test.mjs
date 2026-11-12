@@ -8,7 +8,7 @@
  * inside them — fog, lighting, the alpha texture fetch and the round discard.
  * The reason is structural rather than a property of one GPU: depth writes are
  * on and submission order is uncorrelated with depth, so roughly 95% of
- * rasterised fragments are killed before the fragment shader runs. Only about
+ * rasterized fragments are killed before the fragment shader runs. Only about
  * 5% of the fill is ever shaded, and making that 5% cheaper is not visible.
  *
  * Two surfaces claimed the opposite and both are pinned here.
@@ -41,7 +41,7 @@
  *
  * What replaces it is the measurement that does discriminate. Point size is the
  * real control: vertex work is flat regardless of size, so the cost is
- * per-sprite rasterisation and shrinking points genuinely helps once fill
+ * per-sprite rasterization and shrinking points genuinely helps once fill
  * begins to matter. The harness already sweeps point size, so the panel reports
  * that response where the noise delta used to sit.
  */
@@ -73,7 +73,7 @@ function boundAnalysis(boundType = 'balanced') {
   return {
     boundType,
     pointSizeScaling: {
-      scalingFactor: 0.11,
+      scalingFactor: 1.82,
       timeRatio: 1.82,
       sizeRatio: 16,
       smallestPointSize: 1,
@@ -82,10 +82,10 @@ function boundAnalysis(boundType = 'balanced') {
       largestMs: 21.8,
       interpretation: 'balanced',
     },
-    lodScaling: { scalingFactor: 0.4, timeRatio: 1.2, pointRatio: 3 },
+    lodScaling: { scalingFactor: 1.2, timeRatio: 1.2, pointRatio: 3, fewestPoints: 1000, mostPoints: 3000 },
     analysis: {
-      fragmentBoundScore: 0.11,
-      vertexBoundScore: 0.4,
+      fragmentBoundScore: 1.82,
+      vertexBoundScore: 1.2,
       explanation: 'balanced',
     },
   };
@@ -204,7 +204,7 @@ test('the reporter never proposes a shader quality to recover frame rate', () =>
 
 test('no bound-type explanation proposes a simpler shader', () => {
   // This prose reaches the user through `boundAnalysis.analysis.explanation`
-  // and is not produced by `_generateRecommendations`, so the behavioural sweep
+  // and is not produced by `_generateRecommendations`, so the behavioral sweep
   // above cannot see it.
   const analyzer = makeAnalyzer();
   for (const bound of ['fragment', 'vertex', 'balanced']) {

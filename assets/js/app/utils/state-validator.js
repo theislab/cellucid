@@ -8,7 +8,7 @@
  */
 
 import { FieldKind, OverlapStrategy } from './field-constants.js';
-import { MAX_INTERSECTION_PAGES } from './page-membership.js';
+import { parseIntersectionKey } from './page-membership.js';
 import {
   requireCategoricalCategoryCount
 } from '../../data/categorical-storage-contract.js';
@@ -69,6 +69,32 @@ export class StateValidator {
       throw new Error(
         `Field name cannot contain the zero-width character ${describeCodePoint(invisible[0])}`
       );
+    }
+    return true;
+  }
+
+  /**
+   * A category label someone gives now (a rename, a merge, a group, a page's
+   * label in Create categorical): the field-name rule for text, so a label
+   * made here is one line, with no space at its ends and no character that
+   * has no glyph (bug hunt R9A-8: a rename made "Alpha\nnewline", which the
+   * legend drew on two lines and the community annotation cannot key). A
+   * label a dataset brings is read as it is (`validateCategoryLabel`).
+   */
+  static validateNewCategoryLabel(label) {
+    if (typeof label !== 'string' || label.length === 0) {
+      throw new Error('a label is a non-empty text');
+    }
+    if (label.trim() !== label) {
+      throw new Error('it starts or ends with a space; give it without');
+    }
+    const control = CONTROL_CHARACTER.exec(label);
+    if (control !== null) {
+      throw new Error(`it holds the control character ${describeCodePoint(control[0])} (a line break or tab, for example); a label is one line`);
+    }
+    const invisible = INVISIBLE_CHARACTER.exec(label);
+    if (invisible !== null) {
+      throw new Error(`it holds the zero-width character ${describeCodePoint(invisible[0])}`);
     }
     return true;
   }
@@ -136,18 +162,21 @@ export class StateValidator {
       'pages',
       'uncoveredLabel'
     ];
+    // `rest` (the field whose category the cells on no page keep) is given only when one is.
+    const given = options !== null && typeof options === 'object' && Object.hasOwn(options, 'rest')
+      ? [...optionKeys, 'rest'].sort() : optionKeys;
     if (
       options === null
       || typeof options !== 'object'
       || Array.isArray(options)
       || Object.getPrototypeOf(options) !== Object.prototype
       || Object.keys(options).sort().some(
-        (optionKey, index) => optionKey !== optionKeys[index]
+        (optionKey, index) => optionKey !== given[index]
       )
-      || Object.keys(options).length !== optionKeys.length
+      || Object.keys(options).length !== given.length
     ) {
       throw new TypeError(
-        `User-defined field options must contain exactly: ${optionKeys.join(', ')}`
+        `User-defined field options must contain exactly: ${optionKeys.join(', ')} (and rest, when the cells on no page keep a field's categories)`
       );
     }
     const {
@@ -156,10 +185,19 @@ export class StateValidator {
       uncoveredLabel,
       overlapStrategy,
       overlapLabel,
-      intersectionLabels
+      intersectionLabels,
+      rest = null
     } = options;
 
     this.validateFieldKey(key);
+    // The field whose category the cells on no page keep: its labels, each open cell's code, its missing code.
+    if (rest !== null && (
+      rest === undefined || typeof rest !== 'object' || Array.isArray(rest)
+      || !Array.isArray(rest.categories) || rest.categories.some(label => typeof label !== 'string')
+      || !ArrayBuffer.isView(rest.codes) || !Number.isSafeInteger(rest.missing)
+    )) {
+      throw new TypeError('rest must be null or the kept field\'s categories (labels), codes and missing code');
+    }
 
     if (!Array.isArray(pages) || pages.length === 0) {
       throw new Error('At least one page is required');
@@ -246,32 +284,15 @@ export class StateValidator {
     }
 
     if (overlapStrategy === OverlapStrategy.INTERSECTIONS) {
-      if (pages.length > MAX_INTERSECTION_PAGES) {
-        throw new RangeError(`Each intersection supports at most ${MAX_INTERSECTION_PAGES} pages`);
-      }
-      for (const [maskKey, label] of Object.entries(intersectionLabels)) {
-        if (!/^[1-9][0-9]*$/.test(maskKey)) {
-          throw new TypeError(
-            `Intersection label key "${maskKey}" must be a canonical positive integer`
-          );
-        }
-        const mask = Number(maskKey);
-        if (
-          !Number.isSafeInteger(mask)
-          || mask >= 2 ** pages.length
-          || (mask & (mask - 1)) === 0
-        ) {
-          throw new RangeError(
-            `Intersection label key "${maskKey}" is not a current multi-page mask`
-          );
-        }
+      for (const [key, label] of Object.entries(intersectionLabels)) {
+        parseIntersectionKey(key, pages.length);
         if (
           typeof label !== 'string'
           || label.length === 0
           || label !== label.trim()
         ) {
           throw new TypeError(
-            `Intersection label "${maskKey}" must be a non-empty trimmed string`
+            `Intersection label "${key}" must be a non-empty trimmed string`
           );
         }
         this.validateCategoryLabel(label);

@@ -14,7 +14,7 @@ const ENV = Object.freeze({
 // GitHub's own 10 s request timeout plus a 3 s connection set-up (the Worker's comment cites both).
 const WORKER_STALL_TIMEOUT_MS = 13_000;
 const CALLER_ABORT_DOCUMENT = Object.freeze({
-  error: 'Worker request was cancelled',
+  error: 'Worker request was canceled',
 });
 const STALL_DOCUMENT = Object.freeze({
   error: 'Worker request stalled: nothing moved for 13 s',

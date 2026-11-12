@@ -15,7 +15,13 @@ plan, and the changes a copy of the dataset writes for them, `CopyChanges`:
 renamed obs columns and categories in place, user fields and highlights as
 obs columns, gene sets in `uns['cellucid']['gene_sets']` and as boolean var
 columns `cellucid_gene_set__<name>` (`geneSetColumns`; the packages write
-the same, pinned by `expected.apply.sequence[].var_columns`),
+the same, pinned by `expected.apply.sequence[].var_columns`), each written,
+renamed or relabeled column's colors in `uns['<column>_colors']` as the
+packages keep them (`colorChanges`: a categorical user field with the colors
+it is shown in, in the view in focus, any other column written with none, a
+rename carrying them, a merged category taking its first category's color,
+and a dataset column recolored in the view in focus with the colors it is
+shown in, a `column-colors` row each: `planColumnColors`, `openingPalette`),
 `history_applied` with `package: 'web'`).
 
 **Entry points:** `historyPseudocode`, `methodsParagraph` + `methodsParts`,
@@ -32,7 +38,7 @@ without being shown.
 **Invariants:**
 - Pure: no DOM, no page state; importable in Node. The State panel
   (`app/ui/modules/state/`) gathers what they need (the tracker, the branch
-  and step shown, the catalogue, the dataset's facts, the version, and the
+  and step shown, the catalog, the dataset's facts, the version, and the
   report's pictures drawn from the live view) and opens or copies the result.
 - They read a step's `kind`, `by`, `squashed`, `group`, `bookmark` and
   `notes`, and the tracker's `groups` and `notes` (the first is the abstract,

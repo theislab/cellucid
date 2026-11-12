@@ -1,6 +1,6 @@
 /**
  * Choosing the wrong file for Load State is the commonest session failure, and
- * the documentation tells the reader to recognise it by one sentence,
+ * the documentation tells the reader to recognize it by one sentence,
  * `NOT_A_SESSION_FILE_MESSAGE`. A wrong file shorter than the signature must
  * say so in the same words, not as an end-of-file error about byte counts.
  */

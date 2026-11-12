@@ -1,7 +1,7 @@
 /**
  * Every native inflate in the data layer is bounded by its reader.
  *
- * A DEFLATE bomb must be cancelled after a few chunks of output, not after the
+ * A DEFLATE bomb must be canceled after a few chunks of output, not after the
  * native decoder has expanded the whole payload. Two readers inflate natively:
  *
  * - the session codec (`app/session/codecs/gzip.js`) feeds the decompressor

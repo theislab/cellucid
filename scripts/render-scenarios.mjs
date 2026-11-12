@@ -27,7 +27,7 @@
  *   --engine name        chromium (default), firefox or webkit
  *   --points N           synthetic cloud size for synthetic sources (200000)
  *   --pattern name       synthetic pattern (clusters)
- *   --views N            views (1..4) for the scenarios that honour it (1)
+ *   --views N            views (1..4) for the scenarios that honor it (1)
  *   --culling mode       lod+frustum (default), lod, frustum or none: adaptive
  *                        LOD and frustum culling, set after the data loads
  *   --antialias on|off   force antialiasing (default: the app's own choice)
@@ -486,7 +486,7 @@ async function ensureViews(page, views) {
   return page.evaluate(() => window._cellucidViewer.getSnapshotViews().length + 1);
 }
 
-async function colourByFirstCategory(page, preferredLabel = null) {
+async function colorByFirstCategory(page, preferredLabel = null) {
   const chosen = await page.evaluate(preferred => {
     const select = document.getElementById('categorical-field');
     if (!(select instanceof HTMLSelectElement)) return null;
@@ -698,7 +698,7 @@ const SCENARIOS = {
     if (!available) {
       return { skipped: 'Connectivity is not available for this dataset.' };
     }
-    const field = await colourByFirstCategory(page);
+    const field = await colorByFirstCategory(page);
     const views = await ensureViews(page, options.views);
     await settle(page);
     const steps = [];
@@ -739,7 +739,7 @@ const SCENARIOS = {
   },
 
   async selection(page, options) {
-    const field = await colourByFirstCategory(page, 'cell_type');
+    const field = await colorByFirstCategory(page, 'cell_type');
     const views = await ensureViews(page, options.views);
     await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
     await settle(page);
@@ -785,7 +785,7 @@ const SCENARIOS = {
   },
 
   async session(page, options, context) {
-    await colourByFirstCategory(page, 'cell_type');
+    await colorByFirstCategory(page, 'cell_type');
     const views = await ensureViews(page, Math.max(2, options.views));
     await settle(page);
     const steps = [];

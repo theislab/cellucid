@@ -6,7 +6,7 @@
  * - View layout mode (grid vs single)
  * - Snapshot creation/removal and the "Link cameras" toggle, which links
  *   only views that show the same representation
- * - One row per view: what it shows ("UMAP · 3D"), its colouring field, its
+ * - One row per view: what it shows ("UMAP · 3D"), its coloring field, its
  *   navigation mode, and whether its camera is linked
  *
  * Cross-module refresh (field selectors, legends, filters) is delegated via
@@ -18,30 +18,47 @@
  * `cells.visibility.set`. A control dispatches; a click on a pane, which the
  * viewer has already focused, is recorded by observation (`view.focus`).
  * Views are named as the Compare views list numbers them
- * (`app/actions/targets/views.js`). The layout mode is the viewer's
+ * (`app/actions/targets/views.js`); a view given a name of its own
+ * (`view.rename`, here: double-click its row, or F2 on it) shows it beside
+ * its number in its row, its pane chip and the Navigation panel. The layout mode is the viewer's
  * (`getViewLayout`); the selector shows it.
  *
  * @module ui/modules/view-controls
  */
 
+import { setControlAvailability } from '../core/control-availability.js';
 import { getNotificationCenter } from '../../notification-center.js';
+import { failureDetails, sayFailure } from '../../../utils/errors.js';
 import { getActions, getStateDomains } from '../../actions/index.js';
 import { PER_VIEW_DOMAINS } from '../../actions/domains.js';
 import { getCurrentHistory } from '../../history/current.js';
+import { throwIfAborted } from '../../../utils/abort.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
 import { dispatchFromControl } from '../../actions/control-dispatch.js';
-import { resolveViewName, viewNameAt, viewNameOf } from '../../actions/targets/views.js';
+import {
+  checkViewLabel,
+  resolveViewName,
+  viewLabelOf,
+  viewNameAt,
+  viewNameOf,
+  viewWords,
+  withViewLabel,
+} from '../../actions/targets/views.js';
 import {
   clearPublishedSnapshotViews,
   publishSnapshotView,
   retireSnapshotView,
 } from '../../view-snapshot-publication.js';
 import { viewerNeedsUiRetirement } from '../core/viewer-lifecycle.js';
+import { visitingViews } from '../../state/domains/view-list.js';
 import { formatCountOf, countNoun } from '../../../utils/format-units.js';
+import { NO_DATASET_LABEL, noDatasetOpenTo, openADatasetTo } from '../no-dataset.js';
 
 const LIVE_VIEW_ID = 'live';
 const VIEW_LAYOUT_MODES = new Set(['grid', 'single']);
 const RENDER_MODES = new Set(['points', 'smoke']);
+/** Why Volumetric smoke cannot be chosen while views are kept. */
+export const SMOKE_NEEDS_ONE_VIEW = 'volumetric smoke draws one view; remove the kept views first (Clear, beside Layout)';
 const NAV_MODE_LABELS = Object.freeze({
   orbit: 'Orbit',
   planar: 'Planar',
@@ -106,12 +123,6 @@ function requireNonEmptyText(value, label) {
     throw new TypeError(`${label} must be a non-empty string.`);
   }
   return value;
-}
-
-function describeError(error) {
-  return error instanceof Error
-    ? error.message
-    : 'The operation rejected with a non-Error value.';
 }
 
 function requireTypedArray(value, Type, length, label) {
@@ -286,6 +297,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     'getSnapshotViews',
     'getViewCameraState',
     'getViewLayout',
+    'getViewName',
     'getViewNavigationMode',
     'removeSnapshotView',
     'setCamerasLocked',
@@ -293,6 +305,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     'setNavigationMode',
     'setViewFocusHandler',
     'setViewLayout',
+    'setViewName',
     'setViewNavigationMode',
     'setViewTitlePrefixes',
   ]) {
@@ -400,8 +413,8 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
   function reportUiFailure(action, error) {
     getNotificationCenter().error(
-      `${action}: ${describeError(error)}`,
-      { category: 'render', duration: 10000 }
+      `${action}: ${sayFailure(error)}`,
+      { category: 'render', duration: 10000, ...failureDetails(error) }
     );
   }
 
@@ -410,15 +423,17 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
    * failed when even that fails. A refusal changed nothing and needs no
    * redraw.
    */
-  function reconciledFailure(action, error) {
+  function reconciledFailure(error) {
     if (error instanceof ActionRefused) return error;
     try {
       syncFromStateAndViewer(true);
       return error;
     } catch (reconciliationError) {
+      // Said after the action's own words ("Keep view failed: …"), which
+      // its caller gives: this says only what followed the failure.
       return new AggregateError(
         [error, reconciliationError],
-        `${action} failed and the view UI could not be reconciled.`
+        'The view controls could not be drawn again after it.'
       );
     }
   }
@@ -431,7 +446,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     try {
       return operation();
     } catch (error) {
-      throw reconciledFailure(action, error);
+      throw reconciledFailure(error);
     }
   }
 
@@ -441,7 +456,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     try {
       return operation();
     } catch (error) {
-      reportUiFailure(action, reconciledFailure(action, error));
+      reportUiFailure(action, reconciledFailure(error));
       return false;
     }
   }
@@ -465,15 +480,20 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   }
 
   /**
-   * Lay the views out in `layoutMode` around the active view, and show the
-   * mode in the selector.
+   * Lay the views out in `layoutMode` (by default the layout they have)
+   * around the active view, and show the mode in the selector. The viewer
+   * keeps the person's layout while smoke is on: smoke draws the live view
+   * alone in either layout, and only the selector says "single" meanwhile
+   * (`effectiveLayoutMode`). Writing "single" into the viewer from a refresh
+   * in smoke undid a starting view's "grid" as it was put back, and the
+   * sample view failed (bug hunt F59).
    * @param {'grid'|'single'} [layoutMode]
    */
-  function pushViewLayoutToViewer(layoutMode = effectiveLayoutMode()) {
+  function pushViewLayoutToViewer(layoutMode = currentLayoutMode()) {
     const exactMode = requireLayoutMode(layoutMode);
     requireCurrentInventory();
     viewer.setViewLayout(exactMode, currentActiveViewId());
-    viewLayoutModeSelect.value = exactMode;
+    viewLayoutModeSelect.value = effectiveLayoutMode();
   }
 
   function syncActiveViewSelectOptions() {
@@ -577,7 +597,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   }
 
   /**
-   * One view's row: its number, what it shows ("UMAP · 3D") with its colouring
+   * One view's row: its number, what it shows ("UMAP · 3D") with its coloring
    * field under it, whether its camera is linked, its navigation mode, and
    * (when the view can be removed) its remove button. The row is a list item;
    * its main part is the button that selects the view, so the picker below
@@ -587,6 +607,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     viewId,
     index,
     label,
+    name,
     shows,
     showsTitle,
     linkedWith,
@@ -599,8 +620,6 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     badge.className = 'split-badge';
     badge.setAttribute('role', 'listitem');
     badge.dataset.viewId = viewId;
-    if (active) badge.classList.add('active');
-    if (cameraFocused) badge.classList.add('active-camera');
     const select = () => {
       if (destroyed) return;
       void dispatchFromControl(
@@ -614,9 +633,17 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     const main = ownerDocument.createElement('button');
     main.type = 'button';
     main.className = 'split-badge-select';
-    main.setAttribute('aria-pressed', active ? 'true' : 'false');
-    main.setAttribute('aria-label', `${viewNameAt(index - 1)}: ${shows}, coloured by ${label}`);
-    main.title = `${showsTitle}\nColoured by ${label}`;
+    badgeSelectButtons.set(badge, main);
+    main.setAttribute('aria-label', `${viewWords(viewNameAt(index - 1), name)}: ${shows}, colored by ${label}`);
+    // F2 (as a highlight page's tab) or a double-click names the view.
+    main.setAttribute('aria-keyshortcuts', 'F2');
+    main.title = `${name === null ? '' : `${name}\n`}${showsTitle}\nColored by ${label}\nDouble-click or F2 to name this view`;
+    main.addEventListener('keydown', event => {
+      if (event.key !== 'F2') return;
+      event.preventDefault();
+      event.stopPropagation();
+      startViewRename(viewId);
+    });
     main.addEventListener('click', event => {
       event.stopPropagation();
       select();
@@ -634,10 +661,19 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     const representation = ownerDocument.createElement('span');
     representation.className = 'split-badge-label';
     representation.textContent = shows;
-    main.append(pill, cameraIndicator, representation);
+    if (name === null) {
+      main.append(pill, cameraIndicator, representation);
+    } else {
+      // A named view: its name first, what it shows after it, quieter.
+      const nameText = ownerDocument.createElement('span');
+      nameText.className = 'split-badge-name';
+      nameText.textContent = name;
+      representation.classList.add('split-badge-label-after-name');
+      main.append(pill, cameraIndicator, nameText, representation);
+    }
     badge.appendChild(main);
 
-    // Second line: the field the view is coloured by, whether its camera is
+    // Second line: the field the view is colored by, whether its camera is
     // linked, and its navigation mode. The first line keeps its full width
     // for what the view shows.
     const meta = ownerDocument.createElement('div');
@@ -645,7 +681,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     const field = ownerDocument.createElement('span');
     field.className = 'split-badge-sub';
     field.textContent = label;
-    field.title = `Coloured by ${label}`;
+    field.title = `Colored by ${label}`;
     meta.appendChild(field);
 
     if (linkedWith.length > 0) {
@@ -678,8 +714,129 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       badge.appendChild(removeBtn);
     }
     badge.appendChild(meta);
+    applyViewBadgeState(badge, { active, cameraFocused });
     return badge;
   }
+
+  /**
+   * A row's state: whether its view is the selected one and whether it is the
+   * view the camera controls drive (several views open). Set on the row in
+   * place, so a selection keeps the row's nodes (`renderSplitViewBadges`).
+   * @param {HTMLElement} badge
+   * @param {{active: boolean, cameraFocused: boolean}} state
+   */
+  function applyViewBadgeState(badge, { active, cameraFocused }) {
+    badge.classList.toggle('active', active);
+    badge.classList.toggle('active-camera', cameraFocused);
+    const pressed = active ? 'true' : 'false';
+    const main = badgeSelectButtons.get(badge);
+    if (main !== undefined && main.getAttribute('aria-pressed') !== pressed) main.setAttribute('aria-pressed', pressed);
+  }
+
+  /** Each row's button that selects its view (`applyViewBadgeState`). */
+  const badgeSelectButtons = new WeakMap();
+
+  // The view being named in its row now (`startViewRename`), or null. The
+  // list is not rebuilt under its field meanwhile (a visibility frame asks
+  // for a rebuild on every filter change); it is drawn again as it closes.
+  let renaming = null;
+
+  /**
+   * Name a view in place: its row's first line becomes a text field with its
+   * name. Enter, or leaving the field, names it (`view.rename`; an empty
+   * field takes the name away), Escape leaves it as it was. A name the
+   * action would refuse ("View 3") is said on the field, which stays open.
+   * @param {string} viewId
+   */
+  function startViewRename(viewId) {
+    if (destroyed || renaming !== null) return;
+    const row = [...splitViewBadges.children].find(child => child.dataset.viewId === viewId) ?? null;
+    const main = row?.querySelector('.split-badge-select') ?? null;
+    if (row === null || main === null) return;
+    const number = viewNameOf(viewer, viewId);
+    const current = viewLabelOf(viewer, viewId);
+    const input = ownerDocument.createElement('input');
+    input.type = 'text';
+    input.className = 'split-badge-name-input';
+    input.value = current ?? '';
+    input.placeholder = number;
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.setAttribute('aria-label', `Name ${number} (empty: no name)`);
+    input.title = 'Enter to name the view, Escape to leave it; empty takes the name away.';
+    main.hidden = true;
+    row.insertBefore(input, main.nextSibling);
+    renaming = viewId;
+    let finished = false;
+
+    const finish = commit => {
+      if (finished) return;
+      const typed = input.value.trim();
+      const next = typed === '' ? null : typed;
+      if (commit && next !== null) {
+        try {
+          checkViewLabel(next);
+        } catch (error) {
+          if (!(error instanceof ActionRefused)) throw error;
+          input.setCustomValidity(error.message);
+          input.reportValidity();
+          input.focus();
+          return;
+        }
+      }
+      finished = true;
+      renaming = null;
+      input.remove();
+      main.hidden = false;
+      // Named by its number now: a view removed meanwhile is not named.
+      let name = null;
+      try {
+        name = viewNameOf(viewer, viewId);
+      } catch {
+        name = null;
+      }
+      renderSplitViewBadges();
+      const again = [...splitViewBadges.children].find(child => child.dataset.viewId === viewId);
+      again?.querySelector('.split-badge-select')?.focus({ preventScroll: true });
+      if (commit && name !== null && next !== viewLabelOf(viewer, viewId)) {
+        void dispatchFromControl(
+          'view.rename',
+          { view: name, name: next },
+          { failure: 'Naming the view failed', category: 'render' }
+        );
+      }
+    };
+    // The row selects its view on a click and the page has key shortcuts:
+    // neither reaches through the field.
+    for (const type of ['click', 'mousedown', 'dblclick']) {
+      input.addEventListener(type, event => event.stopPropagation());
+    }
+    input.addEventListener('input', () => input.setCustomValidity(''));
+    input.addEventListener('blur', () => finish(true));
+    input.addEventListener('keydown', event => {
+      event.stopPropagation();
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        finish(true);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        finish(false);
+      }
+    });
+    input.focus();
+    input.select();
+  }
+
+  /** A double-click on a view's row names it (not on its remove or navigation button). */
+  const handleBadgeDoubleClick = event => {
+    if (destroyed) return;
+    const target = event.target instanceof Element ? event.target : null;
+    const row = target?.closest('.split-badge') ?? null;
+    if (row === null || target.closest('.split-badge-remove, .split-badge-nav, .split-badge-name-input') !== null) return;
+    event.preventDefault();
+    startViewRename(row.dataset.viewId);
+  };
+  splitViewBadges.addEventListener('dblclick', handleBadgeDoubleClick);
 
   /** Select an open view: the sidebar edits it, the camera controls drive it. */
   function selectView(viewId) {
@@ -690,25 +847,22 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   }
 
   /**
-   * Remove the live view's row: with one kept view, that kept view goes and
-   * the live view shows alone; with more, the live view is hidden.
+   * Remove the live view's row: the live view is hidden and the kept views
+   * stay, however many there are (the × removes the view its row shows,
+   * F144). The first kept view is selected when the live view was. With one
+   * kept view left, that view shows alone and has no ×; Clear views (or
+   * `view.clear`) brings the live view back.
    */
   function removeLiveView() {
     const currentSnapshots = requireSnapshotInventory(viewer);
     if (currentSnapshots.length === 0) {
       throw new ActionRefused('The live view is the only view; keep a view before removing it.');
     }
-    if (currentSnapshots.length === 1) {
-      removeSnapshot(currentSnapshots[0].id);
-      activateView(LIVE_VIEW_ID);
+    if (currentActiveViewId() === LIVE_VIEW_ID) {
+      activateView(currentSnapshots[0].id);
       pushViewLayoutToViewer();
-    } else {
-      if (currentActiveViewId() === LIVE_VIEW_ID) {
-        activateView(currentSnapshots[0].id);
-        pushViewLayoutToViewer();
-      }
-      viewer.setLiveViewHidden(true);
     }
+    viewer.setLiveViewHidden(true);
     renderSplitViewBadges();
     updateSplitViewUI();
   }
@@ -752,10 +906,14 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     );
   }
 
-  // The badges are rebuilt from scratch, and the coordinator asks for that on
-  // every visibility frame (each filter or highlight change). A rebuild with
-  // the same views, labels, modes and focus would only replace the list with
-  // an identical one, so it is skipped.
+  // The badges are rebuilt from scratch when what a row says changes, and the
+  // coordinator asks for a render on every visibility frame (each filter or
+  // highlight change): a render with the same views, labels and modes keeps
+  // the rows. A selection or a camera focus changes only the rows' state, set
+  // on the rows in place (`applyViewBadgeState`): a click selects its view
+  // and redraws, and a row replaced between the two presses of a
+  // double-click lost the double-click on WebKit, which sends no dblclick
+  // when the second press's row is gone by its release (CI run 43106620008).
   let renderedBadgeKey = null;
   let renderedPrefixKey = null;
 
@@ -771,9 +929,10 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       views.push({
         viewId,
         label,
+        name: viewLabelOf(viewer, viewId),
         shows: embedding === null ? '—' : `${embedding.name} · ${embedding.dimension}D`,
         showsTitle: embedding === null
-          ? 'No dataset'
+          ? NO_DATASET_LABEL
           : `Shows ${embedding.name} (${embedding.label}), ${embedding.dimension}D` +
             (embedding.isDefault ? `, the dataset's ${embedding.dimension}D default` : ''),
         layoutKey: embedding?.layoutKey ?? null,
@@ -802,9 +961,9 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   }
 
   /**
-   * "View 2" for an open view while several are open, else null: the name
-   * the representation picker and the Navigation panel give the view they
-   * edit.
+   * "View 2" (with its name: 'View 2 "Early"') for an open view while
+   * several are open, else null: the name the representation picker and the
+   * Navigation panel give the view they edit.
    *
    * @param {string} viewId
    * @returns {string|null}
@@ -814,7 +973,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     const views = describeOpenViews();
     if (views.length <= 1) return null;
     const position = views.findIndex(view => view.viewId === viewId);
-    return position === -1 ? null : viewNameAt(position);
+    return position === -1 ? null : viewWords(viewNameAt(position), views[position].name);
   }
 
   /** Whether any two open views show the same representation. */
@@ -828,8 +987,32 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     return false;
   }
 
+  // A restore visiting the views (`visitingViews`) focuses each in turn, a
+  // removed live view among them, and awaits field reads between them: the
+  // list is drawn from the person's focus once the visit ends (L14-3).
+  let badgesAfterVisit = false;
+  function renderSplitViewBadgesAfterVisit() {
+    if (badgesAfterVisit) return;
+    badgesAfterVisit = true;
+    const frame = ownerDocument.defaultView.requestAnimationFrame.bind(ownerDocument.defaultView);
+    const again = () => {
+      if (destroyed) return;
+      if (visitingViews()) {
+        frame(again);
+        return;
+      }
+      badgesAfterVisit = false;
+      renderSplitViewBadges();
+    };
+    frame(again);
+  }
+
   function renderSplitViewBadges() {
     if (destroyed) return false;
+    if (visitingViews()) {
+      renderSplitViewBadgesAfterVisit();
+      return false;
+    }
     const snapshots = requireCurrentInventory();
     // One read of each owner for one render pass. Every handler attached below
     // reads its own, because it runs long after this pass finished.
@@ -855,20 +1038,28 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     };
 
     const badgeKey = JSON.stringify([
-      activeViewId,
       camerasLocked,
-      focusedId,
       linkGroups,
       views.map(view => [
         view.viewId,
         view.label,
+        view.name,
         view.shows,
         view.showsTitle,
         view.navigationMode,
         view.onRemove !== null
       ])
     ]);
-    if (badgeKey !== renderedBadgeKey || splitViewBadges.children.length !== views.length) {
+    const stateOf = view => ({
+      active: view.viewId === activeViewId,
+      cameraFocused: views.length > 1 && focusedId === view.viewId
+    });
+    if (renaming === null && badgeKey === renderedBadgeKey && splitViewBadges.children.length === views.length) {
+      for (const row of splitViewBadges.children) {
+        const view = views.find(each => each.viewId === row.dataset.viewId);
+        if (view !== undefined) applyViewBadgeState(row, stateOf(view));
+      }
+    } else if (renaming === null) {
       const focusedElementView = ownerDocument.activeElement?.closest?.('.split-badge')?.dataset.viewId ?? null;
       const focusedClass = ownerDocument.activeElement?.className ?? null;
       splitViewBadges.innerHTML = '';
@@ -877,8 +1068,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
           ...view,
           index: position + 1,
           linkedWith: linkedWith(view.viewId),
-          active: view.viewId === activeViewId,
-          cameraFocused: views.length > 1 && focusedId === view.viewId
+          ...stateOf(view)
         }));
       });
       renderedBadgeKey = badgeKey;
@@ -895,7 +1085,10 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     updateCameraLockUI(views);
     // The pane chips on the plot name each view the way its row does.
     const prefixes = views.length > 1
-      ? views.map((view, position) => [view.viewId, `${position + 1} · ${view.shows.replace(' · ', ' ')}`])
+      ? views.map((view, position) => [
+        view.viewId,
+        `${position + 1}${view.name === null ? '' : ` · ${view.name}`} · ${view.shows.replace(' · ', ' ')}`,
+      ])
       : [];
     const prefixKey = JSON.stringify(prefixes);
     if (prefixKey !== renderedPrefixKey) {
@@ -927,9 +1120,10 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     pill.textContent = String(position + 1);
     const text = ownerDocument.createElement('span');
     text.className = 'split-badge-label';
+    const named = views[position].name === null ? views[position].shows : `${views[position].name} · ${views[position].shows}`;
     text.textContent = linkedPositions.length === 0
-      ? views[position].shows
-      : `${views[position].shows} · with ${countNoun(linkedPositions.length, 'view')} ${linkedPositions.join(', ')}`;
+      ? named
+      : `${named} · with ${countNoun(linkedPositions.length, 'view')} ${linkedPositions.join(', ')}`;
     // The same camera mark and ring as the focused view's own row.
     const cameraIndicator = ownerDocument.createElement('span');
     cameraIndicator.className = 'split-badge-camera';
@@ -992,11 +1186,13 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     viewLayoutModeSelect.value = effectiveLayoutMode();
     splitKeepViewBtn.disabled = !modeIsPoints || !cellsPresent;
     splitKeepViewBtn.title = !cellsPresent
-      ? 'Load a dataset to keep views'
+      ? openADatasetTo('keep views')
       : modeIsPoints
         ? 'Freeze the current view as a panel'
         : 'Switch to “Points” mode to keep views';
-    viewLayoutModeSelect.disabled = !modeIsPoints;
+    setControlAvailability(viewLayoutModeSelect, modeIsPoints
+      ? null
+      : 'volumetric smoke draws one view; switch Render mode to Points to lay out views');
   }
 
   /**
@@ -1038,6 +1234,10 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     syncRenderModeState(renderMode, false);
     splitClearBtn.disabled = !hasSnaps;
     splitClearBtn.title = hasSnaps ? 'Remove all kept views' : 'No kept views to remove.';
+    // Smoke draws one view: while views are kept its choice is off and says
+    // why, as Keep view is off in smoke (`setting.set` gives the reason).
+    const smokeChoice = Array.from(renderModeSelect.options).find(option => option.value === 'smoke');
+    if (smokeChoice !== undefined) setControlAvailability(smokeChoice, hasSnaps ? SMOKE_NEEDS_ONE_VIEW : null);
     // Keep the button state in sync when linking or the views change
     // programmatically (e.g., session restore).
     updateCameraLockUI();
@@ -1067,7 +1267,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       throw new ActionRefused('Views can be kept in the Points render mode only; switch Render mode to Points first.');
     }
     if (!cellsPresent) {
-      throw new ActionRefused('Open a dataset before keeping a view.');
+      throw new ActionRefused(noDatasetOpenTo('keep a view'));
     }
     const sourceViewId = currentActiveViewId();
     const sourceLayoutMode = currentLayoutMode();
@@ -1137,14 +1337,15 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
   /**
    * Give the kept view `viewId` what the selected view shows at the last
-   * step of the branch `branch` of the history shown (its colouring,
+   * step of the branch `branch` of the history shown (its coloring,
    * filters, hidden cells and camera): each per-view domain's value with
    * that view's entry taken from the branch's last step, put back through
    * the domain's owner. What the branch names that the state shown now lacks
    * (a field made on that branch only) is refused, naming it, and the kept
-   * view goes with the failed action.
+   * view goes with the failed action. `signal`: the action's (its Stop): a
+   * field read for it ends with it, and the kept view goes as with a failure.
    */
-  async function showBranchIn(viewId, branch) {
+  async function showBranchIn(viewId, branch, signal) {
     const history = getCurrentHistory();
     if (history === null || history.active === null) {
       throw new ActionRefused('The history of this dataset has not started; there is no branch to keep a view of.', { code: 'unavailable' });
@@ -1154,11 +1355,13 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     const position = [LIVE_VIEW_ID, ...viewer.getSnapshotViews().map(snapshot => snapshot.id)].indexOf(viewId);
     const domains = getStateDomains();
     for (const id of PER_VIEW_DOMAINS) {
+      throwIfAborted(signal);
       const owner = domains.owner(id);
       const now = await owner.capture();
       const entry = history.valueAt(tip, id).views[selected];
-      await owner.restore({ ...now, views: now.views.map((value, index) => (index === position ? entry : value)) }, { signal: null });
+      await owner.restore({ ...now, views: now.views.map((value, index) => (index === position ? entry : value)) }, { signal });
     }
+    throwIfAborted(signal);
   }
 
   /**
@@ -1219,7 +1422,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
 
   function setCellVisibility(cells, visible) {
     if (!Number.isSafeInteger(state.pointCount) || state.pointCount === 0) {
-      throw new ActionRefused('Open a dataset before hiding or showing cells.');
+      throw new ActionRefused(noDatasetOpenTo('hide or show cells'));
     }
     const exactVisible = requireBoolean(visible, 'Cell visibility');
     if (cells === null) {
@@ -1278,7 +1481,7 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
     runUiAction('View focus failed', () => {
       focusViewFromOverlay(viewId);
       getActions()
-        .recordObserved('view.focus', { view: viewNameOf(viewer, viewId) })
+        .recordObserved('view.focus', { view: viewNameOf(viewer, viewId) }, {}, withViewLabel(viewLabelOf(viewer, viewId), null))
         .catch(error => console.error('[ViewControls] View focus could not be recorded.', error));
     });
   };
@@ -1324,16 +1527,34 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
   // The actions these controls implement (`definitions/views.js`).
   const actions = getActions();
   const withdrawals = [
-    actions.provide('view.keep', async ({ branch }) => {
-      const keptId = inAction('Keep view failed', () => keepView());
-      if (branch !== undefined) await showBranchIn(keptId, branch);
+    actions.provide('view.keep', async ({ branch, name }, { signal }) => {
+      const label = name === undefined ? null : checkViewLabel(name);
+      const keptId = inAction('Keep view failed', () => {
+        const id = keepView();
+        if (label !== null) {
+          viewer.setViewName(id, label);
+          renderSplitViewBadges();
+        }
+        return id;
+      });
+      if (branch !== undefined) await showBranchIn(keptId, branch, signal);
       return { view: viewNameOf(viewer, keptId) };
     }),
     actions.provide('view.remove', ({ view }) => inAction('View removal failed', () => {
       const viewId = resolveViewName(viewer, view);
+      // Read before it goes: the step names the view it removed.
+      const label = viewLabelOf(viewer, viewId);
       if (viewId === LIVE_VIEW_ID) removeLiveView();
       else removeSnapshotView(viewId);
-      return { view };
+      return withViewLabel(label, { view });
+    })),
+    actions.provide('view.rename', ({ view, name }) => inAction('Naming the view failed', () => {
+      const viewId = resolveViewName(viewer, view);
+      const label = name === null ? null : checkViewLabel(name);
+      const was = viewLabelOf(viewer, viewId);
+      viewer.setViewName(viewId, label);
+      renderSplitViewBadges();
+      return was === null ? { view } : { view, was };
     })),
     actions.provide('view.clear', () => inAction('Clear views failed', () => ({ views: clearViews() }))),
     actions.provide('view.layout.set', ({ layout }) => inAction('View layout change failed', () => {
@@ -1341,8 +1562,9 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       return { layout };
     })),
     actions.provide('view.focus', ({ view }) => inAction('View selection failed', () => {
-      selectView(resolveViewName(viewer, view));
-      return { view };
+      const viewId = resolveViewName(viewer, view);
+      selectView(viewId);
+      return withViewLabel(viewLabelOf(viewer, viewId), { view });
     })),
     actions.provide('view.cameras.link', ({ linked }) => inAction('Camera lock change failed', () => {
       setCamerasLinked(linked);
@@ -1429,6 +1651,9 @@ export function initViewControls({ state, viewer, dom, renderDom, callbacks }) {
       });
       cleanup(() => {
         cameraLockBtn.removeEventListener('click', handleCameraLockClick);
+      });
+      cleanup(() => {
+        splitViewBadges.removeEventListener('dblclick', handleBadgeDoubleClick);
       });
       cleanup(() => {
         viewLayoutModeSelect.removeEventListener(

@@ -72,9 +72,9 @@ test('latent-space outlier filtering uses the active field raw quantiles', async
   );
   expect(filteredState.visibility).toEqual(new Array(120).fill(1));
 
-  // Every filter applies until it is removed, whatever is coloured: the
+  // Every filter applies until it is removed, whatever is colored: the
   // outlier filter keeps hiding its cells, and is listed, while the view is
-  // coloured by another field.
+  // colored by another field.
   await page.locator('#continuous-field').selectOption({ label: 'score' });
   await expect(page.locator('#filter-count')).toHaveText('Showing 60 of 120 cells');
   await expect(page.locator('#active-filters')).toContainText('cell_type: outlier ≤ 50%');
@@ -138,7 +138,7 @@ test('computing can be cancelled: nothing is kept, the slider is back at 100%, a
   await expect(page.locator('#outlier-filter-note')).toContainText('First use reads');
 
   // The 120-cell fixture is read in a moment; hold the computation until the
-  // test lets it go, as a large remote latent space would, honouring Cancel.
+  // test lets it go, as a large remote latent space would, honoring Cancel.
   await page.evaluate(() => {
     const loader = window._cellucidState.fieldLoader;
     const load = loader.loadOutlierQuantiles;

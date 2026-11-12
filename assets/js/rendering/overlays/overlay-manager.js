@@ -8,6 +8,8 @@
  * @module rendering/overlays/overlay-manager
  */
 
+import { InternalError } from '../../utils/errors.js';
+
 export class OverlayManager {
   /**
    * @param {WebGL2RenderingContext} gl
@@ -46,18 +48,18 @@ export class OverlayManager {
       );
     }
     if (this._pendingRetirements.has(overlay)) {
-      throw new Error('OverlayManager cannot register an overlay pending retirement.');
+      throw new InternalError('OverlayManager cannot register an overlay pending retirement.');
     }
     const id = overlay.id;
     for (const pending of this._pendingRetirements) {
       if (pending.id === id) {
-        throw new Error(
+        throw new InternalError(
           `OverlayManager cannot register "${id}" while its prior owner is pending retirement.`
         );
       }
     }
     if (this._overlays.has(id)) {
-      throw new Error(`OverlayManager already owns overlay "${id}".`);
+      throw new InternalError(`OverlayManager already owns overlay "${id}".`);
     }
     this._overlays.set(id, overlay);
     this._dirtyOrder = true;

@@ -69,14 +69,14 @@
  * map), `active`, `pool.get`, `reconcile`,
  * `snapshot()` (a named save) and `subscribe`, whose events say what changed:
  * `step {tracker, steps}`, `moved {tracker}`, `edited {tracker, op, journal,
- * steps, removed}`, `tracker {tracker}`, `loaded`, `replayed {tracker}`,
+ * steps, removed, journalRemoved}`, `tracker {tracker}`, `loaded`, `replayed {tracker}`,
  * `recording {tracker}` (also as the paused draft changes) and `chat
  * {tracker, conversation}`.
  *
  * @module app/history/autosave
  */
 
-import { createOpaqueId } from '../utils/opaque-id.js';
+import { createOpaqueId } from '../../utils/opaque-id.js';
 import { partJoiner, skeletonArrays, skeletonParts, splitValue, verifyArray } from './value-parts.js';
 import { everyStep, stepHashes, storedJournalEntry, storedStep } from './step-records.js';
 import { hashValue } from './value-pool.js';
@@ -85,8 +85,9 @@ import { SAVED_STATE_SCHEMA, SavedStateGone, SavedStateRecordsGone, SavedStateTa
 import { historySettings } from './history-settings.js';
 import { NO_PAGE_CHROME, assertPageChrome, decodeArray, encodeArray, valuesAtStep } from '../session/history-file.js';
 import { formatCountOf } from '../../utils/format-units.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
-const listeners = new Set();
+const listeners = createListenerSet('the saved states');
 /** The autosaves of this page, so any removal of saved states resumes one paused for room. */
 const liveAutosaves = new Set();
 const CHANNEL_NAME = 'cellucid-history';
@@ -114,14 +115,11 @@ function broadcastChannel() {
  */
 export function onSavedStatesChange(listener) {
   broadcastChannel();
-  listeners.add(listener);
-  return () => listeners.delete(listener);
+  return listeners.add(listener);
 }
 
 function tell() {
-  for (const listener of [...listeners]) {
-    try { listener(); } catch (error) { console.error('[autosave] listener failed', error); }
-  }
+  listeners.notify();
 }
 
 /** Tell this page and the others. */
@@ -369,13 +367,13 @@ async function batchOf(trees, valueOf, { changes, skip = null, writtenMessages =
       journalEntries.push({ tracker: id, entry: now });
       if (!now.purged) for (const step of [...now.before.steps, ...now.after.steps]) addValues(step);
     };
-    if (wholeTracker || change.allJournal) {
-      for (const entry of journal) writeEntry(entry);
-    } else {
+    if (wholeTracker || change.allJournal) for (const entry of journal) writeEntry(entry);
+    if (!wholeTracker) {
+      // An entry named that the journal no longer holds (taken out by a restore) is removed.
       for (const entryIdOf of change.journal) {
         const entry = journal.find(candidate => candidate.id === entryIdOf);
         if (entry === undefined) batch.removedJournal.push({ tracker: id, entry: entryIdOf });
-        else writeEntry(entry);
+        else if (!change.allJournal) writeEntry(entry);
       }
     }
     const chats = chatsOf(tree);
@@ -550,11 +548,28 @@ function savedStateRecord(listing, {
   };
 }
 
+/**
+ * The label of the latest step of `trees` (by when it last changed), other
+ * than a tracker's first: what an unnamed saved state is told apart by in
+ * Load… (every autosave was "Autosave"). Null when it holds no step.
+ */
+function lastStepOf(trees) {
+  let latest = null;
+  for (const tree of trees) {
+    for (const step of tree.steps.values()) {
+      if (step.parent === null || typeof step.label !== 'string') continue;
+      if (latest === null || (step.until ?? step.at ?? 0) >= (latest.until ?? latest.at ?? 0)) latest = step;
+    }
+  }
+  return latest?.label ?? null;
+}
+
 /** What a saved state's record lists of its trackers, taken with its records (`batchOf`): the same moment. */
 function listingOf(trees) {
   return {
     trackers: trees.map(tree => ({ id: tree.id, name: tree.name, steps: tree.steps.size - 1, removed: tree.removed !== null && tree.removed !== undefined })),
     stepCount: trees.reduce((sum, tree) => sum + tree.steps.size - 1, 0),
+    lastStep: lastStepOf(trees),
     kept: keptOf(trees),
   };
 }
@@ -747,6 +762,8 @@ export function createAutosave({
         for (const id of event.steps ?? []) changes.steps.add(id);
         for (const id of event.removed ?? []) changes.removedSteps.add(id);
         if (event.journal != null) changes.journal.add(event.journal);
+        // An entry an exact restore took out of Recently deleted goes from the saved state too.
+        for (const id of event.journalRemoved ?? []) changes.journal.add(id);
         if (typeof event.op === 'string' && event.op.startsWith('journal.')) changes.allJournal = true;
         if (event.steps === undefined && event.removed === undefined) changes.whole = true;
         break;
@@ -757,6 +774,14 @@ export function createAutosave({
       case 'loaded':
         // An offer to continue is moot once a history is loaded here.
         withdrawOffer();
+        // A continued saved state that could not be restored whole (F155: a part this version cannot read)
+        // is not written into: it keeps every part as it was, and the history goes on as a saved state beside it.
+        if (adoptNext !== null && (event.unrestored ?? 0) > 0) {
+          // Its lock goes (this page's own autosave's goes with the entry below).
+          if (adoptNext.release !== release) adoptNext.release?.();
+          adoptNext.release = null;
+          adoptNext = null;
+        }
         if (adoptNext !== null) {
           // A continued saved state is written into again, taken over whole by its first write.
           if (entryId !== adoptNext.id) releaseLock();
@@ -934,6 +959,12 @@ export function createAutosave({
     /** The saved state this history is written into, or null before its first write. */
     get entryId() { return entryId; },
     get paused() { return paused; },
+    /**
+     * Whether every step from now on is kept in this browser: a store, the
+     * switch on, room left. When not, opening another dataset or leaving the
+     * page asks first (`dataset-history.js` `unkept`).
+     */
+    get keeping() { return store !== null && enabled() && !paused; },
     /** Write everything again (the autosave switched on again, room made after it was full). */
     resume() {
       const wasPaused = paused;
@@ -1069,6 +1100,7 @@ export async function listSavedStates(store = defaultHistoryStore()) {
       createdAt: Number.isFinite(entry.createdAt) ? entry.createdAt : 0,
       updatedAt: Number.isFinite(entry.updatedAt) ? entry.updatedAt : 0,
       steps: Number.isSafeInteger(entry.stepCount) ? entry.stepCount : 0,
+      lastStep: typeof entry.lastStep === 'string' ? entry.lastStep : null,
       chats: Number.isSafeInteger(entry.kept?.chats) ? entry.kept.chats : 0,
       content: ['state', 'steps'].includes(entry.content) ? entry.content : 'history',
       paused: entry.kept?.paused === true,

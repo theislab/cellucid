@@ -174,6 +174,7 @@ function userCategoryField(id, key, values = Uint8Array.of(0, 1, 0)) {
     overlapLabel: null,
     intersectionLabels: null,
     uncoveredLabel: null,
+    palette: null,
   };
 }
 
@@ -1000,8 +1001,9 @@ test('main wires the session files, the dataset history and the view carry direc
   assert.match(mainSource, /getHistory: \(\) => datasetHistories\?\.current\(\) \?\? null/);
   // The history goes first whenever a runtime is replaced, before anything of the dataset is touched.
   assert.match(mainSource, /function retireDatasetInteractions\(\{ keepHistory = false \} = \{\}\) \{\s*if \(!keepHistory\) void datasetHistories\?\.retire\(\);/);
-  // It begins once the starting view is applied.
-  assert.match(mainSource, /restoreAdvertisedDatasetState\(\{[\s\S]*?\}\);\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*if \(publication\.isCurrent\(\) === true\) await beginShownDatasetHistory\(shownHistory\);/);
+  // It begins once the starting view is applied, and the first coloring
+  // (`first-coloring.js`) shown before it: part of the state it opens on.
+  assert.match(mainSource, /restoreAdvertisedDatasetState\(\{[\s\S]*?\}\);\s*(?:\/\/[^\n]*\n\s*)+if \(!keepHistory && \(stateOutcome\.status === 'ready' \|\| stateOutcome\.status === 'ready-state-error'\)[\s\S]*?await colorByFirstField\(\{[\s\S]*?\}\);[\s\S]*?\n\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*if \(publication\.isCurrent\(\) === true\) await beginShownDatasetHistory\(shownHistory\);/);
   // The same dataset read again on other cells keeps its history and puts no starting view back.
   assert.match(mainSource, /const keepHistory = loadMethod === DATA_LOAD_METHODS\.SUBSAMPLE && \(datasetHistories\?\.current\(\) \?\? null\) !== null;/);
   assert.match(mainSource, /const shownHistory = keepHistory\s*\? datasetHistories\.current\(\)\s*: datasetHistories\.open\(/);

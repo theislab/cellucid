@@ -8,7 +8,7 @@
 
 import { CellSet, copyCellList, isCellList, requireCellList } from '../../utils/cell-set.js';
 import { BaseManager } from '../core/base-manager.js';
-import { getPageColor } from '../../utils/page-colors.js';
+import { getPageColor, nextPageColor } from '../../utils/page-colors.js';
 import { highlightAccessorMethods } from './highlight-accessors.js';
 import {
   MIN_VISIBLE_ALPHA_BYTE,
@@ -18,6 +18,9 @@ import {
 import { isCategoricalCodes } from '../../../data/categorical-storage-contract.js';
 import { formatBound, formatCountOf } from '../../../utils/format-units.js';
 import { lodMembershipAdmits } from '../../../rendering/high-perf/renderer-contracts.js';
+import { isHexColor } from '../../../utils/hex-color.js';
+import { geneValueLabel } from '../../../data/expression-transform.js';
+import { categoryDisplayName } from '../../actions/targets/names.js';
 
 function requireFieldSource(source) {
   if (source !== 'obs' && source !== 'var') {
@@ -113,18 +116,6 @@ function requireCategoryFieldKey(field) {
   return field.key;
 }
 
-function formatCategoryNameForGroupLabel(categoryName) {
-  if (typeof categoryName === 'string') {
-    if (
-      categoryName.length === 0
-      || categoryName !== categoryName.trim()
-    ) {
-      return JSON.stringify(categoryName);
-    }
-    return categoryName;
-  }
-  return String(categoryName);
-}
 
 function requireActiveHighlightGroups(owner) {
   if (!Array.isArray(owner.highlightPages)) {
@@ -534,7 +525,7 @@ export const highlightStateMethods = {
     // counted as soon as a dataset loads.
     if (capacity === 0) return 0;
     // The page list counts every page on each highlight and page change (a
-    // colour drag included), and a count is a pass over every enabled cell
+    // color drag included), and a count is a pass over every enabled cell
     // of the page: it is kept while the page has the same enabled cell
     // lists. A list is never written in place (each change publishes a new
     // one), so the same lists are the same cells.
@@ -607,7 +598,7 @@ export const highlightStateMethods = {
     const page = {
       id,
       name: pageName,
-      color: getPageColor(this.highlightPages.length),
+      color: nextPageColor(this.highlightPages.map(each => each.color)),
       highlightedGroups: []
     };
     this.highlightPages.push(page);
@@ -675,7 +666,7 @@ export const highlightStateMethods = {
     if (!page) return false;
 
     const next = String(color ?? '').trim();
-    if (!/^#[0-9a-fA-F]{6}$/.test(next)) {
+    if (!isHexColor(next)) {
       console.warn('[State] Invalid page color:', color);
       return false;
     }
@@ -1066,7 +1057,7 @@ export const highlightStateMethods = {
     const group = {
       id,
       type: 'category',
-      label: `${fieldKey}: ${formatCategoryNameForGroupLabel(categoryName)}`,
+      label: `${fieldKey}: ${categoryDisplayName(categoryName)}`,
       enabled: true,
       fieldKey,
       fieldIndex,
@@ -1104,8 +1095,10 @@ export const highlightStateMethods = {
       id,
       type: 'range',
       // The bounds as every range bound is written (and the label a session
-      // restores: `field/overlay-internals.js`).
-      label: `${field.key}: ${formatBound(minVal)} – ${formatBound(maxVal)}`,
+      // restores: `field/overlay-internals.js`), a gene's in the units of the
+      // values shown ("Ins1 · log1p(norm.): 1 – 2", Data mapping › Expression
+      // values); a gene made in the app keeps its own values.
+      label: `${geneValueLabel(field.key, source === 'var' && field._isUserDefined !== true ? (this.getShownExpressionTransform?.() ?? null) : null)}: ${formatBound(minVal)} – ${formatBound(maxVal)}`,
       enabled: true,
       fieldKey: field.key,
       fieldIndex,

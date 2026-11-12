@@ -23,7 +23,7 @@
 import { yieldToMacrotask } from '../../../utils/yield-macrotask.js';
 import { decodeUvarint, uvarintLength, writeUvarint } from './varint.js';
 import { formatCountOf } from '../../../utils/format-units.js';
-import { throwIfAborted } from '../../../utils/abort.js';
+import { throwIfAborted, requireSignalOrNull } from '../../../utils/abort.js';
 
 export const CELL_SET_SORTED_DELTA = 0;
 export const CELL_SET_BITSET = 1;
@@ -169,9 +169,7 @@ export async function decodeCellSet(bytes, { cellCount, signal }) {
   if (!Number.isSafeInteger(cellCount) || cellCount < 0) {
     throw new TypeError('Cell-set cellCount must be a non-negative safe integer.');
   }
-  if (signal !== null && (typeof signal !== 'object' || typeof signal.aborted !== 'boolean')) {
-    throw new TypeError('Cell-set signal must be an AbortSignal or null.');
-  }
+  requireSignalOrNull(signal, 'Cell-set signal');
   throwIfAborted(signal);
   const encoding = bytes[0];
 

@@ -27,7 +27,7 @@ import { historyModelDocument } from '../assets/js/app/history/model.js';
  * The digest of `history-model.schema.json`. cellucid-python and cellucid-r
  * pin the same one in their session reader tests.
  */
-const HISTORY_MODEL_SHA256 = 'bc403ababa0a52bf62a1446b6f3598135b1990cd5a4116818ab26e3696004bc7';
+const HISTORY_MODEL_SHA256 = '0896116c1e791e370b7247d61e734bc22f96047f5d1ed49a39738cf4f8a5333c';
 
 const REGENERATE = 'Run node scripts/generate-history-model.mjs (it writes the three copies and prints the digest), '
   + 'update both packages\' reading models to the records it describes, and pin the printed digest in the three tests.';

@@ -5,7 +5,7 @@
 // complete one the field selector calls back into, and partial copies used when
 // the change arrived from state instead of from a click. The copies drifted —
 // a dataset's advertised starting state, Load State and a viewer host command all
-// coloured the plot and populated the legend while the statistics line kept
+// colored the plot and populated the legend while the statistics line kept
 // reading "Field: None". These assertions keep the partial copies from coming
 // back.
 
@@ -144,7 +144,7 @@ test('the statistics line follows a signal, not a list of refresh sites', () => 
 
   // One writer. Anything else naming `statsDisplay` is a second list that can
   // fall behind the first, which is exactly how the line came to read
-  // "Field: None" over a fully coloured plot.
+  // "Field: None" over a fully colored plot.
   const writers = [
     ...coordinatorSource.matchAll(/statsDisplay\.updateStats/g)
   ];

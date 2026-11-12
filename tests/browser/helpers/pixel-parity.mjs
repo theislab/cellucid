@@ -15,7 +15,7 @@ import { isHostedMacosFirefox } from './hosted-gl.mjs';
  * two views of one geometry drawn with equal cameras; a PNG export that
  * differed from an identical export while the SVG of the same figure was
  * byte-identical. The same bytes drawn twice from the same objects stayed
- * identical every time. That is rounding, not data: a wrong point, colour,
+ * identical every time. That is rounding, not data: a wrong point, color,
  * order or camera moves whole points, dozens of pixels with deltas far
  * above one.
  *
@@ -31,7 +31,7 @@ import { isHostedMacosFirefox } from './hosted-gl.mjs';
  * run 41382954122), so there a capture is the same picture while no more
  * than one lit pixel in a thousand differs, by any amount
  * (`helpers/hosted-gl.mjs`, which also says what that bound cannot show):
- * the most measured is 13 in a million; a wrong order, colour, camera or
+ * the most measured is 13 in a million; a wrong order, color, camera or
  * missing cells moves far more. Every other cell holds the measure above.
  */
 export const ROUNDING_SHARE_ON_HOSTED_MACOS_FIREFOX = 1 / 1000;

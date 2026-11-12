@@ -7,7 +7,12 @@
  * @module ui/modules/figure-export/utils/export-helpers
  */
 
+import { fileTimestamp } from '../../../../utils/download.js';
+
 /**
+ * One segment of a figure's file name: words joined by `_`, letters and
+ * digits of every script kept (an accented or CJK dataset name stays),
+ * other punctuation dropped.
  * @param {unknown} value
  * @returns {string}
  */
@@ -16,31 +21,17 @@ function sanitizeFilenamePart(value) {
   if (!raw) return 'untitled';
   return raw
     .replace(/\s+/g, '_')
-    .replace(/[^a-zA-Z0-9._-]/g, '')
+    .replace(/[^\p{L}\p{N}\p{M}._-]/gu, '')
     .replace(/_+/g, '_')
     .replace(/^_+|_+$/g, '')
     .slice(0, 80) || 'untitled';
 }
 
 /**
- * @param {Date} [date]
- * @returns {string}
- */
-export function formatTimestampForFilename(date = new Date()) {
-  const pad2 = (n) => String(n).padStart(2, '0');
-  const yyyy = String(date.getFullYear());
-  const mm = pad2(date.getMonth() + 1);
-  const dd = pad2(date.getDate());
-  const hh = pad2(date.getHours());
-  const min = pad2(date.getMinutes());
-  const ss = pad2(date.getSeconds());
-  return `${yyyy}${mm}${dd}_${hh}${min}${ss}`;
-}
-
-/**
  * Build a conservative, cross-platform filename.
  *
- * The view segment is left out when it would only repeat the field segment.
+ * The field is written once: the view segment is left out when it only repeats
+ * the field, and the field segment when the view's label begins with it.
  *
  * @param {object} parts
  * @param {string|null} [parts.datasetName]
@@ -52,15 +43,17 @@ export function formatTimestampForFilename(date = new Date()) {
  * @returns {string}
  */
 export function buildExportFilename({ datasetName, fieldKey, viewLabel, variant, ext, timestamp }) {
-  const ts = timestamp || formatTimestampForFilename();
+  const ts = timestamp || fileTimestamp();
   const base = sanitizeFilenamePart(datasetName || 'cellucid');
   const field = fieldKey ? sanitizeFilenamePart(fieldKey) : null;
-  // A view nobody renamed is labelled with its colour field, so naming both
-  // wrote the field twice ("..._cell_type_cell_type_...").
+  // A view nobody renamed is labeled with its color field, or with a filter of it
+  // ("cell_type: hiding B1 cells"): the field is written once, as the view's label begins
+  // ("..._cell_type_cell_type_..." otherwise).
   const viewPart = viewLabel ? sanitizeFilenamePart(viewLabel) : null;
   const view = viewPart === field ? null : viewPart;
+  const fieldShown = field !== null && view !== null && view.startsWith(`${field}_`) ? null : field;
   const extra = variant ? sanitizeFilenamePart(variant) : null;
 
-  const segments = [base, field, view, extra, ts].filter(Boolean);
+  const segments = [base, fieldShown, view, extra, ts].filter(Boolean);
   return `${segments.join('_')}.${sanitizeFilenamePart(ext).replace(/^\.+/, '')}`;
 }

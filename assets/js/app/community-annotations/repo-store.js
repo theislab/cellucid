@@ -11,6 +11,7 @@
 import { dispatchAnnotationConnectionChanged } from './connection-events.js';
 import { parseExactJson } from './wire-contract.js';
 import { parseCanonicalGitHubRepositoryReference } from './github-reference.js';
+import { webStorage } from '../../utils/web-storage.js';
 
 const REPO_MAP_KEY = 'cellucid:community-annotations:repo-map';
 
@@ -61,8 +62,9 @@ function storageFailure(operation, cause) {
 
 function readStorage(key) {
   try {
-    if (typeof localStorage === 'undefined') throw new Error('localStorage is unavailable');
-    return localStorage.getItem(key);
+    const kept = webStorage('localStorage');
+    if (kept === null) throw new Error('localStorage is unavailable');
+    return kept.getItem(key);
   } catch (cause) {
     throw storageFailure('read', cause);
   }
@@ -70,8 +72,9 @@ function readStorage(key) {
 
 function writeStorage(key, value) {
   try {
-    if (typeof localStorage === 'undefined') throw new Error('localStorage is unavailable');
-    localStorage.setItem(key, value);
+    const kept = webStorage('localStorage');
+    if (kept === null) throw new Error('localStorage is unavailable');
+    kept.setItem(key, value);
   } catch (cause) {
     throw storageFailure('write', cause);
   }
@@ -79,8 +82,9 @@ function writeStorage(key, value) {
 
 function removeStorage(key) {
   try {
-    if (typeof localStorage === 'undefined') throw new Error('localStorage is unavailable');
-    localStorage.removeItem(key);
+    const kept = webStorage('localStorage');
+    if (kept === null) throw new Error('localStorage is unavailable');
+    kept.removeItem(key);
   } catch (cause) {
     throw storageFailure('remove', cause);
   }

@@ -205,10 +205,10 @@ test('Apply raise and lower: the digest is the opened cells\' whatever the frame
   assert.equal(raised, await referenceDigest(directRaised, 'X_pca', [0, 1, 2]));
 });
 
-test('a session saved on 10 % checks against the same cells cut in place from a whole opening', async () => {
+test('a session saved on 10% checks against the same cells cut in place from a whole opening', async () => {
   const entries = await zippedStoreEntries(path.join(PRIORITY_FIXTURES, 'written.zarr.zip'));
   const root = await openZarr(memoryStore(entries), { decodedChunkCacheBytes: 0 });
-  // Saved on a 10 % opening of the priority-ordered file: its first 30 rows.
+  // Saved on a 10% opening of the priority-ordered file: its first 30 rows.
   const saved = await (await sharedStore(root)).open({ mode: 'subsample', k: 30 });
   await saved.readEmbedding('X_umap', [0, 1], true);
   const savedDigest = await saved.readCellOrderDigest('X_umap', [0, 1]);
@@ -220,7 +220,7 @@ test('a session saved on 10 % checks against the same cells cut in place from a 
   const cut = await opened.open({ mode: 'kept', spec: saved.cellSubset.spec, kept: saved.cellSubset.kept });
   assert.equal(cut.nObs, 30);
   assert.equal(await cut.readCellOrderDigest('X_umap', [0, 1]), savedDigest);
-  // And from a 20 % opening.
+  // And from a 20% opening.
   const opened20 = await sharedStore(root);
   const twenty = await opened20.open({ mode: 'subsample', k: 60 });
   await twenty.readEmbedding('X_umap', [0, 1], false);
@@ -248,7 +248,7 @@ test('a priority-ordered file and the same cells as given digest alike', async (
   assert.equal(asGiven.cellSubset?.openOrder ?? null, null);
   await priority.readEmbedding('X_umap', [0, 1], true);
   assert.equal(await priority.readCellOrderDigest('X_umap', [0, 1]), await asGiven.readCellOrderDigest('X_umap', [0, 1]));
-  // Their 10 % subsamples (the priority file's first rows; the given file's
+  // Their 10% subsamples (the priority file's first rows; the given file's
   // cells of the same specification, opened in priority order) too.
   const prioritySubset = await (await sharedStore(await openZarr(memoryStore(entries), { decodedChunkCacheBytes: 0 }))).open({ mode: 'subsample', k: 30 });
   const spec = prioritySubset.cellSubset.spec;

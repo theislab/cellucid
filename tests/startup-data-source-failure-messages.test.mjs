@@ -171,7 +171,7 @@ test('the sentence never quotes the raw text; the notification keeps it as its D
         'recovery failed'
       )
     ),
-    'recovery failed Causes: first cause; second cause'
+    'recovery failed: first cause; second cause'
   );
 });
 
@@ -184,4 +184,29 @@ test('failure descriptions require an exact subject and verb', () => {
     () => describeDataSourceFailure('Sample datasets', '', new Error('x')),
     /verb must be a non-empty string/
   );
+});
+
+test('one dataset a listing could not list is named by its id, with its own cause and no URL', () => {
+  const storeUrl = 'http://127.0.0.1:54683/anndata/garcia.zarr/.zmetadata';
+  const cause = new DataSourceError(
+    `Failed to fetch: ${storeUrl}`,
+    DataSourceErrorCode.NETWORK_ERROR,
+    'anndata',
+    { url: storeUrl, status: 503 },
+  );
+  const unlisted = new DataSourceError(
+    `Dataset 'garcia' (garcia.zarr/) cannot be listed: ${cause.message}`,
+    cause.code,
+    'anndata',
+    { ...cause.details, datasetId: 'garcia', path: 'garcia.zarr/', unlisted: 'garcia', cause },
+  );
+  const sentence = describeDataSourceFailure('Sample datasets', 'could not be loaded', unlisted);
+  assert.equal(
+    sentence,
+    `Sample datasets could not be loaded: “garcia” could not be listed${
+      describeDataSourceFailure('X', 'y', cause).slice('X y'.length)}`,
+  );
+  assert.doesNotMatch(sentence, /https?:|\/anndata\/|garcia\.zarr/);
+  assert.match(dataSourceFailureDetails(unlisted), /garcia\.zarr\/\.zmetadata/, 'the Details keep the address');
+  assert.equal(classifyDataSourceFailure(unlisted), classifyDataSourceFailure(cause), 'classified as its cause');
 });

@@ -14,14 +14,15 @@
  * from the screen's frozen state for the pane — the look, the data tints, the
  * ambient clock and Atelier's contact-shadow map — and the pane's presented
  * camera. Each raster pixel is mapped back to the pane NDC it shows through
- * the same viewport-to-plot placement as the points (`createPlotProjection`),
- * so the look stays registered with the data under any crop or letterbox.
+ * the same viewport-to-plot placement as the points (`createPlotPlacement`:
+ * the plot has the view's aspect and the view fills it), so the look stays
+ * registered with the data under any crop.
  * PNG gets the raster at device pixels; SVG embeds it as an `<image>` under
  * the points, at the hybrid point raster's 2× density.
  *
  * WHEN IT IS DRAWN
  * Only on the viewer's own paper (`Background: Match viewer`): a look is an
- * opaque picture of the stage, so on White, Transparent or a custom colour
+ * opaque picture of the stage, so on White, Transparent or a custom color
  * the figure keeps the paper it was asked for.
  *
  * KNOWN, BOUNDED DIFFERENCES FROM THE SCREEN
@@ -36,7 +37,7 @@
  */
 
 import { renderBackdropLookRaster } from '../../../../../rendering/backdrops/backdrop-look-raster.js';
-import { createPlotProjection } from '../utils/plot-projection.js';
+import { createPlotPlacement } from '../utils/plot-fit.js';
 
 /**
  * Whether a figure draws the pane's look: a look is active for the pane and
@@ -53,8 +54,8 @@ export function figureDrawsBackdropLook(appearance, surface, renderState) {
 }
 
 /**
- * The affine map from raster NDC (the plot rectangle) to the pane NDC it
- * shows: `pane = raster * [sx, sy] + [ox, oy]`.
+ * The affine map from raster NDC (the plot rectangle, i.e. the view or the
+ * crop) to the pane NDC it shows: `pane = raster * [sx, sy] + [ox, oy]`.
  *
  * @param {object} options
  * @param {{ viewportWidth: number; viewportHeight: number }} options.renderState
@@ -63,23 +64,18 @@ export function figureDrawsBackdropLook(appearance, surface, renderState) {
  * @returns {{ ndcTransform: number[]; viewportPerPlot: number }}
  */
 export function resolveBackdropLookPlacement({ renderState, plotRect, crop = null }) {
-  const projection = createPlotProjection({ renderState, plotRect, crop });
-  const origin = projection.viewportToPlot(projection.srcX0, projection.srcY0);
-  const vw = projection.viewportW;
-  const vh = projection.viewportH;
-  const toViewportX = (plotX) => (plotX - origin.x) / projection.scale + projection.srcX0;
-  const toViewportY = (plotY) => (plotY - origin.y) / projection.scale + projection.srcY0;
-  const centreX = plotRect.x + plotRect.width / 2;
-  const centreY = plotRect.y + plotRect.height / 2;
+  const { source, scale } = createPlotPlacement({ renderState, plotRect, crop });
+  const vw = source.viewportWidth;
+  const vh = source.viewportHeight;
   return {
     ndcTransform: [
-      (plotRect.width / projection.scale) / vw,
-      (plotRect.height / projection.scale) / vh,
-      (2 * toViewportX(centreX)) / vw - 1,
-      1 - (2 * toViewportY(centreY)) / vh,
+      source.width / vw,
+      source.height / vh,
+      (2 * (source.x + source.width / 2)) / vw - 1,
+      1 - (2 * (source.y + source.height / 2)) / vh,
     ],
     // Pane pixels per plot unit.
-    viewportPerPlot: 1 / projection.scale,
+    viewportPerPlot: 1 / scale,
   };
 }
 

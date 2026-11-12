@@ -2,13 +2,13 @@
  * Cells to open (Session › Open data): a share of the cells, applied to the
  * open dataset in place.
  *
- * - Below 100 % the count, the method's settings and Apply appear; Apply
+ * - Below 100% the count, the method's settings and Apply appear; Apply
  *   reads the dataset again with exactly the cells the specification keeps
  *   (`data/subsample.js`), and everything (point count, the Dataset box, the
  *   cell identity) names them.
  * - A highlight made before is carried across by original cell position:
  *   the cells of it still open, and no other.
- * - Back at 100 %, every cell is open again.
+ * - Back at 100%, every cell is open again.
  *
  * Fixture: `data-mapping-full.h5ad` (300 cells).
  */
@@ -51,7 +51,7 @@ async function pointCount(page) {
   return page.evaluate(() => window._cellucidState?.pointCount ?? 0);
 }
 
-/** The original positions of the cells of the highlight group labelled `label`, ascending. */
+/** The original positions of the cells of the highlight group labeled `label`, ascending. */
 async function highlightOriginals(page, label) {
   return page.evaluate(name => {
     const state = window._cellucidState;
@@ -73,7 +73,7 @@ test('a share of the cells is read in place, and a highlight keeps its cells tha
   await chooseFiles(page.locator('#user-data-file-input'), FILE);
   await expect.poll(() => pointCount(page)).toBe(300);
 
-  // At 100 %: every cell, nothing to apply, no settings.
+  // At 100%: every cell, nothing to apply, no settings.
   await expect(page.locator('#subsample-count')).toHaveText('All 300 cells');
   await expect(page.locator('#subsample-settings')).toBeHidden();
   await expect(page.locator('#subsample-apply')).toBeDisabled();
@@ -188,7 +188,7 @@ test('one cell is not offered: a link asking for it is refused with the reason, 
   await expect(page.locator('#dataset-name')).toHaveText('Current UI fixture');
   expect(await page.evaluate(() => window._cellucidState.cellIdentity.isSubset)).toBe(false);
   await openCollapsedPanels(page);
-  // 0.5 % of 120 cells is one cell: said, and not applied.
+  // 0.5% of 120 cells is one cell: said, and not applied.
   await page.locator('#subsample-percent').fill('0.5');
   await expect(page.locator('#subsample-count')).toHaveText('1 of 120 cells: one cell has no coordinate variation to draw, so at least 2 cells open.');
   await expect(page.locator('#subsample-apply')).toBeDisabled();
@@ -236,6 +236,10 @@ test('every count of the open cells says how many of every cell they are, the pi
   await expect.poll(() => pointCount(page)).toBe(60);
   await dismissWelcome(page);
   const option = page.locator('#dataset-select option', { hasText: 'Current UI fixture' });
+  // The chosen sample says its name alone at rest (the Dataset card says its
+  // cells); reached for, the picker says its open cells.
+  await expect(option).toHaveText('Current UI fixture');
+  await page.locator('#dataset-select').focus();
   await expect(option).toHaveText('Current UI fixture (60 of 120 cells)');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 60 of 120 cells');
   // Every cell again: the counts are the dataset's.
@@ -243,6 +247,7 @@ test('every count of the open cells says how many of every cell they are, the pi
   await page.locator('#subsample-percent').fill('100');
   await page.locator('#subsample-apply').click();
   await expect.poll(() => pointCount(page)).toBe(120);
+  await page.locator('#dataset-select').focus();
   await expect(option).toHaveText('Current UI fixture (120 cells)');
   await expect(page.locator('#filter-count')).toHaveText('Showing all 120 cells');
   expect(errors).toEqual([]);

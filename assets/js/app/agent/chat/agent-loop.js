@@ -2,10 +2,10 @@
  * @fileoverview One turn of the chat bar's agent: from the person's message
  * to the agent's last word.
  *
- * The model is called with the conversation and the catalogue's tools; each
+ * The model is called with the conversation and the catalog's tools; each
  * tool call it makes is run in this tab (`bridge/tool-call.js`: dispatched as
  * the agent, in this turn, so every change is a step of the person's
- * history labelled with the agent's name); the results go back to the model;
+ * history labeled with the agent's name); the results go back to the model;
  * and so on until it answers without a call. Every message is added to the
  * conversation as it completes (`conversation.js`), so the chat shows it and
  * keeps it with the history.
@@ -25,7 +25,7 @@
  *   other failure ends the turn with its sentence (a refused key, no credit,
  *   a model the key may not use).
  * - **Every call is counted.** A call that failed or was stopped after the
- *   provider began to answer cost tokens too, as do the summariser's calls:
+ *   provider began to answer cost tokens too, as do the summarizer's calls:
  *   the next message or note of the turn carries them (`otherCalls`,
  *   `conversation.js` `usageOf`), so the chat's tokens and its budget count
  *   every call made.
@@ -36,19 +36,24 @@
  * - **A question with choices** (`ask.js`, the chat's own tool): the call
  *   is answered at once and the turn ends after that reply's calls; the
  *   person's answer is their next message.
+ * - **Never silence.** A turn always ends with words for the person: the
+ *   reply, a question with choices, or a note (stopped, an error, a
+ *   refusal, the longest answer reached, the budget spent, or a reply with
+ *   no words: a model may end after its reasoning alone, bug hunt F82).
  *
  * @module app/agent/chat/agent-loop
  */
 
 import { appendMessage, modelMessages, summarize, usageOf } from './conversation.js';
 import { formatCount } from '../../../utils/format-units.js';
-import { SUMMARY_SYSTEM, overflows, summaryInputOf } from './context.js';
+import { SUMMARY_SYSTEM, nextPromptTokens, overflows, summaryInputOf } from './context.js';
 import { runToolCall } from '../bridge/tool-call.js';
 import { ASKED_TEXT, ASK_TOOL, askOf } from './ask.js';
 import { earlierResultContent } from '../bridge/data-guard.js';
 import { dataScopeNow } from '../data-scope.js';
 import { ProviderError, isRetryable } from '../providers/contract.js';
 import { awaitWithSignal, isCancellation, throwIfAborted } from '../../../utils/abort.js';
+import { backoffDelayMs } from '../../../utils/backoff.js';
 
 /** What a turn was asked: the person's message's first line, its white space folded. */
 function turnLabelOf(text) {
@@ -64,7 +69,7 @@ export const RETRY_CEILING_MS = 60_000;
 /** The wait before try `attempt` + 1 (0-based) of a call that failed with `error`. */
 export function retryDelayOf(error, attempt, random = Math.random) {
   if (Number.isFinite(error?.retryAfterMs) && error.retryAfterMs > 0) return error.retryAfterMs;
-  return Math.round(Math.min(RETRY_CEILING_MS, RETRY_FIRST_MS * 2 ** attempt) * (0.5 + random() / 2));
+  return Math.round(backoffDelayMs(attempt, { firstMs: RETRY_FIRST_MS, ceilingMs: RETRY_CEILING_MS, random }));
 }
 
 function waitFor(ms, signal, win) {
@@ -126,11 +131,11 @@ async function callModel({ provider, request, signal, setStatus, win, random, on
   }
 }
 
-/** Ever smaller shares of each tool result the summariser is sent, until the text fits. */
+/** Ever smaller shares of each tool result the summarizer is sent, until the text fits. */
 const SUMMARY_SHARE_FLOOR = 2 ** -20;
 
 /**
- * Summarise the conversation before `before` with the turn's model. Each
+ * Summarize the conversation before `before` with the turn's model. Each
  * call's tokens (the failed tries' too) are added to `spent`.
  */
 async function writeSummary({ conversation, before, provider, key, model, signal, setStatus, win, random, spent, beforeRetry }) {
@@ -191,6 +196,7 @@ function stoppedResult(call, toolIndex) {
  *   key: string|null,
  *   model: {id: string, contextTokens: number|null, outputTokens: number|null},
  *   effort?: string|null,
+ *   cacheLength?: string,
  *   budget?: number|null,
  *   system: string,
  *   tools: object[],
@@ -205,12 +211,12 @@ function stoppedResult(call, toolIndex) {
  *   scopeOf?: () => {summariesOnly: boolean},
  * }} options - `lastUsage`: the prompt the conversation's last call reported, after how many
  *   model messages (the context estimate's starting point; null before the first call)
- * @returns {Promise<{ended: 'end'|'asked'|'stopped'|'error'|'refusal'|'max-tokens'|'budget', error?: Error,
+ * @returns {Promise<{ended: 'end'|'asked'|'stopped'|'error'|'refusal'|'max-tokens'|'empty'|'budget', error?: Error,
  *   usage: {input: number, output: number, cacheRead: number, cacheWrite: number, calls: number},
  *   lastUsage: {input: number, count: number}|null}>} `usage`: every call of the turn (`usageOf`)
  */
 export async function runAgentTurn({
-  conversation, provider, key, model, effort = null, budget = null, system, tools, toolIndex, actions, turn, signal, onChange,
+  conversation, provider, key, model, effort = null, cacheLength = '5m', budget = null, system, tools, toolIndex, actions, turn, signal, onChange,
   lastUsage = null, win = globalThis.window ?? null, random = Math.random, scopeOf = dataScopeNow,
 }) {
   const userIndex = conversation.messages.findLastIndex(message => message.role === 'user' && message.turn === turn);
@@ -221,7 +227,7 @@ export async function runAgentTurn({
   let current = null;
   /** The tokens the call in progress reported (a later report replaces an earlier one). */
   let attempt = null;
-  /** Calls of this turn not on a message yet (failed or stopped tries, the summariser's): the next message or note carries them. */
+  /** Calls of this turn not on a message yet (failed or stopped tries, the summarizer's): the next message or note carries them. */
   let unrecorded = noUsage();
   /** The calls of the reply added last, until their results are: {calls, results}. */
   let unanswered = null;
@@ -255,9 +261,20 @@ export async function runAgentTurn({
     const recorded = usageOf(conversation);
     return recorded.input + recorded.output + unrecorded.input + unrecorded.output;
   };
+  /** The prompt the next call would send (the context estimate's, `nextPromptTokens`). */
+  const nextPrompt = () => nextPromptTokens({
+    conversation, lastInput: known?.input ?? null, lastCount: known?.count ?? 0, system, tools,
+  });
+  /**
+   * Whether the next call would pass the chat's budget: it is not made. The
+   * budget is a cap, so the call that would cross it is the one left out
+   * (each call reads the whole prompt again: checked only against what was
+   * spent, a 150,000-token budget ended at 209,751, L14-7).
+   */
+  const overBudget = () => budget !== null && spentNow() + nextPrompt() > budget;
   /** Before another try: past the chat's budget, the turn ends there. */
   const beforeRetry = () => {
-    if (budget !== null && spentNow() >= budget) throw new BudgetSpent();
+    if (overBudget()) throw new BudgetSpent();
   };
   const ended = (how, extra = {}) => ({ ended: how, ...extra, usage: usageOf(conversation, turn), lastUsage: known });
 
@@ -272,9 +289,10 @@ export async function runAgentTurn({
 
   function budgetNote() {
     const spent = spentNow();
+    const next = spent >= budget ? '' : `, and its next call would read about ${formatCount(nextPrompt())} more`;
     add({
       role: 'note', turn, kind: 'limit',
-      text: `This chat used ${formatCount(spent)} tokens, its budget is ${formatCount(budget)}; raise it in the chat settings to go on.`,
+      text: `This chat used ${formatCount(spent)} tokens, its budget is ${formatCount(budget)}${next}; raise it in the chat settings to go on.`,
     });
     return ended('budget');
   }
@@ -289,7 +307,7 @@ export async function runAgentTurn({
     while (true) {
       throwIfAborted(signal);
       // The person's budget for this chat: no model call past it.
-      if (budget !== null && spentNow() >= budget) return budgetNote();
+      if (overBudget()) return budgetNote();
       setStatus({ phase: 'thinking' });
       current = {
         role: 'assistant', turn, provider: provider.id, agent, model: model.id, parts: [], at: Date.now(),
@@ -306,7 +324,7 @@ export async function runAgentTurn({
           sentCount = messages.length;
           await callModel({
             provider,
-            request: { key, model: model.id, system, messages, tools, outputTokens: model.outputTokens, effort },
+            request: { key, model: model.id, system, messages, tools, outputTokens: model.outputTokens, effort, cacheLength },
             signal, setStatus, win, random, beforeRetry,
             onFailed: () => {
               message.parts = [];
@@ -323,6 +341,12 @@ export async function runAgentTurn({
                   break;
                 case 'thinking':
                   setStatus({ phase: 'thinking' });
+                  break;
+                case 'progress':
+                  // A note for the person between calls: shown as it comes, before the call it introduces.
+                  if (last?.type === 'progress') last.text += event.text;
+                  else message.parts.push({ type: 'progress', text: event.text });
+                  onChange({ kind: 'text', message });
                   break;
                 case 'tool-call':
                   message.parts.push({ type: 'tool-call', id: event.id, name: event.name, args: event.args });
@@ -344,7 +368,7 @@ export async function runAgentTurn({
           break;
         } catch (error) {
           if (!(error instanceof ProviderError) || error.kind !== 'too-long' || summarised) throw error;
-          // Too long: summarise what came before this turn (or, inside a turn
+          // Too long: summarize what came before this turn (or, inside a turn
           // that alone grew too long, everything so far) and call again.
           summarised = true;
           message.parts = [];
@@ -372,14 +396,28 @@ export async function runAgentTurn({
           add({ role: 'note', turn, kind: 'limit', text: `The reply reached the longest answer ${model.id} gives at once; ask it to go on.` });
           return ended('max-tokens');
         }
+        // Ended with no word for the person (only reasoning, or nothing): the chat says so, never silence.
+        if (!message.parts.some(part => part.type === 'text' && part.text.trim() !== '')) {
+          add({ role: 'note', turn, kind: 'empty', text: `${agent} ended its turn without a reply; ask it to go on, or try again.` });
+          return ended('empty');
+        }
         return ended('end');
       }
-      const results = [];
-      unanswered = { calls, results };
+      // The calls' results, kept as each one comes (the conversation is saved then), so a reload
+      // mid-way keeps what finished: a read that ran was answered "the page closed before this call
+      // finished" (live pass 2, S4). Nothing is sent to a model before every call is answered.
+      const answers = { role: 'tool', turn, results: [] };
+      add(answers);
+      const results = answers.results;
+      const answered = result => {
+        results.push(result);
+        onChange({ kind: 'message', message: answers });
+      };
+      unanswered = { calls, results, answers };
       let asked = false;
       for (const call of calls) {
         if (signal.aborted) {
-          results.push(stoppedResult(call, toolIndex));
+          answered(stoppedResult(call, toolIndex));
           continue;
         }
         if (call.name === ASK_TOOL.name) {
@@ -387,7 +425,7 @@ export async function runAgentTurn({
           const question = askOf(call.args);
           const ok = !('problem' in question);
           asked ||= ok;
-          results.push({
+          answered({
             id: call.id, name: call.name, title: ASK_TOOL.title, step: null, isError: !ok,
             content: [{ type: 'text', text: ok ? ASKED_TEXT : question.problem }],
           });
@@ -395,7 +433,7 @@ export async function runAgentTurn({
         }
         const title = toolIndex.get(call.name)?.title ?? call.name;
         setStatus({ phase: 'tool', tool: title });
-        const { result, step, summariesOnly } = await runToolCall({
+        const { result, step, summariesOnly, code } = await runToolCall({
           actions, tools: toolIndex, name: call.name, args: call.args, agent, turn, signal,
           // The chat is the connection: a permission granted "in this chat" holds for its calls.
           connection: { id: conversation.id, kind: 'chat' }, scopeOf,
@@ -405,14 +443,15 @@ export async function runAgentTurn({
             turnLabel: turnLabelOf(conversation.messages[userIndex].text),
           },
         });
-        results.push({
+        answered({
           id: call.id, name: call.name, title, content: result.content, isError: result.isError, step,
           // Made under the dataset's switch: sent again as it is, and the turn's Sent line can say so.
           ...(summariesOnly ? { summariesOnly: true } : {}),
+          // Why the action refused, as its code (kept with the chat, never sent: the model reads the sentence).
+          ...(code === undefined ? {} : { code }),
         });
       }
       unanswered = null;
-      add({ role: 'tool', turn, results });
       throwIfAborted(signal);
       if (asked) return ended('asked');
     }
@@ -420,8 +459,8 @@ export async function runAgentTurn({
     if (isCancellation(error) || signal.aborted) {
       // The call stopped mid-answer cost what it reported so far.
       if (current !== null) countAttempt();
-      // What was streamed before the Stop stays, as words only.
-      const words = current?.parts.filter(part => part.type === 'text' && part.text !== '') ?? [];
+      // What was streamed before the Stop stays, as words only (the reply's, and the notes shown between calls).
+      const words = current?.parts.filter(part => (part.type === 'text' || part.type === 'progress') && part.text !== '') ?? [];
       if (words.length > 0) add({ ...current, parts: words, stop: 'stopped' });
       add({ role: 'note', turn, kind: 'stopped', text: 'Stopped.' });
       return ended('stopped');
@@ -429,13 +468,14 @@ export async function runAgentTurn({
     if (error instanceof BudgetSpent) return budgetNote();
     // Calls of the last reply not run: answered so, or the next call to the model would be refused.
     if (unanswered !== null) {
-      const { calls, results } = unanswered;
+      const { calls, results, answers } = unanswered;
       unanswered = null;
       const reason = error?.message ?? String(error);
-      add({ role: 'tool', turn, results: calls.map(call => results.find(result => result.id === call.id) ?? {
+      answers.results = calls.map(call => results.find(result => result.id === call.id) ?? {
         id: call.id, name: call.name, title: toolIndex.get(call.name)?.title ?? call.name, isError: true, step: null,
         content: [{ type: 'text', text: `Not run: the turn failed (${reason}).` }],
-      }) });
+      });
+      onChange({ kind: 'message', message: answers });
     }
     add({
       role: 'note', turn, kind: 'error',

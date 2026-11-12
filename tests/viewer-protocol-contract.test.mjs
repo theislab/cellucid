@@ -23,6 +23,7 @@ import {
   VIEWER_EVENT_FIELDS,
   VIEWER_RESULT_META_FIELDS,
   VIEWER_ACTION_STEP_FIELDS,
+  VIEWER_ACTION_UNRECORDED,
   VIEWER_HISTORY_CHANGE_KINDS,
   decodeViewerBinaryCommand,
   encodeViewerLoadSession,
@@ -50,7 +51,7 @@ const FIXTURE = path.join(ROOT, 'tests/fixtures/viewer-protocol.json');
  * The digest of `viewer-protocol.json`. cellucid-python
  * (`tests/test_viewer_channel_contract.py`) and cellucid-r pin the same one.
  */
-const VIEWER_PROTOCOL_SHA256 = '3a38ca81ac9a906dbc995727a73e94f52a1a0dd3fa7a71d500817d45c5fdfb6d';
+const VIEWER_PROTOCOL_SHA256 = 'c117822a5d87df03439fdbed9af460617764b59d9e560ba7c0e519ec5f708dae';
 
 test('viewer-protocol.json is the protocol module\'s document, byte for byte, at the pinned digest', () => {
   const bytes = readFileSync(FIXTURE, 'utf8');
@@ -226,6 +227,9 @@ test('binary frames are the header length, the JSON header and the body', () => 
       // The outcome is the body, UTF-8 JSON; the step is {id, label} or null.
       assert.deepEqual(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(4 + headerLength))), example.outcome);
       if (header.step !== null) assert.deepEqual(Object.keys(header.step), [...VIEWER_ACTION_STEP_FIELDS]);
+      // Why a change made no step: one of the closed set, or null (a step was made, or no change: a read).
+      assert.ok(header.unrecorded === null || Object.hasOwn(VIEWER_ACTION_UNRECORDED, header.unrecorded), header.unrecorded);
+      assert.ok(header.step === null || header.unrecorded === null, 'never a reason beside a step');
     }
   }
   assert.deepEqual([...kinds].sort(), Object.keys(VIEWER_BINARY_EVENT_HEADER_FIELDS).sort(), 'one example per binary event');
@@ -275,8 +279,15 @@ test('a result the protocol cannot carry is refused before it is sent', () => {
   assert.throws(() => encodeViewerResult({ ...base, revision: 0 }), /revision/);
   const categorical = {
     ...base, kind: 'categorical', id: 'user_cat_1',
-    meta: { key: 'k', categories: ['a', 'b'], origin: 'user' }, cells: null,
+    meta: { key: 'k', categories: ['a', 'b'], colors: ['#ff9900', '#0077c8'], origin: 'user' }, cells: null,
   };
+  // The colors it is shown in: one lowercase #rrggbb a category, in its order.
+  for (const colors of [['#ff9900'], ['#FF9900', '#0077c8'], ['#f90', '#0077c8'], ['#ff9900', '#0077c8', '#ad50e0'], null]) {
+    assert.throws(() => encodeViewerResult({ ...categorical, meta: { ...categorical.meta, colors }, values: new Uint8Array(10) }),
+      /one #rrggbb color \(lowercase\) for each of its categories/);
+  }
+  const { colors: _colors, ...withoutColors } = categorical.meta;
+  assert.throws(() => encodeViewerResult({ ...categorical, meta: withoutColors, values: new Uint8Array(10) }), /must carry exactly key, categories, colors, origin/);
   assert.throws(() => encodeViewerResult({ ...categorical, values: Uint8Array.of(0, 1, 2, 0, 0, 0, 0, 0, 0, 0) }), /names no category/);
   assert.ok(encodeViewerResult({ ...categorical, values: new Uint8Array(10).fill(255) }));
   assert.throws(() => encodeViewerResult({ ...categorical, values: new Uint8Array(9) }), /9 values for 10 cells/);
@@ -298,4 +309,19 @@ test('an action command names its action as the catalogue does: one pattern, eve
   for (const definition of getActionCatalog().list()) {
     assert.ok(isViewerActionType(definition.type), `${definition.type} is a type an action command can name`);
   }
+});
+
+test('why a change made no step: one closed set, each with the sentence a host says, as an agent is told it', async () => {
+  const { UNRECORDED_NOTES } = await import('../assets/js/app/agent/bridge/mcp-content.js');
+  const { action, examples } = viewerProtocolDocumentFixture();
+  assert.deepEqual(action.unrecorded, { ...VIEWER_ACTION_UNRECORDED });
+  assert.deepEqual(Object.keys(VIEWER_ACTION_UNRECORDED), ['unchanged', 'retracted', 'off', 'paused', 'elsewhere', 'no-history']);
+  assert.deepEqual(Object.keys(UNRECORDED_NOTES).sort(), Object.keys(VIEWER_ACTION_UNRECORDED).sort(), 'the agent is told each reason a host hears');
+  for (const [reason, sentence] of Object.entries(VIEWER_ACTION_UNRECORDED)) {
+    // Said after the call that asked ("viewer.color_by(...): …"): lower case, one sentence, no step made.
+    assert.match(sentence, /^[a-z].*no step was recorded.*\.$/, reason);
+  }
+  // The examples show a change answered with why it made no step.
+  const reasons = examples.binaryEvents.filter(example => example.header.type === 'action_result').map(example => example.header.unrecorded);
+  assert.ok(reasons.includes('unchanged') && reasons.includes(null));
 });

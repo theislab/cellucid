@@ -18,19 +18,19 @@ import { formatCountOf } from '../utils/format-units.js';
 export const MIN_VISIBLE_ALPHA_BYTE = 3;
 
 /**
- * A cell's colour (RGBA8) never carries its visibility: the transparency
+ * A cell's color (RGBA8) never carries its visibility: the transparency
  * does. Its alpha byte says how it is layered instead, three layers drawn
  * bottom to top:
  *
  * - `UNREAD_ALPHA_BYTE`: a cell a gene sample did not read (a gene read for
  *   a sample of the open cells, `data/anndata/subsample-plan.js`), which has
- *   no value yet. It is drawn first, flat, in a colour derived from the
+ *   no value yet. It is drawn first, flat, in a color derived from the
  *   view's background (`rendering/read-cell-layer.js`, `unreadCellColor`),
  *   so the map keeps its shape but recedes; its RGB bytes are not drawn.
- * - `BENEATH_ALPHA_BYTE`: a cell drawn beneath the coloured ones -- a
- *   continuous field's no-value grey (a gene's cells read that do not express
+ * - `BENEATH_ALPHA_BYTE`: a cell drawn beneath the colored ones -- a
+ *   continuous field's no-value gray (a gene's cells read that do not express
  *   it, a missing value) -- so a sparse gene's expressing cells are never
- *   covered by the grey around them.
+ *   covered by the gray around them.
  * - 255: a cell drawn as usual, on top.
  *
  * The renderer draws a field with lower layers in one pass a layer over the
@@ -44,10 +44,10 @@ export const BENEATH_ALPHA_BYTE = 254;
 export const UNREAD_ALPHA_BYTE = 253;
 
 /**
- * What the alpha byte of an RGBA8 colour array says, named by every consumer
- * that reads one: `'layer'` for a field's colours of the cells (255,
+ * What the alpha byte of an RGBA8 color array says, named by every consumer
+ * that reads one: `'layer'` for a field's colors of the cells (255,
  * `BENEATH_ALPHA_BYTE` or `UNREAD_ALPHA_BYTE`; their visibility is the
- * transparency), `'opacity'` for the colours of markers of their own
+ * transparency), `'opacity'` for the colors of markers of their own
  * (centroids), whose alpha byte is the marker's opacity, 0 hiding it.
  *
  * @param {unknown} meaning
@@ -56,7 +56,7 @@ export const UNREAD_ALPHA_BYTE = 253;
  */
 export function requireColorAlphaMeaning(meaning, label) {
   if (meaning !== 'layer' && meaning !== 'opacity') {
-    throw new TypeError(`${label} must say what its colours' alpha byte is: 'layer' or 'opacity', not ${String(meaning)}.`);
+    throw new TypeError(`${label} must say what its colors' alpha byte is: 'layer' or 'opacity', not ${String(meaning)}.`);
   }
   return meaning;
 }
@@ -64,7 +64,7 @@ export function requireColorAlphaMeaning(meaning, label) {
 /** Platform byte order of the RGBA8 words read below. */
 const LITTLE_ENDIAN = new Uint8Array(Uint32Array.of(1).buffer)[0] === 1;
 
-/** The answer for colours with every cell on top. */
+/** The answer for colors with every cell on top. */
 const SINGLE_LAYER = Object.freeze({ layered: false, unread: 0 });
 
 /**

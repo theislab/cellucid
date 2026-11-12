@@ -44,8 +44,10 @@ test('a read again that fails is said once, and the cells open before stay', asy
   const failure = new Error('The browser could not read the file again.');
   const { controls, harness } = await openControls(t, async () => { throw failure; });
   const before = harness.statuses.length;
-  assert.deepEqual(await controls.reopenOpenDataset({ mode: 'subsample', method: 'uniform', k: 120, seed: 7, strict: true }), { shown: false, inPlace: false });
+  // The answer carries the one sentence the person was told (`failure`), for the action or move that asked.
+  const answer = await controls.reopenOpenDataset({ mode: 'subsample', method: 'uniform', k: 120, seed: 7, strict: true });
   const said = harness.statuses.slice(before);
+  assert.deepEqual(answer, { shown: false, inPlace: false, failure: said[0]?.message });
   assert.equal(said.length, 1);
   assert.equal(said[0].isError, true);
   assert.match(said[0].message, /^"Lung atlas" could not be read again with these cells.* The cells open before are still open\.$/);

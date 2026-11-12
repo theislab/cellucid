@@ -19,6 +19,7 @@
  */
 
 import { wireAppDialog } from '../../components/app-dialog.js';
+import { setControlAvailability } from '../../core/control-availability.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
 import { mappingWith, missingKey } from '../../../history/replay.js';
 
@@ -128,7 +129,7 @@ export function createReplayReport({ dialog, reveal, read, again }) {
     blank.value = '';
     blank.textContent = 'Use instead…';
     select.append(blank);
-    select.disabled = true;
+    setControlAvailability(select, 'the names on this dataset are being read; choose once they are listed');
     const names = missing.kind === 'field' ? fieldsHere() : categoriesHere(missing.field);
     names.then(found => {
       for (const name of found) {
@@ -137,7 +138,9 @@ export function createReplayReport({ dialog, reveal, read, again }) {
         option.textContent = name;
         select.append(option);
       }
-      select.disabled = found.length === 0;
+      setControlAvailability(select, found.length === 0
+        ? `this dataset has no ${missing.kind === 'field' ? 'field' : 'category'} to use instead`
+        : null);
       select.value = chosen.get(key) ?? '';
     }, error => {
       blank.textContent = 'Names could not be read';

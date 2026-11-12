@@ -17,7 +17,7 @@
  * - `obsm/{i}/{cols}` -- `obsm` entry `i` read at columns `cols` (`0-1`);
  * - `vectors/{v}/{vcols}/{e}/{ecols}` -- `obsm` entry `v` at `vcols`, drawn
  *   on the embedding `obsm/{e}/{ecols}`;
- * - `obsp/{p}` -- the neighbour graph in `obsp` entry `p`;
+ * - `obsp/{p}` -- the neighbor graph in `obsp` entry `p`;
  * - `var/{axis}/{names}` -- the genes of one expression matrix (`X`, `raw`
  *   or `layer-{k}`, behind `mod-{j}:` for modality `j` of a multimodal
  *   dataset) named by one name source (`index` or `column-{k}`), and
@@ -490,7 +490,7 @@ export function assembleAnnDataCandidates(described, { slots, guessed, rejected 
     defaults[slot] = ref === null ? null : { key: ref.key, columns: [...ref.columns] };
   }
   // The graph the dataset opens with (`defaultGraph`): connectivities, else
-  // Seurat's shared-nearest-neighbour graph of the modality it opens with.
+  // Seurat's shared-nearest-neighbor graph of the modality it opens with.
   const graph = defaultGraph(described.obsp.map(item => item.key), { modality });
   const loadFailures = new Map(rejected);
   // raw when the file has it (Scanpy's convention), else X; otherwise the
@@ -622,7 +622,7 @@ export function parseMappingEmbeddingPath(path) {
 const GRAPH_ROUTE = new RegExp(`^obsp/(${DECIMAL})$`);
 
 /**
- * The route of one mapped neighbour graph: `obsp` entry `obspIndex`, whose
+ * The route of one mapped neighbor graph: `obsp` entry `obspIndex`, whose
  * summary and edges are both read at it.
  *
  * @param {number} obspIndex
@@ -636,7 +636,7 @@ export function mappingGraphPath(obspIndex) {
 }
 
 /**
- * The `obsp` entry a mapped neighbour-graph route names, or null for any
+ * The `obsp` entry a mapped neighbor-graph route names, or null for any
  * other path (the dataset's own graph, `obsp`).
  *
  * @param {string} path
@@ -964,7 +964,7 @@ export function parseMappingLatentPath(path) {
 
 /**
  * The layout descriptor of one `obsm` array read at `columns` for one
- * dimension: keyed and labelled by its canonical embedding id, loaded from its
+ * dimension: keyed and labeled by its canonical embedding id, loaded from its
  * mapping route.
  *
  * @param {Object} candidates
@@ -991,7 +991,7 @@ export function mappingLayoutDescriptor(candidates, ref, dimension) {
 /**
  * A load-time refusal of one mapping choice: an array the catalog lists as
  * usable whose values cannot be shown or read as chosen (a NaN in an
- * embedding, a neighbour graph that is not symmetric, a latent space over the
+ * embedding, a neighbor graph that is not symmetric, a latent space over the
  * memory budget). `key` names the AnnData key -- an `obsm` or `obsp` key,
  * `X`, `raw`, a layer or a `var` column -- so that one option is marked
  * unusable for the session while every other stays available.
@@ -1132,9 +1132,10 @@ export function valueLoadDefect(values, width, firstCell = 0) {
  * The default rule's keys are never load-checked here and never skipped: a
  * present `X_umap` that holds a NaN is an error when it is loaded (the adapter
  * loads the default dimension's embedding before the file is adopted, and the
- * others when they are first shown), not a reason to guess. Only when the
- * default rule fills no slot is the best guess made, and a guessed candidate
- * that fails its check is skipped for the next one. This is the same sequence as the synchronous
+ * others when they are first shown), not a reason to guess. Every slot the
+ * default rule (or `filled`: a launch's named slots over it, already held to
+ * the rule's checks) leaves empty is guessed, and a guessed candidate that
+ * fails its check is skipped for the next one. This is the same sequence as the synchronous
  * `resolveEmbeddingSlots` with a `loadCheck`, run with an asynchronous check:
  * each failed key is recorded and the guess is recomputed, so the result is
  * the same and the work is bounded by the candidate count.
@@ -1142,12 +1143,13 @@ export function valueLoadDefect(values, width, firstCell = 0) {
  * @param {Array<{key: string, width: number|null, usable: boolean, reason: string|null}>} entries
  * @param {(key: string, columns: number[]) => Promise<string|null>} loadCheck
  *   Resolves to null when the columns load, else to the reason they do not.
- * @param {{modality?: string|null}} [options] - The modality a dataset of several opens with
+ * @param {{modality?: string|null, filled?: Object|null}} [options] - The modality a dataset of
+ *   several opens with; the slots already chosen (null: the default rule's)
  * @returns {Promise<{slots: Object, guessed: string[], rejected: Array<[string, string]>}>}
  */
-export async function resolveEmbeddingSlotsAsync(entries, loadCheck, { modality = null } = {}) {
-  const slots = defaultEmbeddingSlots(entries, { modality });
-  if (DIMENSION_SLOTS.some(slot => slots[slot] !== null)) {
+export async function resolveEmbeddingSlotsAsync(entries, loadCheck, { modality = null, filled = null } = {}) {
+  const slots = filled ?? defaultEmbeddingSlots(entries, { modality });
+  if (filled === null) {
     for (const slot of DIMENSION_SLOTS) {
       const ref = slots[slot];
       if (ref === null) continue;
@@ -1161,7 +1163,6 @@ export async function resolveEmbeddingSlotsAsync(entries, loadCheck, { modality 
         );
       }
     }
-    return { slots, guessed: [], rejected: [] };
   }
   const failures = new Map();
   const checked = new Map();
@@ -1170,20 +1171,21 @@ export async function resolveEmbeddingSlotsAsync(entries, loadCheck, { modality 
   for (;;) {
     const guess = bestGuessEmbeddingSlots(entries, {
       modality,
+      filled: slots,
       loadCheck: key => (failures.has(key) ? failures.get(key) : null),
     });
     let failed = false;
-    // The guessed slots load together, not one after another.
-    await Promise.all(DIMENSION_SLOTS.map(async slot => {
+    // The guessed slots load together, not one after another; the slots
+    // already chosen are not checked here (their load reports them).
+    const guessedSlots = DIMENSION_SLOTS.filter(slot => guess.guessed.includes(`embeddings.${slot}`));
+    await Promise.all(guessedSlots.map(async slot => {
       const ref = guess.slots[slot];
-      if (ref === null) return;
       const checkKey = JSON.stringify([ref.key, ref.columns]);
       if (!checked.has(checkKey)) checked.set(checkKey, loadCheck(ref.key, [...ref.columns]));
       await checked.get(checkKey);
     }));
-    for (const slot of DIMENSION_SLOTS) {
+    for (const slot of guessedSlots) {
       const ref = guess.slots[slot];
-      if (ref === null) continue;
       const defect = await checked.get(JSON.stringify([ref.key, ref.columns]));
       if (defect !== null) {
         failures.set(ref.key, defect);

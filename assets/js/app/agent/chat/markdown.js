@@ -105,7 +105,12 @@ export function parseMarkdown(text) {
   return blocks;
 }
 
-const INLINE = /(`+)([\s\S]*?[^`])\1(?!`)|\*\*([\s\S]+?)\*\*|__([\s\S]+?)__|(?<![\w*])\*(?!\s)([\s\S]+?)(?<!\s)\*(?![\w*])|(?<![\w_])_(?!\s)([\s\S]+?)(?<!\s)_(?![\w_])|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/;
+/**
+ * One inline run. Underscores mark emphasis only at a word's edge, never
+ * inside one (`snake__case__name`, `window.__xss`), single or double, as
+ * CommonMark reads them; asterisks may (`**bold**er`).
+ */
+const INLINE = /(`+)([\s\S]*?[^`])\1(?!`)|\*\*([\s\S]+?)\*\*|(?<![\w_])__(?!\s)([\s\S]+?)(?<!\s)__(?![\w_])|(?<![\w*])\*(?!\s)([\s\S]+?)(?<!\s)\*(?![\w*])|(?<![\w_])_(?!\s)([\s\S]+?)(?<!\s)_(?![\w_])|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/;
 
 /**
  * Inline Markdown as runs: `{text}`, `{code}`, `{strong: runs}`, `{em: runs}`, `{link, href}`.
@@ -113,17 +118,19 @@ const INLINE = /(`+)([\s\S]*?[^`])\1(?!`)|\*\*([\s\S]+?)\*\*|__([\s\S]+?)__|(?<!
  */
 export function parseInline(text) {
   const runs = [];
-  let rest = String(text);
-  while (rest.length > 0) {
-    const match = rest.match(INLINE);
-    if (match === null) { runs.push({ text: rest }); break; }
-    if (match.index > 0) runs.push({ text: rest.slice(0, match.index) });
+  const source = String(text);
+  // Matched in the whole text, not in what is left of it: a word-edge rule sees the character before.
+  const inline = new RegExp(INLINE.source, 'g');
+  let at = 0;
+  for (const match of source.matchAll(inline)) {
+    if (match.index > at) runs.push({ text: source.slice(at, match.index) });
     if (match[1] !== undefined) runs.push({ code: match[2] });
     else if (match[3] !== undefined || match[4] !== undefined) runs.push({ strong: parseInline(match[3] ?? match[4]) });
     else if (match[5] !== undefined || match[6] !== undefined) runs.push({ em: parseInline(match[5] ?? match[6]) });
     else runs.push({ link: match[7], href: match[8] });
-    rest = rest.slice(match.index + match[0].length);
+    at = match.index + match[0].length;
   }
+  if (at < source.length) runs.push({ text: source.slice(at) });
   return runs;
 }
 

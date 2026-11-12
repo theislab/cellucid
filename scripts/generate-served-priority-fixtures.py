@@ -11,7 +11,7 @@ source:
 
 - ``object.json``: an in-memory AnnData with a cell-major ``X`` (served
   gene-major, with ``varm['cellucid_prefix_counts']``), a gene-major layer,
-  an embedding, a neighbour graph, a categorical and a float obs column;
+  an embedding, a neighbor graph, a categorical and a float obs column;
 - ``file.json``: the same data written to an ``.h5ad`` with a cell-major
   ``X`` and served from the file (``X`` stays cell-major, rows in order).
 

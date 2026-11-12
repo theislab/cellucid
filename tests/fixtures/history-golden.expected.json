@@ -1,6 +1,6 @@
 {
   "about": "What reading and applying history-golden.cellucid-session must give (scripts/generate-history-golden.mjs).",
-  "sha256": "7118bfd010f4dbb7644223d28cd99d4142ed049338c4ed24ae4c0ab7b944ec96",
+  "sha256": "9711bbc4dfd19fd91809a2ab3967cab54b6982c2a3907c73432200e72414ca4a",
   "dataset": {
     "id": "history_golden",
     "name": "History golden",
@@ -4246,7 +4246,7 @@
     "created_at": "2026-11-04T12:00:00.000Z",
     "app": {
       "version": "0.9.6",
-      "catalog": "a805685f10d2625d649d61f7c516f811c624cfd751566267f3cd0bed0cded688"
+      "catalog": "725d32e5357cebbcff332be5a599667cf42ebb63ce55bd73e39ce4a1469556c4"
     },
     "scope": {
       "trackers": [
@@ -4311,7 +4311,7 @@
       "highlight.cells",
       "highlight.group.toggle"
     ],
-    "values": 33
+    "values": 34
   },
   "trackers": [
     {
@@ -4667,7 +4667,7 @@
             "action",
             "color.by",
             1,
-            "Coloured by gene CD3E",
+            "Colored by gene CD3E",
             "color_by(gene=\"CD3E\")",
             "agent",
             "Claude",
@@ -4708,9 +4708,9 @@
             "s7",
             "action",
             "highlight.category",
-            1,
+            2,
             "Highlighted \"T cell\" of cell_type (250 cells) on page \"Types\"",
-            "highlight_category(\"cell_type\", \"T cell\", page=\"Types\")",
+            "highlight_category(\"cell_type\", [\"T cell\"], page=\"Types\")",
             "user",
             null,
             null,
@@ -4792,7 +4792,7 @@
             "s12",
             "action",
             "category.merge",
-            1,
+            2,
             "Merged B cell into T cell in cell_type",
             "merge_categories(\"cell_type\", \"B cell\", into=\"T cell\")",
             "user",
@@ -4877,7 +4877,7 @@
             "action",
             "color.by",
             1,
-            "Coloured by gene NKG7",
+            "Colored by gene NKG7",
             "color_by(gene=\"NKG7\")",
             "user",
             null,
@@ -4915,7 +4915,7 @@
             "s5",
             "s6"
           ],
-          "summary": "Ran markers on cell_type, kept the T cell markers and coloured by CD3E."
+          "summary": "Ran markers on cell_type, kept the T cell markers and colored by CD3E."
         }
       ],
       "notes": [
@@ -4964,7 +4964,7 @@
           "on": {
             "turn": "claude-1"
           },
-          "text": "Ran markers on cell_type, kept the T cell markers and coloured by CD3E.",
+          "text": "Ran markers on cell_type, kept the T cell markers and colored by CD3E.",
           "origin": "agent"
         },
         {
@@ -5254,7 +5254,7 @@
             "action",
             "color.by",
             1,
-            "Coloured by leiden",
+            "Colored by leiden",
             "color_by(\"leiden\")",
             "user",
             null,
@@ -5291,9 +5291,10 @@
       "values": {
         "cells": "b0c5258c2fbbfe7b621295a83f07f7274639755862b9e1b176a43a6df6b7fc86",
         "mapping": "194caeb93b2986474d3542fd63e3a7a5a585fc019c9725d8d1d9d8faede34d6c",
-        "field-overlays": "c569fbc0331de1fb54724207e4d9fc8daf3bb10f536ed8720329f8d8392a9760",
+        "expression": "414be17378d48a180d0a22ee07a733f089a33eb40e64b530fe71aac47e8a242a",
+        "field-overlays": "c2aa8b4afe1d04d10f8c5d543560dd424b6aa81ff2c474934da2c04a43d89e01",
         "gene-sets": "0456a4ee71fc3ee94169eacd7d19fe41acc0e71cc5bde7573f107cae07e8fba1",
-        "views": "915ed05b20f34fb29a692e17bb7936cc2295c4692e219e254034422d498837ae",
+        "views": "df5309295635d4e45ada27a58e912107ddbc899b4f8fe1989f03f2aee913a537",
         "active-field": "2fee883ed27633672c9e97f6d095252053637d97cc9337f573dc7c505c037f03",
         "filters": "9d5388a65100d0afd4c5e24d6705eb48a924591a7fc634a786567e9ee9c3fcca",
         "colors": "9d5388a65100d0afd4c5e24d6705eb48a924591a7fc634a786567e9ee9c3fcca",
@@ -5302,7 +5303,7 @@
         "camera": "afb874d15175f56cf82a82f3981c56d6eb9d23dfe8e71b6e013bb9ab19152d2a",
         "camera-path": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
         "settings": "d370b12d715e372cb4df644c4aa7528d8a4f8c7d3b070d05039b6a27f71e77d4",
-        "analysis": "3b2a26213f103ab9301c22447568cb41af3aebd72823597df2421f7b1a0a05dc",
+        "analysis": "78aa99a26eb4f02fb52e6bb5c79c256606ca30fae30f0333e257dcc52c8922ae",
         "layout": "bb8b2df6c3dc9b0d3fddfa9af2759383c551c5ed458e63f6b290146be2729042"
       }
     },
@@ -5312,9 +5313,10 @@
       "values": {
         "cells": "b0c5258c2fbbfe7b621295a83f07f7274639755862b9e1b176a43a6df6b7fc86",
         "mapping": "194caeb93b2986474d3542fd63e3a7a5a585fc019c9725d8d1d9d8faede34d6c",
+        "expression": "414be17378d48a180d0a22ee07a733f089a33eb40e64b530fe71aac47e8a242a",
         "field-overlays": "d14886ee7458cf1374091f0631c3df42af6f888a078744683b5c0a005a7b9837",
         "gene-sets": "0456a4ee71fc3ee94169eacd7d19fe41acc0e71cc5bde7573f107cae07e8fba1",
-        "views": "915ed05b20f34fb29a692e17bb7936cc2295c4692e219e254034422d498837ae",
+        "views": "df5309295635d4e45ada27a58e912107ddbc899b4f8fe1989f03f2aee913a537",
         "active-field": "7a30f389f93ddd266e30ad805cb54d99a3320669c21e5f0b064f23a22e2a0dca",
         "filters": "9d5388a65100d0afd4c5e24d6705eb48a924591a7fc634a786567e9ee9c3fcca",
         "colors": "9d5388a65100d0afd4c5e24d6705eb48a924591a7fc634a786567e9ee9c3fcca",
@@ -5323,7 +5325,7 @@
         "camera": "afb874d15175f56cf82a82f3981c56d6eb9d23dfe8e71b6e013bb9ab19152d2a",
         "camera-path": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
         "settings": "d370b12d715e372cb4df644c4aa7528d8a4f8c7d3b070d05039b6a27f71e77d4",
-        "analysis": "3b2a26213f103ab9301c22447568cb41af3aebd72823597df2421f7b1a0a05dc",
+        "analysis": "78aa99a26eb4f02fb52e6bb5c79c256606ca30fae30f0333e257dcc52c8922ae",
         "layout": "bb8b2df6c3dc9b0d3fddfa9af2759383c551c5ed458e63f6b290146be2729042"
       }
     },
@@ -5333,9 +5335,10 @@
       "values": {
         "cells": "b0c5258c2fbbfe7b621295a83f07f7274639755862b9e1b176a43a6df6b7fc86",
         "mapping": "194caeb93b2986474d3542fd63e3a7a5a585fc019c9725d8d1d9d8faede34d6c",
+        "expression": "414be17378d48a180d0a22ee07a733f089a33eb40e64b530fe71aac47e8a242a",
         "field-overlays": "0394975116b0cfdb52495fe63830e051e4a30a5fe0d2aed8d2a7cb513319a11f",
         "gene-sets": "f8fed6f4934be9d5e9ad6ec21d77c211237d465f99991e3c490ea9aa04cd6522",
-        "views": "915ed05b20f34fb29a692e17bb7936cc2295c4692e219e254034422d498837ae",
+        "views": "df5309295635d4e45ada27a58e912107ddbc899b4f8fe1989f03f2aee913a537",
         "active-field": "7a30f389f93ddd266e30ad805cb54d99a3320669c21e5f0b064f23a22e2a0dca",
         "filters": "9d5388a65100d0afd4c5e24d6705eb48a924591a7fc634a786567e9ee9c3fcca",
         "colors": "9d5388a65100d0afd4c5e24d6705eb48a924591a7fc634a786567e9ee9c3fcca",
@@ -7145,7 +7148,7 @@
     {
       "tracker": "t-0b7c6f0e-3c1a-4a52-9d1e-5f2b8c4a7e10",
       "branch": "b0",
-      "text": "Annotation of the golden sample: *T cells* first, then the `leiden` clusters.\n\nSingle-cell data were explored interactively in Cellucid (version 0.9.6). The dataset “History golden” (600 cells and 4 genes) was opened in full. The 7 steps applied are listed below, in order. 1 recorded step no longer applied after an earlier step was removed and is not included. The complete history, with every parameter, can be reopened from the accompanying Cellucid session file.\n\nBefore QC\nThe following 1 step was applied: (1) renamed NK cell to NK in cell_type.\n\nQC\nThe following 2 steps were applied, in this order: (2) highlighted 40 cells as \"Doublets\" on page \"QC\"; (3) added the continuous column score. Steps 2–3 were taken by a Python notebook through the Cellucid viewer API.\n\nAfter QC\nThe following 4 steps were applied, in this order: (4) ran Marker genes; (5) kept the gene set T cell markers (2 genes); (6) coloured by gene CD3E; (7) merged B cell into T cell in cell_type. Steps 4–6 were taken by an AI assistant (Claude, claude-sonnet-4-6) at the user's request."
+      "text": "Annotation of the golden sample: *T cells* first, then the `leiden` clusters.\n\nSingle-cell data were explored interactively in Cellucid (version 0.9.6). The dataset “History golden” (600 cells and 4 genes) was opened in full. The 7 steps applied are listed below, in order. 1 recorded step no longer applied after an earlier step was removed and is not included. The complete history, with every parameter, can be reopened from the accompanying Cellucid session file.\n\nBefore QC\nThe following 1 step was applied: (1) renamed NK cell to NK in cell_type.\n\nQC\nThe following 2 steps were applied, in this order: (2) highlighted 40 cells as \"Doublets\" on page \"QC\"; (3) added the continuous column score. Steps 2–3 were taken by a Python notebook through the Cellucid viewer API.\n\nAfter QC\nThe following 4 steps were applied, in this order: (4) ran Marker genes; (5) kept the gene set T cell markers (2 genes); (6) colored by gene CD3E; (7) merged B cell into T cell in cell_type. Steps 4–6 were taken by an AI assistant (Claude, claude-sonnet-4-6) at the user's request."
     },
     {
       "tracker": "t-0b7c6f0e-3c1a-4a52-9d1e-5f2b8c4a7e10",
@@ -7514,7 +7517,7 @@
       }
     ],
     "provenance": {
-      "session_sha256": "7118bfd010f4dbb7644223d28cd99d4142ed049338c4ed24ae4c0ab7b944ec96",
+      "session_sha256": "9711bbc4dfd19fd91809a2ab3967cab54b6982c2a3907c73432200e72414ca4a",
       "tracker": "t-0b7c6f0e-3c1a-4a52-9d1e-5f2b8c4a7e10",
       "branch": "b0",
       "step": "s13",
@@ -7543,6 +7546,10 @@
           "note": "Presentation: not applied to the object."
         }
       ],
+      "expression": {
+        "normalize": false,
+        "log1p": false
+      },
       "session": null
     }
   }

@@ -135,7 +135,7 @@ function addCounters(destination, source) {
 }
 
 /**
- * Bytes a buffer source contributes, honouring the WebGL2 element-range form.
+ * Bytes a buffer source contributes, honoring the WebGL2 element-range form.
  *
  * @param {*} source - `ArrayBuffer`, `ArrayBufferView`, or a byte count.
  * @param {number} argumentCount - Total arguments the call supplied.

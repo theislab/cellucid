@@ -126,7 +126,7 @@ function collectionSize(file, bytes, address) {
  *
  * Each collection is read once, from its address for the bytes its
  * referenced objects take (the caller counts them from the elements'
- * lengths): one request per collection, and neighbouring collections merge
+ * lengths): one request per collection, and neighboring collections merge
  * into one in the byte reader. When that is only the start of a collection
  * (the elements read are some of many), the objects it holds are indexed;
  * decoding an object past them raises `IncompleteCollectionError`, and the
@@ -138,7 +138,7 @@ function collectionSize(file, bytes, address) {
  * collections need less than one of its blocks (`ByteReader.blockBytes`)
  * reads through the block cache too: a read that short costs the same round
  * trip as the block, and the collections beside it (the next categories, the
- * next colours, the rest of a collection a later read needs) come with it
+ * next colors, the rest of a collection a later read needs) come with it
  * instead of a dependent round trip each. A load of more (a string column's
  * collections) is read exactly, its reads merged by the byte reader. Either
  * way an element's collections are the caller's alone: they go once the

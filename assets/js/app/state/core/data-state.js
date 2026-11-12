@@ -25,6 +25,8 @@ import { DataStateVarAxisMethods } from '../managers/var-axis.js';
 import { DataStateLatentSpaceMethods } from '../managers/latent-space.js';
 import { DataStateOutlierQuantileMethods } from '../managers/outlier-quantiles.js';
 import { DataStateOpenCellsMethods } from '../managers/open-cells.js';
+import { DataStateExpressionMethods } from '../managers/expression-values.js';
+import { RAW_VALUES } from '../../../data/expression-transform.js';
 import { inactiveFieldBytes, releaseInactiveFieldsOverBudget } from '../managers/field/residency.js';
 import { registerResidentHolder, setOpenCells, setWorkingSet } from '../../../data/memory-budget.js';
 
@@ -43,7 +45,10 @@ export class DataState extends EventEmitter {
       if (event.reason === 'overlay') this._syncCentroidLabelsShown(event.viewId);
     });
     this.fieldLoader = null;
+    // The mapped matrix's gene loader, showing the expression transform
+    // (state/managers/expression-values.js); the transform asked.
     this.varFieldLoader = null;
+    this._expressionTransform = RAW_VALUES;
 
     // The open cells drawn: the memory model's working set (`pointCount`).
     this._pointCount = 0;
@@ -226,6 +231,7 @@ applyMixin(DataState.prototype, DataStateVarAxisMethods.prototype);
 applyMixin(DataState.prototype, DataStateLatentSpaceMethods.prototype);
 applyMixin(DataState.prototype, DataStateOutlierQuantileMethods.prototype);
 applyMixin(DataState.prototype, DataStateOpenCellsMethods.prototype);
+applyMixin(DataState.prototype, DataStateExpressionMethods.prototype);
 applyMixin(DataState.prototype, DataStateFieldMethods.prototype);
 applyMixin(DataState.prototype, DataStateColorMethods.prototype);
 applyMixin(DataState.prototype, DataStateFilterMethods.prototype);

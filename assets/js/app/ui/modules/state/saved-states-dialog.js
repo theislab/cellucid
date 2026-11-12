@@ -20,10 +20,12 @@
 import { formatAgo } from './model.js';
 import { reportHistoryFailure } from './shared.js';
 import { formatWhen } from '../../../history/exports/report.js';
-import { ICONS, createIconButton } from '../../components/controls.js';
+import { ICONS, createButton, createIconButton } from '../../components/controls.js';
 import { wireAppDialog } from '../../components/app-dialog.js';
+import { setControlAvailability } from '../../core/control-availability.js';
 import { InlineEditor } from '../../components/inline-editor.js';
 import { formatBytes, formatCountOf } from '../../../../utils/format-units.js';
+import { upperFirst } from '../../../../utils/text-case.js';
 
 /**
  * @param {object} options
@@ -46,6 +48,21 @@ import { formatBytes, formatCountOf } from '../../../../utils/format-units.js';
  *   Replay a saved state's steps on the dataset shown (the State panel runs it and shows its report)
  * @param {() => number} [options.now]
  */
+/** What the list names a saved state: its name, or an autosave by its latest step. */
+function listedName(entry) {
+  return entry.name ?? entry.lastStep ?? 'Autosave';
+}
+
+/**
+ * How the dialog's messages name it, as the list does: "Opening the autosave at
+ * “Colored by gene CD8B”" (found 2026-11-10: the list named an autosave by its
+ * latest step and its notice said "Opening Autosave").
+ */
+function spokenName(entry) {
+  if (entry.name != null) return entry.name;
+  return entry.lastStep != null ? `the autosave at “${entry.lastStep}”` : 'the autosave';
+}
+
 export function createSavedStatesDialog({
   dialog, list, empty, status, nameInput, contentSelect, saveAsButton, save, remove, replayFileButton, openFileButton, onReplayFile = null,
   store, hasHistory, onReplay = null, now = () => Date.now(),
@@ -84,7 +101,8 @@ export function createSavedStatesDialog({
     head.className = 'saved-state-head';
     const name = ownerDocument.createElement('span');
     name.className = 'saved-state-name';
-    name.textContent = entry.name ?? 'Autosave';
+    // An autosave is told apart by what it last did ("Colored by gene CD8B"); its badge says it is one.
+    name.textContent = listedName(entry);
     name.title = name.textContent;
     const kind = ownerDocument.createElement('span');
     kind.className = 'history-badge';
@@ -102,19 +120,17 @@ export function createSavedStatesDialog({
     body.append(head, meta);
     const actions = ownerDocument.createElement('div');
     actions.className = 'saved-state-actions';
-    const open = ownerDocument.createElement('button');
-    open.type = 'button';
-    open.className = 'btn btn-compact';
+    // A row of the list: its actions are quiet, Open the main one.
+    const open = createButton({
+      label: entry.current ? 'Shown' : 'Open',
+      variant: 'quiet-primary',
+      ariaLabel: entry.current ? `${name.textContent} is shown` : `Open ${name.textContent}`,
+    });
     open.dataset.savedAction = 'open';
-    open.textContent = entry.current ? 'Shown' : 'Open';
     open.disabled = entry.current === true;
-    open.setAttribute('aria-label', entry.current ? `${name.textContent} is shown` : `Open ${name.textContent}`);
     // Its steps applied again on the dataset shown, which may be another one.
-    const replay = ownerDocument.createElement('button');
-    replay.type = 'button';
-    replay.className = 'btn btn-compact';
+    const replay = createButton({ label: 'Replay here', variant: 'quiet' });
     replay.dataset.savedAction = 'replay';
-    replay.textContent = 'Replay here';
     replay.hidden = onReplay === null || entry.current === true;
     replay.disabled = !hasHistory();
     replay.setAttribute('aria-label', `Replay the steps of ${name.textContent} on the dataset shown`);
@@ -135,17 +151,10 @@ export function createSavedStatesDialog({
     const question = ownerDocument.createElement('span');
     question.className = 'saved-state-question';
     question.textContent = 'Delete for good?';
-    const yes = ownerDocument.createElement('button');
-    yes.type = 'button';
-    yes.className = 'btn btn-compact btn-danger';
+    const yes = createButton({ label: 'Delete', variant: 'danger', className: 'btn-compact', ariaLabel: `Delete ${name.textContent} for good` });
     yes.dataset.savedAction = 'delete-confirmed';
-    yes.textContent = 'Delete';
-    yes.setAttribute('aria-label', `Delete ${name.textContent} for good`);
-    const keep = ownerDocument.createElement('button');
-    keep.type = 'button';
-    keep.className = 'btn btn-compact';
+    const keep = createButton({ label: 'Keep', variant: 'quiet' });
     keep.dataset.savedAction = 'keep';
-    keep.textContent = 'Keep';
     confirm.append(question, yes, keep);
     row.append(body, actions, confirm);
     return row;
@@ -154,8 +163,9 @@ export function createSavedStatesDialog({
   async function refresh() {
     const saved = store();
     const run = ++generation;
-    nameInput.disabled = !hasHistory();
-    contentSelect.disabled = !hasHistory();
+    const nothingToSave = hasHistory() ? null : 'there is no history to save yet; take a step first';
+    setControlAvailability(nameInput, nothingToSave);
+    setControlAvailability(contentSelect, nothingToSave);
     saveAsButton.disabled = !hasHistory() || nameInput.value.trim().length === 0;
     replayFileButton.hidden = onReplayFile === null;
     replayFileButton.disabled = !hasHistory();
@@ -208,12 +218,33 @@ export function createSavedStatesDialog({
     const entry = entries.get(id);
     const saved = store();
     if (!entry || saved === null) return;
-    const name = entry.name ?? 'Autosave';
+    const name = spokenName(entry);
     switch (button.dataset.savedAction) {
-      case 'open':
-        await act(`Opening ${name}`, () => saved.open(id), `Opened ${name}.`);
-        if (dialog.open && status.dataset.tone === 'success') app.close();
+      case 'open': {
+        say(`Opening ${name}…`);
+        let outcome;
+        try {
+          outcome = await saved.open(id);
+        } catch (error) {
+          say(`Opening ${name} failed.`, 'danger');
+          reportHistoryFailure(`Opening ${name}`, error);
+          await refresh();
+          break;
+        }
+        if (outcome.opened || outcome.problem === null) {
+          // Opened; or not, and why is on the page (the opening's progress, a
+          // newer choice), which this modal dialog would cover. It said
+          // "Opened" whatever happened (2026-11-11).
+          say(outcome.opened ? `Opened ${name}.` : '', outcome.opened ? 'success' : 'muted');
+          if (dialog.open) app.close();
+          break;
+        }
+        say(`${upperFirst(name)} was not opened: ${outcome.problem}`, 'danger');
+        // The offer to reopen a file of this computer is on the page, under this dialog.
+        if (outcome.code === 'needs-person' && dialog.open) app.close();
+        else await refresh();
         break;
+      }
       case 'replay':
         if (onReplay === null || !hasHistory()) break;
         // The replay runs on the page: its progress and report are the State panel's.

@@ -4,7 +4,7 @@
  *
  * Every read is one of four kinds:
  * - `high`: what the user just asked for and is waiting to see (a chosen gene,
- *   the field a view is coloured by);
+ *   the field a view is colored by);
  * - `normal`: work the user started and is watching (a gene signature, a
  *   correlation);
  * - `bulk`: one of many requests of a long run (differential expression,
@@ -42,7 +42,7 @@
  * @module data/fetch-scheduler
  */
 
-import { onAbort, abortReason, cancelled } from '../utils/abort.js';
+import { onAbort, abortReason, cancelled, requireSignalOrNull } from '../utils/abort.js';
 import { REMOTE_POLICY } from '../formats/io/byte-source.js';
 
 /** @typedef {'high'|'normal'|'bulk'|'low'} DownloadPriority */
@@ -143,7 +143,7 @@ export class FetchScheduler {
    * End every download, queued or in flight, and refuse new ones: the dataset
    * these downloads belong to was replaced. Each download is aborted (its
    * `start` signal fires) and every waiter is rejected with `reason` at once,
-   * whether or not the download honours its signal, so nothing of one dataset
+   * whether or not the download honors its signal, so nothing of one dataset
    * can hold back another's downloads.
    *
    * @param {unknown} reason
@@ -203,9 +203,7 @@ export class FetchScheduler {
     if (typeof start !== 'function') {
       throw new TypeError('A download needs a start function.');
     }
-    if (signal !== null && !(signal instanceof AbortSignal)) {
-      throw new TypeError('A download signal must be an AbortSignal or null.');
-    }
+    requireSignalOrNull(signal, 'A download signal');
     if (signal?.aborted) return Promise.reject(abortReason(signal));
     if (this._closedReason !== null) return Promise.reject(this._closedReason);
 

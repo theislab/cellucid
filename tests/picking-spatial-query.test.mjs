@@ -13,6 +13,7 @@ import {
   drawnPointRadiusCss,
   findScreenSpacePick,
 } from '../assets/js/rendering/picking.js';
+import { POINT_SPRITE_MAX_PX, pointScaleFor, pointSpriteSize } from '../assets/js/rendering/point-sprite.js';
 import { admissionMembership, prefixMembership } from './helpers/lod-membership.mjs';
 
 const FOV = (45 * Math.PI) / 180;
@@ -56,6 +57,7 @@ function pick(overrides) {
     pointSize: 8,
     sizeAttenuation: 0,
     fov: FOV,
+    pointSizeMax: POINT_SPRITE_MAX_PX,
     spatialIndex: null,
     ...overrides,
   });
@@ -81,6 +83,7 @@ test('the dot under the pointer wins over a nearer dot beside it', () => {
   const beside = project(mvp, nearerBeside);
   const besideRadius = drawnPointRadiusCss({
     w: beside.w, pointSize: 8, sizeAttenuation: 0, fov: FOV, framebufferHeight: 600, devicePixelRatio: 1,
+    pointSizeMax: POINT_SPRITE_MAX_PX,
   });
   assert.ok(Math.hypot(beside.x - cursor.x, beside.y - cursor.y) > besideRadius + PICK_TOLERANCE_CSS_PX);
   assert.equal(pick({ positions, mvpMatrix: mvp, cursor }).cellIndex, 1);
@@ -106,11 +109,38 @@ test('the hit area is the drawn dot plus the tolerance, and follows point size',
   // Perspective attenuation grows a near dot exactly as the shader does.
   const radius = drawnPointRadiusCss({
     w: centre.w, pointSize: 2, sizeAttenuation: 1, fov: FOV, framebufferHeight: 600, devicePixelRatio: 1,
+    pointSizeMax: POINT_SPRITE_MAX_PX,
   });
   assert.equal(
     pick({ positions, mvpMatrix: mvp, cursor, pointSize: 2, sizeAttenuation: 1 }).cellIndex,
     6 <= radius + PICK_TOLERANCE_CSS_PX ? 0 : -1,
   );
+});
+
+test('a cell near the camera is picked whole, in front of what lies behind it (no near fade)', () => {
+  // The camera 3 from the target. A near fade (F97, removed on the owner's
+  // decision 2026-11-11) left cells nearer than 1.5 of it unpicked; a cell is
+  // picked at its drawn size however near the camera it is.
+  const mvp = cameraMvp(3);
+  const cursor = project(mvp, [0, 0, 0]);
+  const common = { mvpMatrix: mvp, cursor, pointSize: 8, sizeAttenuation: 1 };
+  const atDepth = depth => Float32Array.from([0, 0, 3 - depth, 0, 0, 0]);
+  for (const depth of [0.39, 0.8, 1.4]) {
+    assert.equal(pick({ ...common, positions: atDepth(depth) }).cellIndex, 0, `the cell at ${depth} is on top`);
+  }
+  // Alone and off the pointer by a little less than its drawn radius: still it.
+  const near = [0.02, 0, 2.2];
+  const offset = project(mvp, near);
+  const radius = drawnPointRadiusCss({ w: offset.w, pointSize: 8, sizeAttenuation: 1, fov: FOV, framebufferHeight: 600, devicePixelRatio: 1, pointSizeMax: POINT_SPRITE_MAX_PX });
+  assert.ok(Math.hypot(offset.x - cursor.x, offset.y - cursor.y) < radius);
+  assert.equal(pick({ ...common, positions: Float32Array.from(near) }).cellIndex, 0);
+  for (const depth of [0.39, 0.8, 1.4, 3]) {
+    assert.equal(
+      drawnPointRadiusCss({ w: depth, pointSize: 8, sizeAttenuation: 1, fov: FOV, framebufferHeight: 600, devicePixelRatio: 1, pointSizeMax: POINT_SPRITE_MAX_PX }),
+      pointSpriteSize(depth, { pointSize: 8, pointScale: pointScaleFor(600, FOV), sizeAttenuation: 1, pointSizeMax: POINT_SPRITE_MAX_PX }) / 2,
+      'the picked size is the drawn sprite\'s',
+    );
+  }
 });
 
 test('a filtered-out cell is never picked; the visible cell behind it is', () => {

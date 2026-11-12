@@ -30,7 +30,9 @@
  * @module app/state/domains/cells
  */
 
+import { askedCellsOf } from '../../../data/cell-subset-policy.js';
 import { formatCountOf } from '../../../utils/format-units.js';
+import { awaitWithSignal, throwIfAborted } from '../../../utils/abort.js';
 
 /** The parts of a subsample's specification that reproduce its cells. */
 const SPEC_KEYS = Object.freeze([
@@ -39,24 +41,19 @@ const SPEC_KEYS = Object.freeze([
 
 /**
  * The open cells as the domain names them: null for every cell, else the
- * subsample's specification at the share it grows to.
+ * subsample's specification at the share it grows to (`askedCellsOf`).
  *
  * @param {Object|null} subset - `AnnDataFileSource.getCellSubset()`
  * @returns {Object|null}
  */
 export function openCellsValueOf(subset) {
-  if (subset === null || subset === undefined) return null;
-  const target = subset.chunks?.target ?? null;
-  if (subset.kept === null && target === null) return null;
-  if (target !== null && target >= subset.nObs) return null;
-  const spec = subset.spec;
-  if (spec === null || spec === undefined) return null;
+  const asked = askedCellsOf(subset);
+  if (asked === null) return null;
   const value = {};
   for (const key of SPEC_KEYS) {
-    if (spec[key] === undefined) continue;
-    value[key] = Array.isArray(spec[key]) ? [...spec[key]] : spec[key];
+    if (asked.spec[key] === undefined) continue;
+    value[key] = Array.isArray(asked.spec[key]) ? [...asked.spec[key]] : asked.spec[key];
   }
-  value.k = target ?? spec.k;
   return value;
 }
 
@@ -91,8 +88,8 @@ function describeGenes(count) {
  *   geneSample: () => ({cells: number, of: number}|null),
  *   genesAsked: () => (number|null),
  *   setGenesAsked: (cells: number|null) => void,
- *   reopen: (request: Object) => Promise<{restoring: Promise<void>}>,
- *   readGenes: (cells: number) => Promise<unknown>,
+ *   reopen: (request: Object, options?: {heavy?: Function|null, signal?: AbortSignal|null}) => Promise<{restoring: Promise<void>}>,
+ *   readGenes: (cells: number, options?: {heavy?: Function|null, signal?: AbortSignal|null}) => Promise<unknown>,
  * }}} options - `openCells`: the open data's controls (`ui/core/ui-coordinator.js`):
  *   the cells open, the gene sample, the genes asked for on these cells, a
  *   reading of the dataset again on other cells keeping what was made
@@ -107,13 +104,19 @@ export function createCellsDomain({ openCells }) {
   }
   return {
     capture,
-    async restore(value) {
+    // `heavy`: the running action's `ctx.heavy` (a history move of an agent): asked before the
+    // cells' totals of normalized values are summed for the cells read. `signal`: the move's
+    // (its Stop): the reading is canceled and the restore throws why, promptly (F147); the
+    // history then puts back what was shown.
+    async restore(value, { heavy = null, signal = null } = {}) {
       if (value === null || typeof value !== 'object' || !Object.hasOwn(value, 'open') || !Object.hasOwn(value, 'genes')) {
         throw new TypeError('The open cells to restore name the cells and the genes asked for.');
       }
       if (JSON.stringify(openCellsValueOf(openCells.subset())) !== JSON.stringify(value.open)) {
-        const { restoring } = await openCells.reopen(requestOfOpenCellsValue(value.open));
-        await restoring;
+        const { restoring } = await openCells.reopen(requestOfOpenCellsValue(value.open), { heavy, signal });
+        // Stopped, the reading was canceled: the cells open before are still open.
+        throwIfAborted(signal);
+        await awaitWithSignal(restoring, signal);
         const now = openCellsValueOf(openCells.subset());
         if (JSON.stringify(now) !== JSON.stringify(value.open)) {
           throw new Error(`The cells could not be read again: ${describeOpen(value.open)} were asked for, ${describeOpen(now)} are open.`);
@@ -122,7 +125,8 @@ export function createCellsDomain({ openCells }) {
       openCells.setGenesAsked(value.genes);
       const sample = openCells.geneSample();
       if (value.genes !== null && sample !== null && sample.cells < Math.min(value.genes, sample.of)) {
-        await openCells.readGenes(value.genes);
+        await openCells.readGenes(value.genes, { heavy, signal });
+        throwIfAborted(signal);
       }
     },
     describe(a, b) {

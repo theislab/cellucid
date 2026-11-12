@@ -3,7 +3,7 @@
  *
  * Every reduced level admits cells in their priority order
  * (`data/cell-priority.js`), so the cells a level draws are exactly the first
- * cells of that order, and they cover the cloud and its colours in the
+ * cells of that order, and they cover the cloud and its colors in the
  * proportions all cells do, within sampling error. At full detail the level
  * draws every cell, in the same stored order as with LOD off, so the two
  * frames are the same picture.
@@ -59,7 +59,7 @@ test('every reduced level is the priority prefix and draws the population; full 
     const index = renderer.spatialIndices.get(dimension);
 
     // What each level should hold, and what the whole cloud holds: an 8 x 8
-    // grid over the first two axes, and six colour buckets.
+    // grid over the first two axes, and six color buckets.
     const positions = state.positionsArray;
     const colors = state.colorsArray;
     let minX = Infinity; let maxX = -Infinity; let minY = Infinity; let maxY = -Infinity;

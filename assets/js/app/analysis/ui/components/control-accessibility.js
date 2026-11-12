@@ -25,8 +25,8 @@ const LABELLABLE = 'input, select, textarea, meter, output, progress';
  * floating copy of the same analysis mode generate distinct element ids.
  *
  * Minted by the page's one id generator (`ui/components/dom-id.js`), so the
- * ids made from it are known as this page's own (`isGeneratedDomId` of the
- * scope): nothing saved or walked names them.
+ * ids made from it hold its separator and are known as this page's own
+ * (`isGeneratedDomId`): nothing saved or walked names them.
  *
  * @param {string} name - Human-meaningful prefix, e.g. an analysis mode id.
  * @returns {string} A unique id prefix.

@@ -4,6 +4,7 @@
 // Provides a clean API for volumetric cloud visualization
 
 import { requireCleanWebGLState } from '../gl-errors.js';
+import { prefersReducedMotion } from '../../utils/reduced-motion.js';
 import { deleteGlObject, deleteProgramReleasingUse, deleteTextureTracked, restorableTexture } from '../gl-utils.js';
 import {
   SMOKE_COMPOSITE_FS,
@@ -31,6 +32,7 @@ import {
   startCloudNoiseTextureGeneration,
 } from './noise-textures.js';
 import { getNotificationCenter } from '../../app/notification-center.js';
+import { InternalError } from '../../utils/errors.js';
 
 const TRANSPARENT_BLACK = new Float32Array([0, 0, 0, 0]);
 const NO_RESOURCE_FAILURES = Object.freeze([]);
@@ -145,7 +147,7 @@ function requireVector3(value, owner) {
  * What a GPU density build read, kept without a copy: the parameters, the
  * arrays by weak reference (a later build reads the same arrays or another
  * build is due; nothing here keeps a replaced array alive), and how many
- * times their owner had handed the colours and the visibility out for
+ * times their owner had handed the colors and the visibility out for
  * writing (`options.writes`, from `getSmokeDensitySource`), so an array
  * rewritten in place is told from the one built. Positions and outlier
  * quantiles are never written once published. A build whose caller names no
@@ -169,7 +171,7 @@ export function captureSmokeInputs(positions, options, textureInfo, summary) {
   };
 }
 
-/** The lower layers' colours a volume was built with, as one comparable string (a new background rebuilds it). */
+/** The lower layers' colors a volume was built with, as one comparable string (a new background rebuilds it). */
 function layerColorsKey(options) {
   const layerColors = options.layerColors ?? null;
   return layerColors === null ? null : `${Array.from(layerColors.zero)}/${Array.from(layerColors.unread)}`;
@@ -183,12 +185,12 @@ function isReferenceTo(reference, array) {
   return reference === null ? array === null : array !== null && reference.deref() === array;
 }
 
-/** The caller's write counts of the colours and the visibility, or null. */
+/** The caller's write counts of the colors and the visibility, or null. */
 function writesOf(options) {
   const writes = options.writes ?? null;
   if (writes === null) return null;
   if (!Number.isSafeInteger(writes.colors) || !Number.isSafeInteger(writes.alpha)) {
-    throw new TypeError('Smoke density writes must count the colours and the visibility writes.');
+    throw new TypeError('Smoke density writes must count the colors and the visibility writes.');
   }
   return { colors: writes.colors, alpha: writes.alpha };
 }
@@ -314,7 +316,16 @@ export class SmokeRenderer {
     // Waiting for noise textures draws nothing new: the generation wakes the
     // viewer when it settles (`setNoiseSettledHandler`). Redrawing the studio,
     // grid and backdrop every frame meanwhile changed no pixel.
-    return this.animationSpeed > 0;
+    return this._drifts();
+  }
+
+  /**
+   * Whether the smoke drifts: a speed above zero and motion not reduced
+   * (`utils/reduced-motion.js`; the viewer redraws when that setting
+   * changes). Otherwise its procedural time holds and the cloud is still.
+   */
+  _drifts() {
+    return this.animationSpeed > 0 && !prefersReducedMotion();
   }
 
   /**
@@ -367,7 +378,7 @@ export class SmokeRenderer {
         SMOKE_FS_SOURCE
       );
       if (!smokeProgram) {
-        throw new Error('SmokeRenderer smoke-program creation failed.');
+        throw new InternalError('SmokeRenderer smoke-program creation failed.');
       }
       compositeProgram = createProgram(
         gl,
@@ -375,7 +386,7 @@ export class SmokeRenderer {
         SMOKE_COMPOSITE_FS
       );
       if (!compositeProgram) {
-        throw new Error('SmokeRenderer composite-program creation failed.');
+        throw new InternalError('SmokeRenderer composite-program creation failed.');
       }
 
       smokeAttribLocations = {
@@ -389,7 +400,7 @@ export class SmokeRenderer {
         ['composite', compositeAttribLocations.position],
       ]) {
         if (!Number.isInteger(location) || location < 0) {
-          throw new Error(
+          throw new InternalError(
             `SmokeRenderer ${owner} shader is missing required a_position input.`
           );
         }
@@ -430,7 +441,7 @@ export class SmokeRenderer {
       ]) {
         for (const [name, location] of Object.entries(locations)) {
           if (location === null) {
-            throw new Error(
+            throw new InternalError(
               `SmokeRenderer ${owner} shader is missing required ${name} uniform.`
             );
           }
@@ -439,12 +450,12 @@ export class SmokeRenderer {
 
       quadBuffer = gl.createBuffer();
       if (!quadBuffer) {
-        throw new Error('SmokeRenderer fullscreen-buffer allocation failed.');
+        throw new InternalError('SmokeRenderer fullscreen-buffer allocation failed.');
       }
       smokeVertexArray = gl.createVertexArray();
       compositeVertexArray = gl.createVertexArray();
       if (!smokeVertexArray || !compositeVertexArray) {
-        throw new Error('SmokeRenderer fullscreen vertex-array allocation failed.');
+        throw new InternalError('SmokeRenderer fullscreen vertex-array allocation failed.');
       }
       gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
       gl.bufferData(
@@ -582,12 +593,12 @@ export class SmokeRenderer {
     // Context loss also starts terminal disposal, but it is the authoritative
     // lifecycle cause and must retain its exact public diagnostic.
     if (this.contextLost) {
-      throw new Error(
+      throw new InternalError(
         `SmokeRenderer cannot ${operation} after WebGL context loss.`
       );
     }
     if (this._disposeStarted || this.disposed) {
-      throw new Error(
+      throw new InternalError(
         `SmokeRenderer cannot ${operation} after disposal has started.`
       );
     }
@@ -735,7 +746,7 @@ export class SmokeRenderer {
     this.noiseGenerationInProgress = false;
     if (transaction === null) return false;
     try {
-      transaction.cancel(`${owner} cancelled GPU cloud-noise generation.`);
+      transaction.cancel(`${owner} canceled GPU cloud-noise generation.`);
     } catch (error) {
       throw asError(
         error,
@@ -789,7 +800,7 @@ export class SmokeRenderer {
   /**
    * Build the density volume of `positions`. `options` are the density
    * builder's (`buildDensityTextureGPU`) and `writes`, the caller's write
-   * counts of the colours and the visibility (`captureSmokeInputs`).
+   * counts of the colors and the visibility (`captureSmokeInputs`).
    */
   buildVolumeGPU(positions, options = {}) {
     this._assertMutableLifecycle('build a density volume');
@@ -1213,7 +1224,7 @@ export class SmokeRenderer {
     try {
       candidateTexture = gl.createTexture();
       if (!candidateTexture) {
-        throw new Error(
+        throw new InternalError(
           'SmokeRenderer target texture allocation failed.'
         );
       }
@@ -1253,7 +1264,7 @@ export class SmokeRenderer {
 
       candidateFramebuffer = gl.createFramebuffer();
       if (!candidateFramebuffer) {
-        throw new Error(
+        throw new InternalError(
           'SmokeRenderer framebuffer allocation failed.'
         );
       }
@@ -1284,7 +1295,7 @@ export class SmokeRenderer {
         const statusName = Object.hasOwn(statusNames, status)
           ? statusNames[status]
           : `0x${status.toString(16)}`;
-        throw new Error(
+        throw new InternalError(
           `SmokeRenderer framebuffer is incomplete: ${statusName} (${targetW}x${targetH}).`
         );
       }
@@ -1433,13 +1444,13 @@ export class SmokeRenderer {
     const gl = this.gl;
 
     if (this.contextLost) {
-      throw new Error('SmokeRenderer cannot render after WebGL context loss.');
+      throw new InternalError('SmokeRenderer cannot render after WebGL context loss.');
     }
     if (this.disposed) {
-      throw new Error('SmokeRenderer cannot render after disposal.');
+      throw new InternalError('SmokeRenderer cannot render after disposal.');
     }
     if (this._disposeStarted) {
-      throw new Error(
+      throw new InternalError(
         'SmokeRenderer cannot render after disposal has started.'
       );
     }
@@ -1576,7 +1587,7 @@ export class SmokeRenderer {
     // frames (an idle, still view) does not make the motion jump. A frame
     // that fails publishes no time.
     const now = performance.now();
-    const nextAnimationTime = this._lastRenderTime === null
+    const nextAnimationTime = this._lastRenderTime === null || !this._drifts()
       ? this.animationTime
       : this.animationTime + Math.min(
         0.1,
@@ -1907,7 +1918,7 @@ export class SmokeRenderer {
         transactionAttempted = true;
         try {
           transaction.cancel(
-            'SmokeRenderer disposal cancelled GPU cloud-noise generation.'
+            'SmokeRenderer disposal canceled GPU cloud-noise generation.'
           );
         } catch (error) {
           failures.push(asError(

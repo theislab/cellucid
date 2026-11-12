@@ -211,8 +211,9 @@ test('real WebGL loss fences every owner with no GL work while the context is aw
       };
       requestAnimationFrame(advance);
     });
+    // The renderer builds no UI of its own (F146): the app's one dialog.
     const overlayCount = document.querySelectorAll(
-      '#cellucid-webgl-context-overlay',
+      '#graphics-reset-dialog[open]',
     ).length;
     const glCallsBeforeDispose = Object.values(glCalls).reduce(
       (total, count) => total + count,
@@ -287,7 +288,7 @@ test('real WebGL loss fences every owner with no GL work while the context is aw
   } else {
     expect(projectileCompletion).toEqual({
       contextLostAtCompletion: true,
-      message: 'Projectile preparation was cancelled because the WebGL context was lost.',
+      message: 'Projectile preparation was canceled because the WebGL context was lost.',
       status: 'cancelled',
     });
   }
@@ -395,7 +396,7 @@ test('physical context loss cancels projectile readiness before its event task',
   });
 
   expect(completion).toEqual({
-    message: 'Projectile preparation was cancelled because the WebGL context was lost.',
+    message: 'Projectile preparation was canceled because the WebGL context was lost.',
     status: 'cancelled',
   });
 });

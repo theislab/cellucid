@@ -264,7 +264,7 @@
 }
 
 /* ------------------------------------------------------------------------
-   Lanes: each element names its slot, the token gives its colour
+   Lanes: each element names its slot, the token gives its color
    --------------------------------------------------------------------- */
 
 .lane-0 { --lane-color: var(--history-lane-0); }
@@ -315,7 +315,7 @@
     --hg-row-height: var(--space-11);
   }
 
-  /* A row's tools are drawn at the touch size (32px), centred in the taller row. */
+  /* A row's tools are drawn at the touch size (32px), centered in the taller row. */
   .history-graph .hg-tool {
     min-width: var(--space-8);
     height: var(--space-8);
@@ -368,10 +368,13 @@
   color: var(--color-text-tertiary);
 }
 
+/* A row: its words (`.hg-words`, which wrap within their column) and its
+   tools (`.hg-tools`), which stay on the first line at the row's end, one
+   line and in one place on every kind of row. */
 .hg-line {
   position: relative;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: flex-start;
   gap: var(--space-1);
   min-height: var(--hg-row-height);
@@ -383,7 +386,16 @@
   background: var(--color-interactive-secondary-hover);
 }
 
-.hg-line > * {
+.hg-words {
+  display: flex;
+  flex: 1 1 0;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.hg-words > * {
   padding-top: calc((var(--hg-row-height) - 1.25em) / 2);
 }
 
@@ -455,7 +467,7 @@
 .hg-flags[hidden],
 .hg-meta[hidden],
 .hg-time[hidden],
-.hg-line > .history-badge[hidden] {
+.hg-words > .history-badge[hidden] {
   display: none;
 }
 
@@ -467,10 +479,11 @@
 
 /* Counts, badges and times are short: they keep their words whole. The label
    keeps a readable width; when the row is too narrow for both, what follows
-   it (count, badge, time, tools) moves to a line of its own under it. */
+   it (count, badge, time) moves to a line of its own under it — the tools
+   stay on the first line. */
 .hg-meta,
 .hg-time,
-.hg-line > .history-badge {
+.hg-words > .history-badge {
   flex: none;
   white-space: nowrap;
 }
@@ -566,7 +579,9 @@
 
 .history-detail-fact {
   display: grid;
-  grid-template-columns: var(--space-16) minmax(0, 1fr);
+  /* The terms are single short words (By, When, Code, Changed): they take
+     their own width and the value takes the rest. */
+  grid-template-columns: max-content minmax(0, 1fr);
   gap: var(--space-2);
   align-items: baseline;
 }
@@ -578,11 +593,18 @@
 .history-detail-value {
   min-width: 0;
   color: var(--color-text-primary);
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
+}
+
+/* A quiet action that leads a value lines its text up with the plain values above. */
+.history-detail-value > .btn-quiet:first-child,
+.history-notes > .btn-quiet {
+  margin-left: calc(-1 * var(--space-1-5));
 }
 
 .history-detail-value code {
-  overflow-wrap: anywhere;
+  /* Break a call only when it cannot fit whole, never inside a word that would fit. */
+  overflow-wrap: break-word;
 }
 
 .history-detail-line,
@@ -603,8 +625,10 @@
 .history-detail-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-1);
-  padding-top: var(--space-1);
+  gap: 0 var(--space-0-5);
+  padding-top: var(--space-0-5);
+  /* The quiet buttons line up with the facts' text, not their own padding. */
+  margin-left: calc(-1 * var(--space-1-5));
 }
 
 .history-notes {
@@ -717,30 +741,6 @@
 
 .history-banner > .btn[hidden] {
   display: none;
-}
-
-/* A menu opened at a row or a button (menu.js). */
-.history-popup-menu {
-  position: fixed;
-  left: var(--history-menu-left, 0px);
-  right: auto;
-  top: var(--history-menu-top, 0px);
-  width: max-content;
-  z-index: var(--z-popover);
-  min-width: max-content;
-  max-width: calc(100vw - var(--space-4));
-}
-
-.history-popup-menu .open-menu-item.is-danger .open-menu-item-label {
-  color: var(--color-danger-text);
-}
-
-.history-popup-menu .open-menu-item[aria-disabled="true"] {
-  opacity: var(--control-disabled-opacity);
-}
-
-.history-popup-menu .open-menu-item[role="menuitemcheckbox"][aria-checked="true"] .open-menu-item-label::before {
-  content: '✓ ';
 }
 
 /* Who took a step, when it was not the person; one quiet badge per origin. */
@@ -1197,7 +1197,7 @@ button.history-replay-step:hover {
   position: fixed;
   top: var(--space-2-5);
   left: calc(var(--sidebar-width) + var(--space-2-5) + var(--space-8));
-  right: var(--space-8);
+  right: calc(var(--space-8) + var(--agent-panel-inline-size, 0px));
   z-index: var(--z-overlay);
   pointer-events: none;
 }
@@ -1206,7 +1206,7 @@ body:has(#sidebar.hidden) .history-tour-bar {
   left: var(--space-8);
 }
 
-/* The bar covers the top edge of the plot, where each view centres its title. */
+/* The bar covers the top edge of the plot, where each view centers its title. */
 body.history-touring #view-title-layer {
   transform: translateY(var(--space-14));
 }

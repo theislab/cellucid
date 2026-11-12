@@ -10,9 +10,14 @@
  * - `/oauth/register`: Dynamic Client Registration (`clients.js`).
  * - `/oauth/authorize`: checks the client and its redirect URI (on failure a
  *   page, never a redirect to an unchecked address), then PKCE, response
- *   type and resource (on failure a redirect with the error, `state` and
- *   `iss`), then keeps the request under a new connect code
+ *   type and resource (on failure the error, `state` and `iss` at the
+ *   redirect URI: at once for claude.ai and chatgpt.com, by a link the
+ *   person follows for any other app), then keeps the request under a new connect code
  *   (`approval.js`) and shows the waiting page (`authorize-page.js`).
+ * - `/oauth/claim`: a Cellucid page of this browser claims a connect code,
+ *   credentialed by the approver cookie the waiting page set
+ *   (`approval.js` `APPROVER_COOKIE`): only the browser that shows the
+ *   page can claim it.
  * - `/oauth/token`: `authorization_code` (once, with the PKCE verifier,
  *   the same client, redirect URI and resource) and `refresh_token`
  *   (rotating: each refresh token works once). Tokens are bound to the
@@ -26,9 +31,11 @@ import { RELAY_BUNDLE } from './generated/bundle.js';
 import { approvalPage, failurePage } from './authorize-page.js';
 import { clientDisplay, registerClient, resolveClient } from './clients.js';
 import { randomBase64Url, sha256Base64Url, textOf } from './encoding.js';
-import { RelayHttpError, isJson, jsonResponse, publicCorsHeaders, readBody } from './http.js';
-import { seal, unseal } from './keys.js';
-import { APPROVAL_SECONDS } from './approval.js';
+import {
+  RelayHttpError, cookieOf, credentialedCorsHeaders, emptyResponse, isJson, jsonResponse, publicCorsHeaders, readBody,
+} from './http.js';
+import { pairingIdOf, seal, unseal } from './keys.js';
+import { APPROVAL_SECONDS, APPROVER_COOKIE, APPROVER_VALUE, isConnectCode } from './approval.js';
 import { PAIRING_HEADER } from './pairing.js';
 import { redirectMatches, redirectUriProblem } from './redirect-uris.js';
 
@@ -46,6 +53,7 @@ export const OAUTH_BODY_MAX_BYTES = 64 * 1024;
 const CODE_ATTEMPTS = 8;
 
 const CODE_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
+const TAB_SECRET = new RegExp(RELAY_BUNDLE.protocol.tabSecretPattern);
 const CODE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
 
 export function protectedResourceMetadata(site) {
@@ -80,7 +88,7 @@ export function authorizationServerMetadata(site) {
 /**
  * `value` when it names this relay's resource, its origin (scheme and host in
  * any case, with or without the trailing slash: MCP clients send the canonical
- * form without it, RFC 3986 normalises to it), else null. Any other path,
+ * form without it, RFC 3986 normalizes to it), else null. Any other path,
  * including the retired `/mcp`, names another resource.
  */
 export function resourceOf(value, site) {
@@ -146,12 +154,28 @@ async function askObject(stub, path, body) {
   return { status: response.status, body: await response.json() };
 }
 
-function errorRedirect(redirectUri, state, issuer, error, description) {
+/**
+ * The answer to an authorization request that is wrong after its client and
+ * redirect URI were checked: the error, `state` and `iss` at the redirect URI.
+ * The relay sends the browser there by itself only for an app it vouches
+ * for (`display.known`: claude.ai or chatgpt.com). Anyone can register a
+ * client with a redirect URI of their own, so redirecting every client's
+ * malformed request at once would make the relay's address an open
+ * redirect to any site (RFC 9700 §4.11.2); for such a client the person
+ * sees the error and a link to take it back.
+ */
+function errorAnswer(redirectUri, display, state, issuer, error, description) {
   const url = new URL(redirectUri);
   url.searchParams.append('error', error);
   url.searchParams.append('error_description', description);
   if (state !== null) url.searchParams.append('state', state);
   url.searchParams.append('iss', issuer);
+  if (!display.known) {
+    return failurePage(`The app asking sent a request Cellucid cannot answer: ${description}.`, 400, {
+      href: url.href,
+      host: display.redirectHost,
+    });
+  }
   return new Response(null, { status: 302, headers: { Location: url.href, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' } });
 }
 
@@ -183,7 +207,8 @@ export async function handleAuthorize(request, site, keys, env, fetchImpl) {
   }
 
   const state = params.get('state') ?? null;
-  const fail = (error, description) => errorRedirect(redirectUri, state, site.issuer, error, description);
+  const display = clientDisplay(client, redirectUri);
+  const fail = (error, description) => errorAnswer(redirectUri, display, state, site.issuer, error, description);
   if (params.get('response_type') !== 'code') return fail('unsupported_response_type', 'Only response_type=code is supported');
   if (params.get('code_challenge_method') !== 'S256') return fail('invalid_request', 'PKCE with code_challenge_method=S256 is required');
   if (!CODE_CHALLENGE.test(params.get('code_challenge') ?? '')) return fail('invalid_request', 'code_challenge must be an S256 challenge (43 base64url characters)');
@@ -191,12 +216,16 @@ export async function handleAuthorize(request, site, keys, env, fetchImpl) {
   const resource = requestedResource === null ? site.resource : resourceOf(requestedResource, site);
   if (resource === null) return fail('invalid_target', `This server issues tokens only for ${site.resource}`);
 
-  const display = clientDisplay(client, redirectUri);
   const pageSecret = randomBase64Url(32);
+  // The browser this page shows in: its approver cookie, kept (two
+  // authorizations waiting in one browser share it) or made now.
+  const kept = cookieOf(request, APPROVER_COOKIE);
+  const approver = kept !== null && APPROVER_VALUE.test(kept) ? kept : randomBase64Url(32);
   const record = {
     createdAt: Date.now(),
     expiresAt: Date.now() + APPROVAL_SECONDS * 1000,
     requestHash: await sha256Base64Url(pageSecret),
+    browserHash: await sha256Base64Url(approver),
     client: { id: client.id, display },
     redirectUri,
     challenge: params.get('code_challenge'),
@@ -209,7 +238,7 @@ export async function handleAuthorize(request, site, keys, env, fetchImpl) {
     const code = newConnectCode();
     const created = await askObject(approvalStub(env, code), '/create', { record: { ...record, code } });
     if (created.status === 201) {
-      return approvalPage({
+      const page = approvalPage({
         code,
         display: `${code.slice(0, 4)}-${code.slice(4)}`,
         request: pageSecret,
@@ -217,6 +246,8 @@ export async function handleAuthorize(request, site, keys, env, fetchImpl) {
         client: display,
         expiresInMinutes: APPROVAL_SECONDS / 60,
       });
+      page.headers.append('Set-Cookie', `${APPROVER_COOKIE}=${approver}; Path=/; Max-Age=${APPROVAL_SECONDS}; Secure; HttpOnly; SameSite=Strict`);
+      return page;
     }
   }
   throw new RelayHttpError(503, 'No connect code was free; try again');
@@ -234,10 +265,8 @@ export async function handleAuthorizeWait(request, site, env) {
   } catch {
     body = null;
   }
-  const { length, alphabet } = RELAY_BUNDLE.protocol.connectCode;
   const code = body?.code;
-  if (typeof code !== 'string' || code.length !== length || [...code].some(symbol => !alphabet.includes(symbol))
-    || typeof body.request !== 'string') {
+  if (!isConnectCode(code) || typeof body.request !== 'string') {
     throw new RelayHttpError(400, 'Name the connect code and the page\'s request');
   }
   const answer = await askObject(approvalStub(env, code), '/wait', {
@@ -246,6 +275,48 @@ export async function handleAuthorizeWait(request, site, env) {
     cancel: body.cancel === true,
   });
   return jsonResponse(answer.body, answer.status);
+}
+
+/**
+ * A Cellucid page claims a connect code (`POST /oauth/claim`, `{code,
+ * secret}`: the code and the page's tab secret, which names its pairing as
+ * the tab's socket does). The request must come from an allowed Cellucid
+ * page (`Origin`) and carry the approver cookie of the browser that shows
+ * the code's waiting page; the browser sends it only with
+ * `credentials: 'include'` from the relay's own site (`SameSite=Strict`:
+ * www.cellucid.com and mcp.cellucid.com are one site). The approval's
+ * answer is the body of a 200, as a socket reply's is: `{ok: true, value:
+ * {client, expiresAt}}`, or `{ok: false, error: {code, message}}` (unknown,
+ * started in another browser, claimed elsewhere, answered): an answer the
+ * person reads, not a failed request. A request no Cellucid page sends (no
+ * allowed origin, not POST, not a code and a tab secret) is a 4xx.
+ */
+export async function handleClaim(request, keys, env, allowedOrigins) {
+  const origin = request.headers.get('Origin');
+  if (origin === null || !allowedOrigins.has(origin)) throw new RelayHttpError(403, 'Only a Cellucid page claims a connect code');
+  const cors = credentialedCorsHeaders(origin);
+  if (request.method === 'OPTIONS') return emptyResponse(204, cors);
+  const refuse = (status, code, message) => jsonResponse({ code, message }, status, cors);
+  if (request.method !== 'POST') return refuse(405, 'method', 'Claim with POST');
+  if (!isJson(request)) return refuse(400, 'malformed', 'Send JSON');
+  let body;
+  try {
+    body = JSON.parse(textOf(await readBody(request, OAUTH_BODY_MAX_BYTES)) ?? '');
+  } catch (error) {
+    if (error instanceof RelayHttpError) return refuse(error.status, 'malformed', error.message);
+    body = null;
+  }
+  if (!isConnectCode(body?.code)) return refuse(400, 'not-a-code', 'That is not a connect code.');
+  if (typeof body.secret !== 'string' || !TAB_SECRET.test(body.secret)) return refuse(400, 'malformed', 'The page must prove its tab secret');
+  const approver = cookieOf(request, APPROVER_COOKIE);
+  const answer = await askObject(approvalStub(env, body.code), '/claim', {
+    pairingId: await pairingIdOf(keys, body.secret),
+    browserHash: approver !== null && APPROVER_VALUE.test(approver) ? await sha256Base64Url(approver) : null,
+  });
+  const reply = answer.status === 200
+    ? { ok: true, value: answer.body }
+    : { ok: false, error: { code: answer.body.code, message: answer.body.message } };
+  return jsonResponse(reply, 200, cors);
 }
 
 // ---- tokens ---------------------------------------------------------------------
@@ -296,9 +367,7 @@ export async function handleToken(request, site, keys, env) {
   switch (params.get('grant_type')) {
     case 'authorization_code': {
       const parts = (params.get('code') ?? '').split('.');
-      const { length, alphabet } = RELAY_BUNDLE.protocol.connectCode;
-      if (parts.length !== 3 || parts[0] !== 'ac1' || parts[1].length !== length
-        || [...parts[1]].some(symbol => !alphabet.includes(symbol))) {
+      if (parts.length !== 3 || parts[0] !== 'ac1' || !isConnectCode(parts[1])) {
         throw grantError('The authorization code is not one this relay issued');
       }
       const clientId = params.get('client_id');
@@ -317,6 +386,7 @@ export async function handleToken(request, site, keys, env) {
         agent: approved.agent,
         clientName: approved.clientName,
         clientHost: approved.clientHost,
+        known: approved.known,
         scope: approved.scope,
       });
       return issueTokens(site, keys, {

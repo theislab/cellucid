@@ -15,6 +15,9 @@
  *        categories: [label, …],
  *        codes: {cells, values},                          // per cell, by original position
  *        sourcePages, overlapStrategy, overlapLabel, intersectionLabels, uncoveredLabel,
+ *        // intersectionLabels: {key: label} by combination of pages, the key
+ *        // its pages' positions in sourcePages joined by "+" ("0+2")
+ *        palette: ['#rrggbb', …]|null,                    // the colors its categories open with
  *        // a continuous field that holds its own values (no sourceField, not purged):
  *        values: {cells, values: Float32Array}            // NaN: no value
  *      }, …]}
@@ -39,10 +42,10 @@
  * every user field whose definition differs its definition (a new template
  * for a field the value adds), removes the fields it does not hold from the
  * registry and from every view's field list, and re-reads the overlays
- * (`applyFieldOverlays`). A view's own colours and hidden categories of a
+ * (`applyFieldOverlays`). A view's own colors and hidden categories of a
  * user category field whose categories changed are carried by label (only
- * what differed from the field's opening colours), so the `filters` and
- * `colors` values that name it stay what they were. Views that colour by or
+ * what differed from the field's opening colors), so the `filters` and
+ * `colors` values that name it stay what they were. Views that color by or
  * filter on a changed field are drawn again.
  *
  * @module app/state/domains/field-overlays
@@ -62,6 +65,8 @@ import { StateValidator } from '../../utils/state-validator.js';
 import { categoricalStorageForCodes, isCategoricalCodes } from '../../../data/categorical-storage-contract.js';
 import { checkCategoryState, withCategoryChanges } from '../../utils/category-state.js';
 import { getFieldRegistry } from '../../utils/field-registry.js';
+import { intersectionKey, parseIntersectionKey } from '../../utils/page-membership.js';
+import { HEX_COLOR, hexOfRgb01, rgb01OfHex } from '../../../utils/hex-color.js';
 
 /**
  * The value with its generated parts left out of a comparison
@@ -99,6 +104,11 @@ function captureUserField(field, identity) {
     item.overlapLabel = field._overlapLabel ?? null;
     item.intersectionLabels = structuredClone(field._intersectionLabels ?? null);
     item.uncoveredLabel = field._uncoveredLabel ?? null;
+    // The colors its categories open with, when the field has its own (a
+    // field made from highlight pages: its pages' colors).
+    item.palette = Array.isArray(field.palette) && field.palette.length === field.categories.length
+      ? field.palette.map(hexOfRgb01)
+      : null;
   } else if (field._sourceField === null) {
     if (!(field.values instanceof Float32Array)) {
       throw new Error(`The user field "${field.key}" is still being read; its state cannot be taken yet.`);
@@ -152,6 +162,7 @@ function newTemplate(item) {
     _overlapLabel: null,
     _intersectionLabels: null,
     _uncoveredLabel: null,
+    palette: null,
   };
 }
 
@@ -168,6 +179,30 @@ function requireColumn(column, ArrayType, context) {
   if (column.cells !== null && (!(column.cells instanceof Uint32Array) || column.cells.length !== column.values.length)) {
     throw new TypeError(`${context} must name one cell (by original position) per value.`);
   }
+}
+
+/**
+ * A user field's intersection labels, each keyed by its pages
+ * (`intersectionKey`), checked against its pages. A key of any other shape
+ * is refused: a value records one kind of key (an older session's steps
+ * replay through the action's own upgrade path, which names pages by name).
+ */
+function readIntersectionLabels(item) {
+  const labels = item.intersectionLabels;
+  if (labels === null) return null;
+  if (typeof labels !== 'object' || Array.isArray(labels)) {
+    throw new TypeError(`User field "${item.key}" to restore must give its intersection labels as a record.`);
+  }
+  const pageCount = Array.isArray(item.sourcePages) ? item.sourcePages.length : 0;
+  const read = {};
+  for (const [key, label] of Object.entries(labels)) {
+    try {
+      read[intersectionKey(parseIntersectionKey(key, pageCount))] = label;
+    } catch (error) {
+      throw new TypeError(`User field "${item.key}" to restore labels an intersection it cannot hold: ${error.message}.`);
+    }
+  }
+  return read;
 }
 
 /** Check one user field of a value (its shape; its arrays are checked as they are laid over the open cells). */
@@ -187,6 +222,10 @@ function requireUserFieldItem(item, index) {
   requireColumn(item.codes, null, `The codes of user field "${item.key}"`);
   if (!OVERLAP_STRATEGIES.includes(item.overlapStrategy)) {
     throw new TypeError(`User field "${item.key}" to restore names an unknown overlap strategy "${item.overlapStrategy}".`);
+  }
+  if (item.palette !== null && (!Array.isArray(item.palette) || item.palette.length !== item.categories.length
+    || item.palette.some(color => typeof color !== 'string' || !HEX_COLOR.test(color)))) {
+    throw new TypeError(`User field "${item.key}" to restore must give its palette as null or one #rrggbb color a category.`);
   }
 }
 
@@ -212,6 +251,7 @@ function prepareDefinition(state, template, item, identity) {
     if (item.kind === 'category') {
       Object.assign(definition, {
         categories: [], centroidsByLayout: new Map(), _normalizedLayouts: new Set(), _sourcePages: [], _intersectionLabels: null,
+        palette: null,
       });
     }
     return definition;
@@ -231,8 +271,9 @@ function prepareDefinition(state, template, item, identity) {
       _sourcePages: structuredClone(item.sourcePages),
       _overlapStrategy: item.overlapStrategy,
       _overlapLabel: item.overlapLabel,
-      _intersectionLabels: structuredClone(item.intersectionLabels),
+      _intersectionLabels: readIntersectionLabels(item),
       _uncoveredLabel: item.uncoveredLabel,
+      palette: item.palette === null ? null : item.palette.map(rgb01OfHex),
     });
   }
   if (item.values !== undefined) {
@@ -293,24 +334,23 @@ function prepareRestore(state, current, value) {
 const SHARED_DEFINITION = [
   'key', 'categories', 'codes', 'values', 'centroidsByLayout', 'loaded', '_normalizedLayouts',
   '_isDeleted', '_isPurged', '_sourceField', '_operation', '_sourcePages', '_overlapStrategy',
-  '_overlapLabel', '_intersectionLabels', '_uncoveredLabel', '_createdAt',
+  '_overlapLabel', '_intersectionLabels', '_uncoveredLabel', '_createdAt', 'palette',
 ];
-
-function channelsOfHex(hex) {
-  return [1, 3, 5].map(at => Number.parseInt(hex.slice(at, at + 2), 16) / 255);
-}
 
 /**
  * Give a field a definition's `properties`: a view's copy its template's, or
  * a template (which a view may show as itself) the definition put back.
- * When its categories change, what belonged to the categories it had goes,
- * and the colours and hidden categories it was given are carried by label:
- * what differed from the opening colours and visibility, as the `colors`
- * and `filters` domains name it.
+ * When its categories change, or the colors they open with (its own
+ * `palette`), what belonged to the categories it had goes, and the colors and
+ * hidden categories it was given are carried by label: what differed from the
+ * opening colors and visibility, as the `colors` and `filters` domains name it.
  */
 function adoptDefinition(copy, source, properties) {
-  const categoriesChange = (source.kind ?? copy.kind) === 'category' && Object.hasOwn(source, 'categories')
-    && copy.categories !== source.categories && !sameValue(copy.categories, source.categories);
+  const category = (source.kind ?? copy.kind) === 'category';
+  const categoriesChange = category && (
+    (Object.hasOwn(source, 'categories') && copy.categories !== source.categories && !sameValue(copy.categories, source.categories))
+    || (Object.hasOwn(source, 'palette') && !sameValue(copy.palette ?? null, source.palette ?? null))
+  );
   let carried = null;
   if (categoriesChange && Array.isArray(copy.categories)) {
     carried = { colors: captureFieldColors(copy, 'obs'), filter: captureFieldFilter(copy, 'obs') };
@@ -333,7 +373,7 @@ function adoptDefinition(copy, source, properties) {
   checkCategoryState(copy);
   withCategoryChanges(copy, {
     visibility: hidden.map(label => ({ index: place.get(label), visible: false })),
-    colors: colors.map(({ category, color }) => ({ index: place.get(category), rgb: channelsOfHex(color) })),
+    colors: colors.map(({ category, color }) => ({ index: place.get(category), rgb: rgb01OfHex(color) })),
   });
 }
 
@@ -438,7 +478,7 @@ export function createFieldOverlaysDomain({ state, viewer, refreshUi }) {
     state.applyFieldOverlays();
     getFieldRegistry().invalidate();
     rebindHighlightGroups(state, fieldsBefore);
-    // Draw again each view that colours by, or filters on, a changed field.
+    // Draw again each view that colors by, or filters on, a changed field.
     const uses = ids.map(id => {
       const owner = id === state.getActiveViewId() ? state : state.viewContexts.get(id);
       const fields = owner.obsData?.fields ?? [];

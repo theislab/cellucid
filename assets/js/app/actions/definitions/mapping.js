@@ -1,12 +1,14 @@
 /**
  * @fileoverview Actions on what is read and how: the data mapping (which
- * stored arrays are the embeddings, the genes, the neighbour graph, the
- * latent space and the vector fields), the cells open (a share of the
- * dataset), and how many of them genes are read for.
+ * stored arrays are the embeddings, the genes, the neighbor graph, the
+ * latent space and the vector fields), the expression values the genes are
+ * shown in (normalized, log1p), the cells open (a share of the dataset), and
+ * how many of them genes are read for.
  *
  * `mapping.set` names only the groups it changes, each by the mapping's own
  * value, so a step that switched the expression matrix replays as that on
- * another dataset. `log1p` is a list of `{matrix, base}` here (the mapping
+ * another dataset; the genes groups it does not name follow a named modality
+ * or matrix there (`followMappingChanges`), as the panel's menus do. `log1p` is a list of `{matrix, base}` here (the mapping
  * holds it keyed by matrix: `mappingChangesOf` / `mappingParamsOf` convert).
  *
  * @module app/actions/definitions/mapping
@@ -14,7 +16,10 @@
 
 import { defineAction } from '../catalog.js';
 import { formatCountOf } from '../../../utils/format-units.js';
-import { SUBSAMPLE_METHODS } from '../../../data/subsample.js';
+import { CELLS_TO_OPEN, cellsToOpenArguments, cellsToOpenWords } from './params.js';
+import { PLACES, placePath } from '../../ui/place-names.js';
+
+const EXPRESSION_PLACE = placePath(PLACES.dataMapping, PLACES.expressionValues);
 
 const EMBEDDING_REF = Object.freeze({
   type: 'object', additionalProperties: false, required: ['key', 'columns'],
@@ -43,7 +48,7 @@ export const MAPPING_GROUP_PARAMS = Object.freeze([
 
 const GROUP_WORDS = Object.freeze({
   embeddings: 'embeddings',
-  knn: 'neighbour graph',
+  knn: 'neighbor graph',
   modality: 'modality',
   gene_names: 'gene names',
   expression: 'expression',
@@ -88,11 +93,17 @@ export function mappingParamsOf(current, next) {
   return params;
 }
 
+/** The expression values a step asked for, as it names them ("normalized · log1p"). */
+function expressionWords(params) {
+  const words = [params.normalize === true ? 'normalized' : null, params.log1p === true ? 'log1p' : null].filter(Boolean);
+  return words.length === 0 ? 'as stored' : words.join(' · ');
+}
+
 export const mappingActions = Object.freeze([
   defineAction({
     type: 'mapping.set',
     title: 'Change the data mapping',
-    summary: 'Choose which stored arrays are the embeddings, neighbour graph, genes (modality, expression matrix, gene names, log1p, highly variable), latent space and vector fields; groups not named stay as they are. Applied as one change: refused, nothing changes.',
+    summary: 'Choose which stored arrays are the embeddings, neighbor graph, genes (modality, expression matrix, gene names, log1p, highly variable), latent space and vector fields; groups not named stay as they are, except the genes groups, which follow a named modality (its defaults) or expression matrix (a gene-name or highly variable column its var axis has is kept, else its default), as the panel does. Applied as one change: refused, nothing changes.',
     group: 'Data',
     params: {
       type: 'object', additionalProperties: false,
@@ -108,7 +119,7 @@ export const mappingActions = Object.freeze([
             },
           },
         },
-        knn: { ...NULLABLE_KEY, description: 'The obsp neighbour graph, or null for none.' },
+        knn: { ...NULLABLE_KEY, description: 'The obsp neighbor graph, or null for none.' },
         modality: { type: 'string', minLength: 1, description: 'The modality genes are read from (a dataset of several).' },
         gene_names: { type: 'string', minLength: 1, description: '"index", or "column:<var column>".' },
         expression: { type: ['string', 'null'], minLength: 1, description: '"X", "raw", "layer:<name>", or null for no genes.' },
@@ -130,7 +141,7 @@ export const mappingActions = Object.freeze([
         },
       },
     },
-    // A mapping change can close analysis windows, drop a gene's colouring,
+    // A mapping change can close analysis windows, drop a gene's coloring,
     // change what views show and reset their cameras.
     touches: ['mapping', 'views', 'active-field', 'filters', 'colors', 'camera', 'analysis'],
     reads: [],
@@ -148,39 +159,56 @@ export const mappingActions = Object.freeze([
     },
   }),
   defineAction({
+    type: 'expression.transform.set',
+    title: 'Set the expression values',
+    summary: `Show and analyze the genes normalized to 10,000 counts per cell and/or log1p (${EXPRESSION_PLACE}; scanpy normalize_total(target_sum=1e4) then log1p). One setting for coloring, legends, filters, the cell card, reads and every analysis (pseudobulk differential expression always sums raw counts). The person's setting: an agent changes it only when the person asks. Offered when the mapped matrix holds counts; normalizing reads each cell's total from an obs column, else sums every gene once (heavy on a large matrix: asked first).`,
+    group: 'Data',
+    // Version 2 spells the switch `normalize` (US, as every name of the
+    // catalog: F149); a version 1 step named it `normalise`.
+    version: 2,
+    upgrade: {
+      1: ({ normalise, ...params }) => (normalise === undefined ? params : { normalize: normalise, ...params }),
+    },
+    params: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        normalize: { type: 'boolean', description: 'Each cell\'s values scaled to 10,000 counts: x · 10,000 / the cell\'s total.' },
+        log1p: { type: 'boolean', description: 'ln(1 + x), after the normalization when both are on.' },
+      },
+    },
+    // Thresholds of a gene (its color range and filter) are in the old
+    // units: the views colored by a gene keep it and lose them.
+    touches: ['expression', 'filters', 'colors'],
+    reads: [],
+    effect: 'state',
+    describe: p => `Expression values: ${expressionWords(p)}`,
+    code: p => `set_expression_transform(${['normalize', 'log1p'].filter(key => Object.hasOwn(p, key)).map(key => `${key}=${p[key] ? 'True' : 'False'}`).join(', ')})`,
+  }),
+  defineAction({
     type: 'cells.open',
     title: 'Open a share of the cells',
-    summary: 'Read the dataset again with every cell, or with exactly `count` cells chosen by a subsample method; highlights, labels, views and filters are kept for the cells still open.',
+    summary: 'Read the dataset again with every cell, or with a subsample: an exact `count` of cells or a `fraction` of them, chosen by a subsample method; highlights, labels, views and filters are kept for the cells still open.',
     group: 'Data',
+    // Version 2 adds `fraction` beside `count`; a version 1 step named a count.
+    version: 2,
+    upgrade: { 1: params => params },
     params: {
       type: 'object', additionalProperties: false, required: ['mode'],
       properties: {
-        mode: { type: 'string', enum: ['all', 'subsample'] },
-        count: { type: 'integer', minimum: 1, description: 'Subsample: how many cells.' },
-        method: {
-          type: ['string', 'null'], enum: [...SUBSAMPLE_METHODS, null], default: null,
-          description: 'Subsample: how the cells are chosen; null for the file\'s default.',
-        },
-        seed: { type: ['integer', 'null'], minimum: 0, maximum: 0xffffffff, default: null, description: 'Subsample: its seed; null for the file\'s.' },
-        field: { type: 'string', minLength: 1, description: 'Stratified: the categorical column it is stratified by.' },
-        allocation: { type: 'string', enum: ['proportional', 'balanced'], default: 'proportional', description: 'Stratified: how the cells are split over the categories.' },
-        embedding: { type: 'string', minLength: 1, description: 'Spatial: the obsm embedding it thins.' },
+        mode: { type: 'string', enum: ['all', 'subsample'], description: 'all: every cell; subsample: the count or fraction given.' },
+        ...CELLS_TO_OPEN,
       },
     },
     // Reading the cells again carries what was made across by original cell
     // position: everything a cell can be named in.
-    touches: ['cells', 'mapping', 'field-overlays', 'gene-sets', 'views', 'active-field', 'filters', 'colors',
+    touches: ['cells', 'mapping', 'expression', 'field-overlays', 'gene-sets', 'views', 'active-field', 'filters', 'colors',
       'visibility', 'highlights', 'camera', 'settings', 'analysis'],
     reads: [],
     effect: 'state',
     // Another share chosen while what was shown is still coming back replaces it.
     supersede: true,
-    describe: p => (p.mode === 'all'
-      ? 'Opened every cell'
-      : `Opened ${formatCountOf(p.count, 'cell')}${p.method === null ? '' : ` (${p.method})`}`),
-    code: p => (p.mode === 'all'
-      ? 'open_cells("all")'
-      : `open_cells(${p.count}${p.method === null ? '' : `, method=${JSON.stringify(p.method)}`}${p.seed === null ? '' : `, seed=${p.seed}`})`),
+    describe: p => (p.mode === 'all' ? 'Opened every cell' : `Opened ${cellsToOpenWords(p)}`),
+    code: p => (p.mode === 'all' ? 'open_cells("all")' : `open_cells(${cellsToOpenArguments(p).join(', ')})`),
   }),
   defineAction({
     type: 'cells.read-genes',

@@ -73,7 +73,7 @@ import { isArrayNode, isGroup } from '../../formats/store.js';
 import { attributeValue, child, elementBytes, encodingType, valueKind } from './elements.js';
 import { readRowSlabs, readStored } from './values.js';
 import { readNullableValues } from './dataframe.js';
-import { compareCodePoints, defaultExpression, expressionRuleInputs } from '../data-mapping.js';
+import { bestGuessOrder, compareCodePoints, defaultExpression, expressionRuleInputs, vectorFieldKeys } from '../data-mapping.js';
 import { columnIndexResidentBytes, geneLayoutOf, readInWholeChunks, readsThroughRowIndex } from './matrix-access.js';
 import { CELL_WORKING_SET_BYTES, RESIDENCY_SHARES, memoryAllowanceBytes, residencyBudgetBytes } from '../memory-budget.js';
 import {
@@ -91,7 +91,7 @@ import {
 } from '../subsample.js';
 import { createCellIdentity } from '../cell-identity.js';
 import { readPriorityLayout } from './priority-layout.js';
-import { formatCountOf } from '../../utils/format-units.js';
+import { formatCountOf, formatPercent } from '../../utils/format-units.js';
 import { chunkMajorOrder, decodingRate } from './progressive-open.js';
 import { geneSampleRequestOf } from '../cell-subset-policy.js';
 import { allocateTypedArray } from '../sparse-column-index.js';
@@ -100,6 +100,17 @@ import { noteRunsOf } from './views/cell-subset.js';
 import { REMOTE_POLICY } from '../../formats/io/byte-source.js';
 import { loadedRoundTripMs } from '../../formats/io/link.js';
 import { measureOf } from '../../utils/machine.js';
+import { DataSourceErrorCode, explainedFailure } from '../data-source.js';
+
+/**
+ * A subsample this dataset cannot be read with (a field or an embedding it
+ * lacks, a column past its width): a refusal of the request, written for the
+ * person, and settled (asking again meets it again), never a fault of the
+ * link (`dataset-connections.js` `classifyDataSourceFailure`).
+ */
+function subsampleRefused(message) {
+  return explainedFailure(message, DataSourceErrorCode.UNSUPPORTED);
+}
 
 /** Chunks of the dominant cell-major array one block of `blocks` spans (see `defaultBlockSize`). */
 const BLOCK_CHUNKS = 4;
@@ -177,7 +188,7 @@ export async function defaultExpressionPath(root, { launch = null, read = null }
 /**
  * The expression matrix at `path` below `root` (`defaultExpressionPath`;
  * `X` by default) described for cost: its layout and stored values. `path`
- * may name the matrix node itself (a neighbour graph's rows are priced as a
+ * may name the matrix node itself (a neighbor graph's rows are priced as a
  * matrix's: `AnnDataReader._graphReadPlan`).
  */
 function matrixOf(root, nObs, path = 'X') {
@@ -206,7 +217,7 @@ function matrixLabel(path) {
 /**
  * The block size `blocks` uses unless given: a run of cells spanning about
  * `BLOCK_CHUNKS` chunks of the dominant cell-major array, so the chunk a
- * block shares with its neighbour at each end costs at most about a
+ * block shares with its neighbor at each end costs at most about a
  * `1 / BLOCK_CHUNKS` more. The dominant array is the expression matrix
  * genes are read from (`expression`, `defaultExpressionPath`: `X`, or
  * `raw.X` when the default rule reads raw) when it is cell-major (a CSR
@@ -304,8 +315,8 @@ export function cellReadLayout(root, nObs, expression = 'X') {
  * scattered method (`uniform`, `stratified`, `spatial`: a representative
  * sample lies throughout the file) are independent of the file's order, so
  * a stored chunk of `c` cells holds one of them with probability
- * `1 - (1 - fraction)^c` and is then read whole (a 1 % uniform share of a
- * file in chunks of 1,000 cells reads every chunk: 99.996 %); `blocks` keeps
+ * `1 - (1 - fraction)^c` and is then read whole (a 1% uniform share of a
+ * file in chunks of 1,000 cells reads every chunk: 99.996%); `blocks` keeps
  * runs of cells spanning whole chunks (`defaultBlockSize`) and `priority` a
  * priority-ordered file's first rows: about their share. An array read byte
  * by byte costs the share of its bytes whatever the method.
@@ -335,7 +346,7 @@ export function cellShareReadShare(layout, fraction, method) {
  * about 20 s. A response-time target for an explicit request whose progress
  * is shown, not a platform limit: people keep their attention on a task for
  * about 10 s without feedback (Nielsen 1993; Miller 1968) and wait about
- * twice that with a progress line; past it the read looks endless (a 20 %
+ * twice that with a progress line; past it the read looks endless (a 20%
  * share of a 2.3M-cell CSR file on a 1.2 MB/s link took 20-25 minutes). The
  * share is the person's to raise (the subsample control, Open all cells);
  * genes then take longer, as the notice says.
@@ -369,7 +380,7 @@ export const FIRST_GENE_SHARE = 1 / 2;
  * true again for later rows until a visit (it holds for a prefix of the
  * rows after each visit's last), and rows it rules out are passed over in
  * one binary search, not visited: `rowChunks` passes over the rows whose
- * elements lie in chunks already counted (a 50 % uniform share's first
+ * elements lie in chunks already counted (a 50% uniform share's first
  * gene priced at each step of the gene sample's fit visited 5M single-row
  * spans a step: 2 s of an opening over a 20 ms link).
  */
@@ -456,7 +467,7 @@ function runsWithout(outer, inner) {
  * ones the byte reader fetches with them rather than making another request
  * (the link's merge gap, `link.js` `mergeGapBytes`, in units): they cost
  * their bytes (counted in `chunks`, and in `gaps`: fetched, never decoded)
- * and no run, as a read of scattered rows fetches them (a 1 %
+ * and no run, as a read of scattered rows fetches them (a 1%
  * uniform share of a 10M-cell `.h5ad` over a 20 ms link: 1,365 rows priced
  * at 81 MB without them, read at 142 MB).
  */
@@ -564,7 +575,7 @@ async function storedBytesPerElement(array, readOptions) {
 /**
  * What the first gene of the expression matrix (`expression`: `X` unless
  * the default rule reads another; or a cell-major matrix node itself, as a
- * neighbour graph's rows are priced) read through its gene index costs for the
+ * neighbor graph's rows are priced) read through its gene index costs for the
  * cells an opening keeps, from the layout alone (no pointer is read): the
  * arrays the first gene reads -- a CSR matrix's pointers of the kept rows
  * and their indices, and their values unless they are read per gene by
@@ -692,7 +703,7 @@ export async function firstGeneReadCost(root, nObs, { valuesOnDemand, decodedChu
     let requests = 0;
     let fetched = 0;
     let keptEntries = 0;
-    const fetch = span => {
+    const ask = span => {
       const hits = span * byRange.perGene;
       const stretches = Math.max(1, Math.ceil(span * byRange.bytes / BYTE_READ_BLOCK_BYTES));
       requests += stretches * (1 - Math.exp(-hits / stretches));
@@ -703,7 +714,7 @@ export async function firstGeneReadCost(root, nObs, { valuesOnDemand, decodedChu
       const to = byRange.elementOf(lastRow + 1);
       if (to <= from) return;
       if (byRange.held === null) {
-        fetch(to - from);
+        ask(to - from);
         return;
       }
       // The span a stored chunk at a time: held stretches kept, the others fetched together.
@@ -712,7 +723,7 @@ export async function firstGeneReadCost(root, nObs, { valuesOnDemand, decodedChu
         const band = Math.floor(at / byRange.unitsPerBand);
         const end = Math.min(to, (band + 1) * byRange.unitsPerBand);
         if (byRange.held(band)) {
-          if (unheld > 0) fetch(unheld);
+          if (unheld > 0) ask(unheld);
           unheld = 0;
           keptEntries += (end - at) * byRange.perGene;
         } else {
@@ -720,7 +731,7 @@ export async function firstGeneReadCost(root, nObs, { valuesOnDemand, decodedChu
         }
         at = end;
       }
-      if (unheld > 0) fetch(unheld);
+      if (unheld > 0) ask(unheld);
     });
     return {
       bytes: fetched * byRange.bytes,
@@ -1187,7 +1198,7 @@ async function readCodes(root, field, readOptions) {
   // The column's parts load with it (`formats/store.js`, `Group.load`).
   await root.load([`obs/${field}`], readOptions);
   const column = child(child(root, 'obs'), field);
-  if (column === null) throw new Error(`A stratified subsample needs the obs field '${field}', which this dataset does not have`);
+  if (column === null) throw subsampleRefused(`A stratified subsample needs the obs field '${field}', which this dataset does not have.`);
   if (isGroup(column) && encodingType(column) === 'categorical') {
     const codesNode = column.get('codes');
     const categories = column.get('categories');
@@ -1204,7 +1215,7 @@ async function readCodes(root, field, readOptions) {
   } else if (isGroup(column) && encodingType(column) === 'nullable-string-array') {
     values = (await readNullableValues(column, field, 'nullable-string-array', 'AnnData', null, null, readOptions)).values;
   }
-  if (values === null) throw new Error(`A stratified subsample needs a categorical or text field; obs['${field}'] is neither`);
+  if (values === null) throw subsampleRefused(`A stratified subsample needs a categorical or text field; obs['${field}'] is neither.`);
   const present = new Set();
   for (const value of values) if (value !== null && value !== undefined) present.add(String(value));
   const categories = [...present].sort(compareCodePoints);
@@ -1217,11 +1228,11 @@ async function readCodes(root, field, readOptions) {
 /** Columns of an obsm embedding as row-major float32, read whole. */
 async function readEmbeddingColumns(root, key, columns, readOptions) {
   const array = child(child(root, 'obsm'), key);
-  if (!isArrayNode(array)) throw new Error(`A spatial subsample needs the embedding obsm['${key}'], which this dataset does not have as a dense array`);
-  if (!['float', 'int', 'uint'].includes(valueKind(array))) throw new Error(`obsm['${key}'] is not numeric`);
+  if (!isArrayNode(array)) throw subsampleRefused(`A spatial subsample needs the embedding obsm['${key}'], which this dataset does not have as a dense array.`);
+  if (!['float', 'int', 'uint'].includes(valueKind(array))) throw subsampleRefused(`A spatial subsample needs numeric coordinates; obsm['${key}'] is not numeric.`);
   const width = array.shape[1] ?? 1;
   for (const column of columns) {
-    if (column >= width) throw new Error(`obsm['${key}'] has no column ${column}`);
+    if (column >= width) throw subsampleRefused(`A spatial subsample reads column ${column} of obsm['${key}'], which has ${formatCountOf(width, 'column')}.`);
   }
   const n = array.shape[0];
   const out = allocateTypedArray(Float32Array, n * columns.length, `obsm['${key}']`);
@@ -1240,17 +1251,22 @@ async function readEmbeddingColumns(root, key, columns, readOptions) {
   return out;
 }
 
-/** The embedding a spatial subsample uses unless one is named: the first 2-D dense obsm array. */
+/** The embedding a spatial subsample uses unless one is named: the best-ranked usable array of two columns or more. */
 function defaultEmbedding(root, nObs) {
   const obsm = child(root, 'obsm');
   if (!isGroup(obsm)) return null;
   const keys = obsm.keys();
-  const preferred = ['X_umap', 'X_tsne', 'X_pca'].filter(key => keys.includes(key));
-  for (const key of [...preferred, ...keys]) {
+  // The one ranked order embeddings are chosen by (`bestGuessOrder`, as the
+  // data mapping's defaults): a dense numeric array of two columns or more,
+  // one row per cell, never a vector field drawn on another array.
+  const vectorKeys = vectorFieldKeys(keys);
+  const usable = keys.filter(key => {
+    if (vectorKeys.has(key)) return false;
     const node = obsm.get(key);
-    if (isArrayNode(node) && node.shape[0] === nObs && node.shape.length === 2 && node.shape[1] >= 2) return key;
-  }
-  return null;
+    return isArrayNode(node) && node.shape[0] === nObs && node.shape.length === 2 && node.shape[1] >= 2
+      && ['float', 'int', 'uint'].includes(valueKind(node));
+  });
+  return bestGuessOrder(usable)[0] ?? null;
 }
 
 /**
@@ -1273,7 +1289,7 @@ function specOf(request, root, nObs, expression = 'X') {
   if (k < FEWEST_OPEN_CELLS) {
     const share = request.k !== undefined && request.k !== null
       ? formatCountOf(k, 'cell')
-      : `${request.percent !== undefined && request.percent !== null ? `${request.percent}%` : String(request.fraction)} of ${formatCountOf(nObs, 'cell')} (${formatCountOf(k, 'cell')})`;
+      : `${request.percent !== undefined && request.percent !== null ? formatPercent(Number(request.percent), { figures: 6 }) : String(request.fraction)} of ${formatCountOf(nObs, 'cell')} (${formatCountOf(k, 'cell')})`;
     throw new RangeError(`A subsample of ${share} cannot open: ${FEWEST_OPEN_CELLS_REASON}, so at least ${formatCountOf(FEWEST_OPEN_CELLS, 'cell')} open.`);
   }
   const spec = { method, nObs, k, seed: request.seed ?? DEFAULT_SUBSAMPLE_SEED };
@@ -1288,7 +1304,7 @@ function specOf(request, root, nObs, expression = 'X') {
   }
   if (method === 'spatial') {
     const embedding = request.embedding ?? defaultEmbedding(root, nObs);
-    if (embedding === null) throw new Error('A spatial subsample needs an embedding, and this dataset has no two-dimensional one');
+    if (embedding === null) throw subsampleRefused('A spatial subsample needs an embedding, and this dataset has no two-dimensional one.');
     spec.embedding = embedding;
     spec.columns = request.columns ?? [0, 1];
     spec.gridSize = request.gridSize ?? DEFAULT_GRID_SIZE;
@@ -1455,7 +1471,7 @@ export async function resolveCellSubset(root, request, context) {
  * more where its cells reach past every cell's blocks; the sample is held
  * to the whole by the `wholeSampleCost` ceiling). In its
  * own priority order each of its first cells lay in a chunk of its own: a
- * 1 % uniform share of a 10M-cell CSR `.h5ad` over an emulated S3 link
+ * 1% uniform share of a 10M-cell CSR `.h5ad` over an emulated S3 link
  * fitted 71 cells in 10.7 s where every cell's sample read 1,572,326 in
  * 5.5 s. Its cells are exactly as asked (sessions, links and Python's and
  * R's `subsample_cells` give the same set); only their order differs, and
@@ -1713,9 +1729,9 @@ export function orderPays({ neededMs, sampleMs }, orderMs) {
  * cell's first gene fits that time (a share's rows are among every cell's:
  * it reads no more). What a share's gene sample may make at most
  * (`geneSampleOf`): a share never costs more than the whole. Measured: a
- * 1 % uniform share of a 10M-cell CSR `.h5ad` fitted to the same time read
+ * 1% uniform share of a 10M-cell CSR `.h5ad` fitted to the same time read
  * 165-172 MB for its first gene, every cell's sample 150 MB; in the file's
- * cell order a 1 % share of Tabula Sapiens (CELLxGENE, S3) read 3.4 MB in
+ * cell order a 1% share of Tabula Sapiens (CELLxGENE, S3) read 3.4 MB in
  * 434 requests for 83 cells where every cell's sample made 351 (its cells
  * reach past every cell's blocks while its bytes are fewer). The page's
  * top-up holds a share's sample to it too, at the whole gene time over the
@@ -1874,7 +1890,7 @@ export function prefixRowsOf(fileRows, nFile, cellOrder = null, cache = createSu
   // back word by word (a word holds 32 rows), or, for cells fewer than
   // those words, by sorting them. The fit's two dozen counts each passed
   // over every open cell in row order before, reading their rows out of
-  // sequence (a 50 % uniform share of 10M cells: 0.47 s of its opening).
+  // sequence (a 50% uniform share of 10M cells: 0.47 s of its opening).
   let words = null;
   return (k, from = 0) => {
     const count = Math.max(0, k - from);
@@ -2150,7 +2166,7 @@ async function resolveInOriginalSpace(root, request, nObs, priority, fileOrder, 
     if (memory === null) return all;
     // Whole blocks aligned to the storage: the cells left out are never
     // read. A uniform subsample's cells lie in most chunks of a row-chunked
-    // array (HLCA, 5 cells a chunk: 10 % of the cells touch 45 % of X's
+    // array (HLCA, 5 cells a chunk: 10% of the cells touch 45% of X's
     // chunks), so its genes would read most of the matrix.
     // A priority-ordered file: uniform under its seed, a prefix of every array.
     const spec = requireSubsampleSpec(priority !== null
@@ -2212,7 +2228,7 @@ async function resolveInOriginalSpace(root, request, nObs, priority, fileOrder, 
       reproduced = false;
     }
     // The same cells opened again (a page restored from the back/forward
-    // cache, a cancelled reading undone) keep what they were: fitted to the
+    // cache, a canceled reading undone) keep what they were: fitted to the
     // device, or not reproducible by their specification.
     if (request.reproduced === false) reproduced = false;
     // Cells their specification gives again are its selection (`again`, the

@@ -23,7 +23,7 @@
  *   bound, not for equality: no more than one lit pixel in a thousand may
  *   differ (`pixelParityVerdict`, `lod-rank-order-resize`,
  *   `segmented-point-stores`). The bound still fails on what moves whole
- *   points: a wrong order, colour or camera, cells missing or drawn twice.
+ *   points: a wrong order, color or camera, cells missing or drawn twice.
  *   A context the browser restores holds every store and texture in a new
  *   GPU object (`graphics-context-restore`), and is compared so too.
  *   It cannot show a difference of fewer pixels than that which only this

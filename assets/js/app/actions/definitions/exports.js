@@ -60,7 +60,7 @@ export const exportActions = Object.freeze([
   defineAction({
     type: 'figure.export',
     title: 'Export the figure',
-    summary: 'Write the figure of the view shown (every view in a grid when the settings say so) as its Download button does, with the figure export\'s settings as they are (figure_export_set changes them: format, size, labels, legend, style): one SVG or PNG file, or several in one ZIP archive. Refused, saying why, when the figure cannot reproduce what the view shows (a render mode other than points, an overlay it cannot draw).',
+    summary: 'Write the figure of the view shown (every view in a grid when the settings say so) as its Download button does, with the figure export\'s settings as they are (figure_export_set changes them: format, size, labels, legend, style): one SVG or PNG file, or several in one ZIP archive (view.picture with source "export" shows that figure first, nothing written). Refused, saying why, when the figure cannot reproduce what the view shows (a render mode other than points, an overlay it cannot draw).',
     group: GROUP,
     params: { type: 'object', additionalProperties: false, properties: {} },
     reads: [],

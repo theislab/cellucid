@@ -13,12 +13,16 @@
  * so a panel's badge means the same thing as the single-view badge.
  *
  * The geometry lives here too, so the SVG rectangle and the Canvas rectangle
- * are the same rectangle.
+ * are the same rectangle, and so do the two drawers of it
+ * (`renderSvgSelectionBadge`, `drawCanvasSelectionBadge`), which the PNG, the
+ * SVG and the export preview all call: the SVG drew rounded corners the PNG
+ * did not, and the preview computed its own rectangle (F158).
  *
  * @module ui/modules/figure-export/utils/selection-badge
  */
 
 import { formatCount } from '../../../../../utils/format-units.js';
+import { escapeXml } from '../../../../utils/dom-utils.js';
 import {
   MIN_VISIBLE_ALPHA_BYTE,
   POINT_VISIBILITY_THRESHOLD,
@@ -120,4 +124,48 @@ export function buildSelectionBadge({ count, plotRect, fontSizePx }) {
     textX: x + BADGE_PADDING,
     textY: y + height - BADGE_PADDING,
   };
+}
+
+/**
+ * The badge as SVG markup.
+ *
+ * @param {NonNullable<ReturnType<typeof buildSelectionBadge>>} badge
+ * @param {string} fontFamily
+ * @param {number} fontSize
+ * @param {import('./figure-ink.js').FigureInk} ink
+ * @returns {string}
+ */
+export function renderSvgSelectionBadge(badge, fontFamily, fontSize, ink) {
+  return (
+    `<g font-family="${escapeXml(fontFamily)}" font-size="${fontSize}" fill="${ink.surfaceInk}">` +
+    `<rect x="${badge.x}" y="${badge.y}" width="${badge.width}" height="${badge.height}" fill="${ink.surface}" fill-opacity="0.85" stroke="${ink.frame}" stroke-width="1"/>` +
+    `<text x="${badge.textX}" y="${badge.textY}" stroke="none">${escapeXml(badge.label)}</text>` +
+    `</g>`
+  );
+}
+
+/**
+ * The badge drawn on a Canvas2D context, as `renderSvgSelectionBadge` writes it.
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {NonNullable<ReturnType<typeof buildSelectionBadge>>} badge
+ * @param {string} fontFamily
+ * @param {number} fontSize
+ * @param {import('./figure-ink.js').FigureInk} ink
+ */
+export function drawCanvasSelectionBadge(ctx, badge, fontFamily, fontSize, ink) {
+  ctx.save();
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = ink.surface;
+  ctx.fillRect(badge.x, badge.y, badge.width, badge.height);
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = ink.frame;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(badge.x, badge.y, badge.width, badge.height);
+  ctx.fillStyle = ink.surfaceInk;
+  ctx.font = `${fontSize}px ${fontFamily}`;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(badge.label, badge.textX, badge.textY);
+  ctx.restore();
 }

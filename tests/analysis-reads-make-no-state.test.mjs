@@ -6,7 +6,8 @@
  * F1's live sweep: undo of a turn left `analysis` changed after
  * `analysis.<mode>.get`). This guard holds the class shut in the sources:
  *
- * - no provider of a read (effect `read`) in `app/analysis/actions.js`, and
+ * - no provider of a read (effect `read`) or of a stop (effect `control`,
+ *   `analysis.cancel`: no step either) in `app/analysis/actions.js`, and
  *   no estimate, reaches `analysisAt` (which makes a mode for a change) or
  *   makes a mode itself; they read through `readAnalysisAt`
  *   (`ComparisonModule.readPanelUI`, which unmakes what it made, in the same
@@ -44,7 +45,7 @@ function providers(text) {
   return out;
 }
 
-/** The catalogue types a provider's type (a template over the modes) stands for. */
+/** The catalog types a provider's type (a template over the modes) stands for. */
 function typesOf(type) {
   if (!type.includes('${mode.name}')) return [type];
   return ANALYSIS_MODES.filter(mode => mode.options !== null).map(mode => type.replace('${mode.name}', mode.name));
@@ -54,7 +55,7 @@ test('no read of the analyses, and no estimate, reaches what makes a mode', () =
   const catalog = createActionCatalog(ACTION_DEFINITIONS);
   const found = providers(source('actions.js'));
   assert.ok(found.length > 10, 'the providers are found');
-  const reads = found.filter(({ kind, type }) => kind === 'provideEstimate' || typesOf(type).every(t => catalog.get(t).effect === 'read'));
+  const reads = found.filter(({ kind, type }) => kind === 'provideEstimate' || typesOf(type).every(t => ['read', 'control'].includes(catalog.get(t).effect)));
   assert.deepEqual(
     [...new Set(reads.map(({ kind, type }) => `${kind}:${type}`))].sort(),
     ['provide:analysis.${mode.name}.get', 'provide:analysis.cancel', 'provide:analysis.list', 'provide:analysis.result', 'provideEstimate:analysis.run'].sort(),

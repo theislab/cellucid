@@ -1,6 +1,6 @@
 /**
  * A categorical field whose cells hold codes above 65,535 behaves exactly like
- * any other through every consumer: colour, legend filter, Alt+click
+ * any other through every consumer: color, legend filter, Alt+click
  * selection and highlight, a kept second view, figure export, and a session
  * round trip. Codes are placed so that any 16-bit truncation (code mod
  * 65,536) lands one category on another and fails an exact assertion:
@@ -16,6 +16,7 @@ import { openCollapsedPanels } from './helpers/panels.mjs';
 import { chooseFiles } from './helpers/file-input.mjs';
 import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mjs';
 import { armSelection } from './helpers/selection-gesture.mjs';
+import { chooseCategoricalField } from './helpers/dataset-ready.mjs';
 
 // `scripts/generate-browser-catalog-fixtures.py`: the current-ui cells, whose
 // cell_type cycles alpha, beta, gamma, with a 70,000-category inventory.
@@ -80,15 +81,15 @@ function readView(page, viewId) {
   }, viewId);
 }
 
-/** One colour per label, every cell of a label in it, no two labels sharing. */
-function expectColoursFollowLabels(view, codes) {
-  const colourByCode = new Map();
+/** One color per label, every cell of a label in it, no two labels sharing. */
+function expectColorsFollowLabels(view, codes) {
+  const colorByCode = new Map();
   for (let cell = 0; cell < codes.length; cell++) {
     const code = codes[cell];
-    if (!colourByCode.has(code)) colourByCode.set(code, view.rgb[cell]);
-    expect(view.rgb[cell], `cell ${cell} (code ${code})`).toBe(colourByCode.get(code));
+    if (!colorByCode.has(code)) colorByCode.set(code, view.rgb[cell]);
+    expect(view.rgb[cell], `cell ${cell} (code ${code})`).toBe(colorByCode.get(code));
   }
-  expect(new Set(colourByCode.values()).size).toBe(colourByCode.size);
+  expect(new Set(colorByCode.values()).size).toBe(colorByCode.size);
 }
 
 function legendRow(page, label) {
@@ -98,14 +99,21 @@ function legendRow(page, label) {
 }
 
 /**
- * The legend lists categories by label, so alpha, beta and gamma are its first
- * rows whatever their codes; scroll it to the top, where they are built.
+ * The legend lists categories in the field's own order (F124), so a label's
+ * row is its code's: alpha is row 65,536 of 70,000. The virtual list builds
+ * only the rows in view; scroll it to the label's row so it is built.
  */
-async function scrollLegendToTop(page) {
-  await page.locator('.legend-items-container.legend-items-virtual').evaluate(list => {
-    list.scrollTop = 0;
+async function scrollLegendToCategory(page, label) {
+  await page.locator('.legend-items-container.legend-items-virtual').evaluate((list, index) => {
+    const row = list.querySelector('.legend-item');
+    const pitch = row.nextElementSibling.offsetTop - row.offsetTop;
+    // A list a later draw replaced is detached: its rows have no pitch, and a
+    // scroll given to it does nothing. Said here, not five minutes later as a
+    // row that never comes.
+    if (!list.isConnected || !(pitch > 0)) throw new Error(`The legend list was replaced before it was scrolled (connected: ${list.isConnected}, row pitch: ${pitch}).`);
+    list.scrollTop = index * pitch;
     list.dispatchEvent(new Event('scroll'));
-  });
+  }, PLACEMENT[label]);
 }
 
 async function findCellPoint(page, cellIndices) {
@@ -144,7 +152,7 @@ function highlightedCells(page) {
   });
 }
 
-test('codes above 65,535 keep their category through colour, filter, selection, views, export and sessions', async ({ page }, testInfo) => {
+test('codes above 65,535 keep their category through color, filter, selection, views, export and sessions', async ({ page }, testInfo) => {
   test.setTimeout(300_000);
   const codes = fixtureCodes();
   const cellsOf = label => codes.flatMap((code, cell) => (code === PLACEMENT[label] ? [cell] : []));
@@ -155,20 +163,20 @@ test('codes above 65,535 keep their category through colour, filter, selection, 
   const errors = observeProductErrors(page);
 
   await openFixture(page);
-  await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
+  await chooseCategoricalField(page, 'uint32 categories', 'cell_type');
   await expect(page.locator('.legend-items-container.legend-items-virtual')).toBeVisible();
 
-  // Colour: the field keeps its uint32 codes exactly, and every label paints
-  // its own colour.
+  // Color: the field keeps its uint32 codes exactly, and every label paints
+  // its own color.
   let live = await readView(page, 'live');
   expect(live.key).toBe('cell_type');
   expect(live.codesType).toBe('Uint32Array');
   expect(live.codes).toEqual(codes);
-  expectColoursFollowLabels(live, codes);
+  expectColorsFollowLabels(live, codes);
 
   // Filter: hiding alpha (code 65,536) hides exactly its 40 cells, and gamma
   // (code 0, where a truncated 65,536 would land) stays.
-  await scrollLegendToTop(page);
+  await scrollLegendToCategory(page, 'alpha');
   await legendRow(page, 'alpha').locator('.legend-checkbox').uncheck();
   await expect(page.locator('#filter-count')).toHaveText('Showing 80 of 120 cells');
   live = await readView(page, 'live');
@@ -185,7 +193,7 @@ test('codes above 65,535 keep their category through colour, filter, selection, 
   await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
   await expect.poll(() => highlightedCells(page)).toEqual(betaCells);
 
-  // A kept second view shows the same field with the same codes and colours.
+  // A kept second view shows the same field with the same codes and colors.
   await page.locator('#split-keep-view-btn').click();
   await expect(page.locator('.split-badge')).toHaveCount(2);
   const keptId = await page.evaluate(() => window._cellucidState.activeViewId);
@@ -196,8 +204,8 @@ test('codes above 65,535 keep their category through colour, filter, selection, 
   expect(kept.rgb).toEqual(live.rgb);
   expect(kept.transparency).toEqual(live.transparency);
 
-  // Figure export: the SVG carries the visible cells in their own colours,
-  // and no alpha (hidden) colour.
+  // Figure export: the SVG carries the visible cells in their own colors,
+  // and no alpha (hidden) color.
   await page.locator('#figure-export-section > summary').click();
   await page.getByRole('button', { name: /^Download\b/ }).click();
   await page.getByLabel('Download format').selectOption('svg');
@@ -232,7 +240,7 @@ test('codes above 65,535 keep their category through colour, filter, selection, 
   expect(restored.codesType).toBe('Uint32Array');
   expect(restored.codes).toEqual(codes);
   expect(restored.transparency).toEqual(live.transparency);
-  expectColoursFollowLabels(restored, codes);
+  expectColorsFollowLabels(restored, codes);
 
   expect(errors).toEqual([]);
 });

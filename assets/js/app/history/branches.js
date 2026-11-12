@@ -280,7 +280,9 @@ export function extendGroup(tracker, edit, group, toId) {
   const members = groupSteps(tracker, group.id);
   const last = members[members.length - 1];
   const to = stepNamed(tracker, toId);
-  if (to.branch !== last.branch || !isOnPath(tracker, last.id, to.id) || to.id === last.id) {
+  // A step it holds already (its last one, one before, or a later step of a turn of it, which joined it).
+  if (to.group === group.id) throw refuse(HISTORY_SENTENCES.alreadyInGroup({ step: to.id, name: group.name }), 'already-in-group');
+  if (to.branch !== last.branch || !isOnPath(tracker, last.id, to.id)) {
     throw refuse(HISTORY_SENTENCES.notConsecutive({ from: members[0].id, to: toId }), 'not-consecutive');
   }
   const added = runOf(tracker, members[0].id, toId).slice(members.length);

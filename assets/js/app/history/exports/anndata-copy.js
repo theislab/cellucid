@@ -16,8 +16,10 @@
  *   fields (recorded, never applied), then user-defined fields (a column
  *   each, by its key); `gene-sets`: one row per set; `highlights`: one
  *   column per group of every page (`cellucid_highlight__<page>__<group>`);
- *   every other domain whose value at the step differs from the tracker's
- *   opening is one `presentation` row, not applied.
+ *   `colors`: one `column-colors` row per dataset column the view in focus
+ *   recolored categories of (in the `colors` value's order), then the
+ *   domain's `presentation` row; every other domain whose value at the step
+ *   differs from the tracker's opening is one `presentation` row, not applied.
  * - **Statuses**: `write` (the dataset lacks it); `unchanged` (it holds it
  *   already: a copy of a copy applies nothing twice); `replace` (a column or
  *   gene set an earlier apply wrote, with `overwrite`); `not-applied` with
@@ -29,7 +31,11 @@
  *   boolean), never "not selected".
  * - **Provenance**: one record appended to `uns['cellucid']['history_applied']`
  *   (JSON text of the model's `Provenance`, `package: 'web'`) when anything
- *   is written. Gene sets go to `uns['cellucid']['gene_sets']` by name, as
+ *   is written. It records the step's expression values (`expression`: the
+ *   `expression` value, `{normalize, log1p}`, null when the session holds
+ *   none), so a notebook knows what the person looked at the genes in; X is
+ *   never changed (the transform is a way of showing the values, a
+ *   `presentation` row like the others). Gene sets go to `uns['cellucid']['gene_sets']` by name, as
  *   the packages write them (origin `session`, `pulled_from: 'viewer'`), and,
  *   one boolean column each, to the var of the genes the data mapping reads
  *   (`geneSetColumns`: `cellucid_gene_set__<name>`, the highlight columns'
@@ -42,6 +48,29 @@
  *   only. A set the step no longer holds has no row (as a field the step
  *   lacks): its record and its column stay. cellucid-python and cellucid-r
  *   write the same columns (`expected.apply.sequence[].var_columns`).
+ * - **Colors**: a column's colors go with it, as Scanpy keeps them
+ *   (`uns['<column>_colors']`, `colorChanges`): a categorical user field
+ *   written with the colors it is shown in (`shownCategoryColors`): in the
+ *   view in focus at the step, the color the person or an agent gave a
+ *   category (the `colors` value), else the color it opens with -- its
+ *   `palette` (a field made from highlight pages: its pages'), else
+ *   Cellucid's own category colors by position (`getCategoryColor`); any
+ *   other column written with none (the colors under its name described
+ *   another column); a renamed column's carried along; a relabeled
+ *   categorical's kept, a merged category taking its first category's color.
+ *   A dataset column recolored in the view in focus (`planColumnColors`)
+ *   takes the colors it is shown in, under its name after the apply's
+ *   renames: each category, by its label once relabeled, the color the person
+ *   or an agent gave it, else the color it opens with -- the colors Scanpy
+ *   keeps for the column (`openingPalette`, as drawn; a category merged by
+ *   the apply takes its first source's), else Cellucid's own by position.
+ *   Its row is `write`, `unchanged` (the column would hold those colors after
+ *   the apply's other changes) or `not-applied` with the reason (a column the
+ *   dataset lacks, a MuData modality's, one not categorical, or none of the
+ *   categories recolored). The `colors` presentation row stays `not-applied`
+ *   (every other color is how the data was shown), its note saying so when a
+ *   field's recolors were written or any `column-colors` row is not
+ *   `not-applied` (`COLORS_NOTE`).
  *
  * What the browser checks that the packages check differently: nothing of
  * the fingerprint (the copy is made of the dataset the history was recorded
@@ -53,12 +82,20 @@
 import { DOMAIN_IDS, domainName } from '../../actions/domains.js';
 import { liveTracker, valuesAt, stepOf, pathTo } from '../tree.js';
 import { nameKey, validateRecord } from '../model.js';
-import { formatCountOf } from '../../../utils/format-units.js';
+import { countNoun, formatCountOf } from '../../../utils/format-units.js';
+import { requireExpressionTransform } from '../../../data/expression-transform.js';
+import { getCategoryColor } from '../../../data/palettes.js';
+import { HEX_COLOR, bytesOfHex, hexOfBytes, hexOfRgb01 } from '../../../utils/hex-color.js';
 
 /** The domains an apply writes; every other domain is presentation. */
 export const DATA_DOMAINS = Object.freeze(['cells', 'field-overlays', 'gene-sets', 'highlights']);
 /** Why a presentation domain is not applied (the packages' words). */
 export const PRESENTATION_NOTE = 'Presentation: not applied to the object.';
+/** The colors row's note when a field's colors went with its column (the packages' words). */
+export const COLORS_NOTE = 'The colors of the user fields written and of the dataset columns recolored go with their columns '
+  + "(uns['<column>_colors']); every other color is how the data was shown: not applied to the object.";
+/** The plan row of a dataset column's colors. */
+export const COLUMN_COLORS_KIND = 'column-colors';
 /** The start of every highlight group's obs column (as `pull` and the packages name it). */
 export const HIGHLIGHT_PREFIX = 'cellucid_highlight__';
 /** The start of every gene set's var column. */
@@ -82,6 +119,10 @@ const numbersNote = column => `The obs column "${column}" holds numbers, not cat
 const noCategoryNote = (column, category) => `The obs column "${column}" has no category "${labelText(category)}".`;
 const ownedNote = (name, step) => `An earlier apply (step ${step}) wrote "${name}" with other values; overwrite replaces it.`;
 const takenSetNote = name => `The object already has a gene set "${name}" that no session wrote; it is never replaced.`;
+const modalityColorsNote = column => `"${column}" is a column of a MuData modality; colors apply to the global obs.`;
+const notCategoricalColorsNote = column => `The obs column "${column}" is not categorical; Scanpy keeps colors for a categorical column only.`;
+const missingCategoriesNote = (column, labels) => `Not written: the ${countNoun(labels.length, 'color')} of ${labels.map(label => `"${label}"`).join(', ')}, `
+  + `which the obs column "${column}" does not have.`;
 
 // ---------------------------------------------------------------------------
 // Names and labels
@@ -166,7 +207,7 @@ export function chooseStep(trackers, { activeTracker = null, tracker = null, bra
 
 /**
  * The dataset fields a step's state uses: every obs column and gene a view
- * colours by or filters on, or a highlight group is bound to, by the key
+ * colors by or filters on, or a highlight group is bound to, by the key
  * the dataset gives it (fields the session made are not listed).
  */
 export function requiredFields(valueOf) {
@@ -297,7 +338,11 @@ function countOf(column, category) {
   return count;
 }
 
-/** A categorical with categories renamed (merged where two read alike), as a copy writes it. */
+/**
+ * A categorical with categories renamed (merged where two read alike, in the
+ * place of the first), as a copy writes it, and for each category after the
+ * place of the first category before it was made from (its colors follow it).
+ */
 function renamedCategorical(column, renames) {
   const labels = [...column.categories];
   for (const [category, name] of renames) {
@@ -305,6 +350,7 @@ function renamedCategorical(column, renames) {
     column.categories.forEach((value, index) => { if (identity(value) === id) labels[index] = name; });
   }
   const merged = [];
+  const sources = [];
   const position = new Map();
   const remap = new Int32Array(labels.length);
   labels.forEach((label, index) => {
@@ -312,12 +358,14 @@ function renamedCategorical(column, renames) {
     if (!position.has(id)) {
       position.set(id, merged.length);
       merged.push(label);
+      sources.push(index);
     }
     remap[index] = position.get(id);
   });
   const codes = codeArray(merged.length, column.codes.length);
   for (let i = 0; i < codes.length; i++) codes[i] = column.codes[i] < 0 ? -1 : remap[column.codes[i]];
-  return { kind: 'categorical', codes, categories: merged.map(labelText), ordered: column.ordered === true };
+  // `labels`: the categories after as labels (a number stays one), as the viewer shows them.
+  return { column: { kind: 'categorical', codes, categories: merged.map(labelText), ordered: column.ordered === true }, sources, labels: merged };
 }
 
 /** A text column with the values each rename names replaced. */
@@ -425,18 +473,273 @@ async function planLabels(overlays, target, earlier) {
     }
   }
   const replaced = new Map();
+  // Each relabeled categorical's count of categories before, its first
+  // category before a category after, and its categories after as labels
+  // (a text column has none).
+  const relabels = new Map();
   for (const [name, { column, renames }] of byColumn) {
-    replaced.set(name, column.kind === 'categorical' ? renamedCategorical(column, renames) : renamedText(column, renames));
+    if (column.kind === 'categorical') {
+      const made = renamedCategorical(column, renames);
+      replaced.set(name, made.column);
+      relabels.set(name, { before: column.categories.length, sources: made.sources, categories: made.labels });
+    } else {
+      replaced.set(name, renamedText(column, renames));
+    }
   }
   for (const entry of overlays.deletedFields) rows.push(labelRow('field-deleted', entry.key, 'not-applied', { note: DELETION_NOTE }));
-  return { rows, rename, replaced, renamed };
+  return { rows, rename, replaced, relabels, renamed };
+}
+
+/**
+ * Its colors go with a column, as Scanpy keeps them (`uns['<column>_colors']`),
+ * by one rule, the same in cellucid-python (`anndata_session/_columns.py`
+ * `write_columns`) and cellucid-r (`R/round-trip.R` `.colors_state`):
+ *
+ * - a column written (added or replaced) has the colors it is shown in (a
+ *   categorical user field's: `shownCategoryColors`), and none otherwise:
+ *   colors held under its name described another column;
+ * - a column renamed takes its colors along when they are Scanpy's form, a
+ *   list of text (colors of another form are removed: they cannot be carried);
+ * - a categorical column relabeled in place keeps its colors when no
+ *   categories merged; when some did, each category keeps the color of the
+ *   first one it was made from (it takes that one's place), and colors that
+ *   are not a list of text with one a category before are removed; a text
+ *   column relabeled loses its colors (Scanpy colors a text column by its
+ *   sorted labels, which a rename reorders);
+ * - a dataset column the session recolored (`recolor`) takes the colors it
+ *   is shown in (`planColumnColors`), after its renames.
+ *
+ * A column left as it is keeps its colors. The `uns` changes a copy writes
+ * (`CopyChanges.uns`): each key to its colors, or null to remove one the
+ * dataset holds.
+ *
+ * @param {CopyTarget} target
+ * @param {{replaced: Map, relabels: Map, rename: Map}} labels - `planLabels`'
+ * @param {Array<{name: string, colors: string[]|null}>} written - The columns written or replaced
+ * @param {Map<string, string[]>} [recolor] - The dataset columns recolored, by their name after the renames
+ * @returns {Promise<Record<string, string[]|null>>}
+ */
+async function colorChanges(target, labels, written, recolor = new Map()) {
+  const changed = await nextColors(target, labels, written, recolor);
+  const held = new Set(target.unsKeys);
+  const uns = {};
+  for (const [column, colors] of changed) {
+    const key = `${column}_colors`;
+    if (colors !== null) uns[key] = colors;
+    else if (held.has(key)) uns[key] = null;
+  }
+  return uns;
+}
+
+/** A column's colors the dataset holds (`uns['<column>_colors']` as text), or null. */
+async function heldColors(target, column) {
+  if (!Array.isArray(target.unsKeys)) throw new TypeError('A copy target names its uns keys (unsKeys).');
+  return target.unsKeys.includes(`${column}_colors`) ? target.colors(column) : null;
+}
+
+/** The colors `colorChanges` leaves, by column: each column whose colors change, to its colors or null (none). */
+async function nextColors(target, labels, written, recolor) {
+  const changed = new Map();
+  const colorsOf = async column => (changed.has(column) ? changed.get(column) : heldColors(target, column));
+  for (const name of labels.replaced.keys()) {
+    const relabel = labels.relabels.get(name);
+    if (relabel === undefined) {
+      changed.set(name, null);
+      continue;
+    }
+    if (relabel.sources.length === relabel.before) continue;
+    const colors = await colorsOf(name);
+    changed.set(name, colors === null || colors.length < relabel.before ? null : relabel.sources.map(at => colors[at]));
+  }
+  const moved = new Map();
+  for (const old of labels.rename.keys()) moved.set(old, await colorsOf(old));
+  for (const old of labels.rename.keys()) changed.set(old, null);
+  for (const [old, name] of labels.rename) changed.set(name, moved.get(old));
+  for (const [name, colors] of recolor) changed.set(name, [...colors]);
+  for (const { name, colors } of written) changed.set(name, colors === null ? null : [...colors]);
+  return changed;
+}
+
+// ---------------------------------------------------------------------------
+// A dataset column the session recolored
+
+/**
+ * The colors the `count` categories of a dataset column open with in the
+ * viewer from the colors Scanpy keeps for it (`held`, `uns['<column>_colors']`
+ * as text): the first `count`, as drawn (`#rrggbb` in lowercase: `#rgb`
+ * widened, the alpha of `#rrggbbaa` dropped), when there are that many and
+ * each is a hex color `bytesOfHex` reads (`palettes.js`
+ * `scanpyCategoryPalette`); null otherwise, and the column opens in
+ * Cellucid's own colors by position. cellucid-python's `opening_palette`.
+ *
+ * @param {string[]|null} held
+ * @param {number} count
+ * @returns {string[]|null}
+ */
+export function openingPalette(held, count) {
+  if (!Array.isArray(held) || count === 0 || held.length < count) return null;
+  const out = [];
+  for (let index = 0; index < count; index++) {
+    const bytes = bytesOfHex(held[index]);
+    if (bytes === null) return null;
+    out.push(hexOfBytes(...bytes));
+  }
+  return out;
+}
+
+/**
+ * Each dataset column the view in focus recolored categories of
+ * (`focusedColumnRecolors`, by the key the dataset names it), with the
+ * colors it is shown in: each category, in the column's order once the
+ * apply's labels are applied, takes the color the person or an agent gave
+ * it, else the color it opens with -- `openingPalette` of the colors held
+ * for the column before the apply (a category merged by the apply takes its
+ * first source's), else Cellucid's own colors by position. cellucid-python's
+ * `plan_column_colors`, row for row.
+ *
+ * A row is `write` when those differ from the colors the column holds after
+ * the apply's other changes, `unchanged` when they are the same,
+ * `not-applied` (with the reason) for a column the dataset lacks, a MuData
+ * modality's column, a column that is not categorical, or one with none of
+ * the categories recolored.
+ *
+ * @param {Map<string, {colors: Map<string, string>, labels: Map<string, unknown>}>} recolored
+ * @param {CopyTarget} target
+ * @param {{replaced: Map, relabels: Map, rename: Map}} labels - `planLabels`'
+ * @param {Map<string, string>} earlierNames - Columns earlier applies renamed, old name to new
+ * @returns {Promise<{rows: object[], recolor: Map<string, string[]>}>}
+ */
+async function planColumnColors(recolored, target, labels, earlierNames) {
+  const present = new Set(target.obsColumns);
+  const wouldHold = await nextColors(target, labels, [], new Map());
+  const rows = [];
+  const recolor = new Map();
+  const row = (name, status, note = null) => ({ kind: COLUMN_COLORS_KIND, domain: 'colors', name, column: null, from: [], cells: null, status, note });
+  for (const [key, given] of recolored) {
+    const before = present.has(key) ? key : earlierNames.get(key) ?? key;
+    const after = labels.rename.get(before) ?? before;
+    if (!present.has(before)) {
+      rows.push(row(after, 'not-applied', target.modalityColumns.has(key) ? modalityColorsNote(key) : absentColumnNote(key)));
+      continue;
+    }
+    const column = await target.column(before);
+    if (column === null || column.kind !== 'categorical') {
+      rows.push(row(after, 'not-applied', notCategoricalColorsNote(after)));
+      continue;
+    }
+    const relabel = labels.relabels.get(before);
+    const count = column.categories.length;
+    const categories = relabel === undefined ? column.categories : relabel.categories;
+    const sources = relabel === undefined ? categories.map((_, index) => index) : relabel.sources;
+    const palette = openingPalette(await heldColors(target, before), count);
+    const ids = categories.map(identity);
+    const shown = ids.map((id, index) => given.colors.get(id)
+      ?? (palette !== null ? palette[sources[index]] : hexOfRgb01(getCategoryColor(sources[index]))));
+    const has = new Set(ids);
+    const missing = [...given.colors.keys()].filter(id => !has.has(id)).map(id => labelText(given.labels.get(id)));
+    if (missing.length === given.colors.size) {
+      rows.push(row(after, 'not-applied', missingCategoriesNote(after, missing)));
+      continue;
+    }
+    const note = missing.length > 0 ? missingCategoriesNote(after, missing) : null;
+    const holds = wouldHold.has(after) ? wouldHold.get(after) : await heldColors(target, after);
+    if (sameArray(holds, shown)) {
+      rows.push(row(after, 'unchanged', note));
+      continue;
+    }
+    recolor.set(after, shown);
+    rows.push(row(after, 'write', note));
+  }
+  return { rows, recolor };
 }
 
 // ---------------------------------------------------------------------------
 // User fields, highlights, gene sets
 
+/**
+ * Each field the view in focus at a step recolors categories of, in the
+ * `colors` value's order: `{source, key, user, colors, labels}` (`user` null
+ * for a dataset field, `key` null for a user field; `colors` each category's
+ * identity to its `#rrggbb`, `labels` each identity to the label as held).
+ * `colors` and `views` are the step's values (null when the session holds
+ * none: nothing recolored, the live view in focus). cellucid-python
+ * (`anndata_session/_colors.py` `_focused_entries`) and cellucid-r
+ * (`.apply_focused_recolors`) read them by the same rule.
+ */
+function focusedEntries(colors, views) {
+  const out = [];
+  if (colors === null || colors === undefined) return out;
+  const perView = colors.views;
+  if (!Array.isArray(perView)) throw new TypeError("This session's colors value views must be a list.");
+  const focus = views === null || views === undefined ? 0 : views.focus;
+  if (!Number.isSafeInteger(focus) || focus < 0) throw new TypeError("This session's views value focus must be a non-negative whole number.");
+  if (focus >= perView.length) throw new TypeError(`This session's colors value holds ${formatCountOf(perView.length, 'view')}, and the view in focus is view ${focus}.`);
+  for (const entry of perView[focus]) {
+    const field = entry?.field;
+    const user = field?.user ?? null;
+    const key = field?.key ?? null;
+    if (user !== null ? typeof user !== 'string' || user === '' : typeof key !== 'string' || key === '') {
+      throw new TypeError(`This session's colors value names a field without ${user !== null ? 'a user field id' : 'a key'}.`);
+    }
+    if (!Array.isArray(entry.colors)) continue;
+    const recolored = new Map();
+    const labels = new Map();
+    for (const { category, color } of entry.colors) {
+      if (typeof color !== 'string' || !HEX_COLOR.test(color)) throw new TypeError(`This session's colors value holds ${JSON.stringify(color)}, not one #rrggbb color.`);
+      recolored.set(identity(category), color);
+      if (!labels.has(identity(category))) labels.set(identity(category), category);
+    }
+    out.push({ source: field.source, key: user === null ? key : null, user, colors: recolored, labels });
+  }
+  return out;
+}
+
+/**
+ * The categories of user fields recolored in the view in focus at a step:
+ * by `<source>\u0000<field id>`, each category's identity to its `#rrggbb`
+ * (`focusedEntries`).
+ *
+ * @param {unknown} colors - The `colors` value (`app/state/domains/colors.js`)
+ * @param {unknown} views - The `views` value (`app/state/domains/views.js`)
+ * @returns {Map<string, Map<string, string>>}
+ */
+export function focusedRecolors(colors, views) {
+  return new Map(focusedEntries(colors, views).filter(entry => entry.user !== null)
+    .map(entry => [`${entry.source}\u0000${entry.user}`, entry.colors]));
+}
+
+/**
+ * The categories of the dataset's obs columns recolored in the view in focus
+ * at a step, by the column's key as the dataset names it (a column renamed in
+ * the session keeps its key), in the `colors` value's order. A gene's colors
+ * (a color map, a range) are never categories: not here. cellucid-python's
+ * `focused_column_recolors`.
+ *
+ * @param {unknown} colors
+ * @param {unknown} views
+ * @returns {Map<string, {colors: Map<string, string>, labels: Map<string, unknown>}>}
+ */
+export function focusedColumnRecolors(colors, views) {
+  const out = new Map();
+  for (const entry of focusedEntries(colors, views)) {
+    if (entry.user === null && entry.source === 'obs' && entry.colors.size > 0) out.set(entry.key, { colors: entry.colors, labels: entry.labels });
+  }
+  return out;
+}
+
 /** One candidate column per user field: its values, or why the session does not apply it. */
-async function planUserFields(fields, target, nObs, unknown) {
+
+/**
+ * The colors a categorical user field's categories are shown in, one
+ * `#rrggbb` a category in its order: the view in focus's recolors, else its
+ * `palette`, else Cellucid's own colors by position.
+ */
+export function shownCategoryColors(field, recolored) {
+  return field.categories.map((category, index) => recolored?.get(identity(category))
+    ?? (Array.isArray(field.palette) ? field.palette[index] : hexOfRgb01(getCategoryColor(index))));
+}
+
+async function planUserFields(fields, target, nObs, unknown, recolors) {
   const candidates = [];
   for (const field of fields) {
     const unapplied = note => ({ kind: 'user-field', domain: 'field-overlays', name: field.key, column: null, cells: null, note });
@@ -458,7 +761,13 @@ async function planUserFields(fields, target, nObs, unknown) {
     } else {
       made = numbersColumn(field.values, nObs, unknown);
     }
-    candidates.push({ kind: 'user-field', domain: 'field-overlays', name: field.key, column: made.column, cells: made.cells, note: null });
+    // The colors a categorical field is shown in, written as `uns['<key>_colors']`.
+    const recolored = recolors.get(`${field.source}\u0000${field.id}`);
+    const colors = field.kind === 'category' ? shownCategoryColors(field, recolored) : null;
+    candidates.push({
+      kind: 'user-field', domain: 'field-overlays', name: field.key, column: made.column, cells: made.cells, note: null, colors,
+      recolored: field.kind === 'category' && recolored !== undefined && recolored.size > 0,
+    });
   }
   return candidates;
 }
@@ -550,6 +859,9 @@ export function historyApplied(record) {
  * @property {Set<string>} modalityColumns - Columns the viewer shows from a MuData's modalities (`<modality>:<key>`)
  * @property {(name: string) => Promise<Object|null>} column - One obs column over every cell by original position,
  *   as `element-writer.js` `column()` takes one (categories as the file stores them), or null
+ * @property {string[]} unsKeys - Its root `uns` keys
+ * @property {(name: string) => Promise<string[]|null>} colors - An obs column's colors, `uns['<name>_colors']`,
+ *   when they are text (Scanpy's form), or null
  * @property {Object|null} cellucid - Its `uns['cellucid']` as plain values, or null
  * @property {Uint32Array|null} known - The cells the state is known on (the open cells of a subsample,
  *   ascending original positions); null for every cell
@@ -559,6 +871,21 @@ export function historyApplied(record) {
  *   change, one per var row, as the viewer names them (the data mapping's gene names); null when the
  *   mapping reads another axis (gene-set columns then go nowhere, said in `leftOut`)
  */
+
+/**
+ * The expression values a step's state holds, as the provenance records them
+ * (the model's `ExpressionValues`): `{normalize, log1p}`, or null when the
+ * session holds no `expression` value (a session from before them).
+ *
+ * @param {unknown} value - The step's `expression` value
+ * @param {string} step
+ * @returns {{normalize: boolean, log1p: boolean}|null}
+ */
+export function expressionValuesOf(value, step) {
+  if (value === undefined || value === null) return null;
+  const asked = requireExpressionTransform(value, `The expression values at step ${step}`);
+  return { normalize: asked.normalize, log1p: asked.log1p };
+}
 
 /**
  * Plan one step of a tracker against a dataset, and the changes a copy
@@ -581,6 +908,7 @@ export async function planAnnDataCopy({ choice, valueOf, target, sessionSha256, 
   const nObs = target.nObs;
   const unknown = unknownMask(nObs, target.known);
   const requires = requiredFields(valueOf);
+  const expression = expressionValuesOf(valueOf('expression'), step);
 
   const applied = historyApplied(target.cellucid);
   const owners = new Map();
@@ -593,6 +921,8 @@ export async function planAnnDataCopy({ choice, valueOf, target, sessionSha256, 
   const oldNameOf = new Map([...labels.rename].map(([from, to]) => [to, from]));
 
   const columns = [];
+  // The columns written or replaced, with the colors each is shown in (`colorChanges`).
+  const written = [];
   const settle = async candidate => {
     const { name } = candidate;
     const out = (status, note = candidate.note) => ({
@@ -601,18 +931,27 @@ export async function planAnnDataCopy({ choice, valueOf, target, sessionSha256, 
     if (candidate.column === null) return out('not-applied');
     if (!presentAfter.has(name)) {
       columns.push({ name, column: candidate.column });
+      written.push({ name, colors: candidate.colors ?? null });
       return out('write');
     }
     if (!owners.has(name)) return out('not-applied', takenColumnNote(name));
     if (sameColumn(await target.column(oldNameOf.get(name) ?? name), candidate.column)) return out('unchanged');
     if (overwrite) {
       columns.push({ name, column: candidate.column });
+      written.push({ name, colors: candidate.colors ?? null });
       return out('replace', `Written by an earlier apply (step ${owners.get(name)}); replaced.`);
     }
     return out('not-applied', ownedNote(name, owners.get(name)));
   };
   const fieldRows = [];
-  for (const candidate of await planUserFields(overlays.userFields, target, nObs, unknown)) fieldRows.push(await settle(candidate));
+  const recolors = focusedRecolors(valueOf('colors') ?? null, valueOf('views') ?? null);
+  // Whether a field written or replaced took colors the step's colors value gave it.
+  let recoloredWritten = false;
+  for (const candidate of await planUserFields(overlays.userFields, target, nObs, unknown, recolors)) {
+    const row = await settle(candidate);
+    if (candidate.recolored && (row.status === 'write' || row.status === 'replace')) recoloredWritten = true;
+    fieldRows.push(row);
+  }
   const currentSets = target.cellucid?.[GENE_SETS_KEY] ?? null;
   if (currentSets !== null && (typeof currentSets !== 'object' || Array.isArray(currentSets))) {
     throw new TypeError("This dataset's uns['cellucid']['gene_sets'] must be a mapping by gene-set name.");
@@ -620,16 +959,22 @@ export async function planAnnDataCopy({ choice, valueOf, target, sessionSha256, 
   const geneSets = planGeneSets(valueOf('gene-sets').sets, currentSets, overwrite);
   const highlightRows = [];
   for (const candidate of planHighlights(valueOf('highlights'), nObs, unknown)) highlightRows.push(await settle(candidate));
+  const columnColors = await planColumnColors(focusedColumnRecolors(valueOf('colors') ?? null, valueOf('views') ?? null), target, labels,
+    new Map(earlierRenames.filter(entry => entry.kind === 'column').map(entry => [entry.from, entry.to])));
+  // Whether any colors went with a column: a field's, or a recolored dataset column's.
+  const colorsWent = recoloredWritten || columnColors.rows.some(row => row.status !== 'not-applied');
+  const presentation = domain => {
+    if (DATA_DOMAINS.includes(domain) || hashes[domain] === root[domain]) return [];
+    const note = domain === 'colors' && colorsWent ? COLORS_NOTE : PRESENTATION_NOTE;
+    return [{ kind: 'presentation', domain, name: domainName(domain), column: null, from: [], cells: null, status: 'not-applied', note }];
+  };
   const byDomain = new Map([
     ['field-overlays', [...labels.rows, ...fieldRows]],
     ['gene-sets', geneSets.rows],
     ['highlights', highlightRows],
   ]);
-  const rows = DOMAIN_IDS.flatMap(domain => {
-    if (byDomain.has(domain)) return byDomain.get(domain);
-    if (DATA_DOMAINS.includes(domain) || hashes[domain] === root[domain]) return [];
-    return [{ kind: 'presentation', domain, name: domainName(domain), column: null, from: [], cells: null, status: 'not-applied', note: PRESENTATION_NOTE }];
-  });
+  if (columnColors.rows.length > 0) byDomain.set('colors', [...columnColors.rows, ...presentation('colors')]);
+  const rows = DOMAIN_IDS.flatMap(domain => byDomain.get(domain) ?? presentation(domain));
   const plan = {
     session_sha256: sessionSha256,
     tracker: choice.tracker.id,
@@ -641,7 +986,7 @@ export async function planAnnDataCopy({ choice, valueOf, target, sessionSha256, 
   validateRecord('ApplyPlan', plan, 'plan');
   const writesAnything = rows.some(row => row.status === 'write' || row.status === 'replace');
 
-  // The changes a copy writes: relabelled and renamed columns in their
+  // The changes a copy writes: relabeled and renamed columns in their
   // places, then the planned columns (replacing one of the same name).
   const obs = [];
   for (const [name, column] of labels.replaced) {
@@ -693,6 +1038,7 @@ export async function planAnnDataCopy({ choice, valueOf, target, sessionSha256, 
       columns: rows.filter(row => (row.kind === 'user-field' || row.kind === 'highlight') && (row.status === 'write' || row.status === 'replace')).map(row => row.name),
       renamed: labels.renamed.map(entry => ({ ...entry })),
       skipped: rows.filter(row => row.status === 'not-applied').map(row => ({ kind: row.kind, name: row.name, note: row.note ?? '' })),
+      expression,
       session: null,
     };
     validateRecord('Provenance', provenance, 'provenance');
@@ -701,6 +1047,8 @@ export async function planAnnDataCopy({ choice, valueOf, target, sessionSha256, 
   }
   const changes = { obs, var: varChanges };
   if (target.genes?.modality != null) changes.varModality = target.genes.modality;
+  const uns = await colorChanges(target, labels, written, columnColors.recolor);
+  if (Object.keys(uns).length > 0) changes.uns = uns;
   if (Object.keys(cellucid).length > 0) changes.cellucid = cellucid;
   return { plan, changes, provenance, leftOut };
 }

@@ -194,7 +194,7 @@ test('offline transition retires network owners and synchronously renders both g
     'window.addEventListener'
   );
   assert.match(offline, /stopAutoPullScheduler\(\)/);
-  assert.match(offline, /abortActiveSync\('Network connection was lost\.'\)/);
+  assert.match(offline, /syncStop\.stop\(new Error\('Network connection was lost\.'\)\)/);
   assert.match(offline, /closeActiveGitHubConnectionModal\(\)/);
   assert.match(offline, /render\(\)/);
 
@@ -203,7 +203,7 @@ test('offline transition retires network owners and synchronously renders both g
     0,
     render.indexOf('// GitHub sync')
   );
-  assert.match(gating, /const online =[\s\S]*?navigator\.onLine !== false/);
+  assert.match(gating, /const online = realmHosts\.online\(\);/);
   assert.match(
     gating,
     /text: 'Offline: GitHub actions are disabled\.'/
@@ -224,7 +224,7 @@ test('a repository cannot be connected while no dataset is open', () => {
   );
   assert.match(
     gating,
-    /if \(datasetId === null\) \{[\s\S]*?text: 'Load a dataset to connect a repository\.'/
+    /if \(datasetId === null\) \{[\s\S]*?text: openADatasetTo\('connect a repository'\)/
   );
   assert.match(gating, /disabled: datasetId === null \|\|/);
 });

@@ -76,7 +76,7 @@ test('a direct AnnData source no longer shown propagates a cache-release failure
 test('direct AnnData connectivity access without an active adapter is terminal', async () => {
   await assert.rejects(
     new AnnDataFileSource().getConnectivityEdges(),
-    /No dataset loaded/
+    /No dataset is open\./
   );
 });
 

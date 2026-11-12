@@ -4,7 +4,7 @@
  *
  * `HP_FS_LIGHT_NO_DEPTH` and `HP_FS_FULL_NO_DEPTH` never discard: where their
  * disc is not covered they output alpha 0, which the straight-alpha blend
- * leaves as the destination it found, because a discard serialises the blend.
+ * leaves as the destination it found, because a discard serializes the blend.
  * The renderer draws every pass without depth (1-D and 2-D views) with them,
  * so they are only correct if that zero is indistinguishable from the discard
  * it stands for: the same pixels, single-sampled and multisampled, whatever
@@ -76,7 +76,7 @@ test('the no-depth point shaders draw what discarding draws where they write zer
     };
 
     // Deterministic, heavily overlapping points: fractional positions, sizes
-    // from sub-pixel to 24 px, varied colours, and alphas that include hidden
+    // from sub-pixel to 24 px, varied colors, and alphas that include hidden
     // (< 0.01), barely visible, translucent and opaque points.
     const count = 3000;
     let seed = 12345;
@@ -154,7 +154,8 @@ test('the no-depth point shaders draw what discarding draws where they write zer
         gl.uniformMatrix4fv(uniform(name), false, identity);
       }
       gl.uniform1f(uniform('u_pointSize'), pointSize);
-      gl.uniform1f(uniform('u_pointSizeMax'), 0);
+      // The viewer's cap (rendering/point-sprite.js POINT_SPRITE_MAX_PX).
+      gl.uniform1f(uniform('u_pointSizeMax'), 160);
       gl.uniform1f(uniform('u_sizeAttenuation'), 0);
       gl.uniform1f(uniform('u_pointScale'), height / (2 * Math.tan(0.4)) * 0.01);
       // Full's lighting and fog, so its whole fragment path is exercised.

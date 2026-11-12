@@ -35,15 +35,17 @@ import {
   hostFaultOfStatus,
   isTransientAnswer,
   isTransientFailure,
+  isWebPageAnswer,
   probeHttpResource,
   spreadOf,
   transientStatusError,
+  webPageInsteadOf,
   withRetries,
 } from '../../formats/io/byte-source.js';
 import { ResponseClock } from '../../formats/io/link.js';
 import { realmHosts } from '../../formats/io/hosts.js';
 import { fileFormatOfName, inputFormat, openableNamesText, readsFromHead, titleOfName } from '../input-formats.js';
-import { formatCountOf } from '../../utils/format-units.js';
+import { formatCountOf, formatDuration } from '../../utils/format-units.js';
 import { keepDownload, keptAtAddress } from '../anndata/transcode/space.js';
 import { decompressed } from '../../formats/rds/stream.js';
 import { writeVersion } from './identity.js';
@@ -121,6 +123,7 @@ export function nextStepWithoutTheHost(name, format) {
     return `Downloaded alone it would be refused too: ${
       noEmbeddingRefusal(`${name} is a 10x Cell Ranger count matrix that`, tenxEmbeddingHint('file', true)).message}`;
   }
+  if (format?.layout === 'folder') return 'Download the folder and open it from your computer (Open… › Folder…).';
   return 'Download it and open it from your computer (Open… › File…).';
 }
 
@@ -132,7 +135,43 @@ export function nextStepWithoutTheHost(name, format) {
  */
 async function hostAnswers(url, signal) {
   try {
+    // Raw fetch: an opaque answer is no delivery this page may read, so it must not count in the book of hosts (`answeredBefore`), nor be held by it.
     await fetch(url, { method: 'HEAD', mode: 'no-cors', cache: 'no-store', credentials: 'omit', signal });
+    return true;
+  } catch (error) {
+    if (isCancellation(error)) throw error;
+    return false;
+  }
+}
+
+/**
+ * Why a dataset at `url` cannot be read, once its first request got no
+ * answer this page may read (`isUnanswered`), said as a file's probe says it
+ * (`hostRefusal`): a host that does not let other websites read it, one
+ * that cannot be reached, one refusing this network for now, this computer
+ * offline. For what is opened without a probe of its own, as a Zarr store
+ * folder (its first read, `.zmetadata`, is the probe).
+ *
+ * `nextStep`: what can succeed instead, when not the file's own
+ * (`nextStepWithoutTheHost`: a dataset catalog is not opened from a download).
+ *
+ * @param {{url: string, name: string, format: Object|null, error: Error, signal?: AbortSignal|null, nextStep?: string}} what
+ * @returns {Promise<Error>}
+ */
+export async function unreadableAtHost({ url, name, format, error, signal = null, nextStep = undefined }) {
+  return hostRefusal({ url, name, format, error, signal, answeredBefore: realmHosts.answeredBefore(url), nextStep });
+}
+
+/**
+ * Whether `other`, an address of the same host that delivered to this site
+ * before (`hosts.deliveredAddress`), other than `url`, can be read now: one
+ * `HEAD` without credentials, its answer readable (CORS) whatever its status.
+ */
+async function readableAgain(other, url, signal) {
+  if (typeof other !== 'string' || other === url) return false;
+  try {
+    // Raw fetch: a probe of whether the host lets this site read it now, which the book's hold on a silent host would answer for it.
+    await fetch(other, { method: 'HEAD', cache: 'no-store', credentials: 'omit', signal });
     return true;
   } catch (error) {
     if (isCancellation(error)) throw error;
@@ -148,29 +187,47 @@ async function hostAnswers(url, signal) {
  * Each fault is said by who is at fault (`hostFaultFailure`, `HOST_FAULTS`):
  *
  * - Not there (404, 410): `missing`, check the link.
- * - Refused (401, 403): from a host that answered this site before this
- *   probe (`answeredBefore`), `refusing` this network for now (hosts do so
- *   after many requests); else `refused`, the link's permissions.
+ * - Refused: a 401 (a sign-in asked for) is `refused`, the link's
+ *   permissions; a 403 from a host that answered this site before this
+ *   probe (`answeredBefore`) is `refusing` this network for now (hosts do so
+ *   after many requests), else `refused`.
  * - A host-side status (5xx, 408, 429): `failing` or `limiting`.
  * - Any other status: the host refused the request; check the link.
  * - No answer this page may read: `offline`, connect; from a host that
- *   answered this site before, `refusing` this network for now; else the
+ *   answered this site before, `refusing` this network for now, unless the
+ *   address that answered then still answers (`readableAgain`): the host
+ *   lets this site read other files of its, not this one; else the
  *   host is asked once more without reading its answer (`hostAnswers`): one
  *   that answers does not let other websites read its files (CORS), and the
  *   way on is what can succeed for this file (`nextStepWithoutTheHost`); one
  *   that does not could not be reached.
  */
-async function hostRefusal({ url, name, format, error, signal, answeredBefore }) {
+async function hostRefusal({ url, name, format, error, signal, answeredBefore, nextStep = nextStepWithoutTheHost(name, format) }) {
   const status = Number.isInteger(error?.status) ? error.status : null;
   const host = new URL(url).host;
   const refuse = (message, code) => explainedFailure(message, code, 'link', { url, status, cause: error });
   const fault = kind => hostFaultFailure({ kind, host, status, what: name, retryAfterMs: error?.details?.hostFault?.retryAfterMs ?? null },
     { url, cause: hostFaultCause(error) });
   if (status === 404 || status === 410) return fault('missing');
-  // A refusal from a host that answered this site before is a refusal of
-  // this network for now (hosts do so after many requests), not the file's
-  // permissions.
-  if (status === 401 || status === 403) return fault(answeredBefore ? 'refusing' : 'refused');
+  // A host that stopped sending (or never began) within the read's patience,
+  // asked again: neither its CORS nor its permissions are why.
+  if (error?.code === BYTE_SOURCE_FAILURES.STALLED) {
+    const quiet = Number.isFinite(error.details?.silentMs) ? ` for ${formatDuration(error.details.silentMs)}` : '';
+    return refuse(
+      (error.details?.phase === 'answer'
+        ? `${host} gave no answer for ${name}${quiet}, also when asked again`
+        : `${host} started sending ${name} and stopped (no more bytes${quiet}), also when asked again`) +
+        ': the host, or the connection to it, is failing or very slow. Try again later.',
+      DataSourceErrorCode.NETWORK_ERROR
+    );
+  }
+  // A 403 from a host that answered this site before is a refusal of this
+  // network for now (hosts do so after many requests), not the file's
+  // permissions. A 401 asks for a sign-in, which no host blocks a network
+  // with: the file is private whatever the host answered before (a lab
+  // server with one public and one private folder).
+  if (status === 401) return fault('refused');
+  if (status === 403) return fault(answeredBefore ? 'refusing' : 'refused');
   if (hostFaultOfStatus(status) !== null) return fault(hostFaultOfStatus(status));
   if (status !== null) {
     return refuse(
@@ -180,14 +237,27 @@ async function hostRefusal({ url, name, format, error, signal, answeredBefore })
   }
   // Offline first: a host that answered before and gives no answer now,
   // while this computer is offline, is not refusing anything.
-  if (globalThis.navigator?.onLine === false) return fault('offline');
+  if (!realmHosts.online()) return fault('offline');
   // Unrelated hosts all silent at once: this side's connection.
   if (realmHosts.connectionDown(url)) return fault('connection');
-  if (answeredBefore || error?.details?.answeredBefore === true) return fault('refusing');
+  if (answeredBefore || error?.details?.answeredBefore === true) {
+    // Answered before by another of its addresses: still readable now, the
+    // host serves this site and lets it read that file, not this one (CORS
+    // set per folder, as a lab server or a repository's download links
+    // are); unreadable too, it refuses this network for now.
+    if (await readableAgain(realmHosts.deliveredAddress(url), url, signal)) {
+      return refuse(
+        `${host} does not let other websites read ${name}, though it lets them read other files of its, so this ` +
+          `site cannot read it. ${nextStep}`,
+        DataSourceErrorCode.PERMISSION_DENIED
+      );
+    }
+    return fault('refusing');
+  }
   if (await hostAnswers(url, signal)) {
     return refuse(
       `${host} does not let other websites read its files, so this site cannot read ${name}. ` +
-        nextStepWithoutTheHost(name, format),
+        nextStep,
       DataSourceErrorCode.PERMISSION_DENIED
     );
   }
@@ -262,7 +332,7 @@ export async function describeRemoteFile({
       { url, name }
     );
   }
-  // A format recognised only to be refused (h5Seurat) is refused before a
+  // A format recognized only to be refused (h5Seurat) is refused before a
   // compressed copy of it is downloaded whole to say so.
   if (format.compression !== undefined && inputFormat(format.format).refusal !== undefined) {
     throw new DataSourceError(inputFormat(format.format).refusal, DataSourceErrorCode.UNSUPPORTED, 'link', { url, name, explained: true });
@@ -554,6 +624,11 @@ async function downloadOnce(resource, { signal, onBytes, environment, clock, del
       `${resource.name} changed on ${host} since it was checked; open it again to read the new version.`,
       { url: resource.url }
     );
+  }
+  if (isWebPageAnswer(response)) {
+    // A sign-in, preview or error page in place of the file: never kept as it.
+    await body.return();
+    throw new DataSourceError(webPageInsteadOf(resource.name, host), DataSourceErrorCode.UNSUPPORTED, 'link', { url: resource.url, explained: true });
   }
   let received = 0;
   // Where the bytes still to come are asked for after a body cut short: the

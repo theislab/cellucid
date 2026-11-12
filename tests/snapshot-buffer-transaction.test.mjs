@@ -378,7 +378,7 @@ function createRenderer() {
     -1, 0, 0,
     1, 0, 0,
   ]);
-  // A snapshot's colour store is RGBA8, 4 bytes a point like the live one.
+  // A snapshot's color store is RGBA8, 4 bytes a point like the live one.
   const rgb = new Uint8Array([
     255, 0, 0, 255,
     0, 0, 255, 255,
@@ -498,7 +498,7 @@ function createRenderer() {
   return { gl, renderer };
 }
 
-/** RGBA of what a view draws: its store's colour and its transparency's R8 byte. */
+/** RGBA of what a view draws: its store's color and its transparency's R8 byte. */
 function snapshotRgba(renderer, snapshot) {
   const store = renderer.gl._state.bufferBytes.get(bufferOf(snapshot.buffer));
   assert.ok(store instanceof Uint8Array);
@@ -513,7 +513,7 @@ function snapshotRgba(renderer, snapshot) {
   return colors;
 }
 
-/** The bytes a snapshot's RGBA8 colour store holds for `colors`. */
+/** The bytes a snapshot's RGBA8 color store holds for `colors`. */
 function storeFromRgba(colors) {
   assert.ok(colors instanceof Uint8Array);
   assert.equal(colors.length % 4, 0);
@@ -809,7 +809,7 @@ test('same-generation snapshots share positions and a color-only update rewrites
   assert.deepEqual(
     gl._state.textureBytes.get(second.alphaTexture),
     new Uint8Array([255, 255]),
-    'null transparency shows every cell; the colours\' alpha byte is never read',
+    'null transparency shows every cell; the colors\' alpha byte is never read',
   );
   assert.equal(
     renderer._snapshotGeometryPools.get(
@@ -877,14 +877,14 @@ test('same-generation snapshots share positions and a color-only update rewrites
     storeFromRgba(replacementColors),
   );
   // The view alone owns its store, already in the order it draws with: the
-  // colours are gathered into it in place, allocating nothing.
+  // colors are gathered into it in place, allocating nothing.
   assert.equal(first.buffer, firstBufferBefore);
   assert.equal(first.vao, firstVaoBefore);
   assert.equal(gl._state.bufferCreateCount, buffersCreatedBefore);
   assert.equal(
     gl._state.uploadCount,
     uploadCountBeforeReplacement,
-    'an in-place recolour allocates no store',
+    'an in-place recolor allocates no store',
   );
   assert.equal(
     gl._state.textureUploadCount,
@@ -1020,7 +1020,7 @@ test('delete-all continues detaching snapshots after a retirement failure', () =
   );
   gl.failDeleteBuffer = true;
 
-  // Only the two colour buffers fail: the position storage is retained for
+  // Only the two color buffers fail: the position storage is retained for
   // reuse, not deleted, when its last view goes.
   assert.throws(
     () => renderer.deleteAllSnapshotBuffers(),
@@ -1234,8 +1234,8 @@ test('rejected split uploads retain zero accepted GPU bytes across cleanup retry
     gl.failUpload = true;
     gl.failDeleteBuffer = true;
 
-    // Colours and visibility together replace the colour store (an
-    // alpha-free recolour of a store the view alone owns is in place).
+    // Colors and visibility together replace the color store (an
+    // alpha-free recolor of a store the view alone owns is in place).
     assert.throws(
       () => renderer.updateSnapshotBuffer(
         'snap_1',
@@ -1310,7 +1310,7 @@ test('null position, color, and VAO allocations roll back exact geometry referen
         3,
         'live',
       ),
-      /colour store could not allocate/,
+      /color store could not allocate/,
     );
     assert.equal(renderer.snapshotBuffers.has('snap_2'), false);
     assert.equal(geometry.refCount, 1);
@@ -1493,7 +1493,7 @@ test('snapshot rollback keeps failed candidate cleanup owned for exact retry', (
   );
 });
 
-test('combined snapshot publication swaps colour, R8, and VAO owners exactly once', () => {
+test('combined snapshot publication swaps color, R8, and VAO owners exactly once', () => {
   const { gl, renderer } = createRenderer();
   const snapshot = renderer.snapshotBuffers.get('snap_1');
   const previousBuffer = snapshot.buffer;
@@ -1568,7 +1568,7 @@ test('a store replacement keeps an extra geometry ref until its old VAO actually
   const positionBuffer = geometry.positionBuffer;
   gl.failDeleteVertexArray = true;
 
-  // Colours and visibility together replace the store and its vertex array.
+  // Colors and visibility together replace the store and its vertex array.
   assert.equal(
     renderer.updateSnapshotBuffer(
       'snap_1',

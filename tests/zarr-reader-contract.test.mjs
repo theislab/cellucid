@@ -2330,7 +2330,7 @@ test('an observation field that is not one-dimensional and cell-aligned is left 
   });
 });
 
-test('normalizes continuous int64 and Float64 obs through the public adapter seam: integers stay exact', async t => {
+test('normalizes continuous int64 and Float64 obs through the public adapter seam: integers stay exact, identifiers past 2^53 as text', async t => {
   async function adapterFor(values, dtype, key) {
     const { reader } = await openAnnData(storeWith({
       nObs: values.length,
@@ -2349,10 +2349,11 @@ test('normalizes continuous int64 and Float64 obs through the public adapter sea
     assert.deepEqual(Array.from(new Float64Array(field.data)), [1, 2, 16_777_217]);
   });
 
-  await t.test('int64 beyond 2^53 reads as the nearest double', async () => {
+  await t.test('int64 beyond 2^53 is identifiers, read as their exact text (F116)', async () => {
     const adapter = await adapterFor(new BigInt64Array([9_007_199_254_740_993n, 2n ** 63n - 1n]), '<i8', 'count');
     const field = await adapter.getObsFieldData('count');
-    assert.deepEqual(Array.from(new Float64Array(field.data)), [2 ** 53, 2 ** 63]);
+    assert.equal(field.kind, 'category');
+    assert.deepEqual(field.categories, ['9007199254740993', '9223372036854775807']);
   });
 
   await t.test('8- and 16-bit integers, which float32 holds exactly, stay float32', async () => {
@@ -2371,7 +2372,7 @@ test('normalizes continuous int64 and Float64 obs through the public adapter sea
 });
 
 // ---------------------------------------------------------------------------
-// Neighbour graphs.
+// Neighbor graphs.
 // ---------------------------------------------------------------------------
 
 test('propagates malformed connectivity and enforces obs-aligned square shape', async t => {

@@ -7,13 +7,6 @@
  * and it is why both owners settle through this one helper.
  */
 
-function describeError(error) {
-  if (error instanceof Error && error.message.length > 0) {
-    return error.message;
-  }
-  return String(error);
-}
-
 function settleCalculationNotification(
   notifications,
   notificationId,
@@ -33,6 +26,5 @@ function settleCalculationNotification(
 }
 
 export {
-  describeError,
   settleCalculationNotification,
 };

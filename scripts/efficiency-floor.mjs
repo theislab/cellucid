@@ -16,21 +16,21 @@
  *
  * Plans (`--plan`):
  * - `full`: every file over the slow link (150 ms, 5 MB/s, HTTP/1.1), all
- *   cells and 1 %; the representative files (one of each storage kind) at
- *   every share (all; 10, 1, 0.1 % by the file's default method; 10 and 1 %
- *   uniform; 1 % blocks; 10 % stratified by `cluster`; 10 % spatial);
+ *   cells and 1%; the representative files (one of each storage kind) at
+ *   every share (all; 10, 1, 0.1% by the file's default method; 10 and 1%
+ *   uniform; 1% blocks; 10% stratified by `cluster`; 10% spatial);
  * - `links`: the representative files at every link (150 ms / 5 MB/s and
- *   20 ms / 50 MB/s, each over HTTP/1.1 and HTTP/2), all cells and 1 %;
- * - `local`: every file picked from this computer, all cells and 1 %;
+ *   20 ms / 50 MB/s, each over HTTP/1.1 and HTTP/2), all cells and 1%;
+ * - `local`: every file picked from this computer, all cells and 1%;
  * - `kept`: every single-file store as a copy kept in this browser (a whole
- *   download read through its page checksums), all cells and 1 %;
- * - `quick`: one file, one link, all cells and 1 % (a check of the harness);
+ *   download read through its page checksums), all cells and 1%;
+ * - `quick`: one file, one link, all cells and 1% (a check of the harness);
  * - `served`: a dataset on this machine served by cellucid-python's server
  *   (`efficiency-floor/served.py`: a synthetic object of `--cells` cells and
  *   `--per-cell` values a cell, or `--file`) and, with `--rscript`,
  *   cellucid-r's (`served.R`, an object), read by the reader over loopback
  *   unthrottled (six HTTP/1.1 connections, as a browser) at every cell and
- *   10 % (`scale-run.mjs --url`): each server's time before its first
+ *   10% (`scale-run.mjs --url`): each server's time before its first
  *   answer, then each step's time, bytes and requests. No floor is computed
  *   (a served store is made as it is read); the browser's own axes are
  *   `efficiency-floor/app-run.mjs`.
@@ -128,7 +128,7 @@ const sourceLabel = r => (r.transport === 'local' ? 'local File' : r.transport =
   : `${r.latencyMs} ms, ${r.bandwidthMBps} MB/s, ${r.protocol}`);
 
 /**
- * The verdict of one element: within 10 % of the floor (bytes; time where
+ * The verdict of one element: within 10% of the floor (bytes; time where
  * a step read it) or not. Small absolute excesses (under one 16 KB block)
  * are within the floor's own rounding (metadata blocks, partial chunk
  * boundaries).

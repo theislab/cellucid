@@ -53,7 +53,11 @@ test('Save keeps the whole history: every tracker, branch, note, Recently delete
   const unnamed = tracker => ({ ...tracker, turns: tracker.turns.map(turn => ({ ...turn, conversation: null, message: null })) });
   assert.deepEqual(read.history.trackers.map(({ chats, ...tracker }) => tracker), session.trackers.map(({ chats, ...tracker }) => unnamed(tracker)));
   const withChats = await share({ ...SAVE_DEFAULTS, chats: true });
-  assert.deepEqual(withChats.read.history.trackers, session.trackers);
+  // The conversations whole, each naming the turns it brings as received (`transcriptForSave`).
+  const received = transcript => [...new Set((transcript.messages ?? []).map(message => message.turn).filter(Boolean))];
+  assert.deepEqual(withChats.read.history.trackers, session.trackers.map(tracker => ({
+    ...tracker, chats: tracker.chats.map(([id, transcript]) => [id, { ...transcript, received: received(transcript) }]),
+  })));
 });
 
 test('Share holds the tracker shown with its main and shown branches; a branch it forks from ends at its fork step', async () => {
@@ -192,7 +196,7 @@ test('Current state only from a paused tab holds what is shown, the paused chang
   const session = await goldenSession();
   const active = session.trackers.find(tracker => tracker.id === session.activeTracker);
   const shown = { ...valuesAtStep(active.steps, active.headId) };
-  // A colour changed while paused: shown, in no step.
+  // A color changed while paused: shown, in no step.
   const other = active.steps.find(step => step.touches.includes('colors') && step.after.colors !== shown.colors);
   shown.colors = other.after.colors;
   const { read } = await share(STATE_DEFAULTS, { shown });

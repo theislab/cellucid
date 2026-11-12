@@ -3,21 +3,21 @@
  * main thread (`utils/figure-export-worker.js`) -- the point passes too,
  * wherever a worker can create a WebGL2 context -- writes vector markup as Blob
  * parts rather than one string, checksums with the shared slicing CRC, and
- * honours a requested depth sort at every point count.
+ * honors a requested depth sort at every point count.
  */
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { createFigureExportZip } from '../assets/js/app/ui/modules/figure-export/utils/zip-archive.js';
-import { embedPngTextChunks } from '../assets/js/app/ui/modules/figure-export/utils/png-metadata.js';
+import { embedPngMetadata } from '../assets/js/app/ui/modules/figure-export/utils/png-metadata.js';
 import { forEachProjectedPoint } from '../assets/js/app/ui/modules/figure-export/utils/point-projector.js';
-import { computeVisibleCameraBounds } from '../assets/js/app/ui/modules/figure-export/utils/coordinate-mapper.js';
+import { sourceHasDrawnCells } from '../assets/js/app/ui/modules/figure-export/utils/coordinate-mapper.js';
 import { writeSvgPointMarkup } from '../assets/js/app/ui/modules/figure-export/renderers/svg-point-markup.js';
 import {
   figureExportRasterizesOnPage,
   openFigureExportWorkerSession,
-  requestVisibleBounds,
+  requestDrawnCells,
 } from '../assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js';
 import { createInProcessFigureExportWorker } from './helpers/figure-export-worker-in-process.mjs';
 import { setFigureExportWorkerFactory } from '../assets/js/app/ui/modules/figure-export/utils/figure-export-worker-client.js';
@@ -179,15 +179,13 @@ test('where the worker cannot draw, the point passes run on the page and everyth
   try {
     const positions = Float32Array.from([0, 0, 0, 0.5, 0.5, 0.5]);
     const session = openFigureExportWorkerSession();
-    await requestVisibleBounds(session, {
-      camera: true,
+    await requestDrawnCells(session, {
       positions,
       dimension: 3,
       transparency: null,
       lodMembership: null,
       renderState: { mvpMatrix: IDENTITY, viewMatrix: IDENTITY, viewportWidth: 10, viewportHeight: 10 },
       crop: null,
-      normTransform: null,
     });
     // The page's pass reports the page's own validation, as the worker would.
     await assert.rejects(
@@ -212,7 +210,7 @@ test('where the worker cannot draw, the point passes run on the page and everyth
     assert.equal(figureExportRasterizesOnPage(), true);
     assert.deepEqual(
       worker.requests.map(message => message.op ?? null),
-      ['visibleBounds', 'webgl2', 'close'],
+      ['drawnCells', 'webgl2', 'close'],
       'the worker never receives a point pass',
     );
     assert.equal(worker.requests[0].uploads.length, 1, 'the positions travel to the worker once');
@@ -257,13 +255,49 @@ test('PNG text chunks are checksummed exactly', async () => {
       'base64'
     ),
   ], { type: 'image/png' });
-  const annotated = Buffer.from(await (await embedPngTextChunks(onePixelPng, {
-    Comment: 'hücre',
+  const annotated = Buffer.from(await (await embedPngMetadata(onePixelPng, {
+    text: { Comment: 'hücre' },
+    dpi: 300,
   })).arrayBuffer());
   const at = annotated.indexOf(Buffer.from('iTXt'));
   const length = annotated.readUInt32BE(at - 4);
   const stored = annotated.readUInt32BE(at + 4 + length);
   assert.equal(stored, referenceCrc32(annotated.subarray(at, at + 4 + length)));
+});
+
+test('a PNG records its DPI: one pHYs right after IHDR, before the image data, replacing the encoder\'s', async () => {
+  // Found 2026-11-10: a "300 DPI" export carried no pHYs, so layout programs placed it at 72 dpi.
+  const onePixelPng = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64'
+  );
+  const chunksOf = bytes => {
+    const chunks = [];
+    for (let at = 8; at < bytes.length;) {
+      const length = bytes.readUInt32BE(at);
+      const type = bytes.toString('latin1', at + 4, at + 8);
+      chunks.push({ type, data: bytes.subarray(at + 8, at + 8 + length), crc: bytes.readUInt32BE(at + 8 + length), whole: bytes.subarray(at + 4, at + 8 + length) });
+      at += 12 + length;
+    }
+    return chunks;
+  };
+  const write = async (png, dpi) => Buffer.from(await (await embedPngMetadata(new Blob([png], { type: 'image/png' }), {
+    text: { Software: 'Cellucid' },
+    dpi,
+  })).arrayBuffer());
+  const once = await write(onePixelPng, 300);
+  const chunks = chunksOf(once);
+  assert.deepEqual(chunks.map(chunk => chunk.type), ['IHDR', 'pHYs', 'IDAT', 'iTXt', 'IEND']);
+  const phys = chunks[1];
+  assert.equal(phys.data.readUInt32BE(0), 11811);
+  assert.equal(phys.data.readUInt32BE(4), 11811);
+  assert.equal(phys.data[8], 1);
+  assert.equal(phys.crc, referenceCrc32(phys.whole));
+  // Written again at another resolution: still one pHYs, the new one.
+  const again = chunksOf(await write(once, 600));
+  assert.equal(again.filter(chunk => chunk.type === 'pHYs').length, 1);
+  assert.equal(again[1].data.readUInt32BE(0), 23622);
+  await assert.rejects(write(onePixelPng, 0), /resolution/);
 });
 
 test('a requested depth sort is honoured above 200,000 points', () => {
@@ -281,7 +315,18 @@ test('a requested depth sort is honoured above 200,000 points', () => {
     dimension: 3,
     colors,
     colorAlpha: 'layer',
-    renderState: { mvpMatrix: IDENTITY, viewportWidth: 100, viewportHeight: 100 },
+    pointDiameterViewportPx: 3,
+    renderState: {
+      mvpMatrix: IDENTITY,
+      viewMatrix: IDENTITY,
+      modelMatrix: IDENTITY,
+      lightDir: Float32Array.from([0, 0, 1]),
+      fov: Math.PI / 4,
+      sizeAttenuation: 0,
+      pointSizeMax: 160,
+      viewportWidth: 100,
+      viewportHeight: 100,
+    },
     plotRect: { x: 0, y: 0, width: 100, height: 100 },
     sortByDepth: true,
     onPoint: (_x, _y, _r, _g, _b, _a, _radius, index) => depths.push(positions[index * 3 + 2]),
@@ -307,6 +352,10 @@ test('vector point markup leaves as Blob parts with the bytes of one string', as
     mvpMatrix: IDENTITY,
     viewMatrix: IDENTITY,
     modelMatrix: IDENTITY,
+    lightDir: Float32Array.from([0, 0, 1]),
+    fov: Math.PI / 4,
+    sizeAttenuation: 0,
+    pointSizeMax: 160,
     viewportWidth: 400,
     viewportHeight: 300,
     shaderQuality: 'ultralight',
@@ -331,8 +380,7 @@ test('vector point markup leaves as Blob parts with the bytes of one string', as
     selectionMutedOpacity: 0.15,
     plotRect,
     crop: null,
-    pointRadiusViewportPx: 1.5,
-    radiusPx: 1.5,
+    pointDiameterViewportPx: 3,
     sortByDepth: false,
   });
   // The expected markup, written the way the renderer wrote it as one string.
@@ -342,9 +390,9 @@ test('vector point markup leaves as Blob parts with the bytes of one string', as
     dimension: 2,
     colors,
     colorAlpha: 'layer',
+    pointDiameterViewportPx: 3,
     renderState,
     plotRect,
-    radiusPx: 1.5,
     onPoint: (x, y, r, g, b, _a, radius) => {
       expected.push(`<circle cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="${radius.toFixed(2)}" fill="rgb(${r},${g},${b})"/>`);
     },
@@ -367,29 +415,28 @@ test('a session sends each typed array to the worker once', async () => {
     };
     const session = openFigureExportWorkerSession();
     const options = {
-      camera: true,
       positions,
       dimension: 3,
       transparency,
       lodMembership: null,
       renderState,
       crop: null,
-      normTransform: null,
     };
-    const first = await requestVisibleBounds(session, options);
-    const second = await requestVisibleBounds(session, options);
+    const first = await requestDrawnCells(session, options);
+    const second = await requestDrawnCells(session, { ...options, crop: { enabled: true, x: 0.6, y: 0.6, width: 0.3, height: 0.3 } });
     session.close();
-    const direct = computeVisibleCameraBounds({
+    const direct = sourceHasDrawnCells({
       positions,
       dimension: 3,
       transparency,
       mvpMatrix: IDENTITY,
-      viewMatrix: IDENTITY,
       viewportWidth: 100,
       viewportHeight: 100,
     });
-    assert.deepEqual(first, direct);
-    assert.deepEqual(second, direct);
+    assert.equal(direct, true);
+    assert.equal(first, direct);
+    // No visible cell lies in the lower-right corner of the view.
+    assert.equal(second, false);
     const [a, b, close] = worker.requests;
     assert.equal(a.uploads.length, 2, 'positions and transparency travel with the first request');
     assert.equal(b.uploads.length, 0, 'the second request names them by id');
@@ -435,25 +482,23 @@ test('positions larger than one ArrayBuffer reach the worker in pieces, never cl
     backed.set(plain);
     assert.equal(isMemoryBacked(backed), true);
     const options = positions => ({
-      camera: true,
       positions,
       dimension: 3,
       transparency: null,
       lodMembership: null,
       renderState: { mvpMatrix: IDENTITY, viewMatrix: IDENTITY, viewportWidth: 100, viewportHeight: 100 },
       crop: null,
-      normTransform: null,
     });
     const session = openFigureExportWorkerSession();
-    const fromMemory = await requestVisibleBounds(session, options(backed));
+    const fromMemory = await requestDrawnCells(session, options(backed));
     session.close();
-    const direct = await requestVisibleBounds(openFigureExportWorkerSession(), options(positions));
+    const direct = await requestDrawnCells(openFigureExportWorkerSession(), options(positions));
     assert.deepEqual(fromMemory, direct);
     const pieces = worker.requests.filter(message => message.piece !== undefined);
     assert.equal(pieces.length, 1, 'one piece');
     assert.ok(worker.requests.every(message => message.uploads === undefined ||
       message.uploads.every(([, array]) => !ArrayBuffer.isView(array) || !isMemoryBacked(array))));
-    const request = worker.requests.find(message => message.op === 'visibleBounds');
+    const request = worker.requests.find(message => message.op === 'drawnCells');
     assert.deepEqual(request.uploads[0][1], { arrayPieces: 0 }, 'the upload names its pieces');
   } finally {
     setFigureExportWorkerFactory(null);

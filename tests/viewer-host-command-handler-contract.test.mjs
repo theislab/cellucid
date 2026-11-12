@@ -1,5 +1,5 @@
 /**
- * A host's (Python's, R's) commands are actions of the catalogue
+ * A host's (Python's, R's) commands are actions of the catalog
  * (`app/viewer-host/command-handler.js`): each is dispatched with origin
  * `host` and the host's name, lowercased, takes the path a control takes,
  * and is answered with its outcome as JSON and the history step it made,
@@ -25,15 +25,14 @@ import { provideHighlightActions } from '../assets/js/app/ui/modules/highlight/h
 import { installFieldActions } from '../assets/js/app/state/actions/field-actions.js';
 import { resolveField } from '../assets/js/app/actions/targets/fields.js';
 
-/** Handlers over the page's dispatcher, for the host `label` while `shown()` names its dataset. */
+/** Handlers over the page's dispatcher, for the host `runtime` while `shown()` names its dataset. */
 function hostHandlers({
-  label = 'Python', language = 'python', shown = () => 'example', actions = getActions(),
+  runtime = 'python', shown = () => 'example', actions = getActions(),
   loadSession = async () => { throw new Error('This test loads no session'); },
 } = {}) {
   return createViewerHostCommandHandlers({
     getShownHostDataset: shown,
-    getHostLabel: () => label,
-    getHostLanguage: () => language,
+    getHostRuntime: () => runtime,
     actions,
     loadSession,
   });
@@ -50,10 +49,10 @@ function provide(t, handlers) {
   t.after(() => { for (const remove of removers) remove(); });
 }
 
-test('the handlers take exactly the dataset shown, the host\'s name and language, the dispatcher and the session loader', () => {
-  const actions = { dispatch: async () => ({ outcome: null, step: null }) };
+test('the handlers take exactly the dataset shown, what opened the viewer, the dispatcher and the session loader', () => {
+  const actions = { dispatch: async () => ({ outcome: null, step: null, unrecorded: null }) };
   const options = {
-    getShownHostDataset: () => 'example', getHostLabel: () => 'R', getHostLanguage: () => 'r', actions,
+    getShownHostDataset: () => 'example', getHostRuntime: () => 'r', actions,
     loadSession: async () => ({ tracker: { id: 't', name: 'T' }, head: 's0' }),
   };
   assert.deepEqual(Object.keys(createViewerHostCommandHandlers(options)), ['handleAction', 'handleLoadSession']);
@@ -63,9 +62,9 @@ test('the handlers take exactly the dataset shown, the host\'s name and language
     { ...options, state: {} },
     { getShownHostDataset: options.getShownHostDataset, actions },
   ]) {
-    assert.throws(() => createViewerHostCommandHandlers(wrong), /require exactly getShownHostDataset, getHostLabel, getHostLanguage, actions, loadSession/);
+    assert.throws(() => createViewerHostCommandHandlers(wrong), /require exactly getShownHostDataset, getHostRuntime, actions, loadSession/);
   }
-  assert.throws(() => createViewerHostCommandHandlers({ ...options, getHostLabel: 'R' }), /getHostLabel must be a function/);
+  assert.throws(() => createViewerHostCommandHandlers({ ...options, getHostRuntime: 'r' }), /getHostRuntime must be a function/);
   assert.throws(() => createViewerHostCommandHandlers({ ...options, loadSession: null }), /loadSession must be a function/);
   assert.throws(() => createViewerHostCommandHandlers({ ...options, actions: {} }), /action dispatcher/);
 });
@@ -85,31 +84,33 @@ test('a host action is dispatched as the host, and answered with its outcome as 
     // are converted, never refused after the action ran.
     outcome: { name: 'leiden', kind: 'categorical', skip: undefined, counts: Uint32Array.of(2, 3), ratio: Number.NaN },
     step: { id: 's3', label: 'Added the categorical column leiden', parent: 's2', touches: ['fields'] },
+    unrecorded: null,
   };
-  const handlers = hostHandlers({ label: 'Python', actions });
+  const handlers = hostHandlers({ runtime: 'python', actions });
   assert.deepEqual(await handlers.handleAction(command('field.push', { cells })), {
     outcome: { name: 'leiden', kind: 'categorical', counts: [2, 3], ratio: null },
     step: { id: 's3', label: 'Added the categorical column leiden' },
+    unrecorded: null,
   });
   // The parameters reach the dispatcher as the channel decoded them (typed arrays in place).
   assert.equal(dispatched[0][1].cells, cells);
   assert.deepEqual(dispatched[0], ['field.push', { cells }, { origin: 'host', host: 'python', turn: null, turnLabel: null }]);
 
-  // A read, or a change that changed nothing: no step.
-  answer = { outcome: undefined, step: null };
-  assert.deepEqual(await hostHandlers({ label: 'R', language: 'r', actions }).handleAction(command('history.get', {})), {
-    outcome: null, step: null,
+  // A read: no step, and nothing to say why.
+  answer = { outcome: undefined, step: null, unrecorded: null };
+  assert.deepEqual(await hostHandlers({ runtime: 'r', actions }).handleAction(command('history.get', {})), {
+    outcome: null, step: null, unrecorded: null,
   });
   assert.deepEqual(dispatched[1][2], { origin: 'host', host: 'r', turn: null, turnLabel: null });
   // A Python notebook's steps are Python's, whatever the viewer calls its host.
-  await hostHandlers({ label: 'Jupyter', language: 'python', actions }).handleAction(command('history.undo', {}));
+  await hostHandlers({ runtime: 'jupyter', actions }).handleAction(command('history.undo', {}));
   assert.deepEqual(dispatched[2][2], { origin: 'host', host: 'python', turn: null, turnLabel: null });
   // A host that named itself nothing is still the host.
-  await hostHandlers({ label: null, language: null, actions }).handleAction(command('history.undo', {}));
+  await hostHandlers({ runtime: null, actions }).handleAction(command('history.undo', {}));
   assert.deepEqual(dispatched[3][2], { origin: 'host', host: null, turn: null, turnLabel: null });
   // A notebook turn travels with each of its actions into the dispatch meta.
-  await hostHandlers({ label: 'R', language: 'r', actions }).handleAction(command('color.by', {}, 'r-turn-2', 'Normalise and cluster'));
-  assert.deepEqual(dispatched[4][2], { origin: 'host', host: 'r', turn: 'r-turn-2', turnLabel: 'Normalise and cluster' });
+  await hostHandlers({ runtime: 'r', actions }).handleAction(command('color.by', {}, 'r-turn-2', 'Normalize and cluster'));
+  assert.deepEqual(dispatched[4][2], { origin: 'host', host: 'r', turn: 'r-turn-2', turnLabel: 'Normalize and cluster' });
 });
 
 test('the steps of one notebook turn are one turn of the history', async t => {
@@ -153,6 +154,67 @@ test('the steps of one notebook turn are one turn of the history', async t => {
   assert.deepEqual(taken.map(step => step.turn ?? step.by?.turn ?? null), ['python-turn-1', 'python-turn-1', null]);
 });
 
+test('a host\'s change that made no step is answered with why (unrecorded), from the history itself', async t => {
+  const { createActionCatalog, defineAction } = await import('../assets/js/app/actions/catalog.js');
+  const { createActionDispatcher } = await import('../assets/js/app/actions/dispatcher.js');
+  const { createDomainRegistry } = await import('../assets/js/app/actions/domains.js');
+  const { createHistory } = await import('../assets/js/app/history/history.js');
+  const { historyActions } = await import('../assets/js/app/actions/definitions/history.js');
+  const { VIEWER_ACTION_UNRECORDED } = await import('../assets/js/data/viewer-protocol.js');
+  const { UNRECORDED_NOTES } = await import('../assets/js/app/agent/bridge/mcp-content.js');
+  // The reasons a host hears are the ones an agent is told: one closed set.
+  assert.deepEqual(Object.keys(UNRECORDED_NOTES).sort(), Object.keys(VIEWER_ACTION_UNRECORDED).sort());
+  const state = { highlights: { active: null, pages: [] } };
+  const domains = createDomainRegistry();
+  for (const id of domains.missing()) {
+    domains.provide(id, {
+      capture: () => (id === 'highlights' ? state.highlights : null),
+      restore: value => { if (id === 'highlights') state.highlights = value; },
+    });
+  }
+  const page = defineAction({
+    type: 'test.page', title: 'Page', summary: 'Show one page.', group: 'Test', reads: [], effect: 'state', touches: ['highlights'],
+    params: { type: 'object', additionalProperties: false, required: ['name'], properties: { name: { type: 'string' } } },
+    describe: params => `Showed ${params.name}`, code: params => `page(${JSON.stringify(params.name)})`,
+  });
+  const dispatcher = createActionDispatcher({ catalog: createActionCatalog([page, ...historyActions]) });
+  dispatcher.provide('test.page', ({ name }) => {
+    state.highlights = { active: null, pages: [{ id: name, name, color: '#000000', groups: [] }] };
+    return null;
+  });
+  let clock = 1_767_225_600_000;
+  const history = createHistory({
+    dispatcher, domains, dataset: { id: 'demo', name: 'Demo', cellOrder: null },
+    newTrackerId: () => 't-00000000-0000-4000-8000-000000000001', now: () => (clock += 1000),
+  });
+  t.after(() => history.destroy?.());
+  await history.startTracker({ name: 'Tracker 1' });
+  const handlers = hostHandlers({ actions: dispatcher });
+  const made = await handlers.handleAction(command('test.page', { name: 'a' }));
+  assert.equal(made.unrecorded, null, 'a step was made');
+  assert.notEqual(made.step, null);
+  // The same page again: nothing changed.
+  assert.deepEqual(await handlers.handleAction(command('test.page', { name: 'a' })), { outcome: null, step: null, unrecorded: 'unchanged' });
+  // A read is no change: nothing to say.
+  const read = await handlers.handleAction(command('history.summary', {}));
+  assert.deepEqual([read.step, read.unrecorded], [null, null]);
+  await handlers.handleAction(command('history.recording.pause', {}));
+  assert.deepEqual(await handlers.handleAction(command('test.page', { name: 'b' })), { outcome: null, step: null, unrecorded: 'paused' });
+  await handlers.handleAction(command('history.recording.resume', {}));
+  history.destroy();
+  assert.deepEqual(await handlers.handleAction(command('test.page', { name: 'c' })), { outcome: null, step: null, unrecorded: 'no-history' });
+});
+
+test('every reason a dispatch gives reaches the host, and none beside a step', async () => {
+  const { VIEWER_ACTION_UNRECORDED } = await import('../assets/js/data/viewer-protocol.js');
+  for (const reason of Object.keys(VIEWER_ACTION_UNRECORDED)) {
+    const actions = { dispatch: async () => ({ outcome: { field: 'cell_type' }, step: null, unrecorded: reason }) };
+    assert.deepEqual(await hostHandlers({ actions }).handleAction(command('color.by', {})), {
+      outcome: { field: 'cell_type' }, step: null, unrecorded: reason,
+    });
+  }
+});
+
 test('a session file a host pushes is loaded as the person loads one, while its dataset is shown', async () => {
   let shown = 'example';
   const loaded = [];
@@ -173,7 +235,7 @@ test('a session file a host pushes is loaded as the person loads one, while its 
   shown = null;
   await assert.rejects(
     handlers.handleLoadSession({ name: 'shared.cellucid-session', file }),
-    /^Error: The viewer shows a dataset Python did not open, so the session "shared\.cellucid-session" was not carried out/,
+    /^Error: The viewer shows a dataset the Python session did not open, so the session "shared\.cellucid-session" was not carried out/,
   );
   assert.equal(loaded.length, 1);
 });
@@ -184,14 +246,14 @@ test('no action is carried out while the viewer shows another dataset', async ()
   const actions = {
     async dispatch(type) {
       dispatched.push(type);
-      return { outcome: null, step: null };
+      return { outcome: null, step: null, unrecorded: null };
     },
   };
   const handlers = hostHandlers({ shown: () => shown, actions });
   for (const action of ['highlight.cells', 'color.by', 'history.get', 'history.undo']) {
     await assert.rejects(
       handlers.handleAction(command(action, {})),
-      new RegExp(`^Error: The viewer shows a dataset Python did not open, so "${action.replace('.', '\\.')}" was not carried out; open Python's dataset again`),
+      new RegExp(`^Error: The viewer shows a dataset the Python session did not open, so "${action.replace('.', '\\.')}" was not carried out; open the dataset of the Python session again`),
     );
   }
   assert.deepEqual(dispatched, []);
@@ -207,7 +269,7 @@ test('an unknown action, and parameters the action\'s schema refuses, reach the 
   await assert.rejects(handlers.handleAction(command('history.jump', { step: 'step 3' })), /step/);
 });
 
-test('a host\'s colouring resolves its field by name, and refuses an absent or ambiguous one', async t => {
+test('a host\'s coloring resolves its field by name, and refuses an absent or ambiguous one', async t => {
   let chosen = 0;
   const state = {
     pointCount: 0,
@@ -236,13 +298,14 @@ test('a host\'s colouring resolves its field by name, and refuses an absent or a
   assert.equal(chosen, 0);
   assert.deepEqual(await handlers.handleAction({ action: 'color.by', params: { field: { source: 'obs', key: 'shown' } } }), {
     outcome: { field: 'shown', source: 'obs', kind: 'category' },
-    // No history on this page: no step.
+    // No history on this page: no step, and the host is told why.
     step: null,
+    unrecorded: 'no-history',
   });
   assert.deepEqual(seen, [['host', 'python']]);
 });
 
-test('a host\'s highlight goes to a page of its colour and never recolours one', async t => {
+test('a host\'s highlight goes to a page of its color and never recolors one', async t => {
   const state = new DataState({}, null);
   state.pointCount = 5;
   state.highlightArray = new Uint8Array(5);
@@ -256,7 +319,7 @@ test('a host\'s highlight goes to a page of its colour and never recolours one',
   });
   assert.equal(typeof outcome, 'object');
 
-  // The person's page keeps its colour; the highlight has a page of its own.
+  // The person's page keeps its color; the highlight has a page of its own.
   assert.deepEqual(
     state.getHighlightPages().map(({ name, color }) => [name, color]),
     [['Page 1', '#2563eb'], ['Page 2', '#123abc']]
@@ -268,7 +331,7 @@ test('a host\'s highlight goes to a page of its colour and never recolours one',
   assert.deepEqual({ ...group, cellIndices: [...group.cellIndices] }, {
     id: 'highlight_1',
     type: 'annotation',
-    label: 'Highlight (2 cells)',
+    label: 'Highlight',
     enabled: true,
     // Original positions 1 and 3 are open cells 3 and 2.
     cellIndices: [2, 3],
@@ -289,7 +352,7 @@ test('a host\'s highlight names original positions: only the open ones are highl
   // Cells 0, 2, 4 of 6, opened in the order 4, 0, 2.
   state.cellIdentity = orderedCellIdentity({ nObs: 6, kept: [0, 2, 4] });
   t.after(provideHighlightActions({ state }));
-  const handlers = hostHandlers({ label: 'R', language: 'r' });
+  const handlers = hostHandlers({ runtime: 'r' });
   await handlers.handleAction({ action: 'highlight.cells', params: { cells: Uint32Array.of(4, 1, 2), color: '#123abc', label: 'Picked' } });
   const [group] = state.getActivePage().highlightedGroups;
   assert.equal(group.label, 'Picked');
@@ -321,13 +384,13 @@ test('a pushed column and a gene set reach the viewer state and are answered wit
   // the column is gathered to them, in that order.
   state.cellIdentity = orderedCellIdentity({ nObs: 10, kept: [1, 3, 5, 8] });
   t.after(installFieldActions({ state }));
-  const handlers = hostHandlers({ label: 'R', language: 'r' });
+  const handlers = hostHandlers({ runtime: 'r' });
 
   const continuous = await handlers.handleAction({
     action: 'field.push',
     params: { key: 'score', kind: 'continuous', categories: null, n_obs: 10, cells: Uint32Array.of(3, 4, 8), values: Float32Array.of(0.5, 9, -1) },
   });
-  assert.deepEqual(continuous, { outcome: { name: 'score', kind: 'continuous', id: 'user_obs_value_1' }, step: null });
+  assert.deepEqual(continuous, { outcome: { name: 'score', kind: 'continuous', id: 'user_obs_value_1' }, step: null, unrecorded: 'no-history' });
   assert.deepEqual([...upserts[0][1].values], [-1, NaN, NaN, 0.5]);
   assert.deepEqual(upserts[0][1].operation, { type: 'notebook-push' });
 
@@ -379,13 +442,22 @@ test('a host\'s data mapping is one transaction whose origin is the notebook\'s'
       return true;
     },
     getDataMapping: () => current,
+    // The groups that follow the matrix are DataState's rule (`followMappingChanges`,
+    // tests/data-mapping-axis-context-contract.test.mjs); this dataset has none to move.
+    followMappingChanges: (base, changes) => ({ ...base, ...changes }),
   };
   t.after(installFieldActions({ state }));
   const handlers = hostHandlers();
   const { outcome } = await handlers.handleAction({ action: 'mapping.set', params: { expression: 'raw' } });
   assert.deepEqual(outcome, { groups: 1 });
   // The mapping applied is the notebook's: what `mapping:changed` reports to it.
-  assert.deepEqual(calls, [[{ ...SHOWN_MAPPING, expression: 'raw' }, { origin: 'notebook' }]]);
+  // The handler's heavy-work asker goes with it (normalized values of another matrix sum its totals).
+  assert.equal(calls.length, 1);
+  const [[mapping, { heavy, signal, ...options }]] = calls;
+  assert.deepEqual([mapping, options], [{ ...SHOWN_MAPPING, expression: 'raw' }, { origin: 'notebook' }]);
+  assert.equal(typeof heavy, 'function');
+  // And the action's Stop (F147).
+  assert.ok(signal instanceof AbortSignal);
   // Refused, nothing changes and the host is told why.
   refuse = true;
   await assert.rejects(handlers.handleAction({ action: 'mapping.set', params: { expression: 'X' } }), /not symmetric/);

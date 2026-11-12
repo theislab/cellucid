@@ -32,7 +32,7 @@ const ELEVATION_ARC_RADIUS = 0.82 * 0.78 * 0.68;
 
 /**
  * Column-major part matrix: translate to the anchor center, scale by the
- * anchor radius, then turn about +Y by `angle` (measured from +X towards +Z,
+ * anchor radius, then turn about +Y by `angle` (measured from +X toward +Z,
  * the convention the compass builders use) after an anchor-local offset.
  */
 function writePartMatrix(out, cx, cy, cz, r, angle, offsetX, offsetY) {
@@ -1163,7 +1163,7 @@ export class OrbitAnchorRenderer {
     const fogFar = viewRadius * 4.0;
 
     // The pane's eye, by the viewer's orbit convention (`updateCamera`:
-    // phi is the polar angle from +Y, theta turns from +X towards +Z): the
+    // phi is the polar angle from +Y, theta turns from +X toward +Z): the
     // shading's view direction (specular, rim) is the camera's.
     const camX = cx + viewRadius * Math.sin(viewPhi) * Math.cos(viewTheta);
     const camY = cy + viewRadius * Math.cos(viewPhi);

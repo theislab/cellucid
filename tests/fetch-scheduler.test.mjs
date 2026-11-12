@@ -1,7 +1,7 @@
 /**
  * The payload download scheduler: foreground downloads start at once and hold
  * new background downloads back; one download per URL serves every caller and
- * is cancelled only when every caller has cancelled.
+ * is canceled only when every caller has canceled.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';

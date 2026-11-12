@@ -13,11 +13,11 @@
  *   and failed with "Normalized user-defined centroids of layout ... were not
  *   published";
  * - an edit made in a kept view gave the live view's copy (the stored field
- *   itself) the new categories under its old per-category colours, and
+ *   itself) the new categories under its old per-category colors, and
  *   selecting the live view again failed with "Category colors must contain
  *   one RGB triplet per category".
  *
- * Each view keeps its own colours and hidden categories, carried through the
+ * Each view keeps its own colors and hidden categories, carried through the
  * edit by category, and a view that shows the field is drawn again from the
  * new codes.
  */
@@ -65,7 +65,7 @@ function observeErrors(page) {
 
 /**
  * The dataset opens on its 3D layout; its 1D and 2D layouts are read when a
- * view first shows them. The field is coloured with its labels shown, and a
+ * view first shows them. The field is colored with its labels shown, and a
  * view is kept: the kept view is selected, and shows its labels too (a view's
  * labels are its own setting, and a label is made only while its view shows
  * labels).
@@ -195,7 +195,7 @@ function readViews(page) {
         if (count > 0) means.push({ category, position: sum.slice(0, dimension).map(total => total / count) });
       });
       const colors = viewId === 'live' && focused === 'live' ? state.colorsArray : view.colorsArray;
-      // The view's category colours and visibility as the state gives them
+      // The view's category colors and visibility as the state gives them
       // (`getLegendModel`, `getColorForCategory`).
       const model = state.getLegendModel(copy);
       views[viewId] = {
@@ -217,8 +217,8 @@ function readViews(page) {
         ),
         labels,
         visible: copy.categories.map((_, index) => model.visible[index] === 1),
-        // The colour each shown category is drawn in, from the view's own
-        // colour buffer, at the first cell of each category with cells.
+        // The color each shown category is drawn in, from the view's own
+        // color buffer, at the first cell of each category with cells.
         drawnColors: Object.fromEntries(copy.categories.flatMap((category, index) => {
           const cell = copy.codes.indexOf(index);
           return cell < 0 || model.visible[index] === 0
@@ -249,9 +249,9 @@ function expectCoherent(read, categories) {
     expect(view.sharesDefinition, `${viewId} holds the stored definition`).toBe(true);
     expect(view.centroidsAreMeans, `${viewId} centroids are the means of its drawn layout`).toBe(true);
     expect(view.shown, `${viewId} shows the field`).toBe(true);
-    // A drawn colour is the view's own colour of the category it is drawn for.
+    // A drawn color is the view's own color of the category it is drawn for.
     for (const [category, rgb] of Object.entries(view.drawnColors)) {
-      expect(rgb, `${viewId} draws ${category} in its own colour`).toEqual(view.ownColors[category]);
+      expect(rgb, `${viewId} draws ${category} in its own color`).toEqual(view.ownColors[category]);
     }
   }
 }
@@ -292,21 +292,22 @@ test('a category deleted in a kept view leaves the live view coherent', async ({
 
   await selectView(page, 1);
   await expect(legendRow(page, 'middle')).toHaveCount(0);
-  await expect(legendRow(page, 'unassigned')).toHaveCount(1);
+  // The one spelling of cells without a label (F124).
+  await expect(legendRow(page, 'Unassigned')).toHaveCount(1);
   await showDimension(page, errors, 'live', 1);
   const read = await readViews(page);
-  expectCoherent(read, ['left', 'right', 'rest', 'unassigned']);
-  expect(read.views.live.labels).toEqual(['left', 'right', 'rest', 'unassigned']);
-  expect(read.views[keptId].labels).toEqual(['left', 'right', 'rest', 'unassigned']);
+  expectCoherent(read, ['left', 'right', 'rest', 'Unassigned']);
+  expect(read.views.live.labels).toEqual(['left', 'right', 'rest', 'Unassigned']);
+  expect(read.views[keptId].labels).toEqual(['left', 'right', 'rest', 'Unassigned']);
   expect(errors).toEqual([]);
 });
 
-test('a merge keeps each view its own colours and hidden categories', async ({ page }) => {
+test('a merge keeps each view its own colors and hidden categories', async ({ page }) => {
   test.setTimeout(180_000);
   const errors = observeErrors(page);
   const keptId = await openWithKeptView(page);
 
-  // The kept view hides 'rest' and recolours 'right'; the live view keeps both.
+  // The kept view hides 'rest' and recolors 'right'; the live view keeps both.
   await legendRow(page, 'rest').locator('.legend-checkbox').uncheck();
   const keptRight = [0.1, 0.8, 0.3];
   await page.evaluate(({ color }) => {
@@ -428,7 +429,7 @@ test('a field deleted, restored or purged in one view is so in every view', asyn
   await selectView(page, 1);
   await page.evaluate(index => window._cellucidState.deleteField('obs', index), fieldIndex);
   await expect(option).toHaveCount(0);
-  // The kept view, shown again, no longer lists the field or is coloured by it.
+  // The kept view, shown again, no longer lists the field or is colored by it.
   await selectView(page, 2);
   await expect(option).toHaveCount(0);
   expect(await page.evaluate(() => window._cellucidState.getActiveField())).toBeNull();

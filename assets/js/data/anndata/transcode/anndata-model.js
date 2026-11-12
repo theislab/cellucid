@@ -58,6 +58,7 @@ import {
   rowsInOrder,
 } from './priority.js';
 import { allocateTypedArray, copyTypedArray } from '../../sparse-column-index.js';
+import { folderKey, portableElementName } from '../write/names.js';
 
 const encoding = (type, version) => ({ 'encoding-type': type, 'encoding-version': version });
 
@@ -67,6 +68,10 @@ const encoding = (type, version) => ({ 'encoding-type': type, 'encoding-version'
  */
 async function writeFrame(writer, path, names, columns, context, notes, what, order = null) {
   const written = [];
+  // Each column under a name the store can hold (`portableElementName`): a
+  // name with `/`, an empty or repeated one, one too long for a file name is
+  // written under its portable form, and said.
+  const taken = new Set([folderKey('_index')]);
   for (const entry of columns) {
     let column = entry.column ?? null;
     if (column === null) {
@@ -77,7 +82,9 @@ async function writeFrame(writer, path, names, columns, context, notes, what, or
       }
       if (column.note) notes.push(`${what} column '${entry.name}': ${column.note}.`);
     }
-    written.push({ name: entry.name, column: order === null ? column : await columnInOrder(column, order, context.readRegion) });
+    const name = portableElementName(entry.name, taken);
+    if (name !== entry.name) notes.push(`${what} column '${entry.name}' is named '${name}' here: a store cannot name a column as it is.`);
+    written.push({ name, column: order === null ? column : await columnInOrder(column, order, context.readRegion) });
   }
   const index = names.map(name => name ?? '');
   await writer.dataframe(path, { index: order === null ? index : Array.from(order, r => index[r]), columns: written });

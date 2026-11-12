@@ -33,7 +33,7 @@ function referenceColors(field, n, missingCode) {
     let layer = 255;
     if (code === missingCode) {
       rgb = [NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8];
-      // A missing value's grey is drawn beneath the categorized cells.
+      // A missing value's gray is drawn beneath the categorized cells.
       layer = 254;
     } else if (field._categoryVisible[code] === 0) {
       rgb = [128, 128, 128];

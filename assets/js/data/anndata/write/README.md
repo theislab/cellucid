@@ -28,12 +28,12 @@ at its own level:
 | `acknowledged-sink.js` | The reader worker's sink: bytes posted to the page in batches, each answered once written, a window of them in flight. |
 | `pool-encoder.js` | Chunks deflated on the decode workers (`runOnDecodeWorker`), put in order. |
 | `changes.js` | One pass checking a copy's changes before a byte is written: names, columns, `uns` values, the merged `uns['cellucid']` (`requireCellucidFileMetadata`), the open dataset's id and name where the file names none. |
-| `names.js` | The specification's portable element-name rule (cellucid-python `require_element_key`). |
-| `copy-target.js` | What a copy is planned against (`readCopyTarget`): the stored obs columns (a MuData's global obs, the placed `<modality>:<key>` ones apart), the values of the columns the plan reads over every cell by original position, in the form `column()` writes them, the var columns of the frame var changes go to, and `uns['cellucid']`. |
+| `names.js` | The specification's portable element-name rule (cellucid-python `require_element_key`), and `portableElementName`: the name a writer gives a name it did not choose (the copy's columns and elements, a converted store's columns, the `.h5ad` export's), said in its notes. |
+| `copy-target.js` | What a copy is planned against (`readCopyTarget`): the stored obs columns (a MuData's global obs, the placed `<modality>:<key>` ones apart), the values of the columns the plan reads over every cell by original position, in the form `column()` writes them, the var columns of the frame var changes go to, the root `uns` keys, the colors of the columns the plan asks (`uns['<column>_colors']` when text, else null), and `uns['cellucid']`. |
 
 ## Entry points
 
-- Page: `BaseAnnDataAdapter.readCopyTarget(names, {signal, owner, varModality})`
+- Page: `BaseAnnDataAdapter.readCopyTarget(names, {signal, owner, varModality, colors})`
   (what the plan reads) and `BaseAnnDataAdapter.writeAnnDataCopy(changes, {sink, signal, owner})`
   (the sink takes one `Blob` per batch; on a failure the caller aborts its
   writable, never closes it, and removes its spool)
@@ -73,7 +73,7 @@ is the source's and is refused). Column kinds are `element-writer.js`
   and the archive's central directory (about 70 bytes an entry). The archive
   goes to the page's sink as it is written. Bytes a copy reads are kept
   neither in the page's memory nor in kept parts (`ReadActivity.readOnce`).
-- Names: kept exactly as stored (never normalised); every name a change
+- Names: kept exactly as stored (never normalized); every name a change
   makes a path follows the portable rule (`names.js`); a source holding one
   name in two Unicode forms is refused (`changes.js`).
 - `formats/zarr/format-v2.js` and `element-writer.js` are in the

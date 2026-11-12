@@ -2,10 +2,10 @@
  * A synthetic page for the history stress suite: every state domain of
  * `app/actions/domains.js` with values of the shapes the app's owners
  * capture (`app/state/domains/README.md`), sized like a real dataset (up to
- * millions of cells, 20 000 genes), and the real action catalogue
+ * millions of cells, 20 000 genes), and the real action catalog
  * (`ACTION_DEFINITIONS`) with handlers that change those values as the
  * page's own implementations do. What is real is everything the history
- * owns: the catalogue's schemas, labels and pseudocode, the dispatcher, the
+ * owns: the catalog's schemas, labels and pseudocode, the dispatcher, the
  * history, the value pool, the session file, the autosave. What is synthetic
  * is the page under it: an owner here captures and restores plain data, so
  * the time a real owner spends reading the viewer is not counted, and the
@@ -188,7 +188,7 @@ function correlationResult(random, cellsPerPage, run) {
     method: 'pearson', slope: random(), intercept: random(),
     xValues: Float32Array.from({ length: cellsPerPage }, () => random()),
     yValues: Float32Array.from({ length: cellsPerPage }, () => random()),
-    xVariable: 'GENE00001', yVariable: 'n_counts', sampled: false,
+    xVariable: 'GENE00001', yVariable: 'n_counts', xLabel: 'GENE00001', yLabel: 'n_counts', sampled: false,
     colorValues: Array.from({ length: cellsPerPage }, (_, i) => `cell_type ${i % 30}`),
     colorVariable: 'cell_type',
   });
@@ -208,11 +208,11 @@ function provenanceOf(dataset, run) {
 }
 
 /**
- * The page: state, owners, the real catalogue and a dispatcher with handlers
+ * The page: state, owners, the real catalog and a dispatcher with handlers
  * for the actions the suite takes.
  *
  * @param {{dataset: ReturnType<typeof syntheticDataset>, seed?: number, markerGroups?: number, correlationCells?: number,
- *   catalog?: object}} options - `catalog`: a catalogue to dispatch through (the suite's timed wrapper)
+ *   catalog?: object}} options - `catalog`: a catalog to dispatch through (the suite's timed wrapper)
  */
 export function syntheticPage({ dataset, seed = 1, markerGroups = 12, correlationCells = 50_000, catalog = null }) {
   const random = seededRandom(seed);
@@ -220,6 +220,7 @@ export function syntheticPage({ dataset, seed = 1, markerGroups = 12, correlatio
   const state = {
     cells: { open: null, genes: null },
     mapping: dataset.mapping,
+    expression: { normalize: false, log1p: false },
     'field-overlays': { renamedFields: [], renamedCategories: [], deletedFields: [], userFields: [] },
     'gene-sets': { sets: [] },
     views: {
@@ -300,7 +301,7 @@ export function syntheticPage({ dataset, seed = 1, markerGroups = 12, correlatio
 
   const handlers = {
     'camera.set': ({ camera: next }) => { perView('camera', () => clonePlain(next)); },
-    // Opening a field changes no colours or filters: those values record only what differs from its opening state.
+    // Opening a field changes no colors or filters: those values record only what differs from its opening state.
     'color.by': ({ field }) => { perView('active-field', () => (field === null ? null : { ...field })); },
     'color.continuous.colormap': ({ field, colormap }) => { fieldEntries('colors', field, entry => ({ ...entry, colormap })); },
     'filter.category.visibility': ({ field, categories, visible }) => {
@@ -349,7 +350,7 @@ export function syntheticPage({ dataset, seed = 1, markerGroups = 12, correlatio
         userFields: [...overlays.userFields, {
           id: `user_${userFieldCounter}`, source: 'obs', kind: 'category', key, deleted: false, purged: false, createdAt: userFieldCounter,
           sourceField: null, operation: null, categories: [...categories], codes: { cells: allCells, values },
-          sourcePages: [], overlapStrategy: 'first', overlapLabel: null, intersectionLabels: false, uncoveredLabel: 'Unassigned',
+          sourcePages: [], overlapStrategy: 'first', overlapLabel: null, intersectionLabels: false, uncoveredLabel: 'Unassigned', palette: null,
         }],
       };
       perView('active-field', () => ({ source: 'obs', user: `user_${userFieldCounter}` }));

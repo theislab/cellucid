@@ -20,8 +20,8 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
       0, 0, 1, 0,
       0, 0, 0, 1,
     ]);
-    const cameraState = () => ({
-      navigationMode: 'orbit',
+    const cameraState = (navigationMode = 'orbit') => ({
+      navigationMode,
       orbit: {
         radius: 3,
         targetRadius: 3,
@@ -53,6 +53,8 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
       },
       bgColor: Float32Array.from([1, 1, 1]),
       cameraDistance: 3,
+      // The sprite cap (rendering/point-sprite.js).
+      pointSizeMax: 160,
       cameraPosition: [0, 0, 3],
       far: 100,
       fogColor: Float32Array.from([1, 1, 1]),
@@ -69,7 +71,13 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
       projectionMatrix: new Float32Array(identity),
       shaderQuality: 'full',
       sizeAttenuation: 1,
-      viewMatrix: new Float32Array(identity),
+      // The camera at (0, 0, 3) looking at the orbit target, the origin.
+      viewMatrix: Float32Array.from([
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, -3, 1,
+      ]),
       viewportHeight: 240,
       viewportWidth: 320,
     });
@@ -87,13 +95,16 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
       ],
       counts: [1, 0],
     });
+    // A 2-D view is seen planar and has axes; a 3-D one is orbited and has
+    // the orientation badge instead (`figureViewHasAxes`).
     const makeView = ({
       id,
       label,
       transparency,
       legendModel,
+      dimension,
     }) => ({
-      cameraState: cameraState(),
+      cameraState: cameraState(dimension === 3 ? 'orbit' : 'planar'),
       data: {
         centroidColors: null,
         centroidFlags: { labels: false, points: false },
@@ -101,15 +112,18 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
         centroidPositions: null,
         colors: Uint8Array.from([255, 0, 0, 255]),
         pointCount: 1,
-        positions: Float32Array.from([0, 0, 0]),
+        positions: new Float32Array(dimension),
         transparency: Uint8Array.from([transparency]),
+        // No vector field drawn over the cells.
+        vectorField: null,
       },
       id,
       label,
+      name: null,
       renderState: renderState(),
       scientificState: {
         datasetGeneration: 7,
-        dimensionLevel: 3,
+        dimensionLevel: dimension,
         fieldKey: 'cluster',
         fieldKind: 'category',
         filters: [],
@@ -139,17 +153,21 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
           label: 'Visible',
           transparency: 1,
           legendModel: categoryLegend(),
+          dimension: 2,
         }),
         makeView({
           id: 'filtered',
           label: 'Filtered',
           transparency: 0,
           legendModel: secondLegend,
+          dimension: 3,
         }),
       ];
       return {
         dpi: format === 'png' ? 96 : null,
         format,
+        // The on-screen arrangement a grid figure keeps: the two panes side by side.
+        gridColumns: 2,
         height: 520,
         meta: {
           views: views.map((view) => ({
@@ -158,6 +176,8 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
             filters: [...view.scientificState.filters],
             id: view.id,
             label: view.label,
+            name: view.name,
+            vectorField: view.data.vectorField,
           })),
         },
         options: {
@@ -189,6 +209,7 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
         },
         selection: {
           highlightArray: null,
+          pageName: null,
           totalCount: 0,
           visibleCount: 0,
         },
@@ -264,7 +285,8 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
   expect(equalText.filter(text => text === 'No visible cells')).toHaveLength(1);
   expect(equalText.filter(text => text === 'UMAP 1')).toHaveLength(1);
   expect(equalText.filter(text => text === 'UMAP 2')).toHaveLength(1);
-  expect(equalText.filter(text => text === 'az 0°')).toHaveLength(2);
+  // Axes on the flat 2-D panel with cells, the orientation on the 3-D one.
+  expect(equalText.filter(text => text === 'az 0°')).toHaveLength(1);
   expect(equalText.filter(text => text === 'cluster')).toHaveLength(1);
   expect(equalText).toContain('A. Visible');
   expect(equalText).toContain('B. Filtered');
@@ -298,7 +320,7 @@ test('grid PNG and Hybrid SVG own per-pane scientific adornments', async ({
   expect(result.hybridSvg).toEqual({
     emptyCount: 1,
     imageCount: 2,
-    orientationCount: 2,
+    orientationCount: 1,
     sharedLegendCount: 1,
     xAxisCount: 1,
   });

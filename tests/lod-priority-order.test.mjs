@@ -90,7 +90,7 @@ test('a level of m cells is the uniform subsample of size m under the same seed'
 
 /**
  * A cloud stored the way an atlas usually is: sorted by cell type, each type
- * in its own place, with very unequal sizes (one type is 0.5 % of the cells).
+ * in its own place, with very unequal sizes (one type is 0.5% of the cells).
  */
 function sortedAtlas(n, dimension) {
   const shares = [0.4, 0.25, 0.2, 0.1, 0.045, 0.005];

@@ -1,55 +1,56 @@
 /**
- * @fileoverview The `colors` state domain: how each view colours each field.
+ * @fileoverview The `colors` state domain: how each view colors each field.
  *
  * Value: `{views: [ViewColors, …]}` (live first, then kept views:
- * `view-list.js`), each `ViewColors` a list of the fields whose colours
+ * `view-list.js`), each `ViewColors` a list of the fields whose colors
  * differ from the field's opening state, in reference order:
  *
  *     {field: {source, key}|{source, user},   // fields.js
  *      colors?: [{category: label, color: '#rrggbb'}, …],
- *                              // categories recoloured (the bytes drawn), in category
+ *                              // categories recolored (the bytes drawn), in category
  *                              // order, then labels held for cells not open yet
- *      colormap?: id,          // a colour map other than the field's default
- *      range?: {min, max},     // a continuous colour range other than the data's
- *      log?: true,             // log colour scale
- *      rescale?: false,        // the colour scale spans the data, not the colour range
- *      zeroGray?: true}        // zeros drawn grey
+ *      colormap?: id,          // a color map other than the field's default
+ *      range?: {min, max},     // a continuous color range other than the data's
+ *      log?: true,             // log color scale
+ *      rescale?: false,        // the color scale spans the data, not the color range
+ *      zeroGray?: true}        // zeros drawn gray
  *
- * A category's colour is recorded only when it differs from the colour its
+ * A category's color is recorded only when it differs from the color its
  * position opens with (the file's palette, else Cellucid's), by label. A
- * colour range is measured against the field's data, never its filter, so a
+ * color range is measured against the field's data, never its filter, so a
  * filter change is the `filters` domain's alone.
  *
  * Restore changes only the fields whose entry differs, in each view whose
- * colours differ, through the methods the legend uses (`setCategoryStates`),
- * and draws the field a view is coloured by again.
+ * colors differ, through the methods the legend uses (`setCategoryStates`),
+ * and draws the field a view is colored by again.
  *
  * @module app/state/domains/colors
  */
 
 import { compareRefs, fieldRef, categoryPlaces, loadFields, requireCategoriesOf, requireField, refId, whenGenesListed } from './fields.js';
-import { differingViews, inEachView, requireViewsFit, viewIdsOf, viewOwner } from './view-list.js';
+import { differingViews, inEachView, requireViewsFit, viewIdsOf, viewOwner, viewReadPart } from './view-list.js';
 import { describePerViewFields } from './filters.js';
 import { pendingCategoryState, holdPendingCategoryState } from '../managers/field/pending-categories.js';
 import { defaultCategoryColors } from '../../utils/category-state.js';
 import { DEFAULT_COLORMAP_ID } from '../../../data/palettes.js';
+import { HEX_COLOR, bytesOfHex, hexOfBytes, hexOfRgb01, rgb01OfHex } from '../../../utils/hex-color.js';
 
 const RANGE_EPSILON = 1e-6;
 
-function hexOfBytes(r, g, b) {
-  return `#${[r, g, b].map(byte => byte.toString(16).padStart(2, '0')).join('')}`;
+/** A color a value holds (`#rrggbb`) as its bytes. */
+function bytesOfColor(color) {
+  if (!HEX_COLOR.test(color)) throw new TypeError(`A field's colors give each category's color as #rrggbb, not ${JSON.stringify(color)}.`);
+  return bytesOfHex(color);
 }
 
-function hexOfChannels(rgb) {
-  return hexOfBytes(...rgb.map(channel => Math.round(channel * 255)));
-}
-
-function channelsOfHex(hex) {
-  return [1, 3, 5].map(at => Number.parseInt(hex.slice(at, at + 2), 16) / 255);
+/** A color a value holds (`#rrggbb`) as 0–1 channels. */
+function rgb01OfColor(color) {
+  bytesOfColor(color);
+  return rgb01OfHex(color);
 }
 
 /**
- * The default colour bytes of a field's categories (a function of position
+ * The default color bytes of a field's categories (a function of position
  * and the file's palette), made once per category list and count.
  */
 const DEFAULTS = new WeakMap();
@@ -63,7 +64,7 @@ function defaultsOf(field) {
 }
 
 /**
- * One field's colours, or null when they are the field's opening colours.
+ * One field's colors, or null when they are the field's opening colors.
  *
  * @param {object} field
  * @param {'obs'|'var'} source
@@ -83,7 +84,7 @@ export function captureFieldColors(field, source) {
       }
     }
     for (const { categoryName, color } of pendingCategoryState(field).colors) {
-      colors.push({ category: categoryName, color: hexOfChannels(color) });
+      colors.push({ category: categoryName, color: hexOfRgb01(color) });
     }
     if (colors.length > 0) entry.colors = colors;
     if (typeof field._colormapId === 'string') entry.colormap = field._colormapId;
@@ -109,7 +110,7 @@ function mayHoldColors(field) {
   return field.kind === 'category' && pendingCategoryState(field).colors.length > 0;
 }
 
-/** One view's colours (`ViewColors`). */
+/** One view's colors (`ViewColors`). */
 export function captureViewColors(owner) {
   const entries = [];
   for (const [data, source] of [[owner.obsData, 'obs'], [owner.varData, 'var']]) {
@@ -122,7 +123,7 @@ export function captureViewColors(owner) {
   return entries.sort((a, b) => compareRefs(a.field, b.field));
 }
 
-/** Put one field of the focused view to `entry` (null: its opening colours), inside a batch. */
+/** Put one field of the focused view to `entry` (null: its opening colors), inside a batch. */
 function applyFieldColors(state, field, entry, place) {
   if (field.kind === 'category') {
     state.ensureCategoryMetadata(field);
@@ -131,13 +132,10 @@ function applyFieldColors(state, field, entry, place) {
     for (const { category, color } of entry?.colors ?? []) {
       const index = place.get(category);
       if (index === undefined) {
-        held.push({ categoryName: category, color: channelsOfHex(color) });
+        held.push({ categoryName: category, color: rgb01OfColor(color) });
         continue;
       }
-      const at = index * 3;
-      wanted[at] = Number.parseInt(color.slice(1, 3), 16);
-      wanted[at + 1] = Number.parseInt(color.slice(3, 5), 16);
-      wanted[at + 2] = Number.parseInt(color.slice(5, 7), 16);
+      wanted.set(bytesOfColor(color), index * 3);
     }
     const own = field._categoryColors;
     const colors = [];
@@ -170,14 +168,14 @@ async function restoreFocusedColors(state, target, signal) {
   if (changed.length === 0) return;
   const refs = changed.map(id => (wanted.get(id) ?? current.get(id)).field);
   if (refs.some(ref => ref.source === 'var')) await whenGenesListed(state, signal);
-  const found = refs.map(ref => requireField(state, ref, {}, 'the colours'));
+  const found = refs.map(ref => requireField(state, ref, {}, 'the colors'));
   await loadFields(state, refs, found, signal);
   const lookups = {};
-  const fields = refs.map(ref => requireField(state, ref, lookups, 'the colours').field);
+  const fields = refs.map(ref => requireField(state, ref, lookups, 'the colors').field);
   const places = fields.map(field => (field.kind === 'category' ? categoryPlaces(field) : null));
   fields.forEach((field, i) => {
     if (places[i] === null) return;
-    requireCategoriesOf(field, places[i], (wanted.get(changed[i])?.colors ?? []).map(({ category }) => category), 'A colour');
+    requireCategoriesOf(field, places[i], (wanted.get(changed[i])?.colors ?? []).map(({ category }) => category), 'A color');
   });
   state.beginBatch();
   try {
@@ -185,7 +183,7 @@ async function restoreFocusedColors(state, target, signal) {
   } finally {
     state.endBatch();
   }
-  // The field the view is coloured by is drawn in its colours again
+  // The field the view is colored by is drawn in its colors again
   // (categories are drawn by the batch's end, `endBatch`).
   const active = state.getActiveField();
   if (active !== null && fields.includes(active) && active.kind === 'continuous' && active.loaded === true) {
@@ -200,17 +198,17 @@ function describeEntry(label, before, after) {
   const a = before ?? {};
   const b = after ?? {};
   const colorsA = new Map((a.colors ?? []).map(({ category, color }) => [category, color]));
-  const recoloured = (b.colors ?? []).filter(({ category, color }) => colorsA.get(category) !== color).map(({ category }) => String(category));
+  const recolored = (b.colors ?? []).filter(({ category, color }) => colorsA.get(category) !== color).map(({ category }) => String(category));
   const reset = [...colorsA.keys()].filter(category => !(b.colors ?? []).some(entry => entry.category === category)).map(String);
-  if (recoloured.length > 0) lines.push(`${label}: recoloured ${recoloured.slice(0, 3).join(', ')}${recoloured.length > 3 ? ` and ${recoloured.length - 3} more` : ''}`);
-  if (reset.length > 0) lines.push(`${label}: default colour for ${reset.slice(0, 3).join(', ')}${reset.length > 3 ? ` and ${reset.length - 3} more` : ''}`);
-  if ((a.colormap ?? null) !== (b.colormap ?? null)) lines.push(`${label}: colour map ${b.colormap ?? 'default'}`);
+  if (recolored.length > 0) lines.push(`${label}: recolored ${recolored.slice(0, 3).join(', ')}${recolored.length > 3 ? ` and ${recolored.length - 3} more` : ''}`);
+  if (reset.length > 0) lines.push(`${label}: default color for ${reset.slice(0, 3).join(', ')}${reset.length > 3 ? ` and ${reset.length - 3} more` : ''}`);
+  if ((a.colormap ?? null) !== (b.colormap ?? null)) lines.push(`${label}: color map ${b.colormap ?? 'default'}`);
   if (JSON.stringify(a.range ?? null) !== JSON.stringify(b.range ?? null)) {
-    lines.push(b.range ? `${label}: colour range ${b.range.min} to ${b.range.max}` : `${label}: colour range of the data`);
+    lines.push(b.range ? `${label}: color range ${b.range.min} to ${b.range.max}` : `${label}: color range of the data`);
   }
-  if ((a.log === true) !== (b.log === true)) lines.push(`${label}: ${b.log ? 'log' : 'linear'} colour scale`);
-  if ((a.rescale !== false) !== (b.rescale !== false)) lines.push(`${label}: colours ${b.rescale === false ? 'span the data' : 'span the range'}`);
-  if ((a.zeroGray === true) !== (b.zeroGray === true)) lines.push(`${label}: zeros ${b.zeroGray ? 'grey' : 'coloured'}`);
+  if ((a.log === true) !== (b.log === true)) lines.push(`${label}: ${b.log ? 'log' : 'linear'} color scale`);
+  if ((a.rescale !== false) !== (b.rescale !== false)) lines.push(`${label}: colors ${b.rescale === false ? 'span the data' : 'span the range'}`);
+  if ((a.zeroGray === true) !== (b.zeroGray === true)) lines.push(`${label}: zeros ${b.zeroGray ? 'gray' : 'colored'}`);
   return lines;
 }
 
@@ -219,20 +217,22 @@ function describeEntry(label, before, after) {
  */
 export function createColorsDomain({ state, viewer, refreshUi }) {
   return {
+    // A step read the view it acted in: staleness compares that view's part alone (F156).
+    readPart: viewReadPart,
     capture() {
       return { views: viewIdsOf(viewer).map(id => captureViewColors(viewOwner(state, id))) };
     },
     async restore(value, { signal = null } = {}) {
       const ids = viewIdsOf(viewer);
-      requireViewsFit(value, ids, 'colours');
+      requireViewsFit(value, ids, 'colors');
       const current = ids.map(id => captureViewColors(viewOwner(state, id)));
       const indices = differingViews(current, value.views);
       await inEachView(state, ids, indices, (_viewId, index) => restoreFocusedColors(state, value.views[index], signal));
       if (indices.length > 0) refreshUi();
     },
-    /** `context.liveHidden`: the live view is hidden at the later value (`views` domain), so the list numbers the kept views from 1. */
-    describe(a, b, { liveHidden = false } = {}) {
-      return describePerViewFields(state, a, b, describeEntry, liveHidden);
+    /** `context.liveHidden`: the live view is hidden at the later value (`views` domain), so the list numbers the kept views from 1; `context.viewLabels`: the views' names there (`viewLabelsInValue`). */
+    describe(a, b, { liveHidden = false, viewLabels = null } = {}) {
+      return describePerViewFields(state, a, b, describeEntry, liveHidden, viewLabels);
     },
   };
 }

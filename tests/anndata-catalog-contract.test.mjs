@@ -88,7 +88,10 @@ test('every other malformed catalog is refused before anything is read', () => {
     [{ schema: 2, default: 'suo', datasets: [entry], extra: 1 }, /\(unexpected: extra\)/],
     [catalog([]), /datasets must list one dataset or more/],
     [{ schema: 2, default: 'he', datasets: [entry] }, /default "he" must be the id of a listed dataset/],
-    [catalog([{ ...entry, name: 'Suo' }]), /must contain id, path and may also contain session \(unexpected: name\)/],
+    [catalog([{ ...entry, title: 'Suo' }]), /must contain id, path and may also contain name, session \(unexpected: title\)/],
+    // A catalog's name for a dataset is a trimmed nonempty text (round 9 close).
+    [catalog([{ ...entry, name: ' Suo' }]), /datasets\[0\]\.name must be the dataset's name, a trimmed nonempty text/],
+    [catalog([{ ...entry, name: '' }]), /datasets\[0\]\.name must be the dataset's name/],
     [catalog([{ id: 'a/b', path: 'a.h5ad' }]), /1 to 180 ASCII letters/],
     [catalog([entry, { id: 'suo', path: 'b.h5ad' }]), /listed twice/],
     [catalog([entry, { id: 'b', path: 'suo.h5ad' }]), /path is listed twice/],
@@ -298,6 +301,8 @@ test('the entries are listed from datasets.json itself, before any file is read'
     catalog: validateAnnDataCatalog(catalog([
       { id: 'tiny-ready', path: 'ready.zarr/' },
       { id: 'other', path: 'cell%20atlas.h5ad' },
+      // Named by the catalog: the name it gives, before the file is read.
+      { id: 'named', name: 'Developing human gonad (Garcia)', path: 'garcia.zarr/' },
     ]), BASE, 'local-demo'),
     sourceType: 'local-demo',
     sourceName: 'Samples',
@@ -306,6 +311,7 @@ test('the entries are listed from datasets.json itself, before any file is read'
   assert.deepEqual(owner.entries(), [
     { id: 'tiny-ready', name: 'ready' },
     { id: 'other', name: 'cell atlas' },
+    { id: 'named', name: 'Developing human gonad (Garcia)' },
   ]);
   assert.equal(host.requests.length, 0);
 });

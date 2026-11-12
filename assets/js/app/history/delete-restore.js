@@ -17,7 +17,7 @@ import { throwIfAborted } from '../../utils/abort.js';
 import { HISTORY_SENTENCES, idNumber, nameKey, suffixedName, validateTracker } from './model.js';
 import { branchOf, branchSteps, descendantsOf, stepOf, trackerRecord, valuesAt } from './tree.js';
 import { bookmarked, stepNamed, takeOut } from './branches.js';
-import { beginEdit, commitEdit, entryOf, exactRestorable, restoreExactly, restoreNameClash, rollbackEdit } from './journal.js';
+import { beginEdit, commitEdit, entryOf, exactRestorable, membershipStepIds, restoreExactly, restoreNameClash, rollbackEdit } from './journal.js';
 import { ActionRefused } from '../actions/dispatcher.js';
 import { quoteName } from '../actions/targets/names.js';
 
@@ -28,7 +28,7 @@ const RENAME_OPS = Object.freeze(['branch.rename', 'group.rename', 'tracker.rena
 
 /**
  * @param {object} h - the history's own context (`history.js`): its operations, and getters
- *   and setters of what it holds now (`active`, `coalesceStep`, `destroyed`, `headValues`, `pending`, `shown`)
+ *   and setters of what it holds now (`active`, `coalesceStep`, `destroyed`, `exclusiveHeavy`, `headValues`, `pending`, `shown`)
  */
 export function createDeleteRestore(h) {
   const {
@@ -38,7 +38,7 @@ export function createDeleteRestore(h) {
   // -------------------------------------------------------------------------
   // Deleting a step, with only its dependants applied again (§3.3.4)
 
-  /** The domains a recorded step's action may write (its catalogue's, else what it recorded). */
+  /** The domains a recorded step's action may write (its catalog's, else what it recorded). */
   function touchesOf(step) {
     if (step.type === null || !catalog.has(step.type)) return new Set(step.touches);
     return new Set([...catalog.get(step.type).touches, ...step.touches]);
@@ -47,7 +47,7 @@ export function createDeleteRestore(h) {
   /**
    * The domains a recorded step's action reads: its result inputs and the
    * state its parameters' names resolve in (`reads` and `context`, the
-   * catalogue's, else what it recorded).
+   * catalog's, else what it recorded).
    */
   function inputsOf(step) {
     const recorded = Object.keys(step.reads).filter(key => key !== 'history');
@@ -126,7 +126,7 @@ export function createDeleteRestore(h) {
         // An input is changed when its canonical form is: a value that differs only by generated ids
         // (a highlight made again under a new id) changes nothing a step reads.
         const changedInputs = new Set();
-        for (const domain of dirty) if (!await sameCanonical(domain, oldParent[domain], newParent[domain])) changedInputs.add(domain);
+        for (const domain of dirty) if (!await sameCanonical(domain, oldParent[domain], newParent[domain], oldParent['field-overlays'], newParent['field-overlays'])) changedInputs.add(domain);
         if (dirty.size > 0) {
           if (each.kind === 'outside') {
             const lost = each.touches.filter(domain => dirty.has(domain));
@@ -150,7 +150,8 @@ export function createDeleteRestore(h) {
             if (failure === null) {
               await restoreTo(newParent, { signal });
               try {
-                await dispatcher.dispatch(each.type, prepared.params, { origin: 'replay', internal: true, rewrite: id, signal });
+                // Heavy work it finds is the delete's (its agent asked: `exclusiveHeavy`).
+                await dispatcher.dispatch(each.type, prepared.params, { origin: 'replay', internal: true, rewrite: id, signal, heavy: h.exclusiveHeavy });
                 reapplied.push(id);
               } catch (error) {
                 if (signal?.aborted) throw error;
@@ -248,7 +249,13 @@ export function createDeleteRestore(h) {
           h.pending = null;
           h.coalesceStep = null;
         }
-        notify('edited', { tracker: tracker.id, op: made.op, journal: made.id, label: made.label, steps: [...made.after.steps.map(step => step.id), ...made.before.steps.filter(step => tracker.steps.has(step.id)).map(step => step.id)], removed: made.before.steps.filter(step => !tracker.steps.has(step.id)).map(step => step.id) });
+        const steps = new Set([
+          ...made.after.steps.map(step => step.id),
+          ...made.before.steps.filter(step => tracker.steps.has(step.id)).map(step => step.id),
+          // A restored group edit changes its steps' group without keeping them.
+          ...membershipStepIds(tracker, made),
+        ]);
+        notify('edited', { tracker: tracker.id, op: made.op, journal: made.id, label: made.label, steps: [...steps], removed: made.before.steps.filter(step => !tracker.steps.has(step.id)).map(step => step.id), journalRemoved: [entry.id] });
         if (entry.op === 'tracker.remove') notify('tracker', { tracker: tracker.id });
         return { entry: entryId, restored: 'exact', journal: made.id, branch: null, report: [] };
       }

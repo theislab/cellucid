@@ -27,30 +27,41 @@
  *   `{type:'result', id, error:{code, message}}` for a call;
  *   `{type:'tools', id, tools}` for a list request; and requests the relay
  *   answers with `{type:'reply', ref, ok, value|error}`:
- *   `{type:'claim', ref, code}` (show me who asks with this connect code),
- *   `{type:'decide', ref, code, allow}`, `{type:'connections', ref}`,
+ *   `{type:'decide', ref, code, allow}` (only the pairing that claimed the
+ *   code), `{type:'connections', ref}`,
  *   `{type:'disconnect', ref, grant}`, `{type:'forget', ref}`.
  *   The text frame `RELAY_PING` is answered `RELAY_PONG` by the platform
  *   without waking the relay (keep-alive and dead-link detection).
  * - **Relay → tab:** `{type:'welcome', protocol}`;
- *   `{type:'call', id, tool, args, agent, grant, client, host}` (run one
- *   tool, as the connection `grant` of the app `client` that `host` vouches
- *   for); `{type:'list', id, grant}` (send the tool list, as that
+ *   `{type:'call', id, tool, args, agent, grant, client, host, known}` (run
+ *   one tool, as the connection `grant` of the app `agent` names: Claude or
+ *   ChatGPT when `known`, else the host that vouches for it; `client` is the
+ *   app's own name, shown only quoted when not `known`); `{type:'list', id, grant}` (send the tool list, as that
  *   connection may use it); `{type:'cancel', id}` (the caller gave up: stop
  *   that call); `{type:'detach', id}` (the caller stopped waiting while the
  *   person is asked: the call goes on, its answer is not sent);
  *   `{type:'reply', ...}`; `{type:'event', name:'connections-changed'}`.
+ * - **Claiming a connect code** is not on the socket: the page sends
+ *   `POST <relay>/oauth/claim` with `{code, secret}` (the tab secret) and
+ *   `credentials: 'include'`, so the browser adds the relay's approver
+ *   cookie, which the relay set with the code's waiting page
+ *   (`__Host-`, `HttpOnly`, `Secure`, `SameSite=Strict`; the page and the
+ *   relay are one site). The relay answers, as a socket reply, `{ok: true,
+ *   value: {client, expiresAt}}` only to the browser that shows the page,
+ *   else `{ok: false, error: {code: 'other-browser', message}}` (or
+ *   `unknown`, `claimed-elsewhere`, `decided`); a socket opened before the
+ *   page set the cookie could not carry it.
  * - **Tab → relay, while a call waits for the person:** `{type:'asking',
  *   id, detail}` when Cellucid asks the person about the call (a large
  *   download, …) and `{type:'answered', id, allowed}` when they answered.
  *   A call still asking when the caller's time runs out is answered with
- *   what to tell the person, and detached, never cancelled: the question
+ *   what to tell the person, and detached, never canceled: the question
  *   stays open in the tab.
  *
  * @module app/agent/bridge/relay-protocol
  */
 
-export const RELAY_PROTOCOL_VERSION = 1;
+export const RELAY_PROTOCOL_VERSION = 2;
 export const RELAY_SUBPROTOCOL = `cellucid-relay.${RELAY_PROTOCOL_VERSION}`;
 export const RELAY_SECRET_PREFIX = 'cellucid-secret.';
 
@@ -115,7 +126,7 @@ export const RESULT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 /**
  * The one tool the relay answers itself: whether a Cellucid tab is connected
  * to this connection, and which. Every other tool is an action of the
- * catalogue, run by the tab.
+ * catalog, run by the tab.
  */
 export const RELAY_STATUS_TOOL = Object.freeze({
   name: 'cellucid_status',

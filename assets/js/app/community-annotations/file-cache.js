@@ -33,7 +33,7 @@
 
 import { toCacheScopeKey } from './cache-scope.js';
 import { assertMergesDocument, assertUserDocument } from './wire-contract.js';
-import { abortReason, onAbort, throwIfAborted } from '../../utils/abort.js';
+import { abortReason, onAbort, throwIfAborted, requireSignalOrNull } from '../../utils/abort.js';
 
 const DB_NAME = 'cellucid_community_annotation_file_cache';
 /** Version 2: records keyed by blob id, with quarantine verdicts and Pull markers. */
@@ -226,19 +226,6 @@ function exactMarker(value, scopeKey) {
   };
 }
 
-function assertAbortSignalOrNull(signal) {
-  if (signal === null) return null;
-  if (
-    typeof signal !== 'object' ||
-    typeof signal.addEventListener !== 'function' ||
-    typeof signal.removeEventListener !== 'function' ||
-    typeof signal.aborted !== 'boolean'
-  ) {
-    throw new TypeError('Community annotation cache signal must be an AbortSignal or null');
-  }
-  return signal;
-}
-
 /** A holder whose `value` is a read request's result once it succeeds (its failure fails the transaction). */
 function resultOf(request) {
   const holder = { value: undefined };
@@ -421,7 +408,7 @@ export class CommunityAnnotationFileCache {
    * @param {{signal?: AbortSignal|null}} [options]
    */
   async putRecords(scope, records, { signal = null } = {}) {
-    const ownerSignal = assertAbortSignalOrNull(signal);
+    const ownerSignal = requireSignalOrNull(signal, 'Community annotation cache signal');
     throwIfAborted(ownerSignal);
     await this.init();
     throwIfAborted(ownerSignal);
@@ -515,7 +502,7 @@ export class CommunityAnnotationFileCache {
   /** Remove every file of a scope whose path is not in `keepPaths`. */
   async pruneToPaths(scope, keepPaths, { signal = null } = {}) {
     if (!(keepPaths instanceof Set)) throw new Error('Community annotation cache keepPaths must be a Set');
-    const ownerSignal = assertAbortSignalOrNull(signal);
+    const ownerSignal = requireSignalOrNull(signal, 'Community annotation cache signal');
     await this.init();
     const scopeKey = this._scopeKey(scope);
     const known = await this.getKnownShas(scope);
@@ -544,7 +531,7 @@ export class CommunityAnnotationFileCache {
 
   /** Record a completed Pull: `{commitOid, annotationsOid, usersOid, ignored}`. */
   async setPullMarker(scope, { commitOid, annotationsOid, usersOid, ignored }, { signal = null } = {}) {
-    const ownerSignal = assertAbortSignalOrNull(signal);
+    const ownerSignal = requireSignalOrNull(signal, 'Community annotation cache signal');
     await this.init();
     const scopeKey = this._scopeKey(scope);
     const marker = exactMarker({
@@ -562,7 +549,7 @@ export class CommunityAnnotationFileCache {
 
   /** Forget a scope's last completed Pull (a Pull about to write records). */
   async deletePullMarker(scope, { signal = null } = {}) {
-    const ownerSignal = assertAbortSignalOrNull(signal);
+    const ownerSignal = requireSignalOrNull(signal, 'Community annotation cache signal');
     await this.init();
     const scopeKey = this._scopeKey(scope);
     await this._transaction([PULLS], 'readwrite', (stores) => {

@@ -145,6 +145,8 @@ function createState(field, paneFields = new Map()) {
       getActiveField() {
         return field;
       },
+      // What a field's values are in (an annotation group on a gene names them).
+      getLegendModel() { return { values: null }; },
       getFieldForView(viewId) {
         return paneFields.has(viewId) ? paneFields.get(viewId) : field;
       },
@@ -602,7 +604,7 @@ test('a proximity step centred on empty space still lands', () => {
     });
   });
 
-  // Dragging from empty space while a selection exists centres the sphere on
+  // Dragging from empty space while a selection exists centers the sphere on
   // that selection's plane, and the renderer reports -1 for the cell it did
   // not hit. The preview already accepts it.
   withDocument(documentOwner.document, () => {

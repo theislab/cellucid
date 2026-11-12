@@ -70,6 +70,7 @@ import { allocateTypedArray } from '../../sparse-column-index.js';
 import { throwIfAborted } from '../../../utils/abort.js';
 import { readUnsCellucid } from '../reader.js';
 import { requireCopyChanges, requireNormalisedDistinct } from './changes.js';
+import { folderKey, portableElementName } from './names.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 
 /** Elements of an AnnData group in the order they are written; any other follows, by name. */
@@ -365,10 +366,15 @@ async function copyNode(node, path, relative, context, anndata) {
   } else {
     writer.group(path, attributesOf(node, context));
   }
+  // Each element under a name a store can hold (`portableElementName`), a
+  // renamed one said.
+  const taken = new Set();
   for (const key of node.keys()) {
     throwIfAborted(context.signal);
-    const childPath = `${path}/${key}`;
+    const as = portableElementName(key, taken);
+    const childPath = `${path}/${as}`;
     if (writer.has(childPath)) continue;
+    if (as !== key) context.notes.push(`${path}/${key} is named '${as}' in the copy: a store cannot name an element as it is.`);
     await copyNode(node.get(key), childPath, `${relative}/${key}`, context, anndata);
   }
   return true;
@@ -398,28 +404,44 @@ async function copyFrame(frame, path, context, { role, changes, relative, anndat
   }
   for (const { name } of changes) if (!order.includes(name)) order.push(name);
   if (changed.has(indexKey)) throw new TypeError(`'${indexKey}' is the index of ${path}, not a column a change writes.`);
+  // Every column under a name a store can hold (`portableElementName`): the
+  // names the changes chose first (checked already), then the source's, a
+  // name it cannot hold (with `/`, too long for a file name, …) written
+  // under its portable form, and said.
+  const taken = new Set([folderKey(indexKey)]);
+  const storedAs = new Map([[indexKey, indexKey]]);
+  for (const name of [...order.filter(name => changed.has(name)), ...order]) {
+    if (storedAs.has(name)) continue;
+    storedAs.set(name, portableElementName(name, taken));
+    if (storedAs.get(name) !== name) context.notes.push(`${path} column '${name}' is named '${storedAs.get(name)}' in the copy: a store cannot name a column as it is.`);
+  }
   const written = [];
   if (frame.has(indexKey)) await copyNode(frame.get(indexKey), `${path}/${indexKey}`, `${relative}/${indexKey}`, context, anndata);
   for (const name of order) {
     throwIfAborted(context.signal);
     const change = changed.get(name);
+    const as = storedAs.get(name);
     if (name === indexKey) {
       // A column that is the index too (anndata stores the one array once, named by both).
       written.push(name);
     } else if (change !== undefined && change.column !== null) {
-      await writer.column(`${path}/${name}`, change.column, role);
-      written.push(name);
+      await writer.column(`${path}/${as}`, change.column, role);
+      written.push(as);
     } else if (change !== undefined) {
       // Renamed, its values as stored.
-      if (await copyNode(frame.get(change.from), `${path}/${name}`, `${relative}/${change.from}`, context, anndata)) written.push(name);
-    } else if (await copyNode(frame.get(name), `${path}/${name}`, `${relative}/${name}`, context, anndata)) {
-      written.push(name);
+      if (await copyNode(frame.get(change.from), `${path}/${as}`, `${relative}/${change.from}`, context, anndata)) written.push(as);
+    } else if (await copyNode(frame.get(name), `${path}/${as}`, `${relative}/${name}`, context, anndata)) {
+      written.push(as);
     }
   }
-  // Children the column order does not list (a categorical's old `__categories`): copied as they are.
+  // Children the column order does not list (a categorical's old `__categories`): copied as they are. A
+  // group an HDF5 file made of a column named with `/` (`a/b` is `b` in a group `a`) was copied as that column.
+  const holdsColumn = key => order.some(name => name.startsWith(`${key}/`));
   for (const key of frame.keys()) {
-    if (key === indexKey || order.includes(key) || renamedFrom.has(key) || skipColumn(key) || writer.has(`${path}/${key}`)) continue;
-    await copyNode(frame.get(key), `${path}/${key}`, `${relative}/${key}`, context, anndata);
+    if (key === indexKey || order.includes(key) || renamedFrom.has(key) || skipColumn(key) || holdsColumn(key)) continue;
+    const as = portableElementName(key, taken);
+    if (writer.has(`${path}/${as}`)) continue;
+    await copyNode(frame.get(key), `${path}/${as}`, `${relative}/${key}`, context, anndata);
   }
   // Declared last, so the column order names exactly the columns written.
   writer.group(path, { ...attrs, _index: indexKey, 'column-order': written });

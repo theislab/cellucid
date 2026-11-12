@@ -20,13 +20,13 @@
  * position 0 mean 0.05 — would leave every position meaning something new, and
  * positions are exactly what gets stored: the session serializer records the raw
  * slider string for every range control, validated only against the element's
- * live bounds, with no migration hook. A session or one of the five published
- * dataset presets carrying `16.5` would silently stop meaning 0.75 and start
- * meaning 0.196.
+ * live bounds, with no migration hook. A session carrying `17` would silently
+ * stop meaning 0.75 and start meaning 0.2.
  *
- * Extending the domain below zero instead leaves the curve alone. Nothing that
- * was ever stored changes meaning, and the reach below 0.25 is added where there
- * was none.
+ * Extending the domain below zero instead leaves the curve alone, and the reach
+ * below 0.25 is added where there was none. The top anchor moved once, from 200
+ * to the sprite cap (R9R-9, 2026-11-11, before any installed base): a position
+ * stored before means a size at most 3.4% smaller.
  *
  * ## Why a dataset gets a size rather than a constant
  *
@@ -38,11 +38,22 @@
  * second is a solid mass — so the default is derived instead of fixed.
  */
 
+import { POINT_SPRITE_MAX_PX } from './point-sprite.js';
+
 /** The point size at slider position 0. The curve's anchor, not its minimum. */
 const POINT_SIZE_AT_SLIDER_ZERO = 0.25;
 
-/** The point size at slider position 100. */
-export const MAXIMUM_POINT_SIZE = 200;
+/**
+ * The point size at slider position 100: the largest sprite a cell is drawn
+ * at (`POINT_SPRITE_MAX_PX`, rendering/point-sprite.js). A size above it draws
+ * the cap for every cell nearer the camera than the perspective scale (all of
+ * them in practice), so slider travel past it was dead and its readout untrue:
+ * position 96.5 to 100 all drew 160 px while reading up to 200 (R9R-9). The
+ * top of the slider is the cap itself. (The bottom differs: a size under the
+ * 0.5-pixel floor is lifted back above it by perspective size scaling as the
+ * camera nears, so that reach is live.)
+ */
+export const MAXIMUM_POINT_SIZE = POINT_SPRITE_MAX_PX;
 
 /** The lowest slider position. Negative on purpose — see the module docstring. */
 export const POINT_SIZE_SLIDER_MINIMUM = -24;
@@ -73,7 +84,7 @@ const POINT_SIZE_REFERENCE_SIZE = 1.5;
  * stopped being a mark for a cell and become a shape in its own right.
  *
  * It bounds only the automatic choice. The slider still reaches
- * `MAXIMUM_POINT_SIZE`, because a person asking for a 200-pixel point has a
+ * `MAXIMUM_POINT_SIZE`, because a person asking for a 160-pixel point has a
  * reason and is looking at the result.
  *
  * The value is where the curve already is for the smallest dataset anyone

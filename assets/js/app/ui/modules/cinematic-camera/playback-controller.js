@@ -7,9 +7,20 @@
  *
  * States: STOPPED → PLAYING ↔ PAUSED → STOPPED
  *
+ * Where the film is: one position, `pauseElapsed` while it does not play.
+ * A pause, a seek and a stop that leaves the camera where it is (the end, an
+ * agent's or a turn's Stop, a reduced-motion completion) all keep it, so the
+ * transport shows where the camera is and Play goes on from there — the one
+ * rule: Play continues from the viewpoint the transport shows; from the end it
+ * starts again. Only the transport's Stop (back to the first keyframe) and a
+ * change of the path (another path: the position meant the old one) put it
+ * back to 0 (R9R-7, 2026-11-11: after a stop the bar read 0:00 while the camera
+ * stayed mid-path).
+ *
  * Under `prefers-reduced-motion: reduce` the loop never runs: the path
  * completes instantly at its end keyframe instead.  CSS cannot reach a
- * `requestAnimationFrame` camera path, so the preference is read here.
+ * `requestAnimationFrame` camera path, so the preference is read from
+ * `utils/reduced-motion.js`.
  *
  * @module ui/modules/cinematic-camera/playback-controller
  */
@@ -22,42 +33,12 @@ import {
 } from './interpolation-engine.js';
 import { isCameraPathReady } from './keyframe-store.js';
 import { readCameraBooleanOption } from '../camera-input-contract.js';
+import { prefersReducedMotion } from '../../../../utils/reduced-motion.js';
+import { createListenerSet } from '../../../../utils/listener-set.js';
 
 const STOPPED = 'STOPPED';
 const PLAYING = 'PLAYING';
 const PAUSED = 'PAUSED';
-
-const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
-
-/** @type {MediaQueryList|null} */
-let reducedMotionMedia = null;
-
-/**
- * The user's live "reduce motion" preference.
- *
- * A platform without `matchMedia` cannot state a preference, so motion stays
- * enabled there; that is the only case in which this reports `false` without
- * having asked the platform.
- *
- * @returns {boolean}
- */
-export function prefersReducedMotion() {
-  if (reducedMotionMedia === null) {
-    if (typeof globalThis.matchMedia !== 'function') return false;
-    const media = globalThis.matchMedia(REDUCED_MOTION_QUERY);
-    if (
-      media === null ||
-      typeof media !== 'object' ||
-      typeof media.matches !== 'boolean'
-    ) {
-      throw new TypeError(
-        'Reduced-motion preference requires an exact MediaQueryList.'
-      );
-    }
-    reducedMotionMedia = media;
-  }
-  return reducedMotionMedia.matches;
-}
 
 /**
  * @param {Object} options
@@ -91,8 +72,10 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   let plan = null;
   let loopEnabled = false;
 
-  // Lightweight event emitter
-  const listeners = { stateChange: new Set(), timeUpdate: new Set() };
+  const listeners = {
+    stateChange: createListenerSet('the camera path playback state'),
+    timeUpdate: createListenerSet('the camera path playback time'),
+  };
 
   function getExactInterpolationOptions() {
     return assertCameraPathOptions(getInterpolationOptions());
@@ -129,9 +112,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   }
 
   function emit(event, data) {
-    for (const fn of listeners[event]) {
-      fn(data);
-    }
+    listeners[event].notify(data);
   }
 
   // ---- Path plan ----
@@ -141,9 +122,9 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
    *
    * Rebuilt only when an input that can change it changes: the keyframes (the
    * store announces every mutation, which drops the plan below) or a setting
-   * the timing or geometry depends on. `loop` is deliberately excluded, because
-   * it steers the clock rather than the path, and rebuilding for it would make
-   * a mid-playback loop toggle re-derive the whole path for nothing.
+   * the timing or geometry depends on. `loop` is one: a looping path that
+   * returns to its start at a constant pace is a seamless loop, whose seam
+   * flows (`interpolation-engine.js` `isSeamlessLoop`).
    */
   function refreshPlan() {
     const options = getExactInterpolationOptions();
@@ -153,7 +134,8 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
       plan.autoPaceSpeed !== options.autoPaceSpeed ||
       plan.positionMethod !== options.positionMethod ||
       plan.rotationMethod !== options.rotationMethod ||
-      plan.easing !== options.easing
+      plan.easing !== options.easing ||
+      plan.loop !== options.loop
     ) {
       plan = createCameraPathPlan(keyframeStore.getAll(), options);
     }
@@ -203,8 +185,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     const now = performance.now() / 1000;
     const active = adoptPlan(now);
     viewer.setCameraState(interpolatePlannedCameraState(active, 1));
-    emit('timeUpdate', { globalT: 1, elapsed: totalDuration, totalDuration });
-    stop({ resetCamera: false });
+    halt({ resetCamera: false, at: totalDuration });
   }
 
   // ---- Frame tick ----
@@ -235,10 +216,9 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
         elapsed = 0;
         globalT = 0;
       } else {
-        // Publish the exact endpoint and finish in place.
+        // Publish the exact endpoint and finish in place, the transport at the end.
         viewer.setCameraState(interpolatePlannedCameraState(active, 1));
-        emit('timeUpdate', { globalT: 1, elapsed: totalDuration, totalDuration });
-        stop({ resetCamera: false });
+        halt({ resetCamera: false, at: totalDuration });
         return;
       }
     }
@@ -309,19 +289,37 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
       'resetCamera',
       'Camera path stop'
     );
+    halt({ resetCamera, at: null });
+  }
+
+  /**
+   * Stop where the film is (`at` null: the position now), at `at` seconds,
+   * or back at the start (`resetCamera`): the position is kept and published,
+   * so the transport says where the camera stopped.
+   */
+  function halt({ resetCamera, at }) {
+    const elapsed = at ?? (state === PLAYING ? performance.now() / 1000 - startTime : pauseElapsed);
     if (rafId != null) rafId();
     rafId = null;
 
     state = STOPPED;
-    pauseElapsed = 0;
+    pauseElapsed = resetCamera || !(totalDuration > 0)
+      ? 0
+      : Math.max(0, Math.min(totalDuration, elapsed));
 
     // The explicit reset command always honors the transport's reset-to-start label.
     if (resetCamera && isCameraPathReady(keyframeStore.getAll())) {
       viewer.setCameraState(interpolatePlannedCameraState(refreshPlan(), 0));
     }
 
+    // Where it stopped first, then that it stopped: a listener ending on the
+    // state change has heard the position (a play that reached the end).
+    emit('timeUpdate', {
+      globalT: totalDuration > 0 ? pauseElapsed / totalDuration : 0,
+      elapsed: pauseElapsed,
+      totalDuration
+    });
     emit('stateChange', state);
-    emit('timeUpdate', { globalT: 0, elapsed: 0, totalDuration });
   }
 
   /**
@@ -366,7 +364,7 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
   }
 
   function getProgress() {
-    if (state === STOPPED) return 0;
+    if (state === STOPPED) return totalDuration > 0 ? Math.min(1, pauseElapsed / totalDuration) : 0;
     if (!Number.isFinite(totalDuration) || totalDuration <= 0) {
       throw new Error(
         'Camera path playback progress requires a positive finite duration.'
@@ -393,6 +391,8 @@ export function createPlaybackController({ viewer, keyframeStore, getInterpolati
     if (state !== STOPPED) {
       stop({ resetCamera: false });
     }
+    // Another path: a position on the old one means nothing on it.
+    pauseElapsed = 0;
   }
 
   keyframeStore.on('changed', onKeyframeChange);

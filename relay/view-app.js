@@ -197,7 +197,7 @@ function script() {
         show(message.params).catch(error => say('The result could not be shown: ' + error.message));
         return;
       case 'ui/notifications/tool-cancelled':
-        say('The call was cancelled.');
+        say('The call was canceled.');
         return;
       case 'ui/notifications/host-context-changed':
         applyContext(message.params);

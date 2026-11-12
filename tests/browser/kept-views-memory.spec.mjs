@@ -10,8 +10,8 @@ const DATASET_URL =
 /**
  * Any number of kept views (there is no view-count ceiling), and memory, not
  * a count, decides what stays on the GPU: when an allocation is refused, the
- * colour stores and R8 textures of kept views that are not presented are
- * released first, and each is rebuilt from its own colours and alpha bytes
+ * color stores and R8 textures of kept views that are not presented are
+ * released first, and each is rebuilt from its own colors and alpha bytes
  * when it is shown again, drawing exactly what it drew before.
  */
 test('six kept views draw in a grid, and views released under memory pressure come back exactly', async ({ page }) => {
@@ -98,7 +98,7 @@ test('six kept views draw in a grid, and views released under memory pressure co
   const released = () => page.evaluate(() => [
     ...window._cellucidViewer.getHPRenderer().snapshotBuffers.values(),
   ].filter(snapshot => snapshot.storesReleased === true).length);
-  // What each kept view holds on the GPU: its colour store and R8 alpha
+  // What each kept view holds on the GPU: its color store and R8 alpha
   // texture read back and hashed, and whether its store is in its geometry's
   // draw order. A pixel difference after the rebuild then says whether the
   // renderer rebuilt different bytes or drew the same bytes differently.
@@ -120,7 +120,7 @@ test('six kept views draw in a grid, and views released under memory pressure co
           out[snapshot.id] = { released: true };
           continue;
         }
-        // A segmented colour store (point-store-segments.js): every segment,
+        // A segmented color store (point-store-segments.js): every segment,
         // read with the GL calls (the renderer facade hands stores out
         // read-only).
         const colors = new Uint8Array(snapshot.bufferByteLength);
@@ -170,7 +170,7 @@ test('six kept views draw in a grid, and views released under memory pressure co
 
   // Show one view alone: the other four kept views are dormant. The next
   // store allocated is refused once, as a device out of memory refuses it,
-  // while the shown view republishes the same colours and visibility (a
+  // while the shown view republishes the same colors and visibility (a
   // store replacement, which allocates).
   await setLayout('single');
   // The layout is changed by an action: a kept view is dormant once a frame
@@ -210,7 +210,7 @@ test('six kept views draw in a grid, and views released under memory pressure co
   expect(pageErrors).toEqual([]);
 
   // Show the grid again: every released view is rebuilt from its own
-  // colours and alpha bytes and draws exactly what it drew before.
+  // colors and alpha bytes and draws exactly what it drew before.
   await setLayout('grid');
   await expect.poll(() => page.evaluate(() => window._cellucidViewer.getPresentedLayout().panes.length)).toBe(6);
   await settled();

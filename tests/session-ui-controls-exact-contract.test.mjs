@@ -407,7 +407,49 @@ test('a control whose choices follow the embedding is checked and applied only o
   }
 });
 
-test('a deferred value that the restored embedding does not offer is refused before any deferred control moves', () => {
+test('the restored choice is applied before the switch that shows it (R9V-1)', () => {
+  // A session saved with the drift overlay on, restored over a page showing
+  // velocity: switched on first, the overlay began loading velocity and the
+  // field change that followed left it stuck "loading". The field goes first.
+  const order = [];
+  const enabled = new FakeControl({ id: 'velocity-overlay-enabled', type: 'checkbox', afterEmbedding: true });
+  const sync = new FakeControl({ id: 'velocity-sync-lod', type: 'checkbox', checked: true, afterEmbedding: true });
+  const field = new FakeControl({
+    id: 'velocity-field', tagName: 'SELECT', value: 'velocity', options: ['drift', 'velocity'], afterEmbedding: true,
+  });
+  const colormap = new FakeControl({
+    id: 'velocity-colormap', tagName: 'SELECT', value: 'viridis', options: ['viridis', 'magma'], afterEmbedding: true,
+  });
+  for (const control of [enabled, sync, field, colormap]) {
+    const dispatch = control.dispatchEvent.bind(control);
+    control.dispatchEvent = event => {
+      order.push(`${control.id}:${event.type}`);
+      return dispatch(event);
+    };
+  }
+  const fixture = installDocument([enabled, sync, field, colormap]);
+  try {
+    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
+    const restoreDeferred = serializer.restoreUIControls({
+      'velocity-overlay-enabled': { type: 'checkbox', checked: true },
+      'velocity-sync-lod': { type: 'checkbox', checked: false },
+      'velocity-field': { type: 'select', value: 'drift' },
+      'velocity-colormap': { type: 'select', value: 'magma' },
+    });
+    assert.deepEqual(order, []);
+    restoreDeferred();
+    assert.deepEqual(order, [
+      'velocity-field:change',
+      'velocity-colormap:change',
+      'velocity-overlay-enabled:change',
+      'velocity-sync-lod:change',
+    ]);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('a deferred value that the restored embedding does not offer keeps its control, is returned, and never stops the others', () => {
   const enabled = new FakeControl({ id: 'velocity-overlay-enabled', type: 'checkbox', afterEmbedding: true });
   const field = new FakeControl({
     id: 'velocity-field',
@@ -423,10 +465,43 @@ test('a deferred value that the restored embedding does not offer is refused bef
       'velocity-overlay-enabled': { type: 'checkbox', checked: true },
       'velocity-field': { type: 'select', value: 'velocity_tsne' },
     });
-    assert.throws(restoreDeferred, /option "velocity_tsne" is not available in current control "velocity-field"/);
-    assert.equal(enabled.checked, false);
-    assert.deepEqual(enabled.events, []);
+    const unread = restoreDeferred();
+    assert.deepEqual(unread.map(({ id }) => id), ['velocity-field']);
+    assert.match(unread[0].reason, /option "velocity_tsne" is not available in current control "velocity-field"/);
+    // The overlay switch is restored; the field keeps the one it has.
+    assert.equal(enabled.checked, true);
+    assert.equal(field.value, 'velocity_umap');
     assert.deepEqual(field.events, []);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test('a saved record is read one control at a time: a value refused, a control added or removed since never fails the others', () => {
+  const mode = new FakeControl({ id: 'render-mode', tagName: 'SELECT', value: 'points', options: ['points', 'smoke'] });
+  const fog = new FakeControl({ id: 'fog-enabled', type: 'checkbox' });
+  const added = new FakeControl({ id: 'added-since', type: 'checkbox', checked: true });
+  const fixture = installDocument([mode, fog, added]);
+  try {
+    const serializer = createUiControlSerializer({ sidebar: fixture.sidebar });
+    const { controls, unread } = serializer.readSavedControls({
+      'render-mode': { type: 'select', value: 'volume' },
+      'fog-enabled': { type: 'checkbox', checked: true },
+      'removed-since': { type: 'checkbox', checked: true },
+    });
+    // The fog switch is read; the mode keeps its value; the control added since keeps its value.
+    assert.deepEqual(controls, {
+      'render-mode': { type: 'select', value: 'points' },
+      'fog-enabled': { type: 'checkbox', checked: true },
+      'added-since': { type: 'checkbox', checked: true },
+    });
+    assert.deepEqual(unread.map(({ id }) => id), ['render-mode', 'removed-since']);
+    assert.match(unread[0].reason, /option "volume" is not available/);
+    assert.match(unread[1].reason, /no such control/);
+    // The record read is complete and valid: it restores.
+    serializer.restoreUIControls(controls)();
+    assert.equal(fog.checked, true);
+    assert.equal(mode.value, 'points');
   } finally {
     fixture.restore();
   }

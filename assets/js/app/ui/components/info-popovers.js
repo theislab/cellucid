@@ -518,7 +518,7 @@ export function initInfoPopovers({ root }) {
     close();
     documentRef.removeEventListener('click', onClick);
     documentRef.removeEventListener('focusin', onFocusIn);
-    documentRef.removeEventListener('keydown', onKeyDown);
+    documentRef.removeEventListener('keydown', onKeyDown, true);
     viewport.removeEventListener('resize', onViewportChange);
     viewport.removeEventListener('scroll', onViewportChange, true);
     viewport.removeEventListener('pagehide', onPageHide);
@@ -530,7 +530,10 @@ export function initInfoPopovers({ root }) {
   }
   documentRef.addEventListener('click', onClick);
   documentRef.addEventListener('focusin', onFocusIn);
-  documentRef.addEventListener('keydown', onKeyDown);
+  // In the capture phase: a dialog keeps its keys from the page
+  // (`app-dialog.js`), and a tip shown inside one still takes its Escape,
+  // which then does not close the dialog under it.
+  documentRef.addEventListener('keydown', onKeyDown, true);
   viewport.addEventListener('resize', onViewportChange);
   viewport.addEventListener('scroll', onViewportChange, {
     capture: true,

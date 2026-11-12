@@ -2,7 +2,7 @@
  * Compare two owned figure-export legend models by value.
  *
  * Legend snapshots are acyclic combinations of finite numbers, strings,
- * booleans, null, arrays, byte arrays (a categorical's colours and
+ * booleans, null, arrays, byte arrays (a categorical's colors and
  * visibility), and plain objects. Object property order is not
  * scientifically meaningful, while array order is.
  *
@@ -25,7 +25,7 @@ export function areLegendModelsSemanticallyEqual(left, right) {
       return false;
     }
 
-    // A categorical's colours and visibility: bytes (`utils/category-state.js`).
+    // A categorical's colors and visibility: bytes (`utils/category-state.js`).
     const aIsBytes = a instanceof Uint8Array;
     if (aIsBytes !== (b instanceof Uint8Array)) return false;
     if (aIsBytes) {

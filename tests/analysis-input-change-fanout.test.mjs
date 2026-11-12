@@ -91,7 +91,7 @@ async function isStale(ui) {
 
 test('only a change of the visible cells makes stale a result scoped to them', async () => {
   const visible = await deUi({ ...DE_OPTIONS, within: 'visible' });
-  // A recolour runs a visibility pass that shows the same cells.
+  // A recolor runs a visibility pass that shows the same cells.
   visibilityPass(visible.state);
   visible.ui.onCellVisibilityChanged();
   assert.equal(await isStale(visible.ui), false);

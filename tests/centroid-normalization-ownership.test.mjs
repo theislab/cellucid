@@ -104,16 +104,16 @@ test('scene publication gives each categorical field one centroid cache, compute
   assert.equal(Object.hasOwn(obs.fields[0], 'centroidsByLayout'), false, 'the field list is not written to');
 });
 
-test('a view kept before a field is first coloured shares its centroids, computed once', () => {
+test('a view kept before a field is first colored shares its centroids, computed once', () => {
   const state = publishedScene(obsFieldList());
   const liveField = loaded(state.obsData.fields[0]);
-  // "Keep view" before the field has ever been used for colouring: the
+  // "Keep view" before the field has ever been used for coloring: the
   // snapshot context is a clone of the live inventory.
   const snapshotField = viewContextCoreMethods._cloneObsData(state.obsData).fields[0];
 
   assertClose(buildFor('live', liveField), NORMALIZED);
   const computed = liveField.centroidsByLayout.get('X_umap');
-  // Selecting the snapshot clones its context field again before colouring.
+  // Selecting the snapshot clones its context field again before coloring.
   assertClose(
     buildFor('snap_1', viewContextCoreMethods._cloneFieldState(snapshotField)),
     NORMALIZED,

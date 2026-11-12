@@ -53,7 +53,7 @@ function createState() {
     updateFilteredCount() {},
     _pushActiveViewLabelToViewer() {},
     _notifyVisibilityChange() {},
-    // A DataState is an event emitter: a recolour says so (`colors:changed`).
+    // A DataState is an event emitter: a recolor says so (`colors:changed`).
     emit() {},
   };
   for (const prototype of [
@@ -90,7 +90,7 @@ test('removing a filter on a non-active field keeps the active field palette', (
   assert.deepEqual(rgbPerCell(state), ACTIVE_RGB);
 });
 
-test('batched visibility and colour edits of a non-active field never repaint the canvas', () => {
+test('batched visibility and color edits of a non-active field never repaint the canvas', () => {
   const { state, other } = createState();
 
   state.beginBatch();

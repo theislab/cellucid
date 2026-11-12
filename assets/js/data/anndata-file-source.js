@@ -34,7 +34,9 @@ import {
 } from './metadata-load-contract.js';
 import { formatCountOf } from '../utils/format-units.js';
 import { retryRefusedAllocation } from './memory-budget.js';
+import { releaseSourceAccessesOf } from './sources/access.js';
 import { isCancellation, cancelled, cancel, throwIfAborted } from '../utils/abort.js';
+import { NO_DATASET_OPEN } from '../app/ui/no-dataset.js';
 
 /** The source type, and the scheme of every dataset address it serves. */
 export const ANNDATA_SOURCE_TYPE = 'anndata';
@@ -172,6 +174,14 @@ export class AnnDataFileSource {
     /** @type {number} Latest load request identity */
     this._loadRequestId = 0;
 
+    /**
+     * What the open dataset was read from and how (`reopenCells` reads it
+     * again): its source owns the accesses of its remote files
+     * (`sources/access.js`), let go with it.
+     * @type {{source: Object, options: Object, title: string, step: string}|null}
+     */
+    this._lastLoad = null;
+
     this.type = ANNDATA_SOURCE_TYPE;
   }
 
@@ -239,7 +249,7 @@ export class AnnDataFileSource {
       const candidateMetadata = identified.metadata;
 
       const candidateStorage = describeAnnDataStorage(source, opened);
-      this._releaseCurrentSource();
+      this._releaseCurrentSource(source);
       this._loader = candidateReader;
       this._adapter = candidateAdapter;
       this._storage = candidateStorage;
@@ -275,6 +285,9 @@ export class AnnDataFileSource {
           } else {
             candidateReader.close();
           }
+          // An opening not adopted lets its files' accesses go, unless the
+          // open dataset reads the same source.
+          if (this._lastLoad?.source !== source) releaseSourceAccessesOf(source);
         } catch (cleanupFailure) {
           terminalError = combineDatasetLifecycleFailures(
             terminalError,
@@ -312,7 +325,10 @@ export class AnnDataFileSource {
     const structure = datasetId === null && defaultDatasetId === null ? structureOf(reader) : null;
     structure?.catch(() => {});
     try {
-      await adapter.initialize({ firstView });
+      // Stopped, the opening stops its reads where they are: the first view's embedding above all,
+      // on a reader that stays open when other cells are read again (found 2026-11-10: a superseded
+      // Apply kept reading it for ~15 s on a slow link).
+      await adapter.initialize({ firstView, signal: opening.signal });
       opening.throwIfStopped();
       this._assertLoadRequest(requestId);
       const id =
@@ -501,7 +517,7 @@ export class AnnDataFileSource {
 
   _requireAdapter() {
     if (!this._adapter) {
-      throw new DataSourceError('No dataset loaded', DataSourceErrorCode.NOT_FOUND, this.type);
+      throw new DataSourceError(NO_DATASET_OPEN, DataSourceErrorCode.NOT_FOUND, this.type);
     }
     return this._adapter;
   }
@@ -514,7 +530,7 @@ export class AnnDataFileSource {
   async getMetadata(datasetId) {
     if (!this._metadata) {
       throw new DataSourceError(
-        'No dataset loaded',
+        NO_DATASET_OPEN,
         DataSourceErrorCode.NOT_FOUND,
         this.type
       );
@@ -587,7 +603,7 @@ export class AnnDataFileSource {
   }
 
   /**
-   * The summary of the neighbour graph the dataset opens with, or null
+   * The summary of the neighbor graph the dataset opens with, or null
    * @param {{signal?: AbortSignal|null}} [options]
    * @returns {Promise<Object|null>}
    */
@@ -626,10 +642,15 @@ export class AnnDataFileSource {
   }
 
   /**
-   * Release the active source without changing the load request identity.
+   * Release the active source without changing the load request identity,
+   * and the accesses of its remote files (`sources/access.js`) unless
+   * `next`, the source taking its place, is the same.
+   * @param {Object|null} [next]
    * @private
    */
-  _releaseCurrentSource() {
+  _releaseCurrentSource(next = null) {
+    const released = this._lastLoad?.source ?? null;
+    this._lastLoad = null;
     if (this._adapter) {
       this._adapter.close();
       this._adapter = null;
@@ -638,6 +659,7 @@ export class AnnDataFileSource {
       this._loader.close();
       this._loader = null;
     }
+    if (released !== null && released !== next) releaseSourceAccessesOf(released);
 
     this.datasetId = null;
     this.filename = null;
@@ -731,6 +753,9 @@ export class AnnDataFileSource {
     } catch (thrown) {
       opening.release();
       const error = opening.outcome(thrown);
+      // The opening's line ends first: an opening that follows (another dataset chosen) is never
+      // shown as part of this one.
+      opening.handle.fail(error);
       // The cells open before are read again, so the dataset on screen and
       // its reader agree (what they share is carried, nothing is fetched):
       // a reading cancelled as its reply came may have been taken already.
@@ -740,7 +765,6 @@ export class AnnDataFileSource {
           console.error('[AnnDataFileSource] The cells open before could not be read again:', restoreFailure);
         });
       }
-      opening.handle.fail(error);
       throw error;
     }
   }
@@ -793,7 +817,7 @@ export class AnnDataFileSource {
   }
 
   /**
-   * How much of the neighbour graph `obsp[key]` the open subsample keeps,
+   * How much of the neighbor graph `obsp[key]` the open subsample keeps,
    * once it was read (`AnnDataReader.subsampleGraphShare`): `{kept, of}`;
    * null when every cell is open or the graph was not read.
    *

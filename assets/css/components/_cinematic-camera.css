@@ -178,7 +178,7 @@
   position: fixed;
   top: var(--space-2-5);
   left: calc(var(--sidebar-width) + var(--space-2-5) + var(--space-8));
-  right: var(--space-8);
+  right: calc(var(--space-8) + var(--agent-panel-inline-size, 0px));
   z-index: var(--z-overlay);
   pointer-events: none;
   opacity: 0;
@@ -194,7 +194,7 @@
 }
 
 /* Only the visible bar takes the pointer. The positioning track spans the
-   viewport so the bar can centre inside it, and a transparent full-width
+   viewport so the bar can center inside it, and a transparent full-width
    track would otherwise swallow clicks meant for the canvas. */
 .cinematic-transport-bar.visible .cinematic-transport-inner {
   pointer-events: auto;
@@ -205,7 +205,7 @@
 }
 
 /* The bar overlays the top edge of the plot, which is where every multiview
-   cell centres its title chip. While the bar is shown the chips step down
+   cell centers its title chip. While the bar is shown the chips step down
    below it; otherwise it hides them and takes the clicks that focus a view. */
 #view-title-layer {
   transition: transform var(--duration-normal) var(--easing-smooth);
@@ -329,6 +329,17 @@ body:has(.cinematic-transport-bar.visible) #view-title-layer {
   opacity: var(--opacity-70);
 }
 
+/* A keyframe's hold: the span the camera rests there, from its marker on. */
+.cinematic-timeline-hold {
+  position: absolute;
+  top: -2px;
+  height: 9px;
+  background: var(--color-text-secondary);
+  border-radius: var(--radius-full);
+  pointer-events: none;
+  opacity: var(--opacity-40);
+}
+
 /* Time readout */
 .cinematic-time-readout {
   font-variant-numeric: tabular-nums;
@@ -356,3 +367,47 @@ body:has(.cinematic-transport-bar.visible) #view-title-layer {
   margin-top: var(--control-block-gap);
 }
 
+
+/* Camera path captions (F110): the named keyframe's label over the plot
+   while the path plays, a documentary's title. Compact, centred low over the
+   plot, above the chat's foot; fades in and out (`captions.js`), at once
+   under reduced motion. */
+.cinematic-caption {
+  position: fixed;
+  left: calc(var(--sidebar-width) + var(--space-8));
+  right: calc(var(--space-8) + var(--agent-panel-inline-size, 0px));
+  bottom: calc(var(--space-8) * 2.5);
+  margin-inline: auto;
+  width: fit-content;
+  max-width: min(36rem, calc(100% - var(--space-8) * 2));
+  padding: var(--space-1-5) var(--space-4);
+  border-radius: var(--radius-sm);
+  /* The same in a picture of the screen (`reads/views.js` drawCaption). */
+  background: rgba(var(--shadow-rgb), var(--opacity-60));
+  color: var(--white);
+  font-size: var(--type-title);
+  font-weight: var(--font-weight-semibold);
+  text-align: center;
+  z-index: var(--z-overlay);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 400ms var(--easing-smooth);
+}
+
+.cinematic-caption.visible {
+  opacity: 1;
+}
+
+.cinematic-caption.no-motion {
+  transition: none;
+}
+
+body:has(#sidebar.hidden) .cinematic-caption {
+  left: var(--space-8);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cinematic-caption {
+    transition: none;
+  }
+}

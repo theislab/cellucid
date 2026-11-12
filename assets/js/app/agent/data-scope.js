@@ -12,7 +12,7 @@
  * picture, or a summary of a group an agent shaped by naming cells: the tool
  * call (`bridge/tool-call.js`) refuses or leaves them out
  * (`bridge/data-guard.js`), for the chat bar and the connector alike, since
- * both run their calls there. It is not anonymisation: a summary of a very
+ * both run their calls there. It is not anonymization: a summary of a very
  * small group (a narrow range, a filter, a rare category) can still reveal
  * its cells' values, and the docs say so.
  *
@@ -39,6 +39,8 @@
  */
 
 import { getCurrentHistory, subscribeCurrentHistory } from '../history/current.js';
+import { webStorage } from '../../utils/web-storage.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
 export const AGENT_DATA_STORAGE_KEY = 'cellucid:agent-data';
 
@@ -50,7 +52,7 @@ export const SUMMARIES_ONLY_PLACE = 'Permissions… in the chat settings or Agen
 
 /** What the switch keeps out, and what it does not do, in two sentences (the notice, the settings, the docs). */
 export const SUMMARIES_ONLY_CAVEAT = 'It keeps values of single cells, extremes (a minimum, a maximum, a median) and pictures out of what agents are sent. '
-  + 'It is not anonymisation: a summary of a very small group can still reveal its cells\' values.';
+  + 'It is not anonymization: a summary of a very small group can still reveal its cells\' values.';
 
 /** The key a dataset with no identity is kept under, for this page only. */
 const UNNAMED = '\u0000page';
@@ -83,23 +85,15 @@ function readStored(storage) {
  *   left out: `localStorage`, and this window's `storage` events (another tab's change)
  */
 export function createAgentDataStore({ storage, win = storage === undefined ? globalThis.window ?? null : null } = {}) {
-  const store = () => {
-    try {
-      return storage === undefined ? globalThis.localStorage ?? null : storage;
-    } catch {
-      return null;
-    }
-  };
+  const store = () => (storage === undefined ? webStorage('localStorage') : storage);
   /** What this page knows: the stored records, and those kept for this page only (none stored). */
   let records = readStored(store());
   const pageOnly = new Map();
-  const listeners = new Set();
+  const listeners = createListenerSet('what agents are sent of a dataset');
   const keyOf = id => (typeof id === 'string' && id !== '' ? id : UNNAMED);
 
   function notify() {
-    for (const listener of [...listeners]) {
-      try { listener(); } catch (error) { console.error('[agents] a data-scope listener failed', error); }
-    }
+    listeners.notify();
   }
 
   function recordOf(key) {
@@ -154,8 +148,7 @@ export function createAgentDataStore({ storage, win = storage === undefined ? gl
     /** Whether the dataset `id` is kept for this page only (it has no identity). */
     pageOnly: id => keyOf(id) === UNNAMED,
     subscribe(listener) {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
+      return listeners.add(listener);
     },
     destroy() {
       win?.removeEventListener?.('storage', onStorage);
@@ -176,6 +169,12 @@ export function agentDataStore() {
 
 /** Nothing shaped (no tracker: a test in Node, a page starting). */
 const NOTHING_SHAPED = Object.freeze({ page: () => false, field: () => false });
+
+/**
+ * Field actions whose field (the outcome's `name`; a rename's `name`) holds the
+ * cells of the field they name: another name of it, a copy, a grouping, an edit.
+ */
+const FIELD_FROM_FIELD = new Set(['field.rename', 'field.revert-name', 'field.duplicate', 'field.group', 'category.merge', 'category.delete']);
 
 /** Highlight actions that make a group from a field (its categories, its range). */
 const FROM_FIELD = new Set(['highlight.category', 'highlight.range']);
@@ -234,11 +233,15 @@ export function createShapeTracker({ actions, state, history = getCurrentHistory
     try {
       if (type === 'highlight.cells' && byAgent && outcome !== null) markGroup(outcome.page, outcome.group);
       else if ((type === 'field.push' || type === 'field.consensus') && byAgent) marks().fields.add(params.key);
-      else if (FROM_FIELD.has(type) && fieldShaped(params.field?.key) && outcome !== null) markGroup(outcome.page, outcome.group);
+      else if (FROM_FIELD.has(type) && fieldShaped(params.field?.key) && outcome !== null) {
+        // A range makes one group; categories, one group each.
+        for (const label of type === 'highlight.category' ? outcome.groups : [outcome.group]) markGroup(outcome.page, label);
+      }
       else if (type === 'highlight.page.combine' && outcome !== null && (params.pages ?? []).some(pageShaped)) markPage(outcome.page);
       else if (type === 'field.create-from-pages' && (params.pages ?? []).some(entry => pageShaped(entry.page))) marks().fields.add(params.key);
-      else if ((type === 'field.rename' || type === 'field.revert-name' || type === 'field.duplicate') && fieldShaped(params.field?.key)) {
-        // Every name it had stays marked: an undo of a rename brings the old name back.
+      else if (FIELD_FROM_FIELD.has(type) && fieldShaped(params.field?.key)) {
+        // Every name it had stays marked: an undo of a rename brings the old name back. A column
+        // made from it (a copy, a grouping, a file's column edited into a new one) is shaped too.
         const name = type === 'field.rename' ? params.name : outcome?.name;
         if (typeof name === 'string') marks().fields.add(name);
       }

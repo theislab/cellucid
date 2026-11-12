@@ -17,7 +17,7 @@
  *   the store's own metadata;
  * - **steps** (each: seconds, bytes, requests, and the bytes against the
  *   whole file): open and first view (the embedding the view draws, at the
- *   cells the default Cells-to-open setting opens), the first colouring
+ *   cells the default Cells-to-open setting opens), the first coloring
  *   field, a first gene, a second gene, twenty genes; then a **second
  *   visit** (a new reader over the same browser storage, on disk): what it
  *   fetched, and every request it sent;
@@ -464,12 +464,12 @@ async function runOne(entry, { share, genes, label, storage }) {
     if (opened.error || adapter === null) return { source, adapter: null };
     const fields = adapter.getObsFields().fields;
     const field = fields.find(item => item.kind === 'category') ?? fields[0];
-    if (field !== undefined) await step(`${label}: colour by ${field.key}`, async () => { await adapter.getObsFieldData(field.key); });
+    if (field !== undefined) await step(`${label}: color by ${field.key}`, async () => { await adapter.getObsFieldData(field.key); });
     let genePaths = [];
     await step(`${label}: gene list`, async () => {
       const list = (await adapter.getGeneList()).fields;
       // Genes spread over the list, as a person picks markers: never
-      // neighbours, which a reader may have read together.
+      // neighbors, which a reader may have read together.
       const count = Math.min(list.length, Math.max(2, genes));
       genePaths = Array.from({ length: count }, (_, i) => list[(i * 7919 + 13) % list.length].path);
       return { genes: list.length };

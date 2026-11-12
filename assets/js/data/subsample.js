@@ -19,10 +19,10 @@
  *   `proportional` (largest remainder) or `balanced` (water-filling), each
  *   stratum first given `min(minPerCategory, its size)` — and keeps the
  *   lowest-ranked cells of each stratum.
- * - **blocks** cuts the cells into runs of `blockSize` neighbours in file
+ * - **blocks** cuts the cells into runs of `blockSize` neighbors in file
  *   order, ranks the runs by the same hash of their number, and keeps whole
  *   runs in rank order, the last one cut to its first cells to make exactly
- *   `k`. Nested like `uniform`. A run of neighbours is a run of storage, so
+ *   `k`. Nested like `uniform`. A run of neighbors is a run of storage, so
  *   a subsample reads about its share of a row-chunked array's bytes.
  * - **spatial** puts the cells of an embedding on a grid of `gridSize`
  *   boxes per axis and splits `k` over the occupied boxes as `balanced`
@@ -340,7 +340,7 @@ class RankedItems {
         : collectItemRanks(items, start, end, key, lower, width, ranks, found);
     }
     // Each long loop is a function of its own (`collectRanks`,
-    // `positionsByRank`), optimised on its own: none runs on in a slower tier
+    // `positionsByRank`), optimized on its own: none runs on in a slower tier
     // when this one is.
     const collected = positionsByRank(ranks.subarray(0, found), key);
     if (have === 0) {
@@ -381,7 +381,7 @@ export function subsampleUniform(nObs, k, seed) {
 }
 
 /**
- * `blocks`: whole runs of `blockSize` neighbouring cells in rank order of
+ * `blocks`: whole runs of `blockSize` neighboring cells in rank order of
  * their run number, the last one cut to its first cells.
  *
  * @param {number} nObs
@@ -396,7 +396,7 @@ export function subsampleBlocks(nObs, k, seed, blockSize) {
 
 /**
  * The `blocks` subsample of `k` cells (`subsampleBlocks`) as its runs of
- * neighbouring cells, `[starts[r], ends[r])` ascending and apart (blocks
+ * neighboring cells, `[starts[r], ends[r])` ascending and apart (blocks
  * next to one another make one run): what a price of its rows needs
  * (`subsample-plan.js` `rowChunks`), in a step a block, not a cell.
  *

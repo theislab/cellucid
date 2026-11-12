@@ -5,6 +5,7 @@ import { openDatasetAsAgent } from './helpers/agent-dataset-open.mjs';
 import { currentUiLike, listCatalogDatasets } from './helpers/catalog-datasets.mjs';
 import { APP_ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { outOfReach } from './helpers/dialog-keys.mjs';
 import {
   AUTH_USER,
   AUTH_USER_KEY,
@@ -726,7 +727,7 @@ async function startGitHubPublication(page) {
     name: 'GitHub sync…',
     exact: true,
   }).click();
-  const modal = page.locator('.community-annotation-modal-overlay').last();
+  const modal = page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)').last();
   await expect(modal).toBeVisible();
   const publish = modal.getByRole('button', {
     name: 'Publish',
@@ -1286,9 +1287,7 @@ test(
     });
     // GitHub setup is modal: the picker is out of the person's reach, so the
     // dataset changes under it the way it really can, by an agent opening one.
-    expect(await page.locator('#dataset-select').evaluate(
-      element => element.closest('[inert]') !== null,
-    )).toBe(true);
+    expect(await outOfReach(page.locator('#dataset-select'))).toBe(true);
     const opened = await openDatasetAsAgent(page, {
       name: SECOND_DATASET_NAME,
       kind: 'sample',
@@ -1722,7 +1721,7 @@ test(
 );
 
 test(
-  'transient role failure preserves connection and recovers while navigator stays online',
+  'transient role failure preserves connection, and the next Pull recovers it while navigator stays online',
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await installStoredAuthentication(page);
@@ -1748,10 +1747,12 @@ test(
 
     await openCatalogDeepLink(page);
     // Each request is asked again while the Worker is busy (the transport's
-    // repeats); once they are spent, the connection is kept and the role is
-    // asked again after the shared back-off.
-    await expect(page.locator('.notification-warning').last()).toContainText(
-      'repository connection was preserved',
+    // repeats, its one retry policy); once they are spent, the connection is
+    // kept and the warning says when the role is asked again.
+    const warning = page.locator('.notification-warning').last();
+    await expect(warning).toContainText('repository connection was preserved');
+    await expect(warning).toContainText(
+      'Cellucid asks again with the next Pull, and at once when this computer comes back online.',
     );
     expect(repoRequestCount).toBeGreaterThan(1);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
@@ -1774,10 +1775,29 @@ test(
 
     const failedRequests = repoRequestCount;
     reachable = true;
-    // No online event: the scheduled retry recovers on its own.
-    await expect.poll(() => runtimeSnapshot(page), {
-      timeout: 60_000,
-    }).toMatchObject({
+    // Nothing asks again on a timer of its own (round 9: the transport's
+    // retries are the one policy): past the host's named reset, no request.
+    await page.waitForTimeout(3_000);
+    expect(repoRequestCount).toBe(failedRequests);
+    expect((await runtimeSnapshot(page)).role).toBe('unknown');
+
+    // No online event: the person's next Pull reads the role again.
+    const section = page.locator('#community-annotation-section');
+    if (!(await section.evaluate(element => element.open))) {
+      await section.locator(':scope > summary').click();
+    }
+    await section.getByRole('button', {
+      name: 'GitHub sync…',
+      exact: true,
+    }).click();
+    await page.getByRole('dialog', {
+      name: 'GitHub sync',
+      exact: true,
+    }).getByRole('button', {
+      name: 'Pull latest',
+      exact: true,
+    }).click();
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       role: 'author',
       currentRepo: `${FIRST_REPO}@main`,
       session: {
@@ -2705,50 +2725,16 @@ test(
 );
 
 test(
-  'a retry whose timer fires during active sync resumes after sync settlement',
+  'a role check asked for during an active sync resumes after sync settlement',
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await installStoredAuthentication(page);
-    // Observe the owner retry timer itself. Its due time alone does not prove
-    // it fired while the pull was active: a loaded runner can deliver the
-    // timer late, after the pull below has already been released, and the
-    // contract would then exercise a different interleaving.
-    await page.addInitScript(() => {
-      const nativeSetTimeout = window.setTimeout;
-      const probe = { armed: 0, fired: 0 };
-      window.setTimeout = function observeRoleRetryTimer(
-        callback,
-        delay,
-        ...args
-      ) {
-        if (
-          typeof callback === 'function' &&
-          /scheduleTransientRoleRetry/.test(new Error().stack ?? '')
-        ) {
-          probe.armed += 1;
-          const observed = (...callbackArgs) => {
-            try {
-              return callback(...callbackArgs);
-            } finally {
-              probe.fired += 1;
-            }
-          };
-          // The back-off follows the measured link (about a second here):
-          // held to a fixed window so the Pull below surely starts first.
-          const heldMs = Math.max(Number(delay) || 0, 5000);
-          probe.dueAt = Date.now() + heldMs;
-          return nativeSetTimeout.call(this, observed, heldMs, ...args);
-        }
-        return nativeSetTimeout.call(this, callback, delay, ...args);
-      };
-      window.__cellucidRoleRetryTimerProbe = probe;
-    });
     let repoRequestCount = 0;
     let failing = true;
     await installGitHubApi(page, async fullName => {
       repoRequestCount += 1;
       if (failing) {
-        // Busy until the role resolution gives up and schedules its retry.
+        // Busy until the role resolution gives up and says so.
         return {
           status: 503,
           body: { error: 'synthetic busy Worker before the active pull' },
@@ -2817,7 +2803,7 @@ test(
       openSync.click();
       const pullLatest = [
         ...document.querySelectorAll(
-          '.community-annotation-modal-overlay button',
+          '.community-annotation-dialog:not(.community-annotation-details-dialog) button',
         ),
       ].find(button => button.textContent === 'Pull latest');
       if (!(pullLatest instanceof HTMLButtonElement)) {
@@ -2830,20 +2816,13 @@ test(
     ).toBe(true);
     expect(repoRequestCount).toBe(requestsBeforePull);
 
-    // The owner retry is due while the explicit pull owns syncBusy. It must be
-    // queued, not consumed into a null-timer state. Wait until it has really
-    // fired, then keep the original margin past its due time so a request it
+    // This computer comes back online while the explicit pull owns syncBusy:
+    // the role check it asks for must be queued behind the pull, never run
+    // beside it nor dropped. Its continuations settle, and a request it
     // wrongly issued would have reached the route handler.
-    expect(await page.evaluate(
-      () => window.__cellucidRoleRetryTimerProbe.armed,
-    )).toBe(1);
-    await expect.poll(
-      () => page.evaluate(() => window.__cellucidRoleRetryTimerProbe.fired)
-    ).toBe(1);
-    const retryDueAt = await page.evaluate(() => window.__cellucidRoleRetryTimerProbe.dueAt);
-    await page.waitForTimeout(
-      Math.max(0, retryDueAt + 400 - Date.now()),
-    );
+    await page.evaluate(() => window.dispatchEvent(new Event('online')));
+    await settleBrowserContinuations(page);
+    await page.waitForTimeout(400);
     expect(repoRequestCount).toBe(requestsBeforePull);
     await page.evaluate(async () => {
       const { getCommunityAnnotationAccessStore } = await import(
@@ -3441,7 +3420,7 @@ test(
     );
     expect(
       await page.locator('.notification-success').allTextContents(),
-    ).not.toContain('Cancelled.');
+    ).not.toContain('Canceled.');
     expect(mutationRequests).toHaveLength(1);
     await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
       authenticated: false,
@@ -3512,14 +3491,22 @@ test(
     releasePublicationRepo.resolve();
     await repoRequestFailed;
 
-    const terminalError = page.locator('.notification-error').last();
-    await expect(terminalError).toBeVisible();
-    await expect(terminalError).toContainText(
-      'Annotation dataset, repository, or authenticated user changed.',
-    );
-    await expect(terminalError).not.toContainText(
-      UNKNOWN_PUBLICATION_GUIDANCE,
-    );
+    // A cancellation, never a failure (`utils/abort.js`: what it belonged to
+    // went away): nothing was sent, so the Publish's card is withdrawn, with
+    // no error and no word of a publication GitHub may have applied; the
+    // sign-out is what happened, and the panel shows it.
+    await expect(page.locator('.notification').filter({
+      hasText: `Publishing your annotations to ${FIRST_REPO}`,
+    })).toHaveCount(0);
+    await expect.poll(() => runtimeSnapshot(page)).toMatchObject({
+      authenticated: false,
+      role: 'unknown',
+    });
+    await settleBrowserContinuations(page);
+    await expect(page.locator('.notification-error')).toHaveCount(0);
+    expect(
+      (await page.locator('.notification').allTextContents()).join('\n'),
+    ).not.toContain(UNKNOWN_PUBLICATION_GUIDANCE);
     expect(mutationCount).toBe(0);
   },
 );
@@ -4033,10 +4020,13 @@ test(
     await page.evaluate(async () => {
       const { getGitHubAuthSession } =
         await import('/assets/js/app/community-annotations/github-auth.js');
+      // The sign-in this tab started (`signIn`) named this state.
+      sessionStorage.setItem('cellucid:github-app-auth:pending', 'started-here');
       const callbackUrl =
         `${window.location.origin}${window.location.pathname}` +
         `${window.location.search}` +
-        '#cellucid_github_auth=1&cellucid_github_token=synthetic-token' +
+        '#cellucid_github_state=started-here' +
+        '&cellucid_github_auth=1&cellucid_github_token=synthetic-token' +
         '&cellucid_github_token_expires_in=28800';
       await getGitHubAuthSession().completeSignInFromRedirect({
         url: callbackUrl,
@@ -4321,12 +4311,15 @@ test(
             '/assets/js/app/community-annotations/github-auth.js'
           );
         const state = { marker: 'valid-token' };
+        // The sign-in this tab started (`signIn`) named this state.
+        sessionStorage.setItem('cellucid:github-app-auth:pending', 'started-here');
         window.history.replaceState(
           state,
           '',
           `${window.location.origin}${window.location.pathname}` +
             `${window.location.search}` +
             `#${retainedBeforeValue}` +
+            '&cellucid_github_state=started-here' +
             '&cellucid_github_auth=1' +
             '&cellucid_github_token=synthetic-token' +
             '&cellucid_github_token_expires_in=28800' +

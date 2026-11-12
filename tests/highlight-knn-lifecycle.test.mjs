@@ -48,7 +48,7 @@ function createKnnTools() {
 /**
  * A k-NN row source (`KnnRowSource`) over undirected `pairs` of
  * `cellCount` cells, answering each read as the reader worker does (a row's
- * neighbours, in request order), after a macrotask; `reads` records each
+ * neighbors, in request order), after a macrotask; `reads` records each
  * read's cells, `fail` makes the next read fail.
  */
 function rowSourceOf(pairs, cellCount) {
@@ -234,7 +234,7 @@ test('a released k-NN step is committed once its rows have arrived, after every 
     [1, 0, [0, 1, 2]],
     [2, 4, [0, 1, 2, 3, 4]],
   ]);
-  // Confirming waits for a step still reading its rows; cancelling drops it.
+  // Confirming waits for a step still reading its rows; canceling drops it.
   const confirmed = [];
   tools.knnCallback = event => confirmed.push(Array.from(event.cellIndices));
   const pending = new KnnExpansion({ graph, seed: 2, transparency });

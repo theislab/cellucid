@@ -16,24 +16,27 @@ import {
   parseAutoPullPreferences,
   serializeAutoPullPreferences,
 } from '../../../community-annotations/auto-pull-preferences.js';
+import { webStorage } from '../../../../utils/web-storage.js';
 
 const AUTO_PULL_STORAGE_KEY =
   'cellucid:community-annotations:auto-pull:v1';
 
 export function readAutoPullPreferences() {
-  if (typeof localStorage === 'undefined') {
+  const kept = webStorage('localStorage');
+  if (kept === null) {
     throw new Error('Auto-pull preferences require localStorage');
   }
   return parseAutoPullPreferences(
-    localStorage.getItem(AUTO_PULL_STORAGE_KEY)
+    kept.getItem(AUTO_PULL_STORAGE_KEY)
   );
 }
 
 export function writeAutoPullPreferences(prefs) {
-  if (typeof localStorage === 'undefined') {
+  const kept = webStorage('localStorage');
+  if (kept === null) {
     throw new Error('Auto-pull preferences require localStorage');
   }
-  localStorage.setItem(
+  kept.setItem(
     AUTO_PULL_STORAGE_KEY,
     serializeAutoPullPreferences(prefs)
   );

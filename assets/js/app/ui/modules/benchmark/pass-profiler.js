@@ -34,12 +34,14 @@
 /**
  * Pass labels, each with the uniform names that identify its programs. The
  * first matching entry wins, so more specific families come first: the
- * highlight shader also carries `u_pointScale`, and the velocity particle
- * shader also carries the centroid shader's camera uniforms.
+ * highlight and centroid shaders carry the point sprite's uniforms too
+ * (`u_pointScale`, rendering/point-sprite.js), so the points are told by
+ * the uniforms only a point pass declares, and the velocity particle shader
+ * also carries the centroid shader's camera uniforms.
  */
 export const PASS_SIGNATURES = Object.freeze([
   Object.freeze(['highlight', Object.freeze(['u_highlightScale', 'u_ringWidth'])]),
-  Object.freeze(['points', Object.freeze(['u_lodIndexTex', 'u_pointScale'])]),
+  Object.freeze(['points', Object.freeze(['u_lodIndexTex', 'u_drawPass'])]),
   Object.freeze(['edges', Object.freeze(['u_lineWidth', 'u_viewportSize'])]),
   Object.freeze(['grid', Object.freeze(['u_gridSpacing', 'u_gridLineWidth'])]),
   Object.freeze(['studio', Object.freeze(['u_floorWeight', 'u_backdropWeight'])]),

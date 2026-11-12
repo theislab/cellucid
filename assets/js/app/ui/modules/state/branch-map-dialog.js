@@ -18,6 +18,7 @@ import { formatAgo } from './model.js';
 import { idNumber } from '../../../history/model.js';
 import { wireAppDialog } from '../../components/app-dialog.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
+import { ICONS, createIconButton } from '../../components/controls.js';
 
 /**
  * @param {object} options
@@ -104,12 +105,7 @@ export function createBranchMap({ dialog, view, ops, graphHandlers, layoutOption
       const last = doc.createElement('td');
       last.textContent = formatAgo(tip?.until ?? tip?.at ?? null, now()).short;
       const menuCell = doc.createElement('td');
-      const more = doc.createElement('button');
-      more.type = 'button';
-      more.className = 'icon-btn';
-      more.setAttribute('aria-label', `Branch “${branch.name}”: actions`);
-      more.title = more.getAttribute('aria-label');
-      more.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>';
+      const more = createIconButton({ label: `Branch “${branch.name}”: actions`, icon: ICONS.more });
       more.addEventListener('click', () => ops.branchMenu(branch.id, more));
       menuCell.append(more);
       tr.append(pickCell, nameCell, from, steps, last, menuCell);

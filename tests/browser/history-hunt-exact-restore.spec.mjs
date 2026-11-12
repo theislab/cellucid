@@ -76,14 +76,16 @@ test('step by step: undo all the way back, then redo all the way forward, each s
   expect(errors).toEqual([]);
 });
 
-test('one jump back over a colouring, a category rename and a kept view gives the opening back', async ({ page }) => {
+test('one jump back over a coloring, a category rename and a kept view gives the opening back', async ({ page }) => {
   const errors = observeProductErrors(page);
   await open(page);
   const field = { source: 'obs', key: 'cell_type' };
+  // The fixture opens colored by cell_type: the rename and the kept view are of the field shown,
+  // and the coloring jumped over is the change to score.
   const run = await recordRun(page, [
-    ['color.by', { field }],
     ['category.rename', { field, category: 'alpha', name: 'A' }],
     ['view.keep', {}],
+    ['color.by', { field: { source: 'obs', key: 'score' } }],
   ]);
   expect(run.after.filter(entry => entry.refused !== null)).toEqual([]);
   // Showing the opening (a click on "Opened", Undo turn of an agent that did all three).

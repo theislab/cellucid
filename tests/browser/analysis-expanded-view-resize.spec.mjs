@@ -215,3 +215,34 @@ test.describe('on a phone', () => {
     expect(errors).toEqual([]);
   });
 });
+
+test('a view sized on a large window stays inside a smaller one, and gets its size back', async ({ page }) => {
+  // F126 (bug hunt): a view given a size lost its cap (`max-*: none`) and kept
+  // its place, so a smaller window left it past the screen's edges, its
+  // header and close button out of reach.
+  const errors = observeProductErrors(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openDataset(page);
+  const content = await openView(page);
+  const corner = content.locator('> .analysis-modal-edge-resize-se');
+  await corner.focus();
+  await page.keyboard.press('End');
+  const large = await layout(content);
+  expect(large.left + large.width).toBeGreaterThan(1000);
+  expect(large.top + large.height).toBeGreaterThan(700);
+
+  for (const size of [{ width: 1000, height: 700 }, { width: 900, height: 520 }]) {
+    await page.setViewportSize(size);
+    await expect.poll(async () => {
+      const box = await content.boundingBox();
+      return box.x >= 8 - 0.5 && box.y >= 8 - 0.5
+        && box.x + box.width <= size.width - 8 + 0.5 && box.y + box.height <= size.height - 8 + 0.5;
+    }, { message: `the view is inside ${size.width} × ${size.height}` }).toBe(true);
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expect.poll(async () => {
+    const { width, height } = await layout(content);
+    return { width, height };
+  }).toEqual({ width: large.width, height: large.height });
+  expect(errors).toEqual([]);
+});

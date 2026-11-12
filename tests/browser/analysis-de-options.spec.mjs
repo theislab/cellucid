@@ -179,3 +179,38 @@ test('Within keeps only the cells of the chosen categories', async ({ page }) =>
   expect(result.groupBSize).toBe(100);
   expect(errors).toEqual([]);
 });
+
+test('a field made while the panel is open is a choice at once, and an agent\'s groups keep one form (L25-6, L25-2)', async ({ page }) => {
+  const errors = observeProductErrors(page);
+  const panel = await openDE(page);
+  await setOptions(page, categories(['A'], ['B']));
+  const outcome = await page.evaluate(async () => {
+    const { getActions } = await import('/assets/js/app/actions/index.js');
+    const actions = getActions();
+    const tree = () => window._cellucidHistories.current().active;
+    const stepsBefore = tree().steps.size;
+    await actions.dispatch('highlight.category', { field: { source: 'obs', key: 'cluster' }, categories: ['A'], page: 'Probe' });
+    await actions.dispatch('field.create-from-pages', { key: 'probe_field', pages: [{ page: 'Probe', label: 'In A' }], uncovered_label: 'Elsewhere' });
+    // Named at once, with groups in another order than the field's: kept in the field's order.
+    const set = await actions.dispatch('analysis.differential.set', {
+      options: { field: 'probe_field', categoriesA: { mode: 'subset', ids: ['Elsewhere'] }, categoriesB: { mode: 'subset', ids: ['In A'] } },
+    });
+    const ab = await actions.dispatch('analysis.differential.set', {
+      options: { field: 'cluster', categoriesA: { mode: 'subset', ids: ['C', 'A'] }, categoriesB: { mode: 'subset', ids: ['B'] } },
+    });
+    // Every step the actions and their observed state changes record is in
+    // once the history is idle (no fixed wait: the condition itself).
+    await window._cellucidHistories.current().idle();
+    // The steps from the first action on (the setup's own `_setOptions` above is a change outside the history).
+    const all = [...tree().steps.values()].slice(stepsBefore).map(step => step.type);
+    const steps = all.slice(all.indexOf('highlight.category'));
+    return { changed: set.outcome?.changed ?? null, abChanged: ab.outcome?.changed ?? null, steps, options: window._comparisonModule.getUI('differential')._options.categoriesA };
+  });
+  expect(outcome.changed).toContain('field');
+  expect(outcome.abChanged).toContain('categoriesA');
+  expect(outcome.options).toEqual({ mode: 'subset', ids: ['A', 'C'] });
+  expect(outcome.steps).not.toContain('history.outside-change');
+  // The person's selects offer it too (Field, Within and Replicates list the categorical fields).
+  await expect.poll(() => panel.locator('select option[value="probe_field"]').count()).toBeGreaterThan(0);
+  expect(errors).toEqual([]);
+});

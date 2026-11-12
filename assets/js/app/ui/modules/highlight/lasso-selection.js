@@ -13,8 +13,7 @@ import {
   HIGHLIGHT_MODE_COPY,
   SELECTION_NOTICE,
   idleSelectionNoticeHtml,
-  selectionNoticeHtml
-} from './mode-copy.js';
+  selectionNoticeHtml, combineHelpHtml } from './mode-copy.js';
 import { pushHistoryStep, selectionUnchanged } from './selection-state.js';
 import { viewerNeedsUiRetirement } from '../../core/viewer-lifecycle.js';
 import {
@@ -126,10 +125,10 @@ export function initLassoSelection(options) {
     if (destroyed) return;
     requireCompletedSelectionEvent(lassoEvent, 'lasso', state.pointCount);
 
-    const stepsLabel = lassoEvent.steps > 1 ? ` (${formatCountOf(lassoEvent.steps, 'view')})` : '';
     void confirmer.confirm({
       tool: 'lasso',
-      label: `Lasso${stepsLabel} (${formatCountOf(lassoEvent.cellCount, 'cell')})`,
+      // Named by the tool (the list shows its count); a second on the page is `Lasso 2`.
+      label: 'Lasso',
       cellIndices: lassoEvent.cellIndices
     });
 
@@ -139,7 +138,7 @@ export function initLassoSelection(options) {
       cellIndices: lassoEvent.cellIndices,
       source: 'lasso',
       onFailure: error => {
-        if (!destroyed) showSelectionDeliveryFailure(error, 'lasso');
+        if (!destroyed) showSelectionDeliveryFailure(error, 'lasso', viewerHostSource.getHostRuntime());
       }
     }));
 
@@ -185,7 +184,7 @@ export function initLassoSelection(options) {
 
     // The empty state before the first step is recorded like any other, so
     // Undo can reach it — the annotation tool has always done this, and a
-    // greyed-out Undo immediately after drawing reads as a broken control.
+    // grayed-out Undo immediately after drawing reads as a broken control.
     pushHistoryStep(selectionState, 'lassoHistory', {
       candidates: selectionState.lastLassoCandidates,
       step: selectionState.lastLassoStep
@@ -370,7 +369,7 @@ export function initLassoSelection(options) {
 
     if (stepEvent.step === 0 && stepEvent.keepControls) {
       const stepInfo =
-        '<strong>No selection</strong><br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>';
+        `<strong>No selection</strong><br><small>${combineHelpHtml()}</small>`;
 
       showLassoControls(0, notice);
 
@@ -389,7 +388,7 @@ export function initLassoSelection(options) {
       modeLabel = ' <span class="lasso-mode-tag intersect">intersected</span>';
     }
 
-    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCountOf(stepEvent.candidateCount, 'cell')}${modeLabel}<br><small>Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract</small>`;
+    const stepInfo = `<strong>Step ${stepEvent.step}:</strong> ${formatCountOf(stepEvent.candidateCount, 'cell')}${modeLabel}<br><small>${combineHelpHtml()}</small>`;
 
     showLassoControls(stepEvent.candidateCount, notice);
 

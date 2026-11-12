@@ -53,7 +53,7 @@ const FIXTURE_URL = new URL('./fixtures/data-mapping-conformance.json', import.m
 // (tests/testthat/test-data-mapping-conformance.R) pin this same digest.
 // Update all three together.
 const FIXTURE_SHA256 =
-  '6f7b7ff0e4392ea00c7e21c7a868ec68d3ec83a63558227f9f7d2c300a666c32';
+  'a3b615e6377f3936ce5701764622ee74ee3c30b95d24303e815eb83476451200';
 
 /**
  * A JSON number literal written with a fraction or an exponent, such as
@@ -123,7 +123,7 @@ test('the fixture is the pinned shared copy', () => {
     createHash('sha256').update(FIXTURE_BYTES).digest('hex'),
     FIXTURE_SHA256
   );
-  assert.equal(FIXTURE.version, 7);
+  assert.equal(FIXTURE.version, 9);
   assert.deepEqual(Object.keys(FIXTURE), [
     '_about',
     'version',

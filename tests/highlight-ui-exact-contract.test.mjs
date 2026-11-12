@@ -280,7 +280,8 @@ test('category highlights preserve primitive identity through save, restore, and
 
   const expectedLabels = [
     'kind: normal',
-    'kind: ""',
+    // Named as every place names a category (`categoryDisplayName`): an empty one as (empty).
+    'kind: (empty)',
     'kind: " x "',
     'kind: 0',
     'kind: false'
@@ -490,6 +491,8 @@ test('selection-tool destruction retires subscriptions and fences retained callb
     getCellIndicesForRange() {
       return [];
     },
+    // What a field's values are in (an annotation group on a gene names them).
+    getLegendModel() { return { values: null }; },
     getFieldForView() {
       return null;
     },
@@ -922,7 +925,8 @@ test('highlight summary dispatches by name, and the handlers refuse state-operat
       const checkbox = renderedGroup.children[0];
       checkbox.checked = false;
       groupsEl.dispatch('change', { target: checkbox });
-      groupsEl.dispatch('click', { target: renderedGroup.children[2], stopPropagation() {} });
+      const removeButton = renderedGroup.children.find(child => String(child.className).split(/\s+/).includes('list-item-remove'));
+      groupsEl.dispatch('click', { target: removeButton, stopPropagation() {} });
       clearButton.dispatch('click', {});
     });
     await settleActions();
@@ -1204,7 +1208,7 @@ test('malformed lasso events fail before history or permanent highlight mutation
   }
   assert.deepEqual(
     dispatched.map(([type, params]) => [type, [...params.cells], params.label, params.tool, params.page]),
-    [['highlight.cells', [3], 'Lasso (1 cell)', 'lasso', 'Page 1']]
+    [['highlight.cells', [3], 'Lasso', 'lasso', 'Page 1']]
   );
   assert.deepEqual(calls, ['add']);
 });
@@ -1257,6 +1261,9 @@ test('selection destruction drains viewer host delivery and suppresses late fail
         viewerHostSource: {
           notifySelection() {
             return delivery;
+          },
+          getHostRuntime() {
+            return 'jupyter';
           }
         },
         selectionState: createHighlightSelectionState(),
@@ -1351,6 +1358,8 @@ test('annotation undo republishes the exact candidate state to the unified rende
     getCellIndicesForRange() {
       return new Uint32Array(0);
     },
+    // What a field's values are in (an annotation group on a gene names them).
+    getLegendModel() { return { values: null }; },
     getFieldForView() {
       return field;
     },
@@ -1438,6 +1447,8 @@ test('continuous preview rejects missing published statistics before querying ce
         rangeCalls += 1;
         return [];
       },
+      // What a field's values are in (an annotation group on a gene names them).
+      getLegendModel() { return { values: null }; },
       getFieldForView() {
         return {
           kind: 'continuous',
@@ -1491,6 +1502,8 @@ test('continuous preview preflights the exact shared selection state before call
         getCellIndicesForRange() {
           return [];
         },
+        // What a field's values are in (an annotation group on a gene names them).
+        getLegendModel() { return { values: null }; },
         getFieldForView() {
           return null;
         },

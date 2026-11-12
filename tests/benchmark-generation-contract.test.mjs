@@ -218,7 +218,7 @@ test('a response is checked against the exact lengths publication demands', () =
         validResponse(count, { colors: new Uint8Array(count * 3) }),
         count
       ),
-    /4000 Uint8 colour components/
+    /4000 Uint8 color components/
   );
   assert.throws(
     () =>

@@ -71,12 +71,12 @@ import {
   joinValue, parseArrayDigest, partJoiner, skeletonArrays, skeletonParts, splitValue, verifyArray,
 } from '../history/value-parts.js';
 import { hashValue } from '../history/value-pool.js';
-import { HISTORY_ID_PATTERNS, HistoryModelError, emptyPatch, recordFields, validateSession } from '../history/model.js';
-import { DOMAIN_IDS } from '../actions/domains.js';
+import { HISTORY_ID_PATTERNS, HistoryModelError, emptyPatch, knownDomainsOnly, recordFields, validateSession } from '../history/model.js';
 import { HOST_LITTLE_ENDIAN } from '../../formats/io/byte-order.js';
 import { isPlainRecord, requireExactKeys, requirePlainRecord } from '../../utils/exact-record.js';
 import { formatCountOf } from '../../utils/format-units.js';
 import { throwIfAborted } from '../../utils/abort.js';
+import { markDamaged } from '../../utils/errors.js';
 
 if (!HOST_LITTLE_ENDIAN) {
   throw new Error('Session files require a little-endian platform.');
@@ -111,9 +111,13 @@ const CHUNK_KEYS_BY_KIND = Object.freeze({
 const KIND_ORDER = Object.freeze(['steps', 'parts', 'array', 'values', 'journal', 'chat']);
 const ARRAY_ENCODINGS = Object.freeze(['raw', 'cell-set']);
 
-/** A file that breaks the format: says what, for the person who chose it. */
+/**
+ * A file that breaks the format: its message says what, for the console and
+ * the notification's Details; the person reads that the file is damaged
+ * (`session-serializer.js` `describeLoadFailure`), never the ids it names.
+ */
 function invalid(what, cause = undefined) {
-  return new TypeError(`This session file is damaged: ${what}`, cause === undefined ? undefined : { cause });
+  return markDamaged(new TypeError(`This session file is damaged: ${what}`, cause === undefined ? undefined : { cause }));
 }
 
 function requireText(value, label) {
@@ -215,24 +219,19 @@ function modelCheck(check) {
 }
 
 /**
- * The domains of a file this version does not have, refused naming them and
- * the version that wrote the file (a step of a newer Cellucid).
+ * Check the session as read, tracker by tracker (`validateSession`'s
+ * `unreadable`, F164): each tracker as this version holds it
+ * (`knownDomainsOnly`: a state domain it does not have is left for the
+ * history to leave out), one this version cannot read left for the history
+ * to leave out (`history.js` `readSaved` names both). Returns the ids of the
+ * trackers it could not read. The header, and how the trackers agree with
+ * each other and the scope, are checked whole (a refusal says the file is
+ * damaged).
  */
-function refuseUnknownDomains(manifest, steps) {
-  const unknown = new Set();
-  for (const step of steps) {
-    for (const id of [...(Array.isArray(step?.touches) ? step.touches : []), ...Object.keys(isPlainRecord(step?.before) ? step.before : {}),
-      ...Object.keys(isPlainRecord(step?.after) ? step.after : {}), ...Object.keys(isPlainRecord(step?.reads) ? step.reads : {})]) {
-      if (!DOMAIN_IDS.includes(id) && id !== 'history') unknown.add(id);
-    }
-  }
-  if (unknown.size === 0) return;
-  const names = [...unknown].sort().map(id => `"${id}"`).join(', ');
-  throw new RangeError(
-    `This session file was written by Cellucid ${manifest.app?.version ?? 'of another version'} and holds `
-    + `${unknown.size === 1 ? 'a part of the state' : 'parts of the state'} this version does not have (${names}). `
-    + 'Open it with that version or a newer one.'
-  );
+function checkSession(manifest, trackers) {
+  const unreadable = [];
+  modelCheck(() => validateSession(sessionRecord(manifest, trackers.map(tracker => knownDomainsOnly(tracker).tracker)), { unreadable }));
+  return new Set(unreadable.map(each => each.id));
 }
 
 /** The value hash of every domain at `stepId` (the after-values on the path from the root). */
@@ -787,7 +786,6 @@ export async function openHistoryFile(source, { signal, onProgress }) {
     if (stage !== 'header') throw new Error('A session file is read once, eager chunks first.');
     stage = 'eager';
     await readStage('eager', (meta, bytes) => takeChunk(meta, bytes, null));
-    refuseUnknownDomains(manifest, [...storedSteps.values()].flat());
     const eagerValues = await joinValues('its eager values');
     late = [];
     trackers = manifest.trackers.map(record => {
@@ -796,15 +794,16 @@ export async function openHistoryFile(source, { signal, onProgress }) {
     });
     // Checked whole now but for its journal, read last: a removed tracker keeps its removal there, so
     // it stands in for it here (by the journal entry the removal needs) and is checked whole after it.
-    modelCheck(() => validateSession(sessionRecord(manifest, trackers.map(tracker => (tracker.removed === null ? tracker : {
+    const unreadable = checkSession(manifest, trackers.map(tracker => (tracker.removed === null ? tracker : {
       ...tracker,
       journal: [{
         id: `j${tracker.nextJournal - 1}`, op: 'tracker.remove', at: tracker.removed.at, by: tracker.removed.by, label: 'Removed',
         before: emptyPatch(), after: emptyPatch(), purged: false,
       }],
-    })))));
+    })));
     const active = trackers.find(tracker => tracker.id === manifest.activeTracker);
-    if (manifest.scope.content !== 'steps') {
+    // The values the head shows are first, as the file was written; one this version cannot read is put back as read.
+    if (manifest.scope.content !== 'steps' && !unreadable.has(active.id)) {
       for (const hash of Object.values(valuesAtStep(active.steps, active.headId))) {
         if (!eagerValues.has(hash)) throw invalid('the values of the step it shows are not among its first chunks.');
       }
@@ -829,8 +828,6 @@ export async function openHistoryFile(source, { signal, onProgress }) {
     ));
     const journals = [];
     for (const [trackerId, stored] of rest.journals) {
-      refuseUnknownDomains(manifest, stored.flatMap(entry => (isPlainRecord(entry?.before) && isPlainRecord(entry?.after)
-        ? [...(entry.before.steps ?? []), ...(entry.after.steps ?? [])] : [])));
       const journal = stored.map((entry, i) => {
         if (!isPlainRecord(entry) || entry.purged !== false || !isPlainRecord(entry.before) || !isPlainRecord(entry.after)) return entry;
         const patch = (side, which) => ({
@@ -853,12 +850,15 @@ export async function openHistoryFile(source, { signal, onProgress }) {
         chats: rest.chats.filter(chat => chat.tracker === tracker.id).map(chat => [chat.conversation, chat.transcript]),
       };
     });
-    modelCheck(() => validateSession(sessionRecord(manifest, whole)));
+    const unreadable = checkSession(manifest, whole);
     if (manifest.scope.content !== 'steps') {
       const referenced = new Set();
-      for (const tracker of whole) for (const step of everyStep(tracker)) for (const hash of stepHashes(step)) referenced.add(hash);
+      for (const tracker of whole) {
+        if (!unreadable.has(tracker.id)) for (const step of everyStep(tracker)) for (const hash of stepHashes(step)) referenced.add(hash);
+      }
       for (const hash of referenced) if (!values.has(hash)) throw invalid('a step refers to a value the file does not hold.');
-      for (const hash of values.keys()) if (!referenced.has(hash)) throw invalid('it holds a value no step refers to.');
+      // A tracker this version cannot read names values it cannot list: each value is then held for it.
+      if (unreadable.size === 0) for (const hash of values.keys()) if (!referenced.has(hash)) throw invalid('it holds a value no step refers to.');
     }
     const used = joiner.used();
     for (const name of partSkeletons.keys()) if (!used.has(name)) throw invalid('it holds a part nothing refers to.');

@@ -17,7 +17,6 @@ function analysis() {
   let intent = 0;
   Object.assign(ui, {
     _isDestroyed: false,
-    _updateTimer: null,
     _notifications: { error() {} },
     runs: [],
     _beginAnalysisIntent: () => ++intent,

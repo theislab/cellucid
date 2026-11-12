@@ -22,7 +22,7 @@
  * A key is present only when it differs from the field's opening state, so
  * opening a field (which fills in its defaults, `ensure*Metadata`) changes
  * nothing here, and a dataset with thousands of genes holds an empty list.
- * Colours are the `colors` domain's: a field's colour range is measured
+ * Colors are the `colors` domain's: a field's color range is measured
  * against its data, never against its filter, so narrowing a filter is one
  * domain's change.
  *
@@ -36,11 +36,13 @@
  */
 
 import { compareRefs, fieldName, fieldRef, categoryPlaces, loadFields, requireCategoriesOf, requireField, refId, whenGenesListed } from './fields.js';
-import { differingViews, inEachView, requireViewsFit, viewIdsOf, viewOwner } from './view-list.js';
+import { differingViews, inEachView, requireViewsFit, viewIdsOf, viewOwner, viewReadPart } from './view-list.js';
 import { viewNameInValue } from '../../actions/targets/views.js';
 import { pendingCategoryState, holdPendingCategoryState } from '../managers/field/pending-categories.js';
 import { categoryCellLimitAt, categoryCellLimitsOf } from '../managers/category-cell-sample.js';
-import { formatCountOf } from '../../../utils/format-units.js';
+import { formatBound, formatCountOf, formatPercent } from '../../../utils/format-units.js';
+import { MISSING_LABEL } from '../managers/filter-manager.js';
+import { categoryDisplayName } from '../../actions/targets/names.js';
 
 /** A continuous range equal to its data's within this is the data's. */
 const RANGE_EPSILON = 1e-6;
@@ -138,7 +140,7 @@ function applyFieldFilter(state, field, entry, place) {
       state.setCategoryCellLimit(field, i, wanted === null ? null : { count: wanted.count, seed: wanted.seed });
     }
     // Labels its open cells do not hold yet (a discovered column, checked
-    // before: `requireCategoriesOf`) stay held, by label; the colours held
+    // before: `requireCategoriesOf`) stay held, by label; the colors held
     // for them are the colors domain's and are kept.
     const pending = pendingCategoryState(field);
     holdPendingCategoryState(field, {
@@ -205,7 +207,7 @@ async function restoreFocusedFilters(state, target, signal) {
       const quantiles = await state.ensureOutlierQuantiles(index);
       if (quantiles !== null) state.computeGlobalVisibility();
     } catch {
-      // Cancelled or failed: the field's outlier status says why; the
+      // Canceled or failed: the field's outlier status says why; the
       // threshold stays as the history holds it.
     }
   }
@@ -228,29 +230,25 @@ function describeEntry(label, before, after) {
   for (const limit of b.limits ?? []) {
     const was = limitsA.get(limit.category);
     if (was === undefined || was.count !== limit.count || was.seed !== limit.seed) {
-      lines.push(`${label}: ${formatCountOf(limit.count, 'cell')} of ${limit.category === null ? 'Missing' : String(limit.category)} kept`);
+      lines.push(`${label}: ${formatCountOf(limit.count, 'cell')} of ${limit.category === null ? MISSING_LABEL : categoryDisplayName(limit.category)} kept`);
     }
   }
   for (const limit of a.limits ?? []) {
     if (!(b.limits ?? []).some(other => other.category === limit.category)) {
-      lines.push(`${label}: every cell of ${limit.category === null ? 'Missing' : String(limit.category)} shown`);
+      lines.push(`${label}: every cell of ${limit.category === null ? MISSING_LABEL : categoryDisplayName(limit.category)} shown`);
     }
   }
   if (JSON.stringify(a.range ?? null) !== JSON.stringify(b.range ?? null)) {
-    lines.push(b.range ? `${label}: range ${formatNumber(b.range.min)} to ${formatNumber(b.range.max)}` : `${label}: whole range`);
+    lines.push(b.range ? `${label}: range ${formatBound(b.range.min)} to ${formatBound(b.range.max)}` : `${label}: whole range`);
   }
-  if ((a.outlier ?? 1) !== (b.outlier ?? 1)) lines.push(`${label}: outlier threshold ${Math.round((b.outlier ?? 1) * 100)}%`);
+  if ((a.outlier ?? 1) !== (b.outlier ?? 1)) lines.push(`${label}: outlier threshold ${formatPercent((b.outlier ?? 1) * 100)}`);
   if ((a.off === true) !== (b.off === true)) lines.push(`${label}: filter ${b.off ? 'off' : 'on'}`);
   if ((a.outlierOff === true) !== (b.outlierOff === true)) lines.push(`${label}: outlier filter ${b.outlierOff ? 'off' : 'on'}`);
   return lines;
 }
 
-function formatNumber(value) {
-  return Number.isInteger(value) ? String(value) : value.toPrecision(4).replace(/\.?0+$/, '');
-}
-
 function listOf(labels) {
-  const shown = labels.slice(0, 3).map(label => (label === null ? 'Missing' : String(label)));
+  const shown = labels.slice(0, 3).map(label => (label === null ? MISSING_LABEL : categoryDisplayName(label)));
   return labels.length > 3 ? `${shown.join(', ')} and ${labels.length - 3} more` : shown.join(', ');
 }
 
@@ -262,14 +260,15 @@ function listOf(labels) {
  * @param {{views: Array<Array<{field: object}>>}} b
  * @param {(label: string, before: object|null, after: object|null) => string[]} describe
  * @param {boolean} liveHidden - The live view is hidden at `b` (views are named as the list numbers them)
+ * @param {Array<string|null>|null} [viewLabels] - The views' names at `b` (`viewLabelsInValue`)
  */
-export function describePerViewFields(state, a, b, describe, liveHidden) {
+export function describePerViewFields(state, a, b, describe, liveHidden, viewLabels = null) {
   const lines = [];
   const count = Math.max(a.views.length, b.views.length);
   for (let v = 0; v < count; v++) {
     const before = new Map((a.views[v] ?? []).map(entry => [refId(entry.field), entry]));
     const after = new Map((b.views[v] ?? []).map(entry => [refId(entry.field), entry]));
-    const prefix = count > 1 ? `${viewNameInValue(v, liveHidden)}, ` : '';
+    const prefix = count > 1 ? `${viewNameInValue(v, liveHidden, viewLabels)}, ` : '';
     for (const id of new Set([...before.keys(), ...after.keys()])) {
       const x = before.get(id) ?? null;
       const y = after.get(id) ?? null;
@@ -285,6 +284,8 @@ export function describePerViewFields(state, a, b, describe, liveHidden) {
  */
 export function createFiltersDomain({ state, viewer, refreshUi }) {
   return {
+    // A step read the view it acted in: staleness compares that view's part alone (F156).
+    readPart: viewReadPart,
     capture() {
       const views = viewIdsOf(viewer).map(id => captureViewFilters(viewOwner(state, id)));
       return { views };
@@ -297,9 +298,9 @@ export function createFiltersDomain({ state, viewer, refreshUi }) {
       await inEachView(state, ids, indices, (_viewId, index) => restoreFocusedFilters(state, value.views[index], signal));
       if (indices.length > 0) refreshUi();
     },
-    /** `context.liveHidden`: the live view is hidden at the later value (`views` domain), so the list numbers the kept views from 1. */
-    describe(a, b, { liveHidden = false } = {}) {
-      return describePerViewFields(state, a, b, describeEntry, liveHidden);
+    /** `context.liveHidden`: the live view is hidden at the later value (`views` domain), so the list numbers the kept views from 1; `context.viewLabels`: the views' names there (`viewLabelsInValue`). */
+    describe(a, b, { liveHidden = false, viewLabels = null } = {}) {
+      return describePerViewFields(state, a, b, describeEntry, liveHidden, viewLabels);
     },
   };
 }

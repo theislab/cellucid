@@ -3,12 +3,21 @@
  *
  * Reusable UI component for selecting multiple items from a list using checkboxes.
  * Designed to match existing dropdown/popup styling in the app (paper box, black border, shadow).
+ *
+ * The popup is anchored to its button and non-modal, as the group picker's
+ * (`group-picker.js`): a native popover (`popover="auto"`) its button opens
+ * (`popovertarget`), so the browser shows it in the top layer, puts it next in
+ * the focus order after the button, and closes it on Escape or a press
+ * outside. It is no modal dialog: the page stays usable while it is open
+ * (F146; it used to state `aria-modal` and hold Tab in a hand-made trap).
  */
 
 import {
+  ICONS,
   coalesceToFrame,
   createButton,
-  createEmptyState
+  createEmptyState,
+  createIconButton
 } from '../../../ui/components/controls.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
 
@@ -22,8 +31,7 @@ import { StyleManager } from '../../../../utils/style-manager.js';
 /**
  * @typedef {Object} MultiSelectDropdownOptions
  * @property {string} id - Unique id prefix for DOM ids
- * @property {string} buttonLabel - Accessible label for the toggle button
- * @property {string} [buttonText='⋯'] - Button text/icon
+ * @property {string} buttonLabel - Accessible label and tooltip of the toggle button (drawn as `ICONS.more`)
  * @property {string} title - Title shown in the popup
  * @property {MultiSelectItem[]} items - List of selectable items
  * @property {Iterable<string>} selectedKeys - Currently selected keys
@@ -41,7 +49,6 @@ export function createMultiSelectDropdown(options) {
   const {
     id,
     buttonLabel,
-    buttonText = '⋯',
     title,
     items,
     selectedKeys,
@@ -59,14 +66,11 @@ export function createMultiSelectDropdown(options) {
   const wrapper = document.createElement('div');
   wrapper.className = 'multi-select-dropdown';
 
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'icon-btn multi-select-dropdown-btn';
-  btn.setAttribute('aria-label', buttonLabel);
+  const btn = createIconButton({ label: buttonLabel, icon: ICONS.more, className: 'multi-select-dropdown-btn' });
   btn.setAttribute('aria-haspopup', 'dialog');
   btn.setAttribute('aria-expanded', 'false');
   btn.setAttribute('aria-controls', `${id}-panel`);
-  btn.textContent = buttonText;
+  btn.setAttribute('popovertarget', `${id}-panel`);
   wrapper.appendChild(btn);
 
   const panel = document.createElement('div');
@@ -74,13 +78,11 @@ export function createMultiSelectDropdown(options) {
   panel.id = `${id}-panel`;
   panel.setAttribute('role', 'dialog');
   panel.setAttribute('aria-label', title);
-  panel.setAttribute('aria-modal', 'true');
-  panel.hidden = true;
-  // Append to body to avoid affecting sidebar scroll position. That places the
-  // panel at the very end of the document, so sequential focus would never
-  // reach it from the trigger — the panel keeps focus itself while it is open
-  // and hands it back to the trigger on close.
-  document.body.appendChild(panel);
+  panel.setAttribute('popover', 'auto');
+  // Beside its button (a popover is drawn in the top layer, wherever it
+  // sits), as the group picker's: inside a modal dialog (the expanded view)
+  // a panel under `body` would be inert.
+  wrapper.appendChild(panel);
 
   const header = document.createElement('div');
   header.className = 'multi-select-dropdown-header';
@@ -195,37 +197,12 @@ export function createMultiSelectDropdown(options) {
     updateMeta();
   };
 
-  let isOpen = false;
+  const isOpen = () => panel.matches(':popover-open');
   let openAbortController = null;
-
-  /** Every element inside the panel a keyboard user can land on, in order. */
-  const getPanelFocusables = () => [
-    ...panel.querySelectorAll(
-      'button, input, select, textarea, [tabindex]:not([tabindex="-1"])'
-    )
-  ].filter(element => !element.disabled);
-
-  const close = ({ restoreFocus = true } = {}) => {
-    if (!isOpen) return;
-    isOpen = false;
-
-    if (openAbortController) {
-      openAbortController.abort();
-      openAbortController = null;
-    }
-
-    // Move focus out before hiding: a focused element inside a `display: none`
-    // subtree is dropped to `<body>`, which loses the user's place entirely.
-    const hadFocusInside = panel.contains(document.activeElement);
-    repositionPanel.cancel();
-    panel.hidden = true;
-    btn.setAttribute('aria-expanded', 'false');
-    if (restoreFocus && hadFocusInside) btn.focus({ preventScroll: true });
-
-    // Reset pending state so next open reflects committed selection.
-    pendingSelected = new Set(committedSelected);
-    if (enableSearch) searchInput.value = '';
-  };
+  /** Whether focus was in the popup as it closed (it then goes back to the button). */
+  let focusWasInside = false;
+  /** A close that must not move focus (the component torn down). */
+  let keepFocusOnClose = false;
 
   const updatePanelPosition = () => {
     const btnRect = btn.getBoundingClientRect();
@@ -236,72 +213,51 @@ export function createMultiSelectDropdown(options) {
   // only needs its position once per frame, read and written together.
   const repositionPanel = coalesceToFrame(updatePanelPosition);
 
-  const open = () => {
-    if (isOpen) return;
-    isOpen = true;
+  const close = ({ restoreFocus = true } = {}) => {
+    if (!isOpen()) return;
+    keepFocusOnClose = !restoreFocus;
+    panel.hidePopover();
+  };
 
+  // Opening and closing, however asked (the button, Escape, a press outside,
+  // Apply): `beforetoggle` comes while focus is still inside the popup.
+  panel.addEventListener('beforetoggle', (event) => {
+    if (event.newState === 'open') {
+      pendingSelected = new Set(committedSelected);
+      if (enableSearch) searchInput.value = '';
+      renderList();
+      updatePanelPosition();
+      return;
+    }
+    focusWasInside = !keepFocusOnClose && panel.contains(document.activeElement);
+    keepFocusOnClose = false;
+  });
+  panel.addEventListener('toggle', (event) => {
+    const opened = event.newState === 'open';
+    btn.setAttribute('aria-expanded', String(opened));
+    if (opened) {
+      openAbortController = new AbortController();
+      // Update position on scroll (capture to catch scrolls from any ancestor)
+      document.addEventListener('scroll', () => repositionPanel(), { signal: openAbortController.signal, capture: true });
+      // Start on the filter box, or the first control when there is none.
+      const initialFocus = enableSearch ? searchInput : panel.querySelector('button, input');
+      initialFocus?.focus({ preventScroll: true });
+      return;
+    }
+    openAbortController?.abort();
+    openAbortController = null;
+    repositionPanel.cancel();
+    if (focusWasInside && btn.isConnected) btn.focus({ preventScroll: true });
+    focusWasInside = false;
+    // Reset pending state so next open reflects committed selection.
     pendingSelected = new Set(committedSelected);
     if (enableSearch) searchInput.value = '';
-    renderList();
+  });
 
-    // Position panel using fixed positioning relative to the button
-    panel.hidden = false;
-    updatePanelPosition();
-
-    btn.setAttribute('aria-expanded', 'true');
-
-    openAbortController = new AbortController();
-    const { signal } = openAbortController;
-
-    // Close on Escape, and keep Tab inside the panel while it is open.
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        close();
-        return;
-      }
-      if (e.key !== 'Tab') return;
-      const focusables = getPanelFocusables();
-      if (focusables.length === 0) return;
-      // Move focus explicitly rather than letting the engine's own Tab order
-      // decide: WebKit omits buttons from sequential focus, so a wrap-only trap
-      // lets focus escape the popup entirely there.
-      e.preventDefault();
-      const current = focusables.indexOf(document.activeElement);
-      const step = e.shiftKey ? -1 : 1;
-      const next = current < 0
-        ? (e.shiftKey ? focusables.length - 1 : 0)
-        : (current + step + focusables.length) % focusables.length;
-      focusables[next].focus();
-    }, { signal });
-
-    // Close on click outside
-    document.addEventListener('mousedown', (e) => {
-      if (!wrapper.contains(e.target) && !panel.contains(e.target)) {
-        close({ restoreFocus: false });
-      }
-    }, { signal });
-
-    // Update position on scroll (capture to catch scrolls from any ancestor)
-    document.addEventListener('scroll', () => repositionPanel(), { signal, capture: true });
-
-    // The panel lives at the end of <body>, so nothing would carry focus into
-    // it. Start on the filter box, or the first control when there is none.
-    const initialFocus = enableSearch ? searchInput : getPanelFocusables()[0];
-    initialFocus?.focus({ preventScroll: true });
-  };
-
-  const toggle = () => {
-    if (isOpen) close();
-    else open();
-  };
-
-  // A native <button> already turns Enter and Space into a click, and Escape is
-  // owned by the document listener installed while the panel is open, so the
-  // trigger needs no key handling of its own.
+  // The button opens and closes the popup itself (`popovertarget`); its click
+  // stays out of the panel header it sits in.
   btn.addEventListener('click', (e) => {
     e.stopPropagation();
-    toggle();
   });
 
   if (enableSearch) {

@@ -1,6 +1,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { waitForPageAtRest } from './helpers/dataset-ready.mjs';
 
 /* The floating panels in the `layout` state domain's value
    (`app/state/domains/layout.js`): what it records is what a restore (a
@@ -36,6 +37,12 @@ async function openPreparedDataset(page) {
   await expect(page.locator('#dataset-name')).toHaveText(
     'Current UI fixture'
   );
+  // The opening is over before a panel's control is pressed: the sidebar
+  // still grows under the pointer while it goes on (the dataset's facts, its
+  // first coloring's legend), and a press landed on the undock button and
+  // its release 50 px lower, on another element (Windows Firefox, nightly
+  // run 43141748516, caught by `split-clicks.mjs`).
+  await waitForPageAtRest(page);
 }
 
 /** The frame a panel stands in: the element that floats and carries its controls. */

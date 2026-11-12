@@ -425,7 +425,7 @@ function oneLeafBtree(type, recordBytes, records, place) {
   padded.set(leafBlock);
   const leafAddress = place(padded);
   const header = new Bytes(48);
-  // Version 0; depth 0 (the root is the leaf); split 100 %, merge 40 %, as libhdf5 creates them.
+  // Version 0; depth 0 (the root is the leaf); split 100%, merge 40%, as libhdf5 creates them.
   header.bytes(TEXT.encode('BTHD')).u8(0).u8(type).u32(nodeBytes).u16(recordBytes).u16(0).u8(100).u8(40);
   header.u64(leafAddress).u16(records.length).u64(records.length);
   return place(checksummed(header.done()));

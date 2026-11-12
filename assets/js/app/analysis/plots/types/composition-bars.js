@@ -7,7 +7,7 @@
  *
  * Data (built by `ui/analysis-types/composition-ui.js`), `data.bars`:
  *   types        cell-type names, bottom segment first
- *   typeColors   each type's colour (the field's palette)
+ *   typeColors   each type's color (the field's palette)
  *   bars         [{label, group}] one per bar; `group` is the condition the
  *                bar belongs to ('' without one) and labels the axis below
  *   values       Float64Array `values[type * bars + bar]`

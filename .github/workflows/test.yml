@@ -45,7 +45,7 @@ jobs:
     # push lands fails these contracts until the next run (run 41213981681:
     # cellucid-python's widget push landed after the job had checked out the
     # previous commit). The widget contract names each checkout's commit and
-    # runs the behaviour contracts on both copies, so its failure says which
+    # runs the behavior contracts on both copies, so its failure says which
     # repository is behind. Push the siblings first.
     defaults:
       run:
@@ -57,7 +57,7 @@ jobs:
         with:
           path: cellucid
 
-      - name: Check out the published dataset session presets
+      - name: Check out the published dataset session presets and their reader
         uses: actions/checkout@v7
         with:
           repository: theislab/cellucid-datasets
@@ -66,6 +66,8 @@ jobs:
           sparse-checkout: |
             anndata/datasets.json
             anndata/*.cellucid-session
+            scripts/publish_session_preset.mjs
+            scripts/anndata_store.mjs
           sparse-checkout-cone-mode: false
 
       - name: Check out the Python package's copies of the shared documents and golden history, and the documentation
@@ -94,6 +96,7 @@ jobs:
             inst/action_catalog.json
             inst/history_model.schema.json
             inst/mcp_tools.json
+            inst/extdata/history_golden.cellucid-session
             tests/testthat/fixtures/history_golden/
           sparse-checkout-cone-mode: false
 

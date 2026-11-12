@@ -1,6 +1,6 @@
 /* components/_opening.css
    The startup overlay: the opening under way while no dataset is shown
-   (app/opening-progress-view.js). It is centred over the empty viewer and
+   (app/opening-progress-view.js). It is centered over the empty viewer and
    takes pointer events only on its panel, so the sidebar stays usable. The
    bar is the shared job progress bar (_jobs.css). */
 
@@ -85,6 +85,16 @@
   display: none;
 }
 
+/* No dataset on screen and no opening (R9E-10): what the viewer is waiting
+   for and where to open one, with the button that shows that place. */
+.opening-overlay[data-state="empty"] .opening-bar,
+.opening-overlay[data-state="empty"] .opening-detail,
+.opening-overlay[data-state="empty"] .opening-note,
+.opening-overlay[data-state="empty"] .opening-failure,
+.opening-overlay[data-state="empty"] .opening-cancel {
+  display: none;
+}
+
 /* An opening waiting for the person to pick one of a file's objects: the
    question, one button per object, and Cancel. */
 .opening-overlay[data-state="choosing"] .opening-failure,
@@ -104,7 +114,8 @@
   z-index: var(--z-floating);
 }
 
-.opening-overlay[data-state="failed"] .opening-step {
+.opening-overlay[data-state="failed"] .opening-step,
+.opening-overlay[data-state="empty"] .opening-step {
   color: var(--color-text-secondary);
 }
 

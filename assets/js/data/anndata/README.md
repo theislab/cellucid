@@ -13,10 +13,10 @@ The step-by-step read path is developer doc 20
 | Module | Owns |
 | --- | --- |
 | `open.js` | `openDatasetStore()`: the one entry from a source to a store root, whatever the file arrived as (view, transcoder, older layout). |
-| `views/` | Layout views by input-format id (`views/index.js`): `loom.js`, `tenx-h5.js`, `tenx-outs.js`, `mudata.js`, `modalities.js` (several feature spaces on the same cells), `h5seurat.js` and `refusal.js` (recognised, refused with what to do), `view-nodes.js` (the node wrappers), and `cell-subset.js` (a subsample presented as a smaller AnnData; see below). |
+| `views/` | Layout views by input-format id (`views/index.js`): `loom.js`, `tenx-h5.js`, `tenx-outs.js`, `mudata.js`, `modalities.js` (several feature spaces on the same cells), `h5seurat.js` and `refusal.js` (recognized, refused with what to do), `view-nodes.js` (the node wrappers), and `cell-subset.js` (a subsample presented as a smaller AnnData; see below). |
 | `transcode/` | One pass over a stream into an AnnData Zarr store in the origin-private file system: `r-object.js` (+ `seurat.js`, `sce.js`, `r-matrices.js`, `r-values.js`), `matrix-market.js`, `tables.js`, `entries.js`, `zarr-writer.js`, `priority.js`, `session.js` (one transcoding, reused across tabs and visits), `space.js` (**kept-store storage for the whole stack**: OPFS directories, manifests, locks, quota, `KEPT_STORE_REVISION` / `KEPT_INDEX_REVISION`), `kept-store.js`, `anndata-model.js`, `refusals.js`. |
 | `older-layouts.js` | Files written before anndata 0.8, presented in the current layout. |
-| `elements.js`, `dataframe.js`, `sparse.js`, `values.js` | The element rules and readers of dataframes, sparse groups and arrays (`readRowsInStoreOrder`, `readInSourceOrder`, exact integers). |
+| `elements.js`, `dataframe.js`, `sparse.js`, `values.js` | The element rules and readers of dataframes, sparse groups and arrays (`readRowsInStoreOrder`, `readInSourceOrder`, exact integers). A file that breaks a rule is refused with `AnnDataFormatError` (`elements.js`), as is every other check of what a file holds (the reader, `matrix-access.js`, `graph-lines.js`, `priority-layout.js`, `views/`); `open.js` `explainFormatError` says it as the file's problem. A check of Cellucid's own work throws a plain error. |
 
 ## Writing (a copy of the open dataset)
 
@@ -42,8 +42,8 @@ The step-by-step read path is developer doc 20
 | `prefix-column-index.js` | Gene columns of a priority-ordered cell-major matrix, indexed in segments of rows. |
 | `kept-column-index.js` | Gene indexes kept in this browser across visits. |
 | `subset-entries.js` | Keeping a CSC gene's entries that fall in a cell subset. |
-| `graph-lines.js` | Neighbour graphs (`obsp`) read line by line; the induced subgraph of open cells. |
-| `reader.js` | `AnnDataReader`: open, fields, genes, embeddings, graphs, category codings, gene-sample reads, exports' row reads. About 5,900 lines; the split is stage 5c of the reorganisation plan. |
+| `graph-lines.js` | Neighbor graphs (`obsp`) read line by line; the induced subgraph of open cells. |
+| `reader.js` | `AnnDataReader`: open, fields, genes, embeddings, graphs, category codings, gene-sample reads, exports' row reads. About 5,900 lines; the split is stage 5c of the reorganization plan. |
 
 ## Invariants
 

@@ -1,11 +1,11 @@
 /**
  * @fileoverview Per-cell kernels of continuous coloring.
  *
- * A continuous field is coloured by one pass that writes each cell's whole
+ * A continuous field is colored by one pass that writes each cell's whole
  * RGBA word: the colormap bytes come from the colormap's exact byte table
  * (`getColormapByteTable`), and an alpha byte that layers it, never its
- * visibility (the view's transparency alone): opaque, the no-value grey's
- * `BENEATH_ALPHA_BYTE`, drawn beneath the coloured cells, or, for a gene
+ * visibility (the view's transparency alone): opaque, the no-value gray's
+ * `BENEATH_ALPHA_BYTE`, drawn beneath the colored cells, or, for a gene
  * sample's cells not read, `UNREAD_ALPHA_BYTE`, drawn faded beneath every
  * cell read (`rendering/read-cell-layer.js`). The per-cell
  * sampler call and three `Math.round`s are gone.
@@ -41,16 +41,16 @@ const word = (r, g, b, a) => new Uint32Array(Uint8Array.of(r, g, b, a).buffer)[0
 /** The table's "sample this `t` exactly" byte, as a word mask. */
 const EXACT_SAMPLE_MASK = word(0, 0, 0, 1);
 /**
- * The no-value grey (NaN, a non-positive value on a log scale, a value at or
+ * The no-value gray (NaN, a non-positive value on a log scale, a value at or
  * below the neutral floor), with the alpha byte that draws it beneath every
- * coloured cell (`BENEATH_ALPHA_BYTE`): its whole word, so no OPAQUE is or'ed
+ * colored cell (`BENEATH_ALPHA_BYTE`): its whole word, so no OPAQUE is or'ed
  * in.
  */
 const MISSING_WORD = word(NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, BENEATH_ALPHA_BYTE);
 /**
  * A cell a gene sample did not read: the bottom layer (`UNREAD_ALPHA_BYTE`),
- * drawn in a colour faded from the view's background
- * (`rendering/read-cell-layer.js`); its RGB bytes are the neutral grey for a
+ * drawn in a color faded from the view's background
+ * (`rendering/read-cell-layer.js`); its RGB bytes are the neutral gray for a
  * reader that draws no layers.
  */
 const UNREAD_WORD = word(NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, UNREAD_ALPHA_BYTE);
@@ -178,7 +178,7 @@ export function scanContinuousColumn(column) {
  * `(log10(v) - log10(min)) / (log10(max) - log10(min))` on a log scale, and
  * each channel is `Math.round(colormap(t) * 255)`. The alpha byte is 255,
  * and `BENEATH_ALPHA_BYTE` for the neutral gray: it is drawn beneath the
- * coloured cells. A sparse column's cells from `readRows` on (not read) are
+ * colored cells. A sparse column's cells from `readRows` on (not read) are
  * the neutral gray with `UNREAD_ALPHA_BYTE`: drawn faded, beneath every cell
  * read; so are a column's cells from `domain.readRows` on (a gene sample's
  * cells not read, `getGeneSample`), whatever the column holds there -- a
@@ -232,17 +232,17 @@ export function writeContinuousColors(colors, column, domain, colormap) {
   // The cells read: the domain's sample, and a sparse column's own read cells.
   const sampled = domain.readRows ?? n;
   if (!Number.isSafeInteger(sampled) || sampled < 0 || sampled > n) {
-    throw new RangeError(`A continuous colouring's cells read must be a whole number from 0 to ${n}.`);
+    throw new RangeError(`A continuous coloring's cells read must be a whole number from 0 to ${n}.`);
   }
   // `rgbOf` answers whole words: a colormap entry made opaque here, the
-  // no-value grey with its own alpha byte.
+  // no-value gray with its own alpha byte.
   const wordOf = rgb => (rgb === MISSING_WORD ? rgb : rgb | OPAQUE);
   const writeCell = (cell, rgb) => {
     words[cell] = wordOf(rgb);
   };
 
   if (isDenseColumn(source)) {
-    // Neighbouring cells often share a value (a gene's zeros, a rounded
+    // Neighboring cells often share a value (a gene's zeros, a rounded
     // covariate); the previous cell's word is reused without any arithmetic.
     let previous = NaN;
     let previousWord = MISSING_WORD;

@@ -28,7 +28,7 @@ generated from), and the history's core (History v2, H1):
   comes back before the scratch tracker goes; if it cannot, that tracker stays in use and says so,
   so what is shown and the tracker in use always agree. `api.active` is the live tracker,
   read-only for every reader.
-- `actions.js`: the history's own catalogue actions (every `history.*` but share, save and the
+- `actions.js`: the history's own catalog actions (every `history.*` but share, save and the
   saved-states list, which persistence provides), each resolving its names and answering its
   result schema, and the estimates of the long ones; `delete-restore.js`: deleting steps (only the
   steps whose touched domains, or whose inputs but for generated ids, changed are applied again)
@@ -49,7 +49,7 @@ generated from), and the history's core (History v2, H1):
 - `turns.js`: turn records (agent, model, conversation, message, label, branch), the branch binding
   (`moved`), and what undoing a turn would do (`turnUndoPlan`: back to before it, or only its own
   steps when others interleaved).
-- `provenance.js`: what a step read (`Step.reads`: its result inputs, the catalogue's `reads`), and
+- `provenance.js`: what a step read (`Step.reads`: its result inputs, the catalog's `reads`), and
   which steps of any action are stale at the head, with their cause. The state its parameters'
   names resolve in is the action's `context`, never recorded, so a rename or a focus change never
   marks a step stale.
@@ -115,6 +115,16 @@ persistence (H2) and the panel (H3) build on, each record checked whole by its v
   which steps each group held (`memberships: [{group, from, to}]`), never its steps.
 
 **Invariants:**
+- A load (`load`, `importTrackers`: Continue, a saved state, a session file) restores part by
+  part (F155): a domain whose owner refuses its value keeps what is shown and is returned in
+  `unrestored`; a tracker whose records this version cannot read is left out (the one shown: its
+  head kept as a new tracker with its conversations); the domains left as shown become one step,
+  "Not restored from the saved state: …" (`unrestoredLabel`), so the head and what is shown agree.
+  Only a broken structure, a cancellation or a replaced dataset ends a load whole. A move
+  (undo, jump) stays whole: one refusal puts back what was shown.
+- Staleness (`provenance.js`) names each changed input with its own cause, and compares an input
+  held per view at the view the step acted in (the owner's `readPart`, F156). A step that changed
+  some views of several, not all, names them in its label (`labelWithViews`, F157).
 - The value of domain D at step S is the after-value of the nearest step on the path root → S
   that touched D, or the root's; showing a step restores only the domains whose value differs.
 - A step is never dropped: one that no longer applies is kept with `status: 'unapplicable'` and
@@ -122,7 +132,7 @@ persistence (H2) and the panel (H3) build on, each record checked whole by its v
 - A replay (`history.replay`, "run my workflow on my next sample") starts a new tracker on the state
   shown whose start names where its steps come from (`start.kind 'replay'`, a `Link`; its report
   and name mapping kept), and dispatches each step again by name (origin `replay`, the step it
-  replays in `replayOf`, its parameters brought to this catalogue's version) while the person's
+  replays in `replayOf`, its parameters brought to this catalog's version) while the person's
   actions wait at the gate. A step that does not apply here changes nothing and is kept, flagged
   with the reason; a step flagged where it was recorded is kept flagged; a step of an unknown
   action, or recorded with a newer version, is kept flagged ("Recorded with a newer Cellucid"); a
@@ -144,7 +154,7 @@ persistence (H2) and the panel (H3) build on, each record checked whole by its v
 - A load is all or nothing: the active head is shown as soon as its values are read, the rest is
   read while it is shown, and any failure (or Cancel) puts back what was shown and keeps the
   trackers there were.
-- Hashing uses `app/utils/sha256.js`, so the history works outside a secure context too.
+- Hashing uses `utils/sha256.js`, so the history works outside a secure context too.
 - The autosave writes every change within a task of it, only what changed (the steps, turns,
   journal entries and messages an event names, the tracker's own record), each value once by hash,
   each sub-value once by name (parts) and each array once by digest (cell sets in the cell-set
@@ -161,7 +171,7 @@ after each operation, older restores, interleaved turns, two writers at once, lo
 step's before-values its parent's, no loose value in the pool), the review's regressions by area
 (`tests/history-v2-concurrency`, `-restore`, `-turns`, `-paused`, `-replay-steps`, `-pool`,
 `-canonical`, `-derived-domains`, `-stale` `.test.mjs`, over `tests/history-fake-page.mjs`),
-`tests/session-selection-tool-contract.test.mjs` (page chrome), `tests/history-catalogue-contract.test.mjs`,
+`tests/session-selection-tool-contract.test.mjs` (page chrome), `tests/history-catalog-contract.test.mjs`,
 `tests/history-hunt-regressions.test.mjs`, `tests/history-model-contract.test.mjs`, `tests/history-model-schema.test.mjs`,
 `tests/history-golden-fixture.test.mjs`, `tests/action-versions-contract.test.mjs`, `tests/action-history-core.test.mjs`, `tests/session-history-file.test.mjs`,
 `tests/history-autosave.test.mjs`, `tests/session-serializer-contract.test.mjs`,

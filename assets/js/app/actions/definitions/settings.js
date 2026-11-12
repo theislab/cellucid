@@ -23,7 +23,15 @@
 
 import { defineAction } from '../catalog.js';
 import { PLAIN_QUOTE } from '../targets/names.js';
-import { FIGURE_EXPORT_PARAMS } from '../../ui/modules/figure-export/utils/session-settings.js';
+import {
+  FIGURE_EXPORT_DEFAULT_SVG_STRATEGY,
+  FIGURE_EXPORT_FRAME_CELLS,
+  FIGURE_EXPORT_PARAMS,
+  FIGURE_EXPORT_SETTINGS,
+  figureExportParamsOf,
+  figureExportSettingsOf,
+  upgradeFigureSizeOfVersion2,
+} from '../../ui/modules/figure-export/utils/session-settings.js';
 
 /** A figure-export parameter's value as a timeline label shows it ("preview enabled on, colorblind mode none"). */
 function figureValueWords(value, quote, nested = false) {
@@ -36,7 +44,7 @@ function figureValueWords(value, quote, nested = false) {
   return typeof value === 'string' ? quote.bare(value) : String(value);
 }
 
-const SETTING_KINDS = Object.freeze(['number', 'count', 'switch', 'choice', 'colour', 'text']);
+const SETTING_KINDS = Object.freeze(['number', 'count', 'switch', 'choice', 'color', 'text']);
 
 /** A setting value as a timeline label shows it. */
 function shownValue(params, outcome, quote) {
@@ -52,7 +60,7 @@ export const SETTING_SCHEMA = Object.freeze({
     id: { type: 'string', description: 'What setting.set names it by.' },
     label: { type: 'string', description: 'Its name in the sidebar.' },
     section: { type: ['string', 'null'], description: 'The sidebar section it is in.' },
-    kind: { type: 'string', enum: [...SETTING_KINDS], description: 'number (a slider or box), count (a whole number of at least 1), switch, choice, colour (#rrggbb) or text.' },
+    kind: { type: 'string', enum: [...SETTING_KINDS], description: 'number (a slider or box), count (a whole number of at least 1), switch, choice, color (a #rrggbb color) or text.' },
     value: { type: ['string', 'number', 'boolean'], description: 'Its value now, as setting.set takes it.' },
     shown: { type: 'string', description: 'What the sidebar shows for the value (a slider\'s position is not always the value it means).' },
     min: { type: 'number' },
@@ -85,7 +93,7 @@ export const settingsActions = Object.freeze([
         },
         value: {
           type: ['string', 'number', 'boolean'],
-          description: 'A number for a slider, true or false for a switch, an option value for a choice, #rrggbb for a colour.',
+          description: 'A number for a slider, true or false for a switch, an option value for a choice, #rrggbb for a color.',
           examples: [20],
         },
       },
@@ -109,8 +117,21 @@ export const settingsActions = Object.freeze([
   }),
   defineAction({
     type: 'figure-export.set',
+    // 2 (2026-11-11): svg_strategy is never null (full-vector until another
+    // is chosen, F160); frame takes "cells" (Fit the cells, F161).
+    // 3 (2026-11-11, F271): the figure is physical — width in millimetres
+    // (size_preset a journal column), which the figure fills; no height;
+    // font_sizes in points. A version-2 step's pixels are converted as a
+    // saved record's are (`upgradeFigureSizeOfVersion2`).
+    version: 3,
+    upgrade: {
+      1: ({ svg_strategy: strategy, ...rest }) => (strategy === undefined
+        ? rest
+        : { ...rest, svg_strategy: strategy ?? FIGURE_EXPORT_DEFAULT_SVG_STRATEGY }),
+      2: params => figureExportParamsOf(upgradeFigureSizeOfVersion2(figureExportSettingsOf(params))),
+    },
     title: 'Change figure export settings',
-    summary: 'Set Figure export options: size, frame, background, fonts, title and axis labels, axes, legend, preview, what Export downloads; only those given change, nothing is exported.',
+    summary: 'Set Figure export options: width (millimetres or a journal column; the figure fills it, text in points keeps its printed size), frame (frame "cells" fits it to the cells, so plots take their shape, not the pane\'s), background, fonts, title and axis labels, axes, legend, preview, what Export downloads; only those given change, nothing is exported (figure-export.get reads them; view.picture with source "export" shows the figure they make).',
     group: 'Settings',
     // The panel's settings are one record of the settings domain
     // (`exportSessionSettings`), not controls of the generic inventory: a
@@ -124,10 +145,25 @@ export const settingsActions = Object.freeze([
     // A width typed, a frame dragged, a title typed: one step while the same options change.
     coalesce: params => Object.keys(params).sort().join(','),
     describe: (params, outcome, quote = PLAIN_QUOTE) => {
-      const parts = Object.entries(params).map(([key, value]) => `${key.replaceAll('_', ' ')} ${figureValueWords(value, quote)}`);
+      const parts = Object.entries(params).map(([key, value]) => (key === 'frame' && value === FIGURE_EXPORT_FRAME_CELLS
+        ? 'frame fitted to the cells'
+        : `${key.replaceAll('_', ' ')} ${figureValueWords(value, quote)}`));
       return `Figure export: ${parts.length === 0 ? 'unchanged' : parts.join(', ')}`;
     },
     code: params => `set_figure_export(${Object.entries(params).map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(', ')})`,
+  }),
+  defineAction({
+    type: 'figure-export.get',
+    title: 'Read the figure export settings',
+    summary: 'The Figure export panel\'s settings now, each named as figure-export.set names it: what Export would write, and what a session or the history put back.',
+    group: 'Settings',
+    params: { type: 'object', additionalProperties: false, properties: {} },
+    reads: [],
+    effect: 'read',
+    // Every setting, as `figure-export.set` takes it: one set of names both ways.
+    result: FIGURE_EXPORT_SETTINGS,
+    describe: () => 'Read the figure export settings',
+    code: () => 'get_figure_export()',
   }),
   defineAction({
     type: 'settings.list',

@@ -1,6 +1,8 @@
 /**
  * Gene signature: score every cell by one or more gene sets and compare the
- * scores across pages.
+ * scores across pages, or across the categories of a field ("Group by": one
+ * run scores a program per cell type, where pages needed one highlight
+ * page per type).
  *
  * The form is the options schema's (`options/signature-options.js`): the
  * gene sets (`ui/components/gene-set-editor.js`), the pages, Run; scoring
@@ -11,9 +13,9 @@
  * @module analysis-types/gene-signature-ui
  */
 
+import { PLACES, placePath } from '../../../ui/place-names.js';
 import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
-import { downloadCSV } from '../../shared/analysis-utils.js';
 import { isFiniteNumber } from '../../shared/number-utils.js';
 import { PageSelectorComponent } from '../shared/page-selector.js';
 import {
@@ -32,8 +34,17 @@ import { SIGNATURE_DISPLAY_KEYS, SIGNATURE_OPTIONS } from '../../options/signatu
 import { createGeneIndex, geneIdentities, notebookGeneSets, resolveGenes } from '../../shared/gene-sets.js';
 import { writePerCellCSV } from '../base-analysis-ui.js';
 import { cellsReadFor } from '../../shared/gene-sample-cells.js';
-import { failureText } from '../../../../utils/errors.js';
 import { listNames, namedError, quoteName } from '../../../actions/targets/names.js';
+import { runStatisticalTests } from '../../stats/statistical-tests.js';
+import { sharedCellsReason } from '../../shared/page-overlap.js';
+import { createFieldGroups } from './field-groups.js';
+import { missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
+import { fieldCategoryCss } from '../../../utils/category-state.js';
+import { failureDetails, sayFailure } from '../../../../utils/errors.js';
+import { RAW_VALUES, describeValues, isValuesRecord, transformWords } from '../../../../data/expression-transform.js';
+
+/** A category's group id in a result scored by a field ("Group by"). */
+const categoryGroupId = name => `category:${name}`;
 
 const METHOD_LABELS = Object.freeze({
   mean: 'mean',
@@ -56,6 +67,21 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     this._shownSet = 0;
     this._geneIndex = null;
     this._geneIndexOf = null;
+    this._fieldGroups = createFieldGroups({
+      dataLayer: this.dataLayer,
+      onReady: () => this._refreshOptionsContext(),
+      onError: error => this._notifications.error(`Gene signature groups: ${sayFailure(error)}`, { ...failureDetails(error), category: 'analysis' })
+    });
+  }
+
+  /** Another set of open cells: the categories' counts are counted again on them. @override */
+  _onOpenCellsChanged() {
+    this._fieldGroups.reset();
+  }
+
+  /** Scored by a field's categories, the result does not depend on the pages chosen. @override */
+  _currentProvenance(options, pageIds, genesReadFor) {
+    return super._currentProvenance(options, options.groupBy === '' ? pageIds : [], genesReadFor);
   }
 
   static getRequirements() {
@@ -66,6 +92,19 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       description: 'Select pages to analyze',
       geneExpression: true
     };
+  }
+
+  /** The mapped matrix's values; UCell ranks within each cell, which they leave unchanged. @override */
+  _valuesRead(options) {
+    if (options.method === 'ucell') return { transform: RAW_VALUES, note: 'Values: as stored (UCell ranks within each cell: normalizing and log1p change no rank)' };
+    return super._valuesRead(options);
+  }
+
+  /** Its values line, though it has no "Expression matrix" option (it reads the mapped one). @override */
+  _valuesNote(options) {
+    const read = this._valuesRead(options);
+    if (read === null) return null;
+    return read.note ?? `Values: ${transformWords(read.transform)} (${placePath(PLACES.dataMapping, PLACES.expressionValues)})`;
   }
 
   _getTitle() {
@@ -90,6 +129,9 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
 
   _getOptionsContext() {
     return {
+      categoricalFields: this.dataLayer.getAvailableVariables('categorical_obs').map(info => ({ key: info.key })),
+      groupsFor: (_entry, record) => this._fieldGroups.groups(record.groupBy),
+      pages: this.dataLayer.getPages().map(page => ({ id: page.id, name: page.name })),
       getGenes: () => this._geneNames(),
       getGeneIdentities: () => geneIdentities(this.dataLayer.state?.varData),
       getMarkerSets: () => {
@@ -123,7 +165,8 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
   }
 
   _getRunBlocker(options) {
-    if (this._selectedPages.length === 0) return 'Select at least one page';
+    if (options.groupBy === '' && this._selectedPages.length === 0) return 'Select at least one page, or group by a field';
+    if (options.groupBy !== '' && options.groups.mode === 'subset' && options.groups.ids.length === 0) return 'Choose at least one group';
     const resolved = this._resolveSets(options.geneSets);
     if (options.geneSets.every(set => set.genes.length === 0)) return 'Add genes to a set';
     if (resolved.every(set => set.resolved.length === 0)) return 'None of the genes are in this dataset';
@@ -159,6 +202,61 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       label: 'Pages'
     });
     this._adoptSelectorDefault();
+    this._showPageSelector();
+  }
+
+  /** The pages are what is scored only while Group by names no field. */
+  _showPageSelector() {
+    if (this._pageSelectContainer) this._pageSelectContainer.hidden = (this._options?.groupBy ?? '') !== '';
+  }
+
+  /** @override */
+  _handleOptionsChanged(key) {
+    this._showPageSelector();
+    super._handleOptionsChanged(key);
+  }
+
+  /**
+   * Each category of the Group by field with cells in the chosen cells (of
+   * "Groups to score"), in the field's order: `{id, name, cellIndices}`,
+   * the cells ascending; a first pass's sample of them.
+   */
+  async _categoryGroups(options, sample, signal) {
+    const field = await this.dataLayer.ensureObsFieldLoaded(options.groupBy, { signal });
+    const { codes } = field;
+    const categories = field.categories.map(String);
+    const scope = this._scopeMask(options.cells, codes.length);
+    const shown = options.groups.mode === 'subset' ? new Set(options.groups.ids) : null;
+    const missing = missingCategoryCode(codes);
+    const counts = new Uint32Array(categories.length);
+    for (let cell = 0; cell < codes.length; cell++) {
+      const code = codes[cell];
+      if (code !== missing && code < categories.length && (scope === null || scope[cell] !== 0)) counts[code] += 1;
+    }
+    const cellsOf = categories.map((_, code) => new Uint32Array(counts[code]));
+    const filled = new Uint32Array(categories.length);
+    for (let cell = 0; cell < codes.length; cell++) {
+      const code = codes[cell];
+      if (code !== missing && code < categories.length && (scope === null || scope[cell] !== 0)) cellsOf[code][filled[code]++] = cell;
+    }
+    const groups = [];
+    categories.forEach((name, code) => {
+      if (counts[code] === 0 || (shown !== null && !shown.has(name))) return;
+      const cellIndices = sample === null ? cellsOf[code] : sample.cells(cellsOf[code]);
+      if (cellIndices.length > 0) groups.push({ id: categoryGroupId(name), name, cellIndices });
+    });
+    if (groups.length === 0) throw new Error(`No cells of the chosen groups of ${options.groupBy} are in the chosen cells`);
+    return groups;
+  }
+
+  /** A cell scope (All, Visible, a page) as one byte a cell; null for every cell. */
+  _scopeMask(cells, cellCount) {
+    if (cells === 'all') return null;
+    if (cells === 'visible') return this.dataLayer.getVisibleCellMask();
+    if (!cells.startsWith('page:')) throw new RangeError(`Unknown cell scope "${cells}"`);
+    const mask = new Uint8Array(cellCount);
+    for (const index of this.dataLayer.getCellIndicesForPage(cells.slice('page:'.length))) mask[index] = 1;
+    return mask;
   }
 
   // ===========================================================================
@@ -171,13 +269,17 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
   }
 
   async _runAnalysisImpl(options, requestId, job, sample = null) {
-    // A first pass scores each page's cells in the sample.
-    const pageIds = sample === null ? [...this._selectedPages] : sample.pageIds([...this._selectedPages]);
+    // A first pass scores each page's (each group's) cells in the sample.
+    const byField = options.groupBy !== '';
+    const groups = byField ? await this._categoryGroups(options, sample, job.signal) : null;
+    if (!this._isCurrentAnalysisRequest(requestId)) return null;
+    const pageIds = byField ? null : sample === null ? [...this._selectedPages] : sample.pageIds([...this._selectedPages]);
     const resolution = this._resolveSets(options.geneSets);
     const scored = resolution.filter(set => set.resolved.length > 0);
+    const counts = this.dataLayer.matrixHoldsCounts('mapped');
     const result = await this.multiVariableAnalysis.computeSignatureScore({
       geneSets: scored.map(set => ({ name: set.name, genes: set.resolved })),
-      pageIds,
+      ...(byField ? { groups } : { pageIds }),
       method: options.method,
       controlSize: options.controlSize,
       bins: options.bins,
@@ -198,7 +300,7 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
         constantGenes: set.constantGenes,
         unmatched: [...resolved.unmatched, ...resolved.ambiguous.map(entry => entry.requested)],
         pages: set.pages.map(page => ({
-          pageId: sample === null ? page.pageId : sample.basePageId(page.pageId),
+          pageId: sample === null || byField ? page.pageId : sample.basePageId(page.pageId),
           pageName: page.pageName,
           scores: page.scores,
           cellIndices: page.cellIndices
@@ -211,7 +313,16 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       .map(set => ({ name: set.name, unmatched: [...set.unmatched, ...set.ambiguous.map(entry => entry.requested)] }));
     // Genes read for a sample of the open cells: each page was scored on its
     // cells among them (`cellIndices`), and the result keeps which.
-    const built = await this._buildResult({ sets, unscored, method: options.method, geneSample: result.geneSample ?? null }, options);
+    const built = await this._buildResult({
+      sets,
+      unscored,
+      method: options.method,
+      geneSample: result.geneSample ?? null,
+      // The field whose categories were scored, null for pages.
+      groupBy: byField ? options.groupBy : null,
+      counts,
+      values: result.values
+    }, options);
     return this._isCurrentAnalysisRequest(requestId) ? built : null;
   }
 
@@ -226,10 +337,16 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       ? [raw.sets[Math.min(this._shownSet, raw.sets.length - 1)]]
       : raw.sets;
     const data = [];
+    // One set: each page in its swatch's color (each category in its
+    // field's); several: each page and set its own color.
+    const pageColors = multiple ? new Map() : raw.groupBy === null
+      ? new Map(this._pageSelector?.getPageColors?.() || [])
+      : this._categoryColors(raw.groupBy);
     for (const set of shown) {
       for (const page of set.pages) {
         data.push({
           pageId: multiple ? `${page.pageId}::${set.name}` : page.pageId,
+          ...(pageColors.has(page.pageId) ? { pageColor: pageColors.get(page.pageId) } : {}),
           pageName: multiple && layout === 'side' ? `${page.pageName} · ${set.name}` : page.pageName,
           values: page.scores.slice(),
           cellIndices: page.cellIndices,
@@ -254,6 +371,13 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
         : `${formatCountOf(raw.sets.length, 'set')} · ${formatCountOf(geneCount, 'gene')} · ${METHOD_LABELS[raw.method]}`,
       metadata: { method: raw.method }
     };
+  }
+
+  /** Each category group's color, the field's own (by group id). */
+  _categoryColors(fieldKey) {
+    const field = this.dataLayer.state?.obsData?.fields?.find(candidate => candidate.key === fieldKey);
+    if (!field || !Array.isArray(field.categories)) return new Map();
+    return new Map(field.categories.map((category, index) => [categoryGroupId(String(category)), fieldCategoryCss(field, index)]));
   }
 
   _rebuildForDisplay(options) {
@@ -386,22 +510,21 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     }
   }
 
-  /** CSV: `page,set,cell_index,score`, every finite score of every set. */
-  async _exportModalCSV() {
+  /**
+   * CSV: `page,set,cell_index,score`, every finite score of every set; with
+   * a Group by field `group,…` (its rows are categories, not pages, as the
+   * result's table names them).
+   */
+  async tableFile() {
     const raw = this._lastResult?.raw;
-    if (!raw) return;
-    try {
-      const pages = raw.sets.flatMap(set => set.pages.map(page => ({
-        pageName: page.pageName,
-        setName: set.name,
-        values: page.scores,
-        cellIndices: page.cellIndices
-      })));
-      const csv = await writePerCellCSV('signature-scores', pages, undefined, this.dataLayer.state.cellIdentity);
-      downloadCSV(csv, 'gene_signature_scores', this._notifications);
-    } catch (err) {
-      this._notifications.error(`CSV export failed: ${failureText(err)}`, { category: 'download' });
-    }
+    if (!raw) return null;
+    const pages = raw.sets.flatMap(set => set.pages.map(page => ({
+      pageName: page.pageName,
+      setName: set.name,
+      values: page.scores,
+      cellIndices: page.cellIndices
+    })));
+    return { name: 'gene_signature_scores', csv: await writePerCellCSV('signature-scores', pages, raw.groupBy === null ? 'page' : 'group', this.dataLayer.state.cellIdentity) };
   }
 
   // ===========================================================================
@@ -534,7 +657,51 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
         rows.push([String(set.name), String(page.pageName ?? ''), m, mean, median]);
       }
     }
-    return { columns: ['gene_set', 'page', 'cells_scored', 'mean_score', 'median_score'], rows: rows.slice(0, top), total: rows.length };
+    return {
+      columns: ['gene_set', result?.raw?.groupBy === null ? 'page' : 'group', 'cells_scored', 'mean_score', 'median_score'],
+      rows: rows.slice(0, top),
+      total: rows.length,
+      about: this._resultAbout(result)
+    };
+  }
+
+  /**
+   * How the scores were made and compared: the method, each set's genes used
+   * and left out, and the expanded view's tests between the pages (t-test
+   * and Mann–Whitney for two, ANOVA and Kruskal–Wallis for more; none when
+   * the pages share cells): an agent had means alone and could not say
+   * whether a difference between pages held.
+   */
+  _resultAbout(result) {
+    const raw = result?.raw;
+    if (!raw) return null;
+    const testsOf = set => {
+      const pages = set.pages.map(page => ({ pageName: page.pageName, values: page.scores, cellIndices: page.cellIndices }));
+      if (pages.length < 2) return raw.groupBy === null ? 'one page: nothing to compare' : 'one group: nothing to compare';
+      const shared = sharedCellsReason(pages);
+      if (shared !== null) return shared;
+      return runStatisticalTests(pages, 'continuous_obs').map(test => ({
+        test: test.testName,
+        statistic: Number.isFinite(test.statistic) ? test.statistic : null,
+        p_value: Number.isFinite(test.pValue) ? test.pValue : null,
+        effect_size: Number.isFinite(test.effectSize) ? test.effectSize : null,
+        effect_size_type: test.effectSizeType
+      }));
+    };
+    return {
+      method: METHOD_LABELS[raw.method] ?? raw.method,
+      group_by: raw.groupBy === null ? 'pages (the highlight pages chosen)' : raw.groupBy,
+      values: raw.method === 'ucell'
+        ? 'as stored: UCell ranks the genes within each cell, which library-size scaling and log1p leave unchanged'
+        : describeValues(raw.values, { counts: raw.counts }),
+      sets: raw.sets.map(set => ({
+        name: String(set.name),
+        genes: set.genes.length,
+        not_found: [...(set.unmatched ?? [])],
+        constant: [...(set.constantGenes ?? [])],
+        tests: testsOf(set)
+      }))
+    };
   }
 
   _exportResult() {
@@ -549,9 +716,14 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
       return;
     }
     const raw = readResultEnvelope(envelope, 'signature');
-    if (!Array.isArray(raw?.sets) || !Array.isArray(raw.unscored) || typeof raw.method !== 'string') {
-      throw new TypeError('A gene signature result must hold its sets');
+    if (
+      !Array.isArray(raw?.sets) || !Array.isArray(raw.unscored) || typeof raw.method !== 'string' ||
+      (raw.groupBy !== null && (typeof raw.groupBy !== 'string' || raw.groupBy.length === 0)) ||
+      typeof raw.counts !== 'boolean' || !isValuesRecord(raw.values)
+    ) {
+      throw new TypeError('A gene signature result must hold its sets, what they were scored by and their values');
     }
+    const categories = raw.groupBy === null ? null : await this._requireGroupField(raw.groupBy);
     // The gene sample the pages were scored on (`computeSignatureScore`):
     // each page's cells among the first `cells` open cells; null when every
     // open cell's genes were read.
@@ -562,6 +734,10 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     }
     for (const set of raw.sets) {
       await requireDatasetGenes(this.dataLayer, [...set.genes, ...set.controlGenes], 'The gene signature result');
+      if (categories !== null) {
+        this._requireCategoryGroups(set.pages, categories, raw.groupBy);
+        continue;
+      }
       requireDatasetPages(this.dataLayer, set.pages.map(page => page?.pageId), 'The gene signature result');
       for (const page of set.pages) {
         if (!ArrayBuffer.isView(page.scores) || !ArrayBuffer.isView(page.cellIndices)) {
@@ -586,6 +762,40 @@ export class GeneSignatureUI extends FormBasedAnalysisUI {
     }
     const result = await this._buildResult(raw, this._requireOptions());
     await this._restoreAnalysisResult(result, envelope.provenance);
+  }
+
+  /** The categories of a result's Group by field, which the dataset must still have. */
+  async _requireGroupField(fieldKey) {
+    if (this.dataLayer.getVariableInfo('categorical_obs', fieldKey) === null) {
+      throw new Error(`The gene signature result groups by "${fieldKey}", which this dataset lacks`);
+    }
+    return this.dataLayer.ensureObsFieldLoaded(fieldKey);
+  }
+
+  /**
+   * A result's category groups, checked against the field: each a category
+   * it has, its scores one a cell, its cells ascending and each of that
+   * category now.
+   */
+  _requireCategoryGroups(groups, field, fieldKey) {
+    const codeOf = new Map(field.categories.map((category, code) => [categoryGroupId(String(category)), code]));
+    const pointCount = field.codes.length;
+    for (const group of groups) {
+      const code = codeOf.get(group?.pageId);
+      if (code === undefined) {
+        throw new Error(`The gene signature result scores group "${group?.pageName}", which field "${fieldKey}" lacks`);
+      }
+      if (!ArrayBuffer.isView(group.scores) || !(group.cellIndices instanceof Uint32Array) || group.scores.length !== group.cellIndices.length) {
+        throw new TypeError(`Gene signature scores of "${group.pageName}" and their cells must be typed arrays of one length`);
+      }
+      let previous = -1;
+      for (const cell of group.cellIndices) {
+        if (cell <= previous || cell >= pointCount || field.codes[cell] !== code) {
+          throw new RangeError(`The gene signature result scored cells of group "${group.pageName}" that are not of it now`);
+        }
+        previous = cell;
+      }
+    }
   }
 
   // ===========================================================================

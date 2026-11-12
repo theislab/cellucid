@@ -886,7 +886,7 @@ test(
                 if (contract.code === 'GITHUB_MUTATION_OUTCOME_UNKNOWN') {
                   assert.equal(
                     error?.message,
-                    'GitHub mutation outcome is unknown after a transport failure',
+                    'The connection dropped while GitHub was writing, so whether the write was made is not known.',
                   );
                 } else {
                   assert.equal(error?.path, USER_PATH);

@@ -25,8 +25,8 @@
  *   hold, and at least an equal share. A refused allocation lowers it (below).
  * - **The working set** is what is drawn: the open cells of the shown
  *   dataset (`setOpenCells`, `CELL_WORKING_SET_BYTES` a cell: positions,
- *   colours, visibility, the spatial tree and draw order on the page and on
- *   the GPU, the coloured field), a neighbour graph while a view shows its
+ *   colors, visibility, the spatial tree and draw order on the page and on
+ *   the GPU, the colored field), a neighbor graph while a view shows its
  *   edges (`setWorkingSet('graph', bytes)`), what a worker builds while it
  *   builds it (a worker's `setWorkingSet` reaches the page, counted under the
  *   worker's name: the reader worker's `'graph build'`), the values the
@@ -75,6 +75,8 @@
  * @module data/memory-budget
  */
 
+import { createListenerSet } from '../utils/listener-set.js';
+
 const GIB = 1024 ** 3;
 
 /** The 8 GiB report earlier Chromium releases give any larger device. */
@@ -94,13 +96,13 @@ const ALLOWANCE_OF_DEVICE = 1 / 2;
 
 /**
  * Bytes one cell holds in the page's working set however a dataset is
- * shown, as measured, not modelled: 64.6 bytes of physical memory a cell for
- * the points themselves -- 3D positions and colours in the page and on the
+ * shown, as measured, not modeled: 64.6 bytes of physical memory a cell for
+ * the points themselves -- 3D positions and colors in the page and on the
  * GPU with the GPU process's own overhead, visibility, the spatial tree and
  * the draw order levels of detail need, and its permutation -- measured
  * steady at 100,000,000 synthetic 3D cells with levels of detail (renderer
  * and GPU processes together, Chromium on Apple M1 Pro; 53.3 in 2D), rounded
- * up, plus the codes of the field the cells are coloured by (4), one
+ * up, plus the codes of the field the cells are colored by (4), one
  * continuous field (4) and its outlier quantile (4). It was 54 (a model that
  * left out the tree, the draw order and the GPU process's overhead), which
  * fitted 148M cells to a 16 GB machine where 125M already swapped while the
@@ -138,7 +140,7 @@ export const RESIDENCY_SHARES = Object.freeze({
   analysisPages: 1 / 16,
   /**
    * The AnnData adapter's cached copies: normalized coordinates, obs field
-   * payloads not handed to a view, and the neighbour graph read last while
+   * payloads not handed to a view, and the neighbor graph read last while
    * no view shows its edges.
    */
   adapterCache: 1 / 16,
@@ -341,8 +343,8 @@ const drawnObjects = new Map();
 const workerParts = new Map();
 
 /**
- * One part of what is drawn besides the open cells (a neighbour graph whose
- * edges a view shows or the k-NN tool uses: `'graph'`; a neighbour graph a
+ * One part of what is drawn besides the open cells (a neighbor graph whose
+ * edges a view shows or the k-NN tool uses: `'graph'`; a neighbor graph a
  * worker is building: `'graph build'`) holds `bytes` now; 0 when nothing.
  * `object`, when given, is what it draws: a cache that keeps the same object
  * does not count it again while it is drawn (`isDrawn`). A worker's part is
@@ -381,7 +383,7 @@ export function isDrawn(object) {
 
 /**
  * The bytes of the typed arrays `value` holds as its own properties, each
- * buffer once (a neighbour graph's arrays, a payload of several arrays).
+ * buffer once (a neighbor graph's arrays, a payload of several arrays).
  *
  * @param {Object|null} value
  * @returns {number}
@@ -440,7 +442,7 @@ export function registerResidentHolder(share, holder) {
   if (holder === null || typeof holder !== 'object' || typeof holder.bytes !== 'function' || typeof holder.trim !== 'function') {
     throw new TypeError('A resident holder has bytes() and trim(budget).');
   }
-  if (typeof holder.label !== 'string' || holder.label.length === 0) throw new TypeError('A resident holder is labelled.');
+  if (typeof holder.label !== 'string' || holder.label.length === 0) throw new TypeError('A resident holder is labeled.');
   const entry = { share, label: holder.label, bytes: holder.bytes, trim: holder.trim };
   holders.add(entry);
   return () => {
@@ -632,8 +634,8 @@ function raiseAllowance(reason) {
 // Listeners
 // ---------------------------------------------------------------------------
 
-const changeListeners = new Set();
-const releaseListeners = new Set();
+const changeListeners = createListenerSet('the memory budgets');
+const releaseListeners = createListenerSet('memory released');
 
 /**
  * Be told when the budgets change (the allowance, the working set, other
@@ -643,9 +645,7 @@ const releaseListeners = new Set();
  * @returns {() => void} Stop being told
  */
 export function onMemoryChange(listener) {
-  if (typeof listener !== 'function') throw new TypeError('A memory-change listener is a function.');
-  changeListeners.add(listener);
-  return () => changeListeners.delete(listener);
+  return changeListeners.add(listener);
 }
 
 /**
@@ -657,22 +657,20 @@ export function onMemoryChange(listener) {
  * @returns {() => void} Stop being told
  */
 export function onMemoryReleased(listener) {
-  if (typeof listener !== 'function') throw new TypeError('A memory-release listener is a function.');
-  releaseListeners.add(listener);
-  return () => releaseListeners.delete(listener);
+  return releaseListeners.add(listener);
 }
 
 function announceRelease(reason, released) {
   if (released.length === 0) return;
   if (handed !== null) report({ released, reason });
-  for (const listener of [...releaseListeners]) listener({ reason, released: [...released] });
+  releaseListeners.notify({ reason, released: [...released] });
 }
 
 function stateChanged(reason) {
   settleMemory(reason);
   const state = memoryState();
   for (const connection of connections) connection.post({ memoryState: state, reason });
-  for (const listener of [...changeListeners]) listener(reason);
+  changeListeners.notify(reason);
   noteMemoryChanged();
 }
 
@@ -719,7 +717,7 @@ export function connectMemoryWorker(worker) {
       if (event.held !== undefined) workerHeld.set(key, Object.freeze({ ...event.held }));
       if (event.working !== undefined) setWorkerParts(key, event.working);
       if (event.released !== undefined) {
-        for (const listener of [...releaseListeners]) listener({ reason: event.reason ?? 'worker', released: [...event.released] });
+        releaseListeners.notify({ reason: event.reason ?? 'worker', released: [...event.released] });
       }
       if (event.refused !== undefined) recordAllocationFailure(event.refused);
       if (event.granted !== undefined) recordAllocationSuccess(event.granted);
@@ -777,7 +775,7 @@ function localHeldByShare() {
 }
 
 /** Listeners of what the page holds in all (the census of other pages). */
-const heldListeners = new Set();
+const heldListeners = createListenerSet('the memory this page holds');
 
 /**
  * What a holder keeps changed (a request ended, a cache emptied when idle):
@@ -790,7 +788,7 @@ export function noteMemoryChanged() {
   setTimeout(() => {
     reportScheduled = false;
     if (reporter !== null) report();
-    else for (const listener of [...heldListeners]) listener(workingSetBytes() + heldBytes());
+    else if (heldListeners.size > 0) heldListeners.notify(workingSetBytes() + heldBytes());
   }, 0);
 }
 
@@ -802,9 +800,7 @@ export function noteMemoryChanged() {
  * @returns {() => void} Stop being told
  */
 export function onHeldChange(listener) {
-  if (typeof listener !== 'function') throw new TypeError('A held-memory listener is a function.');
-  heldListeners.add(listener);
-  return () => heldListeners.delete(listener);
+  return heldListeners.add(listener);
 }
 
 /**
@@ -827,7 +823,7 @@ export function receiveMemoryMessage(message) {
       openCells: state.openCells,
     });
     settleMemory(message.reason ?? 'settle');
-    for (const listener of [...changeListeners]) listener(message.reason ?? 'settle');
+    changeListeners.notify(message.reason ?? 'settle');
     report();
     return true;
   }

@@ -18,9 +18,9 @@
  * | a loaded field whose added rows were not read | released (read again when used) | first rows |
  * | a text or boolean column whose added rows hold a value it had not | released, its categories found again from every cell | first rows |
  * | outlier quantiles (measured over every cell of a category) | dropped; a filter in use gets them again (`resumeOutlierFilters`) | dropped, likewise |
- * | continuous statistics, a filter or colour range | measured again; a range at a bound follows it, a range inside it stays, a range outside it is reset (said) | likewise |
+ * | continuous statistics, a filter or color range | measured again; a range at a bound follows it, a range inside it stays, a range outside it is reset (said) | likewise |
  * | category counts, centroids | counted again | counted again |
- * | a user-defined category made from a file's column (a copy, an edit, a consensus) | added cells labelled as its other cells of the same source category (`derivedCodes`) | first rows |
+ * | a user-defined category made from a file's column (a copy, an edit, a consensus) | added cells labeled as its other cells of the same source category (`derivedCodes`) | first rows |
  * | any other user-defined category's codes (labels set by hand) | added cells missing | first rows |
  * | a user-defined value field's values | added cells NaN | first rows |
  * | a user-defined copy of a value field | the source's arrays | the source's arrays |
@@ -28,7 +28,7 @@
  * | a category or range highlight group | takes the added cells in its category or range that are visible (`takeInNewlyOpenCells`) | cells past the end leave; a group left empty goes (said) |
  * | any other highlight group (made by hand) | unchanged (it names its cells) | likewise |
  * | an analysis's scores (`registries/derived-results.js`) | unchanged (they name their cells) | cells past the end leave |
- * | colours, visibility, highlight array | made again from the field shown and the filters | likewise |
+ * | colors, visibility, highlight array | made again from the field shown and the filters | likewise |
  * | identity, priority | the new opening's | the new opening's |
  *
  * Growing equals opening the larger share for everything derived from the
@@ -172,12 +172,12 @@ function mergedCells(a, b) {
 /**
  * The codes of a user-defined category made from a file's column (`field`,
  * its `_sourceField` naming `source`) with `cells` (ascending positions)
- * labelled as the field labels its other cells of the same source category:
+ * labeled as the field labels its other cells of the same source category:
  * every copy, edit (a category deleted, two merged, renamed) and consensus
  * is a category-for-category function of its source, read off the cells it
  * labels. A source category none of those holds takes the field's category
  * of the same name, if it has one, else stays missing. A cell already
- * labelled keeps its label. Null when the field is not a function of its
+ * labeled keeps its label. Null when the field is not a function of its
  * source (labels set by hand on some cells) or nothing changes.
  *
  * @param {{key: string, categories: string[], codes: ArrayBufferView}} field
@@ -254,7 +254,7 @@ export class DataStateOpenCellsMethods {
    *   `positions`: the shown layout's positions for the `n` cells (the
    *   dimension manager's, resized first); `obs` / `var`: the added rows of
    *   loaded fields by cache key (growing only), a text or boolean column's
-   *   with its grown categories and their colours when its added cells
+   *   with its grown categories and their colors when its added cells
    *   hold labels it had not shown (`category-growth.js`).
    * @returns {{from: number, to: number, released: string[], extended: string[], droppedGroups: string[], resetRanges: string[], resetFilters: string[], resumeActive: {source: 'obs'|'var', index: number}|null}}
    *   What could not stay as it was, or changed, for the caller to say
@@ -334,7 +334,7 @@ export class DataStateOpenCellsMethods {
     this.cellVisibilityMask = allShown
       ? createShownCellVisibilityMask(n)
       : resizedCellArray(this.cellVisibilityMask, from, n, { fill: 1 });
-    // Colours and visibility are made again from the field shown and the
+    // Colors and visibility are made again from the field shown and the
     // filters (`restoreActiveFieldColors` below).
     this.colorsArray = createNeutralColors(n);
     this.categoryTransparency = new Uint8Array(n).fill(1);
@@ -401,6 +401,9 @@ export class DataStateOpenCellsMethods {
     this._highlightMembershipScratch = null;
     this.cellIdentity = identity;
     this.cellPriority = exactPriority;
+    // The cells' totals of the expression transform are by position: taken
+    // again in the new order (`expression-values.js`).
+    this.renewShownVarLoader();
 
     for (const [inventory, cache] of [[this.obsData, this._fieldDataCache], [this.varData, this._varFieldDataCache]]) {
       const fields = inventory?.fields ?? [];
@@ -487,11 +490,11 @@ export class DataStateOpenCellsMethods {
   /**
    * Publish the resized cells (`resizeOpenCells`) to the viewer and make
    * everything drawn from them again: the live points (the camera stays),
-   * the priority, the field shown with its filters, colours and centroids,
+   * the priority, the field shown with its filters, colors and centroids,
    * then the highlights (a category or range group takes the cells added in
    * it that are visible, `takeInNewlyOpenCells`). A field shown that was
    * released (`resumeActive`) waits for its caller to load it again; the
-   * view is shown uncoloured meanwhile.
+   * view is shown uncolored meanwhile.
    *
    * @param {{layoutKey: string|null, from: number, capacity?: number|null}} options - The layout
    *   the live view shows; the open cell count before the resize; the cells
@@ -679,7 +682,7 @@ export class DataStateOpenCellsMethods {
       // it is not kept (it is checked against them).
       if (field._continuousStats !== undefined) {
         const stats = field._continuousStats;
-        for (const [name, label] of [['_continuousFilter', 'the filter'], ['_continuousColorRange', 'the colour range']]) {
+        for (const [name, label] of [['_continuousFilter', 'the filter'], ['_continuousColorRange', 'the color range']]) {
           const range = field[name];
           if (range !== undefined && (range.min !== stats.min || range.max !== stats.max)) outcome.resetRanges.push(`${label} of ${field.key}`);
           delete field[name];
@@ -727,7 +730,7 @@ export class DataStateOpenCellsMethods {
       return;
     }
     // A gene's sparse form carries to its resized values (`data/column-forms.js`):
-    // it stays coloured and measured from its entries.
+    // it stays colored and measured from its entries.
     const values = resizedCellArray(field.values, from, n, { added: grown ? addedRows.values : null });
     field.values = noteColumnForm(values, resizedForm(columnFormOf(field.values), from, n, grown ? columnFormOf(addedRows.values) : null));
     this._carryContinuousRanges(field, n, outcome);
@@ -735,7 +738,7 @@ export class DataStateOpenCellsMethods {
 
   /**
    * A continuous field's statistics measured again over its resized values,
-   * with its filter and colour ranges carried (`carriedRange`); a range
+   * with its filter and color ranges carried (`carriedRange`); a range
    * nothing of which lies within the new values is reset, and said. @private
    */
   _carryContinuousRanges(field, n, outcome) {
@@ -752,7 +755,7 @@ export class DataStateOpenCellsMethods {
     for (const [name, range] of [['_continuousFilter', filter], ['_continuousColorRange', colorRange]]) {
       const carried = carriedRange(range, oldStats, stats);
       if (carried === null) {
-        outcome.resetRanges.push(`${name === '_continuousFilter' ? 'the filter' : 'the colour range'} of ${field.key}`);
+        outcome.resetRanges.push(`${name === '_continuousFilter' ? 'the filter' : 'the color range'} of ${field.key}`);
       } else if (carried !== undefined) {
         field[name] = carried;
       }
@@ -763,7 +766,7 @@ export class DataStateOpenCellsMethods {
 
   /**
    * User-defined fields' own arrays as `n` cells, in every copy
-   * (`_userDefinedFieldCopies`): a category's codes (added cells labelled
+   * (`_userDefinedFieldCopies`): a category's codes (added cells labeled
    * from its source column when it was made from one, else missing),
    * a value field's values (added cells NaN); a copy of a field takes its
    * source's arrays. Centroids are counted again. @private
@@ -779,7 +782,7 @@ export class DataStateOpenCellsMethods {
       if (template.kind === 'category' && ArrayBuffer.isView(template.codes)) {
         const { missingValue } = categoricalStorageForCodes(template.codes, `User-defined field "${template.key}"`);
         const resized = resizedCellArray(template.codes, from, n, { fill: missingValue });
-        // Cells added to a category made from a file's column are labelled
+        // Cells added to a category made from a file's column are labeled
         // from it (its source is resized above), as opening them would.
         const codes = n > from ? this._derivedUserDefinedCodes({ ...template, codes: resized }, cellRange(from, n)) ?? resized : resized;
         const { centroidsByLayout, normalizedLayouts } = registry.computeCentroidsByLayout(codes, template.categories, this);

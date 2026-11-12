@@ -15,7 +15,7 @@
  * So after a raise (20,000 -> 30,000) or a lower (30,000 -> 12,345), once
  * the new tree's order is adopted, every frame -- full detail, culled, a
  * reduced level, a reduced level culled -- is byte-identical to the frame of
- * the same cells published directly, and so are the position and colour
+ * the same cells published directly, and so are the position and color
  * stores, in 3D and in 2D. Right after the Apply, before the tree, the
  * reduced level draws its cells by rank at once. Stores are forced into
  * segments of 4,096 points so the resize crosses segment boundaries. The
@@ -240,7 +240,7 @@ for (const dimension of [3, 2]) {
       expect(result.segments[0]).toBe(Math.ceil(to / SEGMENT_POINTS));
       expect(result.segments[1]).toBe(result.segments[0]);
       expect(result.positionDifference, 'first position word that differs').toBe(-1);
-      expect(result.colorDifference, 'first colour word that differs').toBe(-1);
+      expect(result.colorDifference, 'first color word that differs').toBe(-1);
       for (const [name, frame] of Object.entries(result.frames)) {
         expect(frame.inputs[1], `${name}: points drawn, level`).toEqual(frame.inputs[0]);
         expect(frame.lit, `${name}: lit pixels`).toBeGreaterThan(500);

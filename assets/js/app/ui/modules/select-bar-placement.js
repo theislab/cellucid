@@ -2,7 +2,7 @@
  * @fileoverview Where the selection bar sits over the plot.
  *
  * The bar (`#select-bar`) belongs to the part of the plot the sidebar does not
- * cover, so it is centred there rather than in the window. That region is not
+ * cover, so it is centered there rather than in the window. That region is not
  * measured here: it is the viewer's presented area (`presentedArea` of
  * `viewer.getPresentedLayout()`), the one rectangle the view grid is laid out
  * in, delivered by `viewer.onPresentedLayoutChange`. The bar and the grid
@@ -18,7 +18,7 @@
  */
 
 /**
- * Centre the bar in the presented area of one resolved layout.
+ * Center the bar in the presented area of one resolved layout.
  *
  * @param {HTMLElement} bar
  * @param {{presentedArea: {cssLeft: number, cssWidth: number}}} layout

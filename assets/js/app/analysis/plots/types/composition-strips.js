@@ -7,7 +7,7 @@
  * Data (built by `ui/analysis-types/composition-ui.js`):
  *   types            cell-type names, in plot order
  *   conditions       condition names
- *   conditionColors  each condition's colour
+ *   conditionColors  each condition's color
  *   points           {type: Int32Array, condition: Int32Array, value: Float64Array, label: string[]}
  *   significance     per type, '' or a mark (*, **, ***) from its adjusted p
  *

@@ -16,19 +16,22 @@
 
 import { FormBasedAnalysisUI } from './base/form-based-analysis.js';
 import { compositionOptions, COMPOSITION_DISPLAY_OPTIONS } from '../../options/composition-options.js';
-import { NO_CELLS, testComposition } from '../../stats/composition-tests.js';
+import { MIN_PAIRS_WITH_CELLS, NO_CELLS, TOO_FEW_PAIRS, compositionPairs, testComposition } from '../../stats/composition-tests.js';
 import { presentCompositionUnits } from '../../compute/composition-counts.js';
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
 import { createResultEnvelope, readResultEnvelope } from '../../shared/analysis-result-session.js';
 import { describeOpenCellChoice } from '../../shared/open-cell-choice.js';
 import { downloadCSV } from '../../shared/analysis-utils.js';
+import { toCSVCell } from '../../compute/csv-export.js';
+import { categoryDisplayName } from '../../../actions/targets/names.js';
 import { createFieldGroups } from './field-groups.js';
 import { fieldCategoryCss } from '../../../utils/category-state.js';
-import { formatCount, formatCountOf, countNoun } from '../../../../utils/format-units.js';
+import { formatCount, formatCountOf, formatPercent, formatPValue, countNoun } from '../../../../utils/format-units.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
 import '../../plots/types/composition-bars.js';
-import { failureText } from '../../../../utils/errors.js';
+import { failureDetails, sayFailure } from '../../../../utils/errors.js';
+import { buttonClassName } from '../../../ui/components/controls.js';
 
 const ADJUSTED_P_SIGNIFICANT = 0.05;
 
@@ -38,18 +41,6 @@ function significanceMark(p) {
   if (p <= 0.01) return '**';
   if (p <= ADJUSTED_P_SIGNIFICANT) return '*';
   return '';
-}
-
-function formatP(p) {
-  if (!Number.isFinite(p)) return '–';
-  return p < 1e-4 ? p.toExponential(1) : p.toPrecision(2);
-}
-
-function csvCell(value) {
-  const text = typeof value === 'number'
-    ? (Number.isFinite(value) ? String(value) : 'NA')
-    : String(value);
-  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 /**
@@ -150,6 +141,67 @@ export function compositionPlotData(composition, display) {
 /** A finite number, or null (JSON has no NaN). */
 const finiteOrNull = value => (typeof value === 'number' && Number.isFinite(value) ? value : null);
 
+/**
+ * A composition result as one table, every cell type a row, the most
+ * significant first (else the most abundant): its cells and pooled
+ * proportion; when tested its mean proportion per condition, log₂ ratio,
+ * test and p values; its proportion in each unit (sample, or condition) when
+ * there are several. The agent's result table (`_resultTable`, its top rows)
+ * and the CSV (`tableFile`, `file: true`) are this one table, so they cannot
+ * disagree; the file adds the statistic, `n_samples_<condition>` (the
+ * samples each condition's mean is over) and, for a paired test, `n_pairs`
+ * (the pairs holding the type's cells, which its test took), which the agent
+ * reads in the result's `about`.
+ *
+ * @param {object} composition
+ * @param {{file: boolean}} options
+ * @returns {{columns: string[], rows: Array<Array<string|number|null>>, unitTotals: number[]}}
+ */
+function compositionTable(composition, { file }) {
+  const { types, units, counts, conditions, test } = composition;
+  const unitCount = units.length;
+  const unitTotals = units.map((_, unit) => types.reduce((sum, _type, type) => sum + counts[type * unitCount + unit], 0));
+  const typeCells = types.map((_, type) => {
+    let sum = 0;
+    for (let unit = 0; unit < unitCount; unit++) sum += counts[type * unitCount + unit];
+    return sum;
+  });
+  const perUnit = unitCount > 1;
+  const paired = test !== null && test.pairs !== null;
+  const columns = ['cell_type', 'cells', 'proportion'];
+  if (test !== null) {
+    columns.push(...conditions.map(name => `mean_proportion_${name}`), 'log2_ratio', 'test');
+    if (file) columns.push('statistic');
+    columns.push('p_value', 'p_adjusted');
+    if (file) columns.push(...conditions.map(name => `n_samples_${name}`), ...(paired ? ['n_pairs'] : []));
+  }
+  if (perUnit) columns.push(...units.map(unit => `proportion_${unit.label}`));
+  const order = types.map((_, index) => index);
+  if (test !== null) {
+    const p = index => (Number.isFinite(test.adjustedP[index]) ? test.adjustedP[index] : Infinity);
+    order.sort((a, b) => p(a) - p(b) || typeCells[b] - typeCells[a]);
+  } else {
+    order.sort((a, b) => typeCells[b] - typeCells[a]);
+  }
+  const share = (part, whole) => (whole > 0 ? part / whole : null);
+  const rows = order.map(index => [
+    String(types[index]),
+    typeCells[index],
+    share(typeCells[index], composition.totalCells),
+    ...(test === null ? [] : [
+      ...conditions.map((_, condition) => finiteOrNull(test.meanProportion[index * conditions.length + condition])),
+      finiteOrNull(test.log2Ratio[index]),
+      test.typeTest[index],
+      ...(file ? [finiteOrNull(test.statistic[index])] : []),
+      finiteOrNull(test.pValue[index]),
+      finiteOrNull(test.adjustedP[index]),
+      ...(file ? [...conditions.map((_, condition) => test.unitsPerCondition[condition]), ...(paired ? [test.pairsTested[index]] : [])] : [])
+    ]),
+    ...(perUnit ? units.map((_, unit) => share(counts[index * unitCount + unit], unitTotals[unit])) : [])
+  ]);
+  return { columns, rows, unitTotals };
+}
+
 export class CompositionUI extends FormBasedAnalysisUI {
   static getRequirements() {
     return {
@@ -167,7 +219,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
     this._fieldGroups = createFieldGroups({
       dataLayer: this.dataLayer,
       onReady: () => this._refreshOptionsContext(),
-      onError: error => this._notifications.error(`Composition cell types: ${failureText(error)}`, { category: 'analysis' })
+      onError: error => this._notifications.error(`Composition cell types: ${sayFailure(error)}`, { ...failureDetails(error), category: 'analysis' })
     });
   }
 
@@ -188,7 +240,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
     return compositionOptions;
   }
 
-  /** The categorical fields, the colouring field and the pages. */
+  /** The categorical fields, the coloring field and the pages. */
   _getOptionsContext() {
     const categoricalFields = this.dataLayer.getAvailableVariables('categorical_obs').map(info => ({
       key: info.key,
@@ -196,19 +248,17 @@ export class CompositionUI extends FormBasedAnalysisUI {
       // Null until the field is read: its categories are not known yet.
       categoryCount: Array.isArray(info.categories) ? info.categories.length : (info.categoryCount ?? null)
     }));
-    const state = this.dataLayer.state;
-    const active = state?.activeFieldSource === 'obs' && state.activeFieldIndex >= 0
-      ? state.obsData?.fields?.[state.activeFieldIndex]
-      : null;
     return {
       categoricalFields,
-      colorField: active?.kind === 'category' ? active.key : null,
+      colorField: this.dataLayer.getColoringCategoricalField(),
       pages: this.dataLayer.getPages().map(page => ({ id: page.id, name: page.name })),
       groupsFor: (_entry, record) => this._fieldGroups.groups(record.cellTypes)
     };
   }
 
   validateDataRequirements() {
+    const base = super.validateDataRequirements();
+    if (!base.valid) return base;
     if (this.dataLayer.getAvailableVariables('categorical_obs').length === 0) {
       return { valid: false, error: 'Requires a categorical field of cell types.' };
     }
@@ -280,12 +330,13 @@ export class CompositionUI extends FormBasedAnalysisUI {
     typeCategories.forEach((name, code) => {
       if (chosen !== null && !chosen.has(name)) return;
       typeIndexOfCode[code] = typeNames.length;
-      typeNames.push(name);
+      // Named as shown (`(empty)`, `(blank)` for a category with no name).
+      typeNames.push(categoryDisplayName(typeField.categories[code]));
       typeColors.push(fieldCategoryCss(typeFieldState, code));
     });
     const identity = categories => Int32Array.from(categories.map((_, index) => index));
-    const sampleNames = sampleField === null ? null : sampleField.categories.map(String);
-    const conditionNames = conditionField === null ? [] : conditionField.categories.map(String);
+    const sampleNames = sampleField === null ? null : sampleField.categories.map(categoryDisplayName);
+    const conditionNames = conditionField === null ? [] : conditionField.categories.map(categoryDisplayName);
     const conditionFieldState = conditionField === null ? null : fieldOf(options.condition);
     const cellCount = typeField.codes.length;
     // A first pass (`shared/progressive-cells.js`): the scope's cells in the sample.
@@ -334,6 +385,19 @@ export class CompositionUI extends FormBasedAnalysisUI {
     const conditionOfUnit = present.unitCondition;
     const presentConditions = conditionField === null ? [] : present.conditions;
     job.step('Testing');
+    // Samples with cells in both of two conditions: the pairs a paired test
+    // takes, counted unpaired too so the result says when one is possible.
+    const twoWithSamples = sampleField !== null && presentConditions.length === 2;
+    const samplesInBoth = twoWithSamples ? compositionPairs(present.unitSample, conditionOfUnit).first.length : null;
+    const paired = options.paired && sampleField !== null && conditionField !== null;
+    if (paired && presentConditions.length !== 2) {
+      throw new Error(`A paired test compares two conditions; the chosen cells hold ${formatCountOf(presentConditions.length, 'condition')} of ${options.condition}. Choose the cells of two (a page of them).`);
+    }
+    // A type is tested over the pairs holding its cells, at least
+    // MIN_PAIRS_WITH_CELLS of them: with fewer pairs in all no type could be.
+    if (paired && samplesInBoth < MIN_PAIRS_WITH_CELLS) {
+      throw new Error(`A paired test needs at least ${MIN_PAIRS_WITH_CELLS} samples of ${options.samples} with cells in both conditions; ${formatCount(samplesInBoth)} ${samplesInBoth === 1 ? 'has' : 'have'}`);
+    }
     const test = presentConditions.length >= 2
       ? testComposition({
         counts,
@@ -342,6 +406,8 @@ export class CompositionUI extends FormBasedAnalysisUI {
         conditionOfUnit,
         conditionCount: presentConditions.length,
         samples: sampleField !== null,
+        unitSample: present.unitSample,
+        paired,
         method: options.method,
         correction: options.correction
       })
@@ -364,6 +430,7 @@ export class CompositionUI extends FormBasedAnalysisUI {
       totalCells,
       method: options.method,
       correction: options.correction,
+      samplesInBoth,
       test
     };
     // What limits the test goes to the notification center once per run;
@@ -423,7 +490,15 @@ export class CompositionUI extends FormBasedAnalysisUI {
         chips.push({
           text: `${formatCount(absent.length)} ${countNoun(absent.length, 'type')} without cells`,
           tone: 'info',
-          title: `No cells in scope, so not tested and not counted in the multiple-testing correction: ${absent.join(', ')}`
+          title: `No cells in the samples tested (paired: in the pairs), so not tested and not counted in the multiple-testing correction: ${absent.join(', ')}`
+        });
+      }
+      const few = composition.types.filter((_, index) => composition.test.typeTest[index] === TOO_FEW_PAIRS);
+      if (few.length > 0) {
+        chips.push({
+          text: `${formatCount(few.length)} ${countNoun(few.length, 'type')} in too few pairs`,
+          tone: 'info',
+          title: `Cells in fewer than ${MIN_PAIRS_WITH_CELLS} pairs, so not tested and not counted in the multiple-testing correction (a pair without the type on either side says nothing about it): ${few.join(', ')}`
         });
       }
     }
@@ -434,7 +509,8 @@ export class CompositionUI extends FormBasedAnalysisUI {
     // The sidebar preview leaves the legend out (hover names each type);
     // the expanded view shows it.
     const rendered = await this._renderPreviewPlot({
-      result: { ...result, options: { ...result.options, legendPosition: 'none' } },
+      result,
+      plotOptions: { ...result.options, legendPosition: 'none' },
       requestId,
       containerId: this._plotContainerIdBase,
       expandable: true,
@@ -485,15 +561,18 @@ export class CompositionUI extends FormBasedAnalysisUI {
     ];
     if (composition.test !== null) {
       rows.push(['Test', composition.test.test]);
+      if (composition.samplesInBoth !== null) {
+        rows.push(['Samples in both conditions', `${formatCount(composition.samplesInBoth)}${composition.test.pairs !== null ? ', tested paired' : ''}`]);
+      }
       rows.push(['Multiple testing', composition.correction === 'bh' ? 'Benjamini-Hochberg' : 'Bonferroni']);
       if (composition.test.overall !== null) {
-        rows.push(['Type × condition χ²', `${composition.test.overall.statistic.toFixed(2)} (df ${composition.test.overall.df}), p ${formatP(composition.test.overall.pValue)}`]);
+        rows.push(['Type × condition χ²', `${composition.test.overall.statistic.toFixed(2)} (df ${composition.test.overall.df}), p ${formatPValue(composition.test.overall.pValue)}`]);
       }
     }
     container.innerHTML = `<table class="analysis-stats-table">${rows.map(([label, value]) => `<tr><td>${escapeHtml(label)}</td><td><strong>${escapeHtml(value)}</strong></td></tr>`).join('')}</table>`;
     const counts = document.createElement('button');
     counts.type = 'button';
-    counts.className = 'analysis-link-btn';
+    counts.className = buttonClassName('quiet');
     counts.textContent = 'Counts CSV';
     counts.title = 'Cells per cell type and sample, for other tools';
     counts.addEventListener('click', () => this._trackInteractiveTask(this._downloadCounts(), 'CSV export'));
@@ -511,19 +590,21 @@ export class CompositionUI extends FormBasedAnalysisUI {
       const cells = [escapeHtml(type)];
       for (let condition = 0; condition < conditions.length; condition++) {
         const mean = test === null ? NaN : test.meanProportion[index * conditions.length + condition];
-        cells.push(Number.isFinite(mean) ? `${(mean * 100).toFixed(1)}%` : '–');
+        cells.push(Number.isFinite(mean) ? formatPercent(mean * 100, 1) : '–');
       }
       if (conditions.length === 2 && test !== null) {
         const ratio = test.log2Ratio[index];
         cells.push(Number.isFinite(ratio) ? ratio.toFixed(2) : '–');
       }
       if (test !== null && test.typeTest[index] === NO_CELLS) {
-        cells.push('No cells in scope', '–', '–');
+        cells.push(composition.test.pairs === null ? 'No cells in scope' : 'No cells in the pairs', '–', '–');
+      } else if (test !== null && test.typeTest[index] === TOO_FEW_PAIRS) {
+        cells.push(`Cells in ${formatCountOf(test.pairsTested[index], 'pair')} of ${formatCount(test.pairs)}`, '–', '–');
       } else if (test !== null) {
         cells.push(
           Number.isFinite(test.statistic[index]) ? test.statistic[index].toPrecision(3) : '–',
-          formatP(test.pValue[index]),
-          `${formatP(test.adjustedP[index])}${significanceMark(test.adjustedP[index]) === '' ? '' : ` ${significanceMark(test.adjustedP[index])}`}`
+          formatPValue(test.pValue[index]),
+          `${formatPValue(test.adjustedP[index])}${significanceMark(test.adjustedP[index]) === '' ? '' : ` ${significanceMark(test.adjustedP[index])}`}`
         );
       }
       return `<tr>${cells.map(cell => `<td>${cell}</td>`).join('')}</tr>`;
@@ -536,69 +617,85 @@ export class CompositionUI extends FormBasedAnalysisUI {
   /** The counts, one row per cell type and one column per sample (or condition). */
   async _downloadCounts() {
     if (await this._refuseStaleExport('CSV')) return;
+    const file = this._countsFile();
+    if (file !== null) downloadCSV(file.csv, file.name, this._notifications);
+  }
+
+  /** The counts table file, or null with no result. */
+  _countsFile() {
     const composition = this._lastResult?.composition;
-    if (!composition) return;
+    if (!composition) return null;
     const { types, units, counts } = composition;
-    const lines = [['cell_type', ...units.map(unit => unit.label)].map(csvCell).join(',')];
+    const lines = [['cell_type', ...units.map(unit => unit.label)].map(toCSVCell).join(',')];
     types.forEach((type, index) => {
-      lines.push([type, ...units.map((_, unit) => counts[index * units.length + unit])].map(csvCell).join(','));
+      lines.push([type, ...units.map((_, unit) => counts[index * units.length + unit])].map(toCSVCell).join(','));
     });
-    downloadCSV(lines.join('\n'), 'composition_counts', this._notifications);
+    return { name: 'composition_counts', csv: lines.join('\n') };
   }
 
   /**
    * The expanded view's CSV: the results per cell type when there is a
    * test, else the counts. Each click downloads one file (Safari keeps only
    * one download of a click); the counts beside results come from the
-   * summary's own link.
+   * summary's own link. The rows are the agent's result table
+   * (`compositionTable`) whole, with what a file read alone needs besides:
+   * the statistic, the samples each condition's mean is over and, paired,
+   * the pairs the test took (F108: the file once gave every sample as the
+   * test's and left out the per-sample proportions).
    */
-  _exportModalCSV() {
+  tableFile() {
     const composition = this._lastResult?.composition;
-    if (!composition) return;
-    const { types, conditions, test } = composition;
-    if (test === null) return this._downloadCounts();
-    const header = ['cell_type', ...conditions.map(name => `mean_proportion_${name}`), 'log2_ratio', 'test', 'statistic', 'pvalue', 'pvalue_adjusted', ...conditions.map(name => `n_samples_${name}`)];
-    const rows = [header.map(csvCell).join(',')];
-    types.forEach((type, index) => {
-      rows.push([
-        type,
-        ...conditions.map((_, condition) => test.meanProportion[index * conditions.length + condition]),
-        test.log2Ratio[index],
-        test.typeTest[index],
-        test.statistic[index],
-        test.pValue[index],
-        test.adjustedP[index],
-        ...conditions.map((_, condition) => test.unitsPerCondition[condition])
-      ].map(csvCell).join(','));
-    });
-    downloadCSV(rows.join('\n'), 'composition_results', this._notifications);
+    if (!composition) return null;
+    if (composition.test === null) return this._countsFile();
+    const { columns, rows } = compositionTable(composition, { file: true });
+    const lines = [columns.map(toCSVCell).join(',')];
+    for (const row of rows) lines.push(row.map(toCSVCell).join(','));
+    return { name: 'composition_results', csv: lines.join('\n') };
   }
 
   // ---------------------------------------------------------------- Sessions
 
   /**
-   * Each cell type's mean proportion per condition and, when tested, its
-   * ratio and p values, the most significant first (top `top`), as an agent
-   * reads the result (`describeResult`).
+   * As an agent reads the result (`describeResult`): each cell type's cells
+   * and pooled proportion, its proportion in each sample (or condition: each
+   * unit of the bars), and when tested its mean proportion per condition,
+   * ratio, test and p values, the most significant first, else the most
+   * abundant (top `top`). Before, without a condition the rows held only the
+   * names: no number an agent could read, and the per-sample shares a
+   * donor-level argument needs were never given.
    * @override
    */
   _resultTable(result, top) {
     const composition = result?.composition;
-    if (!composition) return { columns: [], rows: [], total: 0 };
-    const { types, conditions, test } = composition;
-    const columns = ['cell_type', ...conditions.map(name => `mean_proportion_${name}`)];
-    if (test !== null) columns.push('log2_ratio', 'p_value', 'p_adjusted');
-    const order = types.map((_, index) => index);
-    if (test !== null) {
-      const p = index => (Number.isFinite(test.adjustedP[index]) ? test.adjustedP[index] : Infinity);
-      order.sort((a, b) => p(a) - p(b));
-    }
-    const rows = order.slice(0, top).map(index => [
-      String(types[index]),
-      ...conditions.map((_, condition) => (test === null ? null : finiteOrNull(test.meanProportion[index * conditions.length + condition]))),
-      ...(test === null ? [] : [finiteOrNull(test.log2Ratio[index]), finiteOrNull(test.pValue[index]), finiteOrNull(test.adjustedP[index])])
-    ]);
-    return { columns, rows, total: types.length };
+    if (!composition) return { columns: [], rows: [], total: 0, about: null };
+    const { columns, rows, unitTotals } = compositionTable(composition, { file: false });
+    return { columns, rows: rows.slice(0, top), total: composition.types.length, about: this._resultAbout(composition, unitTotals) };
+  }
+
+  /** What the composition counted and tested, as the expanded view's Statistics say it. */
+  _resultAbout(composition, unitTotals) {
+    const { fields, units, conditions, test } = composition;
+    return {
+      cell_types: fields.cellTypes,
+      samples: fields.samples === '' ? null : fields.samples,
+      condition: fields.condition === '' ? null : fields.condition,
+      cells: composition.totalCells,
+      cells_per_unit: units.map((unit, index) => ({ name: unit.label, cells: unitTotals[index] })),
+      ...(test === null ? { test: null } : {
+        test: test.test,
+        samples_per_condition: conditions.map((name, condition) => ({ name, samples: test.unitsPerCondition[condition] })),
+        ...(composition.samplesInBoth === null ? {} : {
+          pairing: test.pairs !== null
+            ? `paired: ${formatCountOf(test.pairs, 'sample')} of ${fields.samples} in both conditions; ${units.length - 2 * test.pairs} units of a sample in one condition only left out; each type tested over the pairs holding its cells, a type in fewer than ${MIN_PAIRS_WITH_CELLS} not tested (test: too few pairs); mean proportions and log2_ratio are over the pairs' samples, as the test reads them`
+            : composition.samplesInBoth >= MIN_PAIRS_WITH_CELLS
+              ? `unpaired; ${formatCountOf(composition.samplesInBoth, 'sample')} of ${fields.samples} are in both conditions: paired: true tests them paired`
+              : `unpaired; ${formatCountOf(composition.samplesInBoth, 'sample')} of ${fields.samples} in both conditions, too few to pair`
+        }),
+        multiple_testing: composition.correction === 'bh' ? 'Benjamini–Hochberg' : 'Bonferroni',
+        ...(test.overall === null ? {} : { overall: `type × condition χ² ${test.overall.statistic.toFixed(2)} (df ${test.overall.df}), p ${formatPValue(test.overall.pValue)}` })
+      }),
+      proportions: `of each unit's counted cells; mean_proportion_* is the mean over a condition's samples${test?.pairs != null ? ' in both conditions (the pairs)' : ''}`
+    };
   }
 
   _exportResult() {
@@ -618,7 +715,10 @@ export class CompositionUI extends FormBasedAnalysisUI {
       result.plotType !== 'composition-bars' ||
       composition === null || typeof composition !== 'object' ||
       !(composition.counts instanceof Uint32Array) ||
-      !(composition.conditionOfUnit instanceof Int32Array)
+      !(composition.conditionOfUnit instanceof Int32Array) ||
+      (composition.samplesInBoth !== null && !Number.isSafeInteger(composition.samplesInBoth)) ||
+      composition.test === undefined ||
+      (composition.test !== null && (composition.test.pairs === undefined || composition.test.pairsTested === undefined))
     ) {
       throw new TypeError('A composition result must hold its counts per cell type and unit');
     }

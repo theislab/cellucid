@@ -5,7 +5,7 @@
  * A field's limits are `field._categoryCellLimits`: a frozen list of
  * `{category, count, seed}` (category by its index in `field.categories`),
  * ascending by category, never changed in place (a change makes a new list,
- * as `utils/category-state.js` does for colours and visibility), so a kept
+ * as `utils/category-state.js` does for colors and visibility), so a kept
  * view's copy of the field shares it. A new definition of the categories
  * (a merge or delete in place, `_publishUserDefinedCategorical`) drops them.
  *

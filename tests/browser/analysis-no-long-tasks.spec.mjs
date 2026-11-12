@@ -468,8 +468,10 @@ async function measured() {
   const modal = app.document.getElementById('welcome-modal');
   const welcomeShown = () => modal.getClientRects().length > 0 && app.getComputedStyle(modal).visibility !== 'hidden';
   await until(welcomeShown, 'the welcome was not shown');
-  app.document.dispatchEvent(new app.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-  await until(() => !welcomeShown(), 'Escape did not close the welcome');
+  // Start exploring (a script's Escape is no key press: a <dialog> closes
+  // only on the browser's own).
+  app.document.getElementById('welcome-start-btn').click();
+  await until(() => !welcomeShown(), 'Start exploring did not close the welcome');
   await until(() => app._comparisonModule?.state?.pointCount === ${CELLS}, 'the dataset did not open');
   // The runs name genes through the data layer: once they are read.
   await app._comparisonModule.state.whenGenesListed();

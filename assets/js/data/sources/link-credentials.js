@@ -23,7 +23,7 @@
  * @module data/sources/link-credentials
  */
 
-import { sha256HexWithoutWebCrypto } from '../../app/utils/sha256.js';
+import { sha256HexWithoutWebCrypto } from '../../utils/sha256.js';
 
 /**
  * Query parameters that only name a file or its version and grant nothing

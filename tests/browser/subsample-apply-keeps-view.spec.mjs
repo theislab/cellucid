@@ -1,9 +1,9 @@
 /**
  * Applying another share of the cells (Session › Open data › Cells to open)
- * keeps where the person was: the camera, the field the view is coloured by
+ * keeps where the person was: the camera, the field the view is colored by
  * and its filters (`ui/modules/subsample-control.js`, `viewCarry`). And what
  * the dataset shows after Apply is exactly what opening it at that share
- * directly shows: positions, colours and visibility, byte for byte.
+ * directly shows: positions, colors and visibility, byte for byte.
  *
  * Fixture: `data-mapping-full.h5ad` (300 cells), served at one address for
  * both openings.
@@ -33,8 +33,8 @@ async function open(page, extra = '') {
   await page.goto(`/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&data=${encodeURIComponent(URL_OF_FILE)}${extra}`, { waitUntil: 'domcontentloaded' });
 }
 
-/** Colour by the first categorical field and hide its first category. */
-async function colourAndFilter(page) {
+/** Color by the first categorical field and hide its first category. */
+async function colorAndFilter(page) {
   return page.evaluate(async () => {
     const state = window._cellucidState;
     const index = state.obsData.fields.findIndex(field => field.kind === 'category' && field._isUserDefined !== true);
@@ -64,13 +64,13 @@ async function shown(page) {
   });
 }
 
-test('Apply keeps the camera, the coloured field and its filter, and shows what opening at that share shows', async ({ browser }) => {
-  // Opened whole, coloured, filtered, camera moved; then 40 % applied.
+test('Apply keeps the camera, the colored field and its filter, and shows what opening at that share shows', async ({ browser }) => {
+  // Opened whole, colored, filtered, camera moved; then 40% applied.
   const context = await browser.newContext();
   const page = await context.newPage();
   await open(page);
   await expect.poll(() => page.evaluate(() => window._cellucidState?.pointCount)).toBe(300);
-  const key = await colourAndFilter(page);
+  const key = await colorAndFilter(page);
   await page.evaluate(() => {
     const viewer = window._cellucidViewer;
     const camera = structuredClone(viewer.getCameraState());
@@ -107,12 +107,12 @@ test('Apply keeps the camera, the coloured field and its filter, and shows what 
   expect(after.hidden).toEqual(before.hidden);
   expect(after.camera).toEqual(before.camera);
 
-  // Opened at 40 % directly, coloured and filtered the same way.
+  // Opened at 40% directly, colored and filtered the same way.
   const directContext = await browser.newContext();
   const direct = await directContext.newPage();
   await open(direct, '&cells=40%25&sample=uniform&seed=7');
   await expect.poll(() => direct.evaluate(() => window._cellucidState?.pointCount)).toBe(120);
-  await colourAndFilter(direct);
+  await colorAndFilter(direct);
   const opened = await shown(direct);
   await closeContextWithApplicationRetirement(directContext);
 

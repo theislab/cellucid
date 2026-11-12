@@ -50,12 +50,12 @@ function twoViewState() {
     candidates: null,
     origin: 'default'
   });
-  // Live view: coloured by leiden with category "a" hidden.
+  // Live view: colored by leiden with category "a" hidden.
   state.activeFieldIndex = 0;
   state.activeFieldSource = 'obs';
   state.obsData.fields[0]._categoryVisible = visibleOf([false, true]);
   state._resetViewContexts();
-  // Kept view: coloured by sample, no filters.
+  // Kept view: colored by sample, no filters.
   state.createViewFromSource('live', 'snap_1');
   dimensionManager.copyViewLayout('live', 'snap_1');
   const snapshot = state.viewContexts.get('snap_1');
@@ -71,6 +71,7 @@ function viewerWith(activeId) {
     getViewLayout: () => ({ mode: 'grid', activeId, liveViewHidden: false }),
     getCamerasLocked: () => true,
     getCentroidFlags: () => ({ points: false, labels: false }),
+    getViewName: () => null,
   };
 }
 

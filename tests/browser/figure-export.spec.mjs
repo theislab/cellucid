@@ -6,6 +6,7 @@ import { expect, test } from './helpers/test.mjs';
 import { expectDownloadNamed } from './helpers/downloads.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { expectContained, tabWalk } from './helpers/dialog-keys.mjs';
 
 const PREPARED_DATASET_URL =
   `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`;
@@ -90,12 +91,11 @@ async function openFigureExport(page, acceptance) {
   await expect(page.locator('#figure-export-section')).toHaveAttribute('open', '');
 
   await page.getByRole('button', { name: /^Framing\b/ }).click();
-  const widthInput = page.getByLabel('Export width (px)');
-  const heightInput = page.getByLabel('Export height (px)');
-  await expect(widthInput).toHaveAttribute('aria-label', 'Export width (px)');
-  await expect(heightInput).toHaveAttribute('aria-label', 'Export height (px)');
-  await widthInput.fill('400');
-  await heightInput.fill('300');
+  // The figure's width in millimetres (F271): 120 mm, the 1.5 column preset.
+  const widthInput = page.getByLabel('Figure width (mm)');
+  await expect(widthInput).toHaveAttribute('aria-label', 'Figure width (mm)');
+  await widthInput.fill('120');
+  await expect(page.getByLabel('Figure width preset')).toHaveValue('one-and-half-column');
   await page.getByRole('button', { name: /^Download\b/ }).click();
   await expect(page.getByLabel('Download format')).toHaveAttribute(
     'aria-label',
@@ -239,10 +239,11 @@ function assertCurrentMetadata(metadata, {
   });
   expect(metadata.view).toBeUndefined();
   expect(metadata.filters).toBeUndefined();
+  // The figure's width in figure pixels (1/96 inch: 120 mm is 454), which it fills; no box height.
   expect(metadata.export).toMatchObject({
     format,
-    width: 400,
-    height: 300,
+    width: 454,
+    height: null,
     dpi,
     strategy,
     includeAxes: true,
@@ -250,10 +251,85 @@ function assertCurrentMetadata(metadata, {
   });
 }
 
-function assertPngArtifact(bytes) {
+/**
+ * The PNG size of the 120 mm export these tests make, as the product derives
+ * it: the figure fills 454 figure pixels (120 mm at 1/96 inch) exactly, at
+ * the height `fillSingleViewWidth` (`utils/layout.js`) lays out for the live
+ * view's aspect and the panel's title, axes and legend: the axes' margins
+ * come from their measured tick labels and the panel's text sizes, in points
+ * (`planFigureAxes`, F158), so they are read from the panel and the live view
+ * here, not assumed.
+ */
+async function expectedPngSize(page) {
+  const figure = await page.evaluate(async () => {
+    const { figureSourceAspect } = await import(
+      '/assets/js/app/ui/modules/figure-export/utils/plot-fit.js'
+    );
+    const { fillSingleViewWidth } = await import(
+      '/assets/js/app/ui/modules/figure-export/utils/layout.js'
+    );
+    const { figurePxOfPt } = await import(
+      '/assets/js/app/ui/modules/figure-export/utils/figure-size.js'
+    );
+    const { computeSourceAxisBounds, figureViewHasAxes } = await import(
+      '/assets/js/app/ui/modules/figure-export/components/axes-builder.js'
+    );
+    const state = window._cellucidState;
+    const { renderState, cameraState, dimensionLevel } = window._cellucidViewer.getPresentedViewState('live');
+    const value = id => document.getElementById(id).value;
+    // Text sizes are points; the layout takes figure pixels.
+    const number = id => figurePxOfPt(Number(value(id)));
+    const plotAspect = figureSourceAspect({ renderState });
+    const hasAxes = document.getElementById('figure-export-axes').checked
+      && figureViewHasAxes({ dimension: dimensionLevel, navigationMode: cameraState.navigationMode });
+    const bounds = hasAxes ? computeSourceAxisBounds({
+      renderState,
+      dimension: dimensionLevel,
+      cameraState,
+      normTransform: state.dimensionManager.getNormTransform(state.getViewLayoutKey('live')),
+    }) : null;
+    const field = state.getFieldForView('live');
+    const includeLegend = document.getElementById('figure-export-legend').checked;
+    const layout = fillSingleViewWidth({
+      width: 454,
+      plotAspect,
+      title: value('figure-export-title'),
+      titleFontSizePx: number('figure-export-title-font-size'),
+      axes: bounds === null ? null : {
+        bounds,
+        xLabel: value('figure-export-xlabel'),
+        yLabel: value('figure-export-ylabel'),
+        tickFontPx: number('figure-export-tick-font-size'),
+        labelFontPx: number('figure-export-axis-font-size'),
+      },
+      includeLegend,
+      legendPosition: document.querySelector('select[aria-label="Legend position"]').value === 'bottom' ? 'bottom' : 'right',
+      legendModel: includeLegend && field ? state.getLegendModel(field) : null,
+      legendFieldKey: includeLegend && field ? field.key : null,
+      legendFontSizePx: number('figure-export-legend-font-size'),
+      fontFamily: value('figure-export-font'),
+    });
+    return {
+      aspect: plotAspect,
+      laid: { width: layout.plotRect.width, height: layout.plotRect.height },
+      totalWidth: layout.totalWidth,
+      totalHeight: layout.totalHeight,
+    };
+  });
+  // The figure is exactly 120 mm wide; the plot keeps the view's shape.
+  expect(figure.totalWidth).toBe(454);
+  expect(Math.abs(figure.laid.width / figure.laid.height - figure.aspect)).toBeLessThan(0.02);
+  const dpiScale = 300 / 96;
+  return {
+    width: Math.round(figure.totalWidth * dpiScale),
+    height: Math.round(figure.totalHeight * dpiScale),
+  };
+}
+
+function assertPngArtifact(bytes, expectedSize) {
   expect(bytes.toString('ascii', 12, 16)).toBe('IHDR');
-  expect(bytes.readUInt32BE(16)).toBe(2400);
-  expect(bytes.readUInt32BE(20)).toBe(1394);
+  expect(bytes.readUInt32BE(16)).toBe(expectedSize.width);
+  expect(bytes.readUInt32BE(20)).toBe(expectedSize.height);
   const chunks = parsePngTextChunks(bytes);
   expect(chunks.get('Software')).toBe('Cellucid (cellucid.com)');
   expect(chunks.get('Website')).toBe('https://cellucid.com');
@@ -284,6 +360,12 @@ function assertSvgArtifact(bytes, strategy) {
     expect(svg).toMatch(
       /<image [^>]*href="data:image\/png;base64,[A-Za-z0-9+/=]+"/,
     );
+    // The points are drawn at 300 dpi at the figure's size (found 2026-11-10: a fixed 2×).
+    for (const [, attributes] of svg.matchAll(/<image ([^>]*)>/g)) {
+      const boxWidth = Number(attributes.match(/\swidth="([\d.]+)"/)[1]);
+      const png = Buffer.from(attributes.match(/href="data:image\/png;base64,([^"]+)"/)[1], 'base64');
+      expect(Math.abs(png.readUInt32BE(16) - boxWidth * 300 / 96)).toBeLessThanOrEqual(1);
+    }
   } else {
     expect(svg).not.toMatch(/<image [^>]*href="data:image\/png;base64,/);
     expect(svg).toMatch(/<circle\b/);
@@ -702,7 +784,7 @@ test('exports PNG and every explicit SVG strategy through the visible UI', async
     strategy: null,
     artifactLabel: `${testInfo.project.name}-figure-export`,
   });
-  assertPngArtifact(png.bytes);
+  assertPngArtifact(png.bytes, await expectedPngSize(page));
 
   for (const strategy of [
     'full-vector',
@@ -831,7 +913,7 @@ test('the point pass drawn on the page equals the one drawn in the worker', asyn
     strategy: null,
     artifactLabel: `${testInfo.project.name}-point-pass-on-page`,
   });
-  assertPngArtifact(png.bytes);
+  assertPngArtifact(png.bytes, await expectedPngSize(page));
   expect(productErrors).toEqual([]);
 });
 
@@ -857,7 +939,7 @@ test('exports the sculpted shader quality as PNG and every SVG strategy', async 
     strategy: null,
     artifactLabel: `${testInfo.project.name}-figure-export-sculpted`,
   });
-  assertPngArtifact(png.bytes);
+  assertPngArtifact(png.bytes, await expectedPngSize(page));
   for (const strategy of ['full-vector', 'hybrid']) {
     const svg = await exportOne({
       page,
@@ -928,6 +1010,7 @@ test('framing preview exposes an exact keyboard and toggle lifecycle', async ({
 
 test('figure-export modal confines focus and restores its exact invoker', async ({
   page,
+  browserName,
 }, testInfo) => {
   const productErrors = observeProductErrors(page);
   await openFigureExport(
@@ -940,9 +1023,6 @@ test('figure-export modal confines focus and restores its exact invoker', async 
   await page.evaluate(async () => {
     const { showFigureExportModal } = await import(
       '/assets/js/app/ui/modules/figure-export/components/modal.js'
-    );
-    window.__figureModalPriorInert = Array.from(document.body.children).map(
-      element => element.inert,
     );
     const content = document.createElement('div');
     for (const label of ['First action', 'Last action']) {
@@ -964,35 +1044,21 @@ test('figure-export modal confines focus and restores its exact invoker', async 
   const modal = page.getByRole('dialog', { name: 'Focus ownership test' });
   await expect(modal).toBeVisible();
   await expect(page.getByRole('button', { name: 'First action' })).toBeFocused();
-  expect(
-    await page.evaluate(() => (
-      Array.from(document.body.children)
-        .filter(element => !element.classList.contains('figure-export-modal'))
-        .every(element => element.inert)
-    )),
-  ).toBe(true);
-
-  await page.keyboard.press('Shift+Tab');
-  await expect(page.getByRole('button', { name: 'Last action' })).toBeFocused();
-  await page.keyboard.press('Tab');
-  await expect(page.getByRole('button', { name: 'First action' })).toBeFocused();
+  // A modal <dialog>: the page behind it is inert, so Tab never reaches it
+  // and the plot cannot take focus.
+  expect(await page.locator('dialog.figure-export-modal').evaluate(dialog => dialog.matches(':modal'))).toBe(true);
+  const walk = await tabWalk(page, browserName, 'dialog.figure-export-modal', 4);
+  expectContained(walk, 'Tab');
+  expect(walk.filter(stop => stop.inside).map(stop => stop.at))
+    .toEqual(expect.arrayContaining(['Last action', 'First action']));
+  await page.getByRole('button', { name: 'First action' }).focus();
   await page.locator('#glcanvas').evaluate(canvas => canvas.focus());
   await expect(page.getByRole('button', { name: 'First action' })).toBeFocused();
 
   await page.keyboard.press('Escape');
   await expect(modal).toHaveCount(0);
   await expect(exportButton).toBeFocused();
-  expect(
-    await page.evaluate(() => ({
-      closed: window.__figureModalClosed,
-      inert: Array.from(document.body.children).map(element => element.inert),
-      priorInert: window.__figureModalPriorInert,
-    })),
-  ).toEqual({
-    closed: true,
-    inert: await page.evaluate(() => window.__figureModalPriorInert),
-    priorInert: await page.evaluate(() => window.__figureModalPriorInert),
-  });
+  expect(await page.evaluate(() => window.__figureModalClosed)).toBe(true);
   expect(productErrors).toEqual([]);
 });
 
@@ -1056,6 +1122,6 @@ test('delivers the staged SVG and PNG batch as one atomic ZIP', async ({
     expect(entry.filename).toMatch(/^[A-Za-z0-9._-]+\.(?:svg|png)$/);
   }
   assertSvgArtifact(entries[0].bytes, 'full-vector');
-  assertPngArtifact(entries[1].bytes);
+  assertPngArtifact(entries[1].bytes, await expectedPngSize(page));
   expect(productErrors).toEqual([]);
 });

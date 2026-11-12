@@ -21,9 +21,12 @@
  * layout). The selection tool and Select mode are input modes, page chrome
  * like a held Alt key, and no setting (History v2 §3.3.8).
  *
- * Restore writes each control that differs and dispatches the event its
- * owner listens for (the session path, `restoreUIControls`); a control whose
- * owner refuses the value fails the restore. Smoke on a device that cannot
+ * Restore reads the saved record one setting at a time (`readSavedControls`,
+ * `readSavedFigureExportSettings`): a value this version cannot use (a
+ * control removed or changed since, a value of another version) keeps the
+ * setting as shown and is said (`unread-settings.js`), and never fails the
+ * others. Then it writes each control that differs and dispatches the event
+ * its owner listens for (`restoreUIControls`). Smoke on a device that cannot
  * draw it is said, as a session says it, and Points is kept.
  *
  * @module app/state/domains/settings
@@ -32,6 +35,9 @@
 import { createUiControlSerializer } from '../../state-serializer/ui-controls.js';
 import { reportSmokeUnavailable } from '../../ui/modules/smoke-availability.js';
 import { sameValue } from './same-value.js';
+import { controlReadout } from '../../ui/core/control-readout.js';
+import { readSavedFigureExportSettings } from '../../ui/modules/figure-export/utils/session-settings.js';
+import { reportUnreadSettings } from './unread-settings.js';
 
 /**
  * What a control is called where it stands: its label, its accessible name,
@@ -42,6 +48,33 @@ function labelOf(id) {
   const text = element?.labels?.[0]?.textContent ?? element?.getAttribute?.('aria-label') ?? element?.textContent ?? null;
   const name = typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '';
   return name.length > 0 && name.length <= 60 ? name : id.replace(/-/g, ' ');
+}
+
+/**
+ * What a control's recorded value reads as where it stands, at any step: a
+ * choice's option, a slider's readout (its owner's, `core/control-readout.js`;
+ * a slider's position is not always what it means), on or off. A slider whose
+ * owner defines no readout reads as its value when its readout shows the
+ * value, and as a position otherwise ("slider at 37 of 0–100").
+ */
+function shownOf(id, record) {
+  if (record.type === 'checkbox') return record.checked ? 'on' : 'off';
+  const element = typeof document === 'undefined' ? null : document.getElementById(id);
+  if (element === null) return record.value;
+  if (record.type === 'select') {
+    const option = [...(element.options ?? [])].find(candidate => candidate.value === record.value);
+    const text = option?.textContent?.replace(/\s+/g, ' ').trim();
+    return text ? text : record.value;
+  }
+  if (record.type === 'range' || record.type === 'number') {
+    const readout = controlReadout(element, record.value);
+    if (readout !== null) return readout;
+    const shown = element.closest?.('.slider-row')?.querySelector?.('.slider-value')?.textContent?.replace(/\s+/g, ' ').trim() ?? '';
+    // No readout beside it, or one that shows the value itself: the value says it.
+    if (shown === '' || shown === String(element.value)) return record.value;
+    return `slider at ${record.value} of ${element.min}–${element.max}`;
+  }
+  return record.value;
 }
 
 /**
@@ -65,24 +98,29 @@ export function createSettingsDomain({ sidebar, viewer, figureExport }) {
       }
       const current = capture();
       if (sameValue(current, value)) return;
+      const unread = [];
       if (!sameValue(current.controls, value.controls)) {
-        const smoke = value.controls['render-mode']?.value === 'smoke' ? viewer.getSmokeSupport() : null;
+        const read = controls.readSavedControls(value.controls);
+        unread.push(...read.unread);
+        const smoke = read.controls['render-mode']?.value === 'smoke' ? viewer.getSmokeSupport() : null;
         const withheld = smoke !== null && !smoke.supported;
-        controls.restoreUIControls(value.controls, withheld ? { withholdControlIds: ['render-mode'] } : {})();
+        unread.push(...controls.restoreUIControls(read.controls, withheld ? { withholdControlIds: ['render-mode'] } : {})());
         if (withheld) reportSmokeUnavailable(smoke);
       }
       if (!sameValue(current.figureExport, value.figureExport) && value.figureExport !== null) {
         if (figureExport === null) throw new Error('The Figure export panel is not available on this page.');
-        figureExport.importSessionSettings(structuredClone(value.figureExport));
+        const read = readSavedFigureExportSettings(structuredClone(value.figureExport), current.figureExport);
+        unread.push(...read.unread.map(({ setting, reason }) => ({ label: `Figure export ${setting}`, reason })));
+        figureExport.importSessionSettings(read.settings);
       }
+      reportUnreadSettings(unread);
     },
     describe(a, b) {
       const lines = [];
       for (const [id, record] of Object.entries(b.controls)) {
         const before = a.controls[id];
         if (sameValue(before, record)) continue;
-        const shown = record.type === 'checkbox' ? (record.checked ? 'on' : 'off') : record.value;
-        lines.push(`${labelOf(id)}: ${shown}`);
+        lines.push(`${labelOf(id)}: ${shownOf(id, record)}`);
       }
       if (!sameValue(a.figureExport, b.figureExport)) lines.push('Figure export settings changed');
       return lines;

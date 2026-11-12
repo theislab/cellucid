@@ -9,8 +9,10 @@
  * 1. A port number (`8765`) is a server on this computer:
  *    `http://localhost:8765`.
  * 2. An address without a scheme whose host is this computer (`localhost`,
- *    `127.0.0.1`, `[::1]`) or that ends in a port (`lab-server:8765`) is a
- *    server reached over `http://`.
+ *    `127.0.0.1`, `[::1]`: `utils/loopback.js`) or that ends in a port (`lab-server:8765`) is a
+ *    server reached over `http://`, unless its path names a file, store or
+ *    catalog (rule 4: `127.0.0.1:8000/atlas.h5ad` is that file, read over
+ *    `http://`).
  * 3. A provider's own form (`hf:user/repo`, `GSE123456`, a DOI, a CELLxGENE,
  *    Zenodo, Figshare, Google Drive, OneDrive, Dropbox, Hugging Face or
  *    GitHub address, `owner/repo/path`) is
@@ -31,6 +33,7 @@
 
 import { getProviderRegistry } from '../../../data/sources/registry.js';
 import { fileFormatOfName, folderFormatOfName } from '../../../data/input-formats.js';
+import { isLoopbackHostname } from '../../../utils/loopback.js';
 
 /** A port number, as `cellucid serve --port` takes it. */
 function asPort(text) {
@@ -39,7 +42,6 @@ function asPort(text) {
   return port >= 1 && port <= 65535 ? port : null;
 }
 
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 const SCHEMELESS_SERVER = /^(\[[0-9a-f:]+\]|[a-z0-9.-]+)(?::(\d{1,5}))?(\/[^?#]*)?$/i;
 /** Whether a path names a dataset file, a store folder or a catalog. */
 function namesData(pathname) {
@@ -51,6 +53,26 @@ function namesData(pathname) {
 function serverBase(url) {
   const path = url.pathname.replace(/\/+$/, '');
   return `${url.origin}${path}`;
+}
+
+/**
+ * A server address as a link's `remote` gives it (`http://localhost:8765/`,
+ * `HTTP://Host:8765`), in the one canonical spelling the address bar
+ * connects by (R9E-3: a trailing slash refused the link); text that is no
+ * web address is returned as it is, for the server's validation to refuse.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function canonicalServerAddress(text) {
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return text;
+  }
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.search !== '' || url.hash !== '') return text;
+  return serverBase(url);
 }
 
 function invalid(message) {
@@ -97,8 +119,10 @@ export function routeAddress(text, { registry = getProviderRegistry() } = {}) {
         return invalid(`${match[2]} is not a port: a port is a number from 1 to 65535, as in localhost:8765.`);
       }
       const hasPort = match[2] !== undefined;
+      // A path naming data is that data at the address, not a server.
+      const pathNamesData = match[3] !== undefined && namesData(match[3]);
       // `zenodo:123` is a provider's short form, not a host and port.
-      if ((LOOPBACK_HOSTS.has(host) || hasPort) && registry.get(host) === null) {
+      if ((isLoopbackHostname(host) || hasPort) && registry.get(host) === null && !pathNamesData) {
         return server(serverBase(new URL(`http://${value}`)));
       }
     }
@@ -128,7 +152,7 @@ export function routeAddress(text, { registry = getProviderRegistry() } = {}) {
   ) {
     return link(value);
   }
-  if (LOOPBACK_HOSTS.has(url.hostname) || LOOPBACK_HOSTS.has(`[${url.hostname}]`)) {
+  if (isLoopbackHostname(url.hostname)) {
     if (url.pathname === '/') return server(serverBase(url));
   }
   return Object.freeze({ kind: 'ask', url: serverBase(url), value });

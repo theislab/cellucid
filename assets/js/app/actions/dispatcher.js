@@ -24,7 +24,9 @@
  *   action that is not a read) passes the confirmer first (`setConfirmer`,
  *   the agent presence: the person's permission settings), with the
  *   action's estimate of its work when its owner gives one
- *   (`provideEstimate`: time and bytes from what this page measured). The
+ *   (`provideEstimate`: time and bytes from what this page measured; an
+ *   estimate that finds the action refused refuses it before anyone is
+ *   asked). The
  *   confirmer allows it, refuses it with its own sentence, or asks the
  *   person, and the agent waits; subscribers hear `asking` when the person
  *   is asked and `answered` when they answered (the relay tells a waiting
@@ -32,7 +34,15 @@
  *   definition's `confirm`) is asked about before the action runs, or, for
  *   a definition with `confirmAt: 'handler'`, by its implementation
  *   (`ctx.confirm(detail)`) once it knows what it costs (a download's size,
- *   `detail`); never when nothing costs (a copy already kept). Without a
+ *   `detail`); never when nothing costs (a copy already kept). Heavy work
+ *   an implementation finds only once it runs (what restoring a saved
+ *   state reads, the cells' totals a new matrix needs) is asked about then
+ *   (`ctx.heavy(estimate)`), as an estimate given at the start would have
+ *   been, unless the start was already judged heavy. An action that may
+ *   fetch an address its parameters name (`opensLinks`: a dataset's link)
+ *   asks, by its implementation and before anything is requested, about an
+ *   address the person has not seen in this tab (`ctx.confirmLink(address)`,
+ *   the kind `unseen-link`, F121). Without a
  *   confirmer an action with `confirm` is refused; a refusal changes
  *   nothing. Only an agent's action is asked about, and what any other
  *   origin that is not a click in the page publishes (`confirm:
@@ -69,10 +79,14 @@ import { withDefaults } from './schema.js';
 import { MARKED_QUOTE, plainSentence } from './targets/names.js';
 import { isSteplessEffect } from './catalog.js';
 import { awaitWithSignal, cancel, cancelled, onAbort, throwIfAborted } from '../../utils/abort.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
 export const ACTION_ORIGINS = Object.freeze([
   'user', 'agent', 'host', 'session', 'replay', 'startup',
 ]);
+
+/** The notebook hosts an action of origin `host` comes from, by language (a step records it: `By.host`). */
+export const ACTION_HOSTS = Object.freeze(['python', 'r']);
 
 /**
  * An action that was not applied, with the reason a person or agent can act
@@ -105,8 +119,9 @@ export const AGENT_CONNECTION_KINDS = Object.freeze(['chat', 'connector', 'local
 /**
  * Which connection an agent's action came through, as the permission
  * settings key it ("allow for this connection") and the history labels it:
- * `{id, kind, client, host}` (`client`: the app's own name, `host`: the
- * host that vouches for it), or null.
+ * `{id, kind, client, host, known}` (`client`: the app's own name, `host`:
+ * the host that vouches for it, `known`: whether that host vouches for the
+ * name, Claude's and ChatGPT's through the relay), or null.
  */
 function requireConnection(connection) {
   if (connection === undefined || connection === null) return null;
@@ -118,7 +133,10 @@ function requireConnection(connection) {
     const value = connection[key] ?? null;
     if (value !== null && typeof value !== 'string') throw new TypeError(`An agent's connection ${key} is text or null`);
   }
-  return Object.freeze({ id: connection.id, kind: connection.kind, client: connection.client ?? null, host: connection.host ?? null });
+  if (connection.known !== undefined && typeof connection.known !== 'boolean') throw new TypeError('An agent\'s connection known is true or false');
+  return Object.freeze({
+    id: connection.id, kind: connection.kind, client: connection.client ?? null, host: connection.host ?? null, known: connection.known === true,
+  });
 }
 
 function requireMeta(meta) {
@@ -131,6 +149,10 @@ function requireMeta(meta) {
     throw new TypeError('An agent action names its agent (Claude, ChatGPT, …)');
   }
   const host = meta?.host ?? null;
+  // Checked here, before anything runs: the history records it (`By.host`), and refuses a step without one.
+  if (origin === 'host' && !ACTION_HOSTS.includes(host)) {
+    throw new TypeError(`A host action names its language: one of ${ACTION_HOSTS.join(', ')}`);
+  }
   const turn = meta?.turn ?? null;
   if (turn !== null && (typeof turn !== 'string' || turn.length === 0)) throw new TypeError('A turn is named by a non-empty text');
   const actsInTurns = origin === 'agent' || origin === 'host';
@@ -153,6 +175,9 @@ function requireMeta(meta) {
     // through its own gate.
     rewrite: meta?.rewrite ?? null,
     replayOf: meta?.internal === true ? (meta?.replayOf ?? null) : null,
+    // Heavy work an internal dispatch finds is its outer action's (a replay, a load that replays):
+    // the outer action's `heavy`, which asks its agent or names the work on its load's progress line.
+    heavy: meta?.internal === true && typeof meta?.heavy === 'function' ? meta.heavy : null,
     internal: meta?.internal === true,
   };
 }
@@ -175,7 +200,15 @@ export function createActionDispatcher({ catalog }) {
   const inFlight = new Set();
   /** Every dispatch from the moment it is made until it ends, reads included: {meta, controller}; what `stop` reaches. */
   const running = new Set();
-  const listeners = new Set();
+  /**
+   * Work an action started that goes on after it answers (`ctx.ongoing(stop)`:
+   * a looping camera path), {meta, stop}, until the work ends or is stopped.
+   * It belongs to the turn that started it: `stop` reaches it as it reaches
+   * the dispatches of that turn (R9R-8), so a film an agent set looping never
+   * outlives the turn the person stopped.
+   */
+  const ongoingWork = new Set();
+  const listeners = createListenerSet('the actions');
   let recorder = null;
   let confirmer = null;
   /** type → the owner's estimate of an action's work (`provideEstimate`). */
@@ -192,9 +225,7 @@ export function createActionDispatcher({ catalog }) {
   let retired = null;
 
   function emit(event) {
-    for (const listener of [...listeners]) {
-      try { listener(event); } catch (error) { console.error('[actions] listener failed', error); }
-    }
+    listeners.notify(event);
   }
 
   function overlapping(domains) {
@@ -208,14 +239,16 @@ export function createActionDispatcher({ catalog }) {
   }
 
   /** The work an action would do, as its owner estimates it (null when it gives none or fails to). */
-  async function estimateOf(definition, params, signal) {
+  async function estimateOf(definition, params, signal, meta) {
     const estimator = estimators.get(definition.type);
     if (estimator === undefined) return null;
     try {
-      const estimate = await estimator(params, { signal });
+      const estimate = await estimator(params, { signal, meta });
       return estimate ?? null;
     } catch (error) {
-      if (signal?.aborted) throw error;
+      // An estimate that finds the action refused refuses it before the person is asked:
+      // never a card approved for a squash of someone else's steps that is then refused.
+      if (signal?.aborted || error instanceof ActionRefused) throw error;
       console.error(`[actions] the estimate of ${definition.type} failed`, error);
       return null;
     }
@@ -226,24 +259,28 @@ export function createActionDispatcher({ catalog }) {
    * for any other origin). At the start (`atHandler` false): every change,
    * with its estimate, and its `confirm` when it is asked before it runs.
    * From its implementation (`atHandler`, `ctx.confirm(detail)`): its
-   * `confirm`, with `detail`, one sentence on what makes it cost.
+   * `confirm`, with `detail`, one sentence on what makes it cost. Resolves
+   * the estimate it was asked with at the start (null when none was made):
+   * heavy work its implementation finds later is judged against it
+   * (`heavyAskerFor`).
    */
-  async function confirmIfNeeded(definition, params, meta, { signal, atHandler = false, detail = null }) {
-    if (meta.origin === 'user' || definition.effect === 'read') return;
+  async function confirmIfNeeded(definition, params, meta, { signal, atHandler = false, detail = null, kind = null }) {
+    if (meta.origin === 'user' || definition.effect === 'read') return null;
     const askedNow = definition.confirm !== null && (definition.confirmAt === 'handler') === atHandler;
-    const confirm = askedNow ? definition.confirm : null;
+    // `kind`: a question the implementation asks of its own (an unseen link), not the definition's `confirm`.
+    const confirm = kind ?? (askedNow ? definition.confirm : null);
     // Only an agent is asked about every change; any other origin that is
     // not a click in the page (a notebook, and a session, a replay or the
     // start, which never publish) is asked before it publishes.
-    if (meta.origin !== 'agent' && confirm !== 'publishes') return;
+    if (meta.origin !== 'agent' && confirm !== 'publishes') return null;
     if (confirmer === null) {
-      if (confirm === null) return;
+      if (confirm === null) return null;
       throw new ActionRefused(
         `${definition.title} needs the person's go-ahead, and this page cannot ask for it`,
         { code: 'needs-confirmation', type: definition.type },
       );
     }
-    const estimate = atHandler ? null : await estimateOf(definition, params, signal);
+    const estimate = atHandler ? null : await estimateOf(definition, params, signal, meta);
     // Whoever waits on the agent's call (the relay, the chat bar) hears when
     // the person is asked, and when they answered.
     let asked = false;
@@ -263,6 +300,50 @@ export function createActionDispatcher({ catalog }) {
         code: 'declined', type: definition.type,
       });
     }
+    return estimate;
+  }
+
+  /**
+   * The `ctx.heavy(estimate)` a handler asks with when it finds work only
+   * once it runs (what restoring a saved state reads, the cells' totals a
+   * new matrix needs): `estimate` as `provideEstimate` gives one (`{ms,
+   * bytes, what}`, and `doing`: the work as a progress line says it while it
+   * runs, F167). An internal dispatch hands it to its outer action's `heavy`
+   * (`meta.heavy`). An agent's action is judged as at its start, by the
+   * person's heavy-work permission, unless its start already was (its own
+   * estimate heavy: asked, or allowed, then); any other origin acts for the
+   * person and is not asked. Rejects with the refusal when declined.
+   * `started()`: the estimate the start was asked with.
+   */
+  function heavyAskerFor(definition, params, meta, signal, started) {
+    return async estimate => {
+      if (estimate === null || estimate === undefined) return;
+      if (typeof estimate !== 'object' || typeof estimate.what !== 'string' || estimate.what.length === 0
+        || (estimate.doing !== undefined && (typeof estimate.doing !== 'string' || estimate.doing.length === 0))) {
+        throw new TypeError('Heavy work found by a handler is an estimate {ms, bytes, what, doing?}');
+      }
+      if (meta.heavy !== null) return meta.heavy(estimate);
+      if (meta.origin !== 'agent' || definition.effect === 'read' || confirmer === null) return;
+      throwIfAborted(signal);
+      let asked = false;
+      let yes = false;
+      const detail = estimate.what;
+      const asking = () => {
+        if (asked) return;
+        asked = true;
+        emit({ kind: 'asking', type: definition.type, params, meta, detail });
+      };
+      try {
+        yes = await confirmer({ definition, params, meta, signal, estimate, confirm: null, detail, stage: 'handler', started: started(), asking });
+      } finally {
+        if (asked) emit({ kind: 'answered', type: definition.type, params, meta, allowed: yes === true });
+      }
+      if (yes !== true) {
+        throw new ActionRefused(`The person declined, so this was not done: ${definition.title} (${definition.describe(params, null, MARKED_QUOTE)}). ${plainSentence(detail)}.`, {
+          code: 'declined', type: definition.type,
+        });
+      }
+    };
   }
 
   /** The `ctx.confirm(detail)` a handler asks with (a `confirmAt: 'handler'` action); `signal`: its dispatch's. */
@@ -279,12 +360,57 @@ export function createActionDispatcher({ catalog }) {
   }
 
   /**
+   * The `ctx.confirmReplacing(detail)` a handler of an action that replaces
+   * the dataset shown (`effect: 'dataset'`) asks with when the work on it is
+   * not kept in this browser (`app/unkept-work-guard.js`): of the kind
+   * `replaces-unkept`, with what would be lost in the sentence the card
+   * shows. Only an agent is asked; any other origin is the person's own
+   * choice, asked in the page. Rejects with the refusal when declined.
+   */
+  function replaceAskerFor(definition, params, meta, signal) {
+    return detail => {
+      if (definition.effect !== 'dataset') {
+        return Promise.reject(new TypeError(`"${definition.type}" does not replace the dataset shown (effect 'dataset')`));
+      }
+      if (typeof detail !== 'string' || detail.length === 0) {
+        return Promise.reject(new TypeError('What would be lost is one sentence'));
+      }
+      return confirmIfNeeded(definition, params, meta, { signal, atHandler: true, detail, kind: 'replaces-unkept' });
+    };
+  }
+
+  /**
+   * The `ctx.confirmLink(address)` a handler of an `opensLinks` action asks
+   * with before it requests an address the person has not seen in this tab
+   * (the handler tells: `ui/modules/seen-addresses.js`): of the kind
+   * `unseen-link`, with the address, marked as data, in the sentence the
+   * card shows and the waiting agent reads. Only an agent is asked; a
+   * notebook, a session or a replay acts for the person. Rejects with the
+   * refusal when declined.
+   */
+  function linkAskerFor(definition, params, meta, signal) {
+    return address => {
+      if (definition.opensLinks !== true) {
+        return Promise.reject(new TypeError(`"${definition.type}" fetches no address its parameters name (opensLinks)`));
+      }
+      if (typeof address !== 'string' || address.length === 0) {
+        return Promise.reject(new TypeError('The address asked about is its text'));
+      }
+      const detail = `It opens ${MARKED_QUOTE(address)}, an address not typed, pasted or opened in this tab before.`;
+      return confirmIfNeeded(definition, params, meta, { signal, atHandler: true, detail, kind: 'unseen-link' });
+    };
+  }
+
+  /**
    * Apply one action.
    * @param {string} type
    * @param {object} params
    * @param {{origin?: string, agent?: string, model?: string, conversation?: string, message?: string, host?: string,
    *   turn?: string, turnLabel?: string, signal?: AbortSignal}} [meta]
-   * @returns {Promise<{outcome: unknown, step: object|null}>}
+   * @returns {Promise<{outcome: unknown, step: object|null, unrecorded: string|null}>} `unrecorded`:
+   *   why a change made no step (a key of `data/viewer-protocol.js` `VIEWER_ACTION_UNRECORDED`, the closed set a host hears and
+   *   `agent/bridge/mcp-content.js` `UNRECORDED_NOTES` tells an agent), null when it made one or is no change (a read, a
+   *   move of the history, a dataset opened, an act outside the state)
    */
   async function dispatch(type, params = {}, meta = {}) {
     if (retired !== null) throw retired;
@@ -306,8 +432,12 @@ export function createActionDispatcher({ catalog }) {
     running.add(work);
     const removeOuter = onAbort(exactMeta.signal, () => controller.abort(exactMeta.signal.reason));
     const confirm = askerFor(definition, exactParams, exactMeta, signal);
+    const confirmLink = linkAskerFor(definition, exactParams, exactMeta, signal);
+    const confirmReplacing = replaceAskerFor(definition, exactParams, exactMeta, signal);
+    let started = null;
+    const heavy = heavyAskerFor(definition, exactParams, exactMeta, signal, () => started);
     try {
-      await awaitWithSignal(confirmIfNeeded(definition, exactParams, exactMeta, { signal }), signal);
+      started = await awaitWithSignal(confirmIfNeeded(definition, exactParams, exactMeta, { signal }), signal);
       if (isSteplessEffect(definition.effect)) {
         // A read, a move of the history (undo, redo, a jump), another
         // dataset opened or an act outside the state (a file written, a
@@ -318,9 +448,14 @@ export function createActionDispatcher({ catalog }) {
         // person's permissions govern, as every other change of an agent's.
         emit({ kind: 'start', type, params: exactParams, meta: exactMeta });
         try {
-          const outcome = await handler(exactParams, { signal, meta: exactMeta, confirm });
+          // A read stopped ends at once, wherever its implementation is (it
+          // changes nothing, so nothing waits for it); a move of the history,
+          // an opening, an act outside the state and a control end when their
+          // implementation does, with what they did.
+          const running = handler(exactParams, { signal, meta: exactMeta, confirm, confirmLink, confirmReplacing, heavy, ongoing: ongoingFor(exactMeta) });
+          const outcome = await (definition.effect === 'read' ? awaitWithSignal(running, signal) : running);
           emit({ kind: 'done', type, params: exactParams, meta: exactMeta, step: null, outcome });
-          return { outcome: outcome ?? null, step: null };
+          return { outcome: outcome ?? null, step: null, unrecorded: null };
         } catch (error) {
           emit({ kind: 'failed', type, params: exactParams, meta: exactMeta, error });
           throw error;
@@ -328,7 +463,7 @@ export function createActionDispatcher({ catalog }) {
       }
       if (!exactMeta.internal) await awaitWithSignal(gate(), signal);
       throwIfAborted(signal);
-      return await apply(definition, exactParams, exactMeta, handler, controller, confirm);
+      return await apply(definition, exactParams, exactMeta, handler, controller, { confirm, confirmLink, confirmReplacing, heavy });
     } finally {
       removeOuter();
       running.delete(work);
@@ -336,7 +471,7 @@ export function createActionDispatcher({ catalog }) {
   }
 
   /** Apply a change (after its go-ahead and the gate): in order with the others on its domains, recorded as a step. */
-  async function apply(definition, exactParams, exactMeta, handler, controller, confirm) {
+  async function apply(definition, exactParams, exactMeta, handler, controller, { confirm, confirmLink, confirmReplacing, heavy }) {
     const { type } = definition;
     if (definition.supersede) {
       for (const entry of inFlight) {
@@ -352,21 +487,43 @@ export function createActionDispatcher({ catalog }) {
     try {
       await Promise.all(waits);
       throwIfAborted(controller.signal);
-      const token = recorder === null ? null : await recorder.before({ definition, params: exactParams, meta: exactMeta });
+      // The history that began recording it is the one told how it ended: another dataset opened
+      // meanwhile has a history of its own, which never puts back or records the replaced one's
+      // change (that history, retired, keeps nothing to put back: its dataset is gone).
+      const recording = recorder;
+      const token = recording === null ? null : await recording.before({ definition, params: exactParams, meta: exactMeta });
       entry.applying = true;
       let outcome;
       try {
-        outcome = await handler(exactParams, { signal: controller.signal, meta: exactMeta, confirm });
+        outcome = await handler(exactParams, { signal: controller.signal, meta: exactMeta, confirm, confirmLink, confirmReplacing, heavy, ongoing: ongoingFor(exactMeta) });
+        // Stopped (the person's Stop, the page closing) while it ran, by a
+        // handler that went on to its end: it ends as a cancellation all the
+        // same and what it changed is put back, so "stopped" never leaves a
+        // change or a step, whether or not its implementation watched the
+        // signal (bug hunt LB-1). One a newer choice of its type replaced and
+        // that still finished keeps its step: the newer one runs right after
+        // it on the same state, and putting back a domain it is about to
+        // replace (the open cells: a read of the dataset) is work for nothing.
+        // One that keeps what it did when stopped (`keepsWhenStopped`: a
+        // camera path stays where the film stopped, F104) answers and keeps
+        // its step.
+        if (
+          controller.signal.aborted
+          && controller.signal.reason?.code !== 'superseded'
+          && !definition.keepsWhenStopped
+        ) throwIfAborted(controller.signal);
       } catch (error) {
         // A retired page has no state left to put back.
-        if (token !== null && retired === null) await recorder.failed(token, error);
+        if (token !== null && retired === null) await recording.failed(token, error);
         throw error;
       }
       // Nor a step to record: its owners are being withdrawn.
       if (retired !== null) throw retired;
-      const step = token === null ? null : await recorder.after(token, outcome ?? null);
+      const step = token === null ? null : await recording.after(token, outcome ?? null);
       emit({ kind: 'done', type, params: exactParams, meta: exactMeta, step, outcome });
-      return { outcome: outcome ?? null, step };
+      // No history records here yet (its dataset's history not started), or the recorder said why it recorded none.
+      const unrecorded = step !== null ? null : token === null ? 'no-history' : (token.unrecorded ?? null);
+      return { outcome: outcome ?? null, step, unrecorded };
     } catch (error) {
       // Retired meanwhile: the owners of its state may be withdrawn under its
       // recording, so whatever failed after is the page closing, not a failure.
@@ -384,7 +541,8 @@ export function createActionDispatcher({ catalog }) {
    * equal: `origin`, `agent`, `turn`): the person's Stop of an agent. Each is
    * aborted with `reason` (a cancellation, `utils/abort.js`) wherever it is:
    * its estimate, a question to the person, the gate (it never runs), or
-   * running (a read ends and a change is rolled back). Returns how many
+   * running (a read ends and a change is rolled back, but for one that
+   * keeps what it did when stopped, `keepsWhenStopped`). Returns how many
    * were stopped.
    *
    * @param {{origin?: string, agent?: string, turn?: string}} match
@@ -399,7 +557,33 @@ export function createActionDispatcher({ catalog }) {
       work.controller.abort(reason);
       stopped += 1;
     }
+    for (const work of [...ongoingWork]) {
+      if (!keys.every(key => work.meta[key] === match[key])) continue;
+      ongoingWork.delete(work);
+      try {
+        work.stop(reason);
+      } catch (error) {
+        console.error('[actions] stopping work an action left going failed', error);
+      }
+      stopped += 1;
+    }
     return stopped;
+  }
+
+  /**
+   * `ctx.ongoing(stop)` of an action of `meta`: register work that goes on
+   * after the action answers; `stop(reason)` ends it when its turn is
+   * stopped. Returns the release its owner calls once the work ends by
+   * itself (stopped another way, finished), so a later Stop of that turn
+   * reaches nothing.
+   */
+  function ongoingFor(meta) {
+    return stopWork => {
+      if (typeof stopWork !== 'function') throw new TypeError('Ongoing work is stopped by a function');
+      const work = { meta, stop: stopWork };
+      ongoingWork.add(work);
+      return () => { ongoingWork.delete(work); };
+    };
   }
 
   /**
@@ -410,19 +594,26 @@ export function createActionDispatcher({ catalog }) {
    * for one), so the step reads the same as a dispatched one. `after`, when
    * the change set off work that changes state too (an analysis's redraw,
    * its run after a delay), resolves once that work has settled: the step is
-   * recorded then and holds all of it (`recorder.observed`).
+   * recorded then and holds all of it (`recorder.observed`). `person`: the
+   * change is the person's own act by construction (a press, a drag, a
+   * control's event that a restore never fires), never work an action set
+   * off.
    */
-  function recordObserved(type, params, meta = {}, outcome = null, { after = null } = {}) {
+  function recordObserved(type, params, meta = {}, outcome = null, { after = null, person = false } = {}) {
     const definition = catalog.check(type, params);
     const exactMeta = requireMeta(meta);
     if (recorder === null) return Promise.resolve(null);
     // A change made while an action on the same state runs (a camera the
-    // cells read again put back, a control a restore sets) is that action's:
-    // its step holds it.
-    for (const entry of inFlight) {
-      if (entry.applying && definition.touches.some(domain => entry.domains.has(domain))) return Promise.resolve(null);
+    // cells read again put back) is that action's: its step holds it. A
+    // person's own act never is (R9W-5: a window closed while its run ran
+    // was the run's, and the stopped run's rollback opened it again): it is
+    // its own step, and a rollback of that action leaves what it changed.
+    if (!person) {
+      for (const entry of inFlight) {
+        if (entry.applying && definition.touches.some(domain => entry.domains.has(domain))) return Promise.resolve(null);
+      }
     }
-    return recorder.observed({ definition, params: withDefaults(definition.params, params), meta: exactMeta, outcome, after })
+    return recorder.observed({ definition, params: withDefaults(definition.params, params), meta: exactMeta, outcome, after, person })
       .then(step => {
         if (step !== null) emit({ kind: 'done', type, params, meta: exactMeta, step, outcome });
         return step;
@@ -434,9 +625,15 @@ export function createActionDispatcher({ catalog }) {
     stop,
     /**
      * @param {string} type
-     * @param {(params: object, ctx: {signal: AbortSignal, meta: object, confirm: (detail: string|null) => Promise<void>}) => unknown} handler
+     * @param {(params: object, ctx: {signal: AbortSignal, meta: object, confirm: (detail: string|null) => Promise<void>,
+     *   confirmLink: (address: string) => Promise<void>,
+     *   heavy: (estimate: {ms: number|null, bytes: number|null, what: string}|null) => Promise<void>}) => unknown} handler
      *   `ctx.confirm`: for a `confirmAt: 'handler'` action, ask the person now
-     *   (an agent's action only; refused: `ActionRefused` code `declined`)
+     *   (an agent's action only; refused: `ActionRefused` code `declined`);
+     *   `ctx.confirmLink`: for an `opensLinks` action, ask before requesting
+     *   an address the person has not seen in this tab (an agent's only);
+     *   `ctx.heavy`: work found once it runs, asked as heavy work is (an
+     *   agent's action only, unless its start was judged heavy already)
      */
     provide(type, handler) {
       catalog.get(type);
@@ -450,9 +647,12 @@ export function createActionDispatcher({ catalog }) {
      * What an action of `type` would do, estimated by the owner of its
      * state from what this page measured (`{ms, bytes, what}`: the time it
      * would take, the bytes it would download, one short phrase; each null
-     * when not known). The agent presence judges heavy work by it.
+     * when not known). The agent presence judges heavy work by it. An
+     * estimator that throws `ActionRefused` refuses the action there, before
+     * the person is asked about it (it checks what the implementation would
+     * refuse: a squash of steps not the agent's own, a locked branch).
      * @param {string} type
-     * @param {(params: object, ctx: {signal: AbortSignal|null}) => (object|null|Promise<object|null>)} estimator
+     * @param {(params: object, ctx: {signal: AbortSignal|null, meta: object}) => (object|null|Promise<object|null>)} estimator
      */
     provideEstimate(type, estimator) {
       catalog.get(type);
@@ -487,7 +687,7 @@ export function createActionDispatcher({ catalog }) {
     /** @param {() => (Promise<void>|void)} next */
     setGate(next) { gate = next; },
     /** @param {(event: object) => void} listener */
-    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    subscribe: listener => listeners.add(listener),
     /**
      * The page's application retires (its teardown, before the owners of
      * the state are withdrawn): every dispatch under way is stopped with one
@@ -502,6 +702,8 @@ export function createActionDispatcher({ catalog }) {
       if (retired !== null) return;
       retired = cancelled('closed', 'The page is closing.');
       for (const work of [...running]) cancel(work.controller, 'closed', 'The page is closing.');
+      // Its owners are withdrawn with the page and end their own work.
+      ongoingWork.clear();
     },
     /** Resolves once nothing is in flight (tests, a save). */
     async idle() {

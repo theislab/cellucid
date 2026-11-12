@@ -9,7 +9,7 @@
  * lands on something else, the browser sends the `click` to their common
  * ancestor, and the control pressed hears nothing. No error anywhere: the
  * spec then waits a minute for what the click should have done
- * (`ui-visual-consistency.spec.mjs`, the licence link, Linux WebKit, Web
+ * (`ui-visual-consistency.spec.mjs`, the license link, Linux WebKit, Web
  * contracts run 42180485733; the Benchmark run button, WebKit, 1 run in 24,
  * `synthetic-dataset.mjs`).
  *

@@ -19,6 +19,7 @@
  */
 
 import { ANNOTATION_PAUSED_HERE, annotationDatasetIdOf } from '../../../community-annotations/runtime-context.js';
+import { setControlAvailability } from '../../core/control-availability.js';
 import { annotationFieldKey } from '../../../community-annotations/field-names.js';
 import {
   getAnnotationRepoForDataset,
@@ -51,17 +52,22 @@ import {
   sliderValueToThreshold,
   thresholdToSliderValue,
 } from './consensus-math.js';
-import { copyTextToClipboard } from './browser-integration.js';
 import { createVisibilityGatedRender } from '../../core/visibility-gate.js';
 import { pendingDetail, pendingLine } from './published-baseline.js';
 import { PLACES } from '../../place-names.js';
-import { onAbort } from '../../../../utils/abort.js';
+import { getUrlAnnotationRepo } from '../../../url-state.js';
+import { parseCanonicalGitHubRepositoryReference } from '../../../community-annotations/github-reference.js';
+import { isAbortSignal, onAbort } from '../../../../utils/abort.js';
+import { failureDetails, joinFailure, sayFailure } from '../../../../utils/errors.js';
 import { fieldByAnnotationKey } from '../../../community-annotations/field-names.js';
 import {
   consensusColumnStatus,
   defaultConsensusColumnKey,
   repositoryConsensusSettings,
 } from './consensus-column.js';
+import { openADatasetTo } from '../../no-dataset.js';
+import { copyText } from '../../../utils/clipboard.js';
+import { realmHosts } from '../../../../formats/io/hosts.js';
 
 const CONSENSUS_SNAPSHOT_FILENAME = 'cellucid-consensus.json';
 
@@ -148,7 +154,7 @@ export function createControlsPanel(controller) {
     annotatableSettingsDraft === null ||
     typeof annotatableSettingsDraft !== 'object' ||
     !(annotatableSettingsDirty instanceof Set) ||
-    !(lifecycleSignal instanceof AbortSignal)
+    !isAbortSignal(lifecycleSignal)
   ) {
     throw new TypeError(
       'The community annotation panel requires its container, its lifecycle signal, the visualization state, the information popover controller, and the annotatable settings draft'
@@ -190,7 +196,7 @@ export function createControlsPanel(controller) {
 
   /**
    * A sub-section of the panel: a heading with its info popover trigger, and
-   * the controls it names, grouped under it (`role="group"` labelled by the
+   * the controls it names, grouped under it (`role="group"` labeled by the
    * heading).
    *
    * @param {string} title
@@ -282,10 +288,7 @@ export function createControlsPanel(controller) {
     const cacheUsername = getCacheUserKey();
     const repo = getAnnotationRepoForDataset(datasetId, cacheUsername);
     const repoConnectedForGating = isAnnotationRepoConnected(datasetId, cacheUsername);
-    const online =
-      typeof navigator !== 'undefined'
-        ? navigator.onLine !== false
-        : true;
+    const online = realmHosts.online();
     if (!repoConnectedForGating) {
       const introInfo = createInfoTooltip('About community annotation', 'community-intro');
       const introBlock = createInfoGroup('Repository', introInfo);
@@ -303,7 +306,7 @@ export function createControlsPanel(controller) {
         introBlock.appendChild(el('p', {
           className: 'status-line',
           role: 'status',
-          text: 'Load a dataset to connect a repository.',
+          text: openADatasetTo('connect a repository'),
         }));
       } else if (!online) {
         introBlock.appendChild(el('p', {
@@ -311,6 +314,19 @@ export function createControlsPanel(controller) {
           role: 'status',
           'data-tone': 'warning',
           text: 'Offline: GitHub actions are disabled.',
+        }));
+      } else if (getUrlAnnotationRepo() !== null && !introError) {
+        // A link naming a repository is connected once GitHub knows who you
+        // are: said, not left silent (R9E-12); one naming none is the link's.
+        const named = getUrlAnnotationRepo();
+        const valid = parseCanonicalGitHubRepositoryReference(named) !== null;
+        introBlock.appendChild(el('p', {
+          className: 'status-line',
+          role: 'status',
+          ...(valid ? {} : { 'data-tone': 'warning' }),
+          text: valid
+            ? `This link names the repository "${named}": Connect repo connects it, signing in with GitHub first.`
+            : 'This link\'s "annotations" is not a repository: it is owner/repo or owner/repo@branch.',
         }));
       }
       const connectBtn = el('button', {
@@ -357,9 +373,7 @@ export function createControlsPanel(controller) {
         startBackgroundTask(async () => {
           const url = new URL(window.location.href);
           url.searchParams.set('annotations', String(repo).trim());
-          const ok = await copyTextToClipboard(url.toString());
-          if (ok) notifications.success('Share link copied.', { category: 'annotation', duration: 2200 });
-          else notifications.error('Unable to copy share link.', { category: 'annotation', duration: 3500 });
+          await copyText(url.toString(), { what: 'the share link', success: 'Share link copied.', category: 'annotation', notifications });
         }, { label: 'Unable to copy the annotation share link' });
       });
       return btn;
@@ -555,7 +569,7 @@ export function createControlsPanel(controller) {
     });
     if (!annotatableKeysForConsensus.length) {
       srcSelect.appendChild(el('option', { value: '', text: '(no annotatable columns)' }));
-      srcSelect.disabled = true;
+      setControlAvailability(srcSelect, 'this dataset has no annotatable column; make one annotatable first');
     } else {
       for (const { fieldKey, found } of annotatedForConsensus) {
         srcSelect.appendChild(el('option', { value: fieldKey, text: found.field.key }));
@@ -892,7 +906,7 @@ export function createControlsPanel(controller) {
           render();
         },
       });
-      annotatableThreshold.input.disabled = !canEditSettings;
+      setControlAvailability(annotatableThreshold.input, canEditSettings ? null : 'only the repository\'s author changes these settings');
       block.appendChild(annotatableThreshold.root);
 
       const annotatableMinWrap = el('div', { className: 'control-block' });
@@ -982,7 +996,7 @@ export function createControlsPanel(controller) {
             { category: 'annotation', duration: 2200 }
           );
         } catch (err) {
-          notifications.error(err?.message || 'Failed to build cellucid-consensus.json', { category: 'annotation', duration: 6000 });
+          notifications.error(`${joinFailure(`${CONSENSUS_SNAPSHOT_FILENAME} could not be written`, sayFailure(err))}`, { category: 'annotation', duration: 6000, ...failureDetails(err) });
         }
       },
     });

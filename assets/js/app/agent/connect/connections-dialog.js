@@ -11,6 +11,7 @@
  */
 
 import { wireAppDialog } from '../../ui/components/app-dialog.js';
+import { createButton } from '../../ui/components/controls.js';
 import { describeConnection } from './model.js';
 
 /**
@@ -49,11 +50,8 @@ export function createConnectionsDialog(dom, { remove, forget, now = () => Date.
     meta.textContent = text.meta;
     meta.title = text.meta;
     body.append(title, meta);
-    const button = doc.createElement('button');
-    button.type = 'button';
-    button.className = 'btn btn-compact';
-    button.textContent = 'Remove';
-    button.setAttribute('aria-label', `Remove ${text.title}`);
+    // A row of the list: its action is quiet.
+    const button = createButton({ label: 'Remove', variant: 'quiet', ariaLabel: `Remove ${text.title}` });
     button.addEventListener('click', async () => {
       button.disabled = true;
       say(`Removing ${text.title}…`);

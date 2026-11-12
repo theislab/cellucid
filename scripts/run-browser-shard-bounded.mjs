@@ -151,8 +151,8 @@ export function parseBoundedShardArguments(arguments_) {
   return Object.freeze({ project, shard: `${current}/${total}`, headed });
 }
 
-/** A child's environment with colour off, so its output reads as plain text. */
-export function environmentWithoutForcedColour(environment) {
+/** A child's environment with color off, so its output reads as plain text. */
+export function environmentWithoutForcedColor(environment) {
   const childEnvironment = { ...environment, NO_COLOR: '1' };
   delete childEnvironment.FORCE_COLOR;
   return childEnvironment;
@@ -192,7 +192,7 @@ function listTests(project, selection, headed, environment) {
     {
       cwd: REPOSITORY_ROOT,
       encoding: 'utf8',
-      env: environmentWithoutForcedColour(environment),
+      env: environmentWithoutForcedColor(environment),
       maxBuffer: MAX_CAPTURE_BYTES,
     }
   );
@@ -701,7 +701,7 @@ function probeFreeLoopbackPorts(ports) {
   );
   if (result.status !== 0 || typeof result.stdout !== 'string') {
     // A probe that cannot run must not stop a run that would otherwise work.
-    // Falling through to the unprobed ladder is exactly the previous behaviour,
+    // Falling through to the unprobed ladder is exactly the previous behavior,
     // and the server still refuses a taken port loudly.
     return new Set(ports);
   }
@@ -726,7 +726,7 @@ function probeFreeLoopbackPorts(ports) {
  * variable. Each pair is now probed before it is planned, and an occupied pair
  * is stepped over exactly like a Fetch-blocked one.
  *
- * An explicitly configured start port is still honoured as a start: a caller
+ * An explicitly configured start port is still honored as a start: a caller
  * who names a port is choosing where to look, not asserting what is free.
  *
  * @param {Record<string, string | undefined>} environment
@@ -829,7 +829,7 @@ function recordHostStateAfterFailure(environment) {
 
 function runBatch(project, files, ports, headed, environment) {
   const childEnvironment = {
-    ...environmentWithoutForcedColour(environment),
+    ...environmentWithoutForcedColor(environment),
     [BROWSER_TEST_PORT_VARIABLE]: String(ports.port),
     [BROWSER_TEST_SAMPLE_PORT_VARIABLE]: String(ports.samplePort),
   };

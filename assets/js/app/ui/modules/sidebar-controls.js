@@ -36,27 +36,80 @@ import { StyleManager } from '../../../utils/style-manager.js';
 import { computeLeftOcclusionRatio } from '../../../rendering/viewport-center.js';
 import { ActionRefused } from '../../actions/dispatcher.js';
 
+/** The sidebar a reveal is waiting for, and the promise every caller gets. */
+let pendingReveal = null;
+
 /**
  * Open the sidebar for a control outside it that leads to one inside it
  * (Data mapping's way to its checklist, a gene sample's way to Genes read
- * for). It works from the first frame: until the controls below take the
- * phone's peek state over, that state is still the root's mark
- * (`viewport-init.js`), which is dropped so the panel starts open; afterwards
- * the toggle opens it, through the one path that keeps its state, ARIA and
- * the presented area.
+ * for, `?`'s way to the Keyboard shortcuts). It works from the first frame:
+ * until the controls below take the phone's peek state over, that state is
+ * still the root's mark (`viewport-init.js`), which is dropped so the panel
+ * starts open; afterwards the toggle opens it, through the one path that
+ * keeps its state, ARIA and the presented area.
+ *
+ * The toggle asks through an action (`layout.sidebar.show`), so the sidebar
+ * opens after this returns, and until it does it is `inert`: a control in it
+ * cannot take focus. The promise resolves once the sidebar is shown, and the
+ * caller focuses then (found 2026-11-11, lens-a11y: `?` pressed with the
+ * sidebar hidden opened the shortcuts but focus never reached them; Genes
+ * read for and Data mapping's focus had the same gap). A refused action
+ * leaves the sidebar hidden and the promise pending: there is nothing to
+ * focus. One reveal waits at a time; a second call shares it.
+ *
+ * Open the sections to show (a panel, a Session section) once it resolves,
+ * not before: a section opened in the same moment reaches the history (its
+ * `toggle`, recorded as `layout.section.open`) while the sidebar's action is
+ * starting, which keeps it as a change made outside the history (R9K-2).
  *
  * @param {Document} ownerDocument
+ * @returns {Promise<void>}
  */
 export function revealSidebar(ownerDocument) {
+  return showSidebar(ownerDocument);
+}
+
+/**
+ * Bring something in the sidebar into view, in the one order the history
+ * keeps whole: the sidebar shown first (its step, `layout.sidebar.show`),
+ * then `open` (the panels and sections to open, the control to focus) once
+ * it is. Every way to a control inside the sidebar from outside it takes
+ * this path (Genes read for, Data mapping, `?`), so none opens a section in
+ * the moment the sidebar's action starts (R9K-2). Resolves with what `open`
+ * returns; a refused show leaves it pending, as `revealSidebar`.
+ *
+ * @template T
+ * @param {Document} ownerDocument
+ * @param {() => T} open
+ * @returns {Promise<T>}
+ */
+export function revealInSidebar(ownerDocument, open) {
+  return showSidebar(ownerDocument).then(() => open());
+}
+
+function showSidebar(ownerDocument) {
   const root = ownerDocument.documentElement;
   if (root.dataset.phoneSheet === 'peek') {
     delete root.dataset.phoneSheet;
     rememberPhoneSheet(ownerDocument.defaultView, 'open');
-    return;
+    return Promise.resolve();
   }
-  if (ownerDocument.getElementById('sidebar')?.classList.contains('hidden')) {
-    ownerDocument.getElementById('sidebar-toggle')?.click();
-  }
+  const sidebar = ownerDocument.getElementById('sidebar');
+  if (sidebar === null || !sidebar.classList.contains('hidden')) return Promise.resolve();
+  if (pendingReveal?.sidebar === sidebar) return pendingReveal.shown;
+  const View = ownerDocument.defaultView;
+  const shown = new Promise(resolve => {
+    const observer = new View.MutationObserver(() => {
+      if (sidebar.classList.contains('hidden')) return;
+      observer.disconnect();
+      pendingReveal = null;
+      resolve();
+    });
+    observer.observe(sidebar, { attributes: true, attributeFilter: ['class'] });
+  });
+  pendingReveal = { sidebar, shown };
+  ownerDocument.getElementById('sidebar-toggle')?.click();
+  return shown;
 }
 
 export function initSidebarControls({ dom, onViewportOcclusionChange, actions }) {
@@ -153,6 +206,15 @@ export function initSidebarControls({ dom, onViewportOcclusionChange, actions })
     occlusionGeometry.canvasWidth = canvasRect.width;
     captureSidebarGeometry();
     publishOcclusionGeometry();
+    // Taken while the sidebar slides (a toggle, or a window turned from a
+    // phone's width to a desktop's, whose hidden sidebar slides to its new
+    // place), the area beside it is published again once it has stopped:
+    // the slide counts as shown, and a hidden sidebar left the panes beside
+    // a gap where it had been (found 2026-11-11: a phone turned sideways kept
+    // three panes in 574 of its 844 px, a 270 px empty band at the left).
+    if (transitionFrame === 0 && isSidebarTransitionRunning()) {
+      transitionFrame = ownerWindow.requestAnimationFrame(awaitSidebarTransitionEnd);
+    }
   };
 
   const publishCachedViewportOcclusion = (sidebarWidth) => {
@@ -225,6 +287,7 @@ export function initSidebarControls({ dom, onViewportOcclusionChange, actions })
     rememberSheet();
     syncSidebarToggleState();
     publishViewportOcclusion();
+    // The slide may start a frame after the class changes: wait for its end.
     if (transitionFrame === 0) {
       transitionFrame = ownerWindow.requestAnimationFrame(
         awaitSidebarTransitionEnd
@@ -313,7 +376,7 @@ export function initSidebarControls({ dom, onViewportOcclusionChange, actions })
     ownerDocument.body.style.webkitUserSelect = '';
     // One step per drag, with the width it ended at.
     if (resizedWidth !== null && resizedWidth !== startWidth) {
-      void actions.recordObserved('layout.sidebar.width', { width: resizedWidth });
+      void actions.recordObserved('layout.sidebar.width', { width: resizedWidth }, {}, null, { person: true });
     }
     resizedWidth = null;
   };
@@ -349,7 +412,7 @@ export function initSidebarControls({ dom, onViewportOcclusionChange, actions })
     startWidth = sidebar.offsetWidth;
     sidebar.classList.add('resizing');
     ownerDocument.body.style.cursor = 'ew-resize';
-    // Safari honours only the -webkit- property.
+    // Safari honors only the -webkit- property.
     ownerDocument.body.style.userSelect = 'none';
     ownerDocument.body.style.webkitUserSelect = 'none';
     event.preventDefault();

@@ -673,7 +673,7 @@ test('production split snapshot VBOs match live RGBA-stream pixels and indexed d
         secondSnapshotDelta:
           bytesAfterSecond - bytesAfterFirst,
         // Snapshots of the live generation borrow the live 2D position store,
-        // so each adds only its RGBA8 colours (4 bytes a point) and R8 (1).
+        // so each adds only its RGBA8 colors (4 bytes a point) and R8 (1).
         expectedFirstSnapshot: pointCount * 5,
         expectedSecondSnapshot: pointCount * 5,
       },

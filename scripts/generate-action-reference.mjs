@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Write the action reference page of the developer docs from the action
- * catalogue (`assets/js/app/actions/definitions/`): every action an agent, a
+ * catalog (`assets/js/app/actions/definitions/`): every action an agent, a
  * Python or R viewer, a session, a replay and the person's own controls take,
  * with its parameters, what it changes, its timeline label and its
  * pseudocode, and every read with what it returns.
@@ -47,8 +47,9 @@ const EFFECT_WORDS = Object.freeze({
   view: 'it changes how the data is shown',
   layout: 'it changes the panels, sections or theme',
   read: 'it reads, changes nothing and records no step',
+  control: 'it stops work under way (a playing camera path, a running analysis) at once, never waiting behind it; the work\'s own step records what it changed, so this records no step',
   history: 'it moves or edits the history itself and records no step of the state (an edit is kept in the history\'s journal, undone from Recently deleted)',
-  dataset: 'it opens another dataset, whose history starts anew (the open one\'s stays kept in this browser), and records no step',
+  dataset: 'it opens another dataset, whose history starts anew (the open one\'s stays kept in this browser while Autosave keeps it), and records no step',
   outside: 'it acts outside the dataset\'s state and history (writes a file the person receives, publishes, or keeps or removes something in this browser for later visits), which the history cannot take back, and records no step',
 });
 
@@ -61,7 +62,7 @@ const CONFIRM_WORDS = Object.freeze({
 });
 
 /**
- * Words for every value of `values`: an effect or a kind the catalogue
+ * Words for every value of `values`: an effect or a kind the catalog
  * gains with no words here fails the page's generation, never prints
  * "undefined".
  */
@@ -69,7 +70,7 @@ function requireWords(words, values, what) {
   const missing = values.filter(value => typeof words[value] !== 'string');
   const extra = Object.keys(words).filter(value => !values.includes(value));
   if (missing.length > 0 || extra.length > 0) {
-    throw new Error(`The action reference has no words for the ${what} ${missing.join(', ') || '(none)'}${extra.length > 0 ? `, and words for ${what}s the catalogue does not have: ${extra.join(', ')}` : ''}; add them to scripts/generate-action-reference.mjs`);
+    throw new Error(`The action reference has no words for the ${what} ${missing.join(', ') || '(none)'}${extra.length > 0 ? `, and words for ${what}s the catalog does not have: ${extra.join(', ')}` : ''}; add them to scripts/generate-action-reference.mjs`);
   }
   return words;
 }
@@ -161,11 +162,21 @@ function actionSection(definition) {
     const inputs = definition.reads.map(id => (id === 'history' ? `the history (${code(id)})` : `${domainName(id)} (${code(id)})`));
     lines.push(`- Depends on: ${inputs.join(', ')}`);
   }
+  if (definition.captures.length > 0) {
+    lines.push(`- Holds what it read of ${definition.captures.map(id => `${domainName(id)} (${code(id)})`).join(', ')}: a later change of it never makes the step stale`);
+  }
   if (definition.confirm !== null) {
     lines.push(`- Asks the person first when an agent takes it: ${CONFIRM_WORDS[definition.confirm]} (${code(definition.confirm)})`);
   }
+  if (definition.effect === 'dataset') {
+    lines.push(`- Asks the person first when an agent takes it while the dataset shown holds steps this browser is not keeping (Autosave off, no storage or no room), which it would drop (${code('replaces-unkept')})`);
+  }
+  if (definition.opensLinks) {
+    lines.push(`- Asks the person first when an agent names a link, an accession or a server they have not seen in this tab, before anything of it is requested (${code('unseen-link')})`);
+  }
   if (definition.coalesce !== null) lines.push('- Repeated at once (a drag, a gesture), it is one step');
   if (definition.supersede) lines.push('- A newer one replaces one still running');
+  if (definition.keepsWhenStopped) lines.push('- Stopped (the person\'s Stop of an agent), it keeps what it did, as its step records');
   if (definition.rerun) lines.push('- Run again on a stale step (the State panel) brings its result up to date');
   lines.push('');
   const params = propertyRows(definition.params, { withRequired: true });
@@ -198,7 +209,7 @@ function actionSection(definition) {
   return lines;
 }
 
-/** The page's text, as this checkout's catalogue makes it. */
+/** The page's text, as this checkout's catalog makes it. */
 export function renderActionReference(definitions = ACTION_DEFINITIONS) {
   const catalog = createActionCatalog(definitions);
   // Groups in the order the areas are listed (`definitions/index.js`), actions by type within one.
@@ -208,22 +219,23 @@ export function renderActionReference(definitions = ACTION_DEFINITIONS) {
   const reads = all.filter(definition => definition.effect === 'read').length;
   const history = all.filter(definition => definition.effect === 'history').length;
   const outside = all.filter(definition => definition.effect === 'outside').length;
+  const controls = all.filter(definition => definition.effect === 'control').length;
   const lines = [
     '# Action reference',
     '',
     '<!-- Generated by scripts/generate-action-reference.mjs in the cellucid repository from the action',
-    '     catalogue (assets/js/app/actions/definitions/). Do not edit: run that script.',
+    '     catalog (assets/js/app/actions/definitions/). Do not edit: run that script.',
     '     tests/action-reference-contract.test.mjs fails while this page differs from what it writes. -->',
     '',
     'This page answers: **"What can be done to an open dataset, by name, and what does each step',
     'change?"** Every change a person makes with a control, and every change or read an agent,',
     'a Python or R viewer, a session or a replay makes, is one of these actions, checked',
     'against the same parameters and recorded as one history step with the same label. The',
-    'catalogue is `assets/js/app/actions/definitions/` in the `cellucid` repository',
+    'catalog is `assets/js/app/actions/definitions/` in the `cellucid` repository',
     '(`app/actions/README.md` there); this page is generated from it. How the action layer, the',
     'state domains and the history work is {doc}`29_action_layer_domains_and_history`.',
     '',
-    `The catalogue holds ${all.length} actions: ${all.length - reads - history - outside} that change the state or open a dataset, ${history} that move or edit the history, ${outside} that act outside the state (a file written, a publication, what this browser keeps), and ${reads} reads.`,
+    `The catalog holds ${all.length} actions: ${all.length - reads - controls - history - outside} that change the state or open a dataset, ${controls} that stop work under way, ${history} that move or edit the history, ${outside} that act outside the state (a file written, a publication, what this browser keeps), and ${reads} reads.`,
     'Parameters name things, never positions: a field as `{source, key}` (`obs` for a column of',
     'the cells, `var` for a gene), a category by its label, a gene by its name, a highlight page',
     'by its name, a view as `"live"` or `"View N"`, and cells by their original position (the',

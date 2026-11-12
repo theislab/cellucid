@@ -4,7 +4,7 @@
  * The store may sit at the top of the archive or inside one folder (a zipped
  * `.zarr` folder); keys are paths relative to the store root either way.
  * Every read goes through the archive's byte reader, so reads asked for
- * together (all chunks of a selection) are planned together: neighbouring
+ * together (all chunks of a selection) are planned together: neighboring
  * entries are fetched in one request, the rest in parallel. A stored
  * (uncompressed) entry can be read by range, which is what lets a sharded
  * Zarr v3 array fetch only the inner chunks it needs.
@@ -29,7 +29,7 @@ export function zipStore(archive, { name } = {}) {
   const map = prefix === '' ? all : entryMap(archive, prefix);
   const storeName = name ?? (prefix ? prefix.slice(0, -1) : archive.name.replace(/\.zip$/i, ''));
 
-  // Entry paths are held normalised (NFC, `zip/names.js` `entryPath`); a key
+  // Entry paths are held normalized (NFC, `zip/names.js` `entryPath`); a key
   // the store's documents name in another form (an NFD column name, as macOS
   // writes) is looked up in that form, so it finds its entry.
   const entryOf = key => map.get(key) ?? map.get(key.normalize('NFC'));

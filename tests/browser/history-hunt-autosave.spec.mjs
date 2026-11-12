@@ -8,12 +8,13 @@
  */
 import { closePageWithApplicationRetirement, expect, test } from './helpers/test.mjs';
 import { ENCODED_SAMPLE_CATALOG_URL } from './helpers/origins.mjs';
-import { dismissWelcome } from './helpers/welcome.mjs';
+import { continueWhereLeftOff, dismissWelcome } from './helpers/welcome.mjs';
 import { takeSteps } from './helpers/state-history.mjs';
 import { observeProductErrors } from './helpers/history-hunt.mjs';
 
 const DATASET_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui&acceptance=history-hunt-autosave`;
 const CELL_TYPE = Object.freeze({ source: 'obs', key: 'cell_type' });
+const SCORE = Object.freeze({ source: 'obs', key: 'score' });
 const hide = categories => ['filter.category.visibility', { field: CELL_TYPE, categories, visible: false }];
 const show = categories => ['filter.category.visibility', { field: CELL_TYPE, categories, visible: true }];
 
@@ -88,9 +89,7 @@ test('a page killed while it writes leaves a saved state that reopens as it was 
   const reopened = await context.newPage();
   const errors = observeProductErrors(reopened);
   await open(reopened);
-  const offer = reopened.locator('.notification').filter({ hasText: 'Continue where you left off?' });
-  await expect(offer).toBeVisible();
-  await offer.getByRole('button', { name: 'Continue' }).click();
+  await continueWhereLeftOff(reopened);
   await expect.poll(() => reopened.evaluate(() => [...document.querySelectorAll('.notification-message')].map(e => e.textContent.trim())), { timeout: 60_000 })
     .toContain('Session fully restored.');
   // Whole: every step reachable, and the state shown is what its head recorded.
@@ -112,7 +111,8 @@ test('a page killed while it writes leaves a saved state that reopens as it was 
 test('two tabs continuing one saved state: it reopens as the history of one of them', async ({ page, context }) => {
   test.setTimeout(180_000);
   await open(page);
-  await takeSteps(page, [['color.by', { field: CELL_TYPE }]]);
+  // The fixture opens colored by cell_type (its first coloring): score is the step.
+  await takeSteps(page, [['color.by', { field: SCORE }]]);
   await expect.poll(() => ownSteps(page)).toBe(1);
   // A second tab on the same dataset continues it while the first is still open.
   const second = await context.newPage();

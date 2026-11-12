@@ -81,7 +81,7 @@ const MIME_BY_EXTENSION = Object.freeze({
   '.md': 'text/markdown; charset=utf-8',
   '.png': 'image/png',
   '.svg': 'image/svg+xml',
-  // The licences shipped beside third-party files (assets/wasm/LICENSES/,
+  // The licenses shipped beside third-party files (assets/wasm/LICENSES/,
   // assets/external/).
   '.txt': 'text/plain; charset=utf-8',
   // The WebAssembly decoders: what WebAssembly.compileStreaming requires.

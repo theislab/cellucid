@@ -9,7 +9,7 @@
  * pointers, chunk lengths from one row to the whole array, empty rows and
  * all-zero genes; obs with a categorical field (unused categories, missing
  * codes), a float, an integer and a nullable boolean column; a 2-D and a 3-D
- * embedding of their own chunking; a neighbour graph with self-loops; and a
+ * embedding of their own chunking; a neighbor graph with self-loops; and a
  * MuData store of two modalities, one measuring only some cells, in a cell
  * order of its own. Each case is a seed; every method, a random size and a
  * random seed run on it.
@@ -341,7 +341,7 @@ test('subsampled reads equal a full read then a gather, and fetch only chunks of
           sameBits(block.values, fullBlock.values, `${label}: cell subset values`);
         }
       }
-      // The neighbour graph: the induced subgraph.
+      // The neighbor graph: the induced subgraph.
       const graph = await reader.getConnectivities('connectivities');
       const want = { indptr: [0], indices: [], data: [] };
       for (const p of kept) {
@@ -668,7 +668,7 @@ test('a priority-ordered file reads its prefix, and other requests through its o
       { mode: 'subsample', method: 'stratified', k: draw(random, 4, n - 1), field: 'cluster' },
       // No method named: the file's default, uniform under its seed (a prefix).
       { mode: 'subsample', k: draw(random, 1, n - 1) },
-      // Blocks named on a priority file: honoured, through the general path.
+      // Blocks named on a priority file: honored, through the general path.
       { mode: 'subsample', method: 'blocks', k: draw(random, 1, n - 1), blockSize: draw(random, 1, 9) },
     ]) {
       const label = `priority case ${c} (${layout}) ${request.method} k=${request.k}${request.seed === undefined ? ' file seed' : ''}`;

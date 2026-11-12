@@ -22,6 +22,8 @@
 
 import { EventEmitter } from '../utils/event-emitter.js';
 import { parseExactJson } from './wire-contract.js';
+import { webStorage } from '../../utils/web-storage.js';
+import { formatRemaining } from '../../utils/format-units.js';
 
 const TAB_ID_KEY = 'cellucid:community-annotations:tab-id:v1';
 const LOCK_PREFIX = 'cellucid:community-annotations:lock:';
@@ -85,10 +87,11 @@ function createTabId() {
 
 function readSessionItem(key) {
   try {
-    if (typeof sessionStorage === 'undefined') {
+    const kept = webStorage('sessionStorage');
+    if (kept === null) {
       throw new Error('sessionStorage is unavailable');
     }
-    return sessionStorage.getItem(key);
+    return kept.getItem(key);
   } catch (cause) {
     throw storageFailure('sessionStorage', 'read', cause);
   }
@@ -96,10 +99,11 @@ function readSessionItem(key) {
 
 function writeSessionItem(key, value) {
   try {
-    if (typeof sessionStorage === 'undefined') {
+    const kept = webStorage('sessionStorage');
+    if (kept === null) {
       throw new Error('sessionStorage is unavailable');
     }
-    sessionStorage.setItem(key, value);
+    kept.setItem(key, value);
   } catch (cause) {
     throw storageFailure('sessionStorage', 'write', cause);
   }
@@ -107,10 +111,11 @@ function writeSessionItem(key, value) {
 
 function readLocalItem(key) {
   try {
-    if (typeof localStorage === 'undefined') {
+    const kept = webStorage('localStorage');
+    if (kept === null) {
       throw new Error('localStorage is unavailable');
     }
-    return localStorage.getItem(key);
+    return kept.getItem(key);
   } catch (cause) {
     throw storageFailure('localStorage', 'read', cause);
   }
@@ -118,10 +123,11 @@ function readLocalItem(key) {
 
 function writeLocalItem(key, value) {
   try {
-    if (typeof localStorage === 'undefined') {
+    const kept = webStorage('localStorage');
+    if (kept === null) {
       throw new Error('localStorage is unavailable');
     }
-    localStorage.setItem(key, value);
+    kept.setItem(key, value);
   } catch (cause) {
     throw storageFailure('localStorage', 'write', cause);
   }
@@ -129,10 +135,11 @@ function writeLocalItem(key, value) {
 
 function removeLocalItem(key) {
   try {
-    if (typeof localStorage === 'undefined') {
+    const kept = webStorage('localStorage');
+    if (kept === null) {
       throw new Error('localStorage is unavailable');
     }
-    localStorage.removeItem(key);
+    kept.removeItem(key);
   } catch (cause) {
     throw storageFailure('localStorage', 'remove', cause);
   }
@@ -347,7 +354,7 @@ export class CommunityAnnotationScopeLock extends EventEmitter {
           'Another browser tab/window is already connected to this annotation project.\n' +
           'To prevent accidental overwrites, this tab cannot connect.\n\n' +
           `Lock acquired: ${existing.acquiredAt}\n` +
-          `Lease remaining: ~${Math.max(1, Math.round((existing.expiresAtMs - now) / 1000))}s.\n\n` +
+          `Lease remaining: ${formatRemaining(existing.expiresAtMs - now)}.\n\n` +
           'Close the other Cellucid tab/window before starting a new connection.',
         holder: existing
       };

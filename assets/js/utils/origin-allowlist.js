@@ -1,32 +1,18 @@
 /**
- * An exact origin allowlist (a Worker's `ALLOWED_ORIGINS` secret), and the
- * loopback hosts on which plain HTTP is accepted.
+ * An exact origin allowlist (a Worker's `ALLOWED_ORIGINS` secret): HTTPS
+ * origins, and plain HTTP only on a loopback host a browser trusts
+ * (`utils/loopback.js` `isSecureContextLoopbackHost`: never `0.0.0.0`).
  *
  * The community-annotation Worker (`app/community-annotations/_worker-code.js`)
- * imports this module. The agent relay (`relay/http.js`) keeps its own copy,
- * which `tests/community-annotation-worker-duplication-contract.test.mjs`
- * holds to the same answers on the same inputs.
+ * imports this module. The agent relay (`relay/http.js`) keeps its own copy
+ * of both rules (it imports nothing outside its folder), which
+ * `tests/community-annotation-worker-duplication-contract.test.mjs` holds to
+ * the same answers on the same inputs.
  *
  * @module utils/origin-allowlist
  */
 
-/**
- * Whether a URL hostname (as `new URL(...).hostname` gives it) names this
- * computer: `localhost` and its subdomains, `127.0.0.0/8`, `[::1]`. A URL's
- * IPv4 host is always written as four decimal octets, so the pattern names
- * every loopback IPv4 address.
- *
- * @param {string} hostname
- * @returns {boolean}
- */
-export function isLoopbackHostname(hostname) {
-  return (
-    hostname === 'localhost' ||
-    hostname.endsWith('.localhost') ||
-    hostname === '[::1]' ||
-    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)
-  );
-}
+import { isSecureContextLoopbackHost } from './loopback.js';
 
 /**
  * Parse a comma-separated list of exact origins: each entry is exactly a
@@ -54,7 +40,7 @@ export function parseOriginAllowlist(raw, fail) {
     const exact = url.origin === entry && !url.username && !url.password;
     const secure =
       url.protocol === 'https:' ||
-      (url.protocol === 'http:' && isLoopbackHostname(url.hostname));
+      (url.protocol === 'http:' && isSecureContextLoopbackHost(url.hostname));
     if (!exact || !secure) {
       throw fail(
         'ALLOWED_ORIGINS entries must be exact HTTPS origins or loopback ' +

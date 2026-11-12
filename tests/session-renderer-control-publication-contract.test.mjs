@@ -184,7 +184,7 @@ function makeRendererControls() {
     // Antialiasing belongs to the same module but publishes to storage rather
     // than to the viewer, because it is a context-creation attribute. It is
     // here so this fake DOM stays the module's real inventory; its own
-    // behaviour is held by `antialias-setting-contract.test.mjs`.
+    // behavior is held by `antialias-setting-contract.test.mjs`.
     hpAntialiasCheckbox: new FakeElement({
       id: 'hp-antialias',
       type: 'checkbox',

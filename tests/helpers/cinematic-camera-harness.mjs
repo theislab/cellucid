@@ -7,11 +7,14 @@
  */
 
 import { initCinematicCamera } from '../../assets/js/app/ui/modules/cinematic-camera/index.js';
+import { cameraStateForOrbitPose } from '../../assets/js/rendering/camera-state-contract.js';
+import { representationName } from '../../assets/js/data/representation-names.js';
 
-const CINEMATIC_DOM_KEYS = [
+/** The Camera Path panel's elements, as `index.html` gives them (one list for every test). */
+export const CINEMATIC_DOM_KEYS = [
   'saveBtn', 'keyframeList', 'clearBtn', 'timingActions', 'setAllDuration', 'setAllBtn',
   'defaultSpeedInput', 'defaultSpeedDisplay', 'positionInterp',
-  'rotationInterp', 'easingSelect', 'loopCheckbox', 'autoplayCheckbox'
+  'rotationInterp', 'easingSelect', 'loopCheckbox', 'autoplayCheckbox', 'captionsCheckbox'
 ];
 
 export function createStubElement({ checked = false, value = '' } = {}) {
@@ -108,6 +111,8 @@ export function createCinematicDom() {
   };
   const dom = {};
   for (const key of CINEMATIC_DOM_KEYS) dom[key] = createStubElement(seeds[key]);
+  // Captions are on in the markup (`#cinematic-captions checked`).
+  dom.captionsCheckbox.checked = true;
   return dom;
 }
 
@@ -184,11 +189,11 @@ export function createStubViewer(initialMode = 'orbit') {
         phi: 0.75,
         target: [index, 0, 0]
       };
-      camera.freefly = {
-        position: [index, 0, 3 + index],
-        yaw: -Math.PI / 2 + index,
-        pitch: 0.1 * index
-      };
+      // As the viewer reports a camera: the pose its mode does not drive
+      // derived from the one it does (`getCurrentCameraStateInternal`).
+      camera.freefly = navigationMode === 'free'
+        ? { position: [index, 0, 3 + index], yaw: -Math.PI / 2 + index, pitch: 0.1 * index }
+        : cameraStateForOrbitPose({ navigationMode, ...camera.orbit }).freefly;
     },
     // One view, the live one: what a keyframe goto names (`actions/targets/views.js`).
     getFocusedViewId: () => 'live',
@@ -260,6 +265,10 @@ export function mountCinematicCamera({ focusedRepresentation = () => null } = {}
     navigation,
     dataSourceManager,
     focusedRepresentation,
+    // A representation's name, as the menus give it: the state's
+    // `representationNameOf` is this function given the dataset's obsm
+    // arrays; a stub dataset has none.
+    representationNameOf: layout => representationName(layout),
   });
   const module = { camera, dom, viewer, navigation, dataSourceManager };
   mounted.add(module);

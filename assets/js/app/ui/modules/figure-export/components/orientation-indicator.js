@@ -5,6 +5,11 @@
  * This component renders a small axis triad and (when available) orbit/freefly
  * angles in the plot corner without touching the main render loop.
  *
+ * The badge is laid out in the pane's viewport pixels and drawn scaled by
+ * `plotScale` (plot px per viewport px, `createPlotPlacement`), as the points
+ * are, so it takes the same share of the plot as of the on-screen view: a
+ * small grid panel is not covered by a badge sized for a whole figure.
+ *
  * @module ui/modules/figure-export/components/orientation-indicator
  */
 
@@ -82,6 +87,21 @@ function beginRoundRectPath(ctx, x, y, w, h, r) {
 }
 
 /**
+ * The badge's frame of reference: the plot's rectangle in viewport pixels,
+ * from its own top-left corner. Everything is laid out there and drawn under
+ * `translate(plotRect.x, plotRect.y) scale(plotScale)`.
+ *
+ * @param {PlotRect} plotRect
+ * @param {number} plotScale - plot px per viewport px
+ */
+function viewportFrameOf(plotRect, plotScale) {
+  if (typeof plotScale !== 'number' || !Number.isFinite(plotScale) || plotScale <= 0) {
+    throw new TypeError('Orientation indicator plotScale must be a finite positive number.');
+  }
+  return { x: 0, y: 0, width: plotRect.width / plotScale, height: plotRect.height / plotScale };
+}
+
+/**
  * @param {any} cameraState
  */
 function getAngleLines(cameraState) {
@@ -109,15 +129,17 @@ function getAngleLines(cameraState) {
  *
  * @param {object} options
  * @param {PlotRect} options.plotRect
+ * @param {number} options.plotScale - plot px per viewport px (`createPlotPlacement`)
  * @param {Float32Array} options.viewMatrix
  * @param {any} options.cameraState
  * @param {string} [options.fontFamily]
- * @param {number} [options.fontSize]
+ * @param {number} [options.fontSize] - in viewport px, scaled with the badge
  * @param {string} [options.textColor]
  * @returns {string}
  */
 export function renderSvgOrientationIndicator({
-  plotRect,
+  plotRect: figurePlotRect,
+  plotScale,
   viewMatrix,
   cameraState,
   fontFamily = 'Arial, Helvetica, sans-serif',
@@ -128,7 +150,8 @@ export function renderSvgOrientationIndicator({
   ink = LIGHT_INK
 }) {
   const textColor = ink.surfaceInk;
-  if (!plotRect || !viewMatrix) return '';
+  if (!figurePlotRect || !viewMatrix) return '';
+  const plotRect = viewportFrameOf(figurePlotRect, plotScale);
 
   const fs = clamp(Math.round(Number(fontSize) || 11), 6, 48);
   const margin = clamp(Math.round(Number.isFinite(marginPx) ? marginPx : (fs * 0.9)), 8, 18);
@@ -164,7 +187,10 @@ export function renderSvgOrientationIndicator({
   axes.sort((a, b) => (b.v[2] || 0) - (a.v[2] || 0));
 
   const parts = [];
-  parts.push(`<g font-family="${escapeXml(fontFamily)}" font-size="${fs}" fill="${escapeXml(textColor)}">`);
+  parts.push(
+    `<g transform="translate(${figurePlotRect.x} ${figurePlotRect.y}) scale(${plotScale})" ` +
+    `font-family="${escapeXml(fontFamily)}" font-size="${fs}" fill="${escapeXml(textColor)}">`
+  );
   parts.push(`<rect x="${x}" y="${y}" width="${size}" height="${size}" rx="${cornerR}" fill="${ink.surface}" fill-opacity="0.85" stroke="${ink.frame}" stroke-width="1"/>`);
 
   for (const axis of axes) {
@@ -205,14 +231,16 @@ export function renderSvgOrientationIndicator({
  * @param {object} options
  * @param {CanvasRenderingContext2D} options.ctx
  * @param {PlotRect} options.plotRect
+ * @param {number} options.plotScale - plot px per viewport px (`createPlotPlacement`)
  * @param {Float32Array} options.viewMatrix
  * @param {any} options.cameraState
  * @param {string} [options.fontFamily]
- * @param {number} [options.fontSize]
+ * @param {number} [options.fontSize] - in viewport px, scaled with the badge
  */
 export function drawCanvasOrientationIndicator({
   ctx,
-  plotRect,
+  plotRect: figurePlotRect,
+  plotScale,
   viewMatrix,
   cameraState,
   fontFamily = 'Arial, Helvetica, sans-serif',
@@ -222,7 +250,8 @@ export function drawCanvasOrientationIndicator({
   padPx = null,
   ink = LIGHT_INK
 }) {
-  if (!ctx || !plotRect || !viewMatrix) return;
+  if (!ctx || !figurePlotRect || !viewMatrix) return;
+  const plotRect = viewportFrameOf(figurePlotRect, plotScale);
 
   const fs = clamp(Math.round(Number(fontSize) || 11), 6, 48);
   const margin = clamp(Math.round(Number.isFinite(marginPx) ? marginPx : (fs * 0.9)), 8, 18);
@@ -256,6 +285,8 @@ export function drawCanvasOrientationIndicator({
   axes.sort((a, b) => (b.v[2] || 0) - (a.v[2] || 0));
 
   ctx.save();
+  ctx.translate(figurePlotRect.x, figurePlotRect.y);
+  ctx.scale(plotScale, plotScale);
   ctx.globalAlpha = 0.85;
   ctx.fillStyle = ink.surface;
   ctx.strokeStyle = ink.frame;

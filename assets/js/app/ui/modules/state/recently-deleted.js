@@ -13,6 +13,7 @@
 
 import { authorOf, formatAgo } from './model.js';
 import { wireAppDialog } from '../../components/app-dialog.js';
+import { ICONS, createButton, createIconButton } from '../../components/controls.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
 
 /**
@@ -70,23 +71,16 @@ export function createRecentlyDeleted({ dom, act, history, ask, notify, now = ()
       meta.className = 'history-deleted-meta';
       meta.textContent = [authorOf(entry.by, null).name, formatAgo(entry.at, now()).long, several ? tracker.name : null].filter(Boolean).join(' · ');
       body.append(label, meta);
-      const restore = doc.createElement('button');
-      restore.type = 'button';
-      restore.className = 'btn btn-compact';
-      restore.textContent = 'Restore';
-      restore.setAttribute('aria-label', `Restore: ${entry.label}`);
+      // A row of the list: Restore is its quiet main action.
+      const restore = createButton({ label: 'Restore', variant: 'quiet-primary', ariaLabel: `Restore: ${entry.label}` });
       restore.addEventListener('click', async () => {
         const outcome = await act('history.journal.undo', { entry: entry.id, tracker: tracker.id });
         if (outcome?.restored === 'as-new') notify(`${entry.label}: restored as new, since what it changed was changed again.`, 'warning');
         else if (outcome !== undefined) notify(`Restored: ${entry.label}.`, 'success');
         draw();
       });
-      const empty = doc.createElement('button');
-      empty.type = 'button';
-      empty.className = 'icon-btn icon-btn-danger';
-      empty.setAttribute('aria-label', `Empty from Recently deleted: ${entry.label}`);
+      const empty = createIconButton({ label: `Empty from Recently deleted: ${entry.label}`, icon: ICONS.delete, tone: 'danger' });
       empty.title = 'Empty it: it can no longer be restored';
-      empty.textContent = '✕';
       empty.addEventListener('click', async () => {
         await act('history.journal.empty', { entry: entry.id, tracker: tracker.id });
         draw();

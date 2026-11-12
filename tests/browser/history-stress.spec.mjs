@@ -22,8 +22,8 @@
  * JSON line (`HISTORY-STRESS {…}`) and writes them to the file
  * `CELLUCID_HISTORY_STRESS_OUT` names; `tests/stress/RESULTS.md` records them.
  * It runs only when asked (`CELLUCID_HISTORY_STRESS=1`), in Chromium, on the
- * machine's GPU (`scripts/lib/browser-launch.mjs`): a software rasteriser
- * would make every frame time the rasteriser's. A 1M-cell page is a heavy
+ * machine's GPU (`scripts/lib/browser-launch.mjs`): a software rasterizer
+ * would make every frame time the rasterizer's. A 1M-cell page is a heavy
  * job: on a 16 GB machine, run it alone (`.cellucid-maintenance/heavy.sh`).
  *
  *   CELLUCID_HISTORY_STRESS=1 npx playwright test tests/browser/history-stress.spec.mjs --project=chromium

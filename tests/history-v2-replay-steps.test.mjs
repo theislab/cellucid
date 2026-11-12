@@ -114,3 +114,21 @@ test('the target resolvers name what they did not find', async () => {
   assert.equal(refusal.code, 'no-such-category');
   assert.deepEqual(refusal.missing, { kind: 'category', name: '7', field: 'leiden' });
 });
+
+test('verify whose first state cannot be shown gives no verdict, in a sentence, its cause kept', async () => {
+  const { page, act, step } = await makePage();
+  await step('a.set', { v: 1 });
+  await step('a.set', { v: 2 });
+  const filters = page.domains.owner('filters');
+  const restore = filters.restore;
+  const unreadable = Object.assign(new Error('The open file could not be read again.'), { code: 'NETWORK_ERROR' });
+  filters.restore = value => { if (value === 0) throw unreadable; return restore(value); };
+  await assert.rejects(act('history.verify', { branch: 'Main' }), error => {
+    assert.equal(error.name, 'ActionRefused');
+    assert.match(error.message, /^"Main" was not verified, because the state it starts from could not be shown: /);
+    assert.equal(error.reason, unreadable, 'kept for Details, not chained into the sentence');
+    assert.equal(error.message.match(/could not be read again/g)?.length ?? 0, 1);
+    return true;
+  });
+  assert.equal(page.state.a, 2, 'what was shown stays');
+});

@@ -64,7 +64,6 @@ function installBaseState(owner, container = null) {
   };
   owner._analysisInvalidationOwner = null;
   owner._activeAnalysisRequestId = null;
-  owner._updateTimer = null;
   owner._modal = null;
   owner._container = container;
   owner._previewContainer = null;
@@ -334,7 +333,6 @@ test(
     quick._destroyPromise = null;
     quick._currentRequestId = 0;
     quick._job = null;
-    quick._debounceTimer = null;
     quick._cache = new Map();
     quick._fieldPickers = { categorical: null, continuous: null };
     quick._pageSelector = null;

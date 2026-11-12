@@ -501,7 +501,7 @@ test('a revisit never opens fewer cells than an earlier visit kept: each chunk p
   const kept = { kind: 'group', keys: () => ['obsm'], has: key => key === 'obsm', get: () => obsm };
   const chunk = await stored([[0, 100], [0, 2]], {});
   const { bytesFor, storedFor } = await firstViewCost(kept, n, null, n);
-  assert.equal(bytesFor(200), 0, 'the kept chunks cost no transfer (the mean priced them at 80 % each)');
+  assert.equal(bytesFor(200), 0, 'the kept chunks cost no transfer (the mean priced them at 80% each)');
   assert.equal(bytesFor(201), chunk);
   assert.equal(bytesFor(1000), 8 * chunk);
   assert.equal(storedFor(200), 2 * chunk, 'decoding them still counts');
@@ -656,7 +656,7 @@ test('a subsample grown from few chunks reads each chunk once and ends as the su
 
 test('a share opens whole when growing it would end later than one reading, from chunks or not', async () => {
   const { planProgressiveOpening } = await import('../assets/js/data/anndata/progressive-open.js');
-  // Lung-atlas-like: 258 embedding chunks of 892 rows, 1 % kept, a link of
+  // Lung-atlas-like: 258 embedding chunks of 892 rows, 1% kept, a link of
   // 1.6 MB/s, 1 MB read by every first view whatever its cells.
   const nObs = 258 * 892;
   const chunkRows = 892;

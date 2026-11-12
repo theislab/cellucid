@@ -45,11 +45,14 @@ import {
 } from '../../../ui/core/visibility-gate.js';
 import {
   createEmptyState,
-  createDisclosure
+  createDisclosure,
+  createStatusLine
 } from '../../../ui/components/controls.js';
-import { formatCells, formatCount, formatCountOf, formatSignificant, countNoun } from '../../../../utils/format-units.js';
+import { formatCells, formatCount, formatCountOf, formatPercent, formatSignificant, countNoun } from '../../../../utils/format-units.js';
 import { PageSelectorComponent, PAGE_MODE } from '../shared/page-selector.js';
 import { createDomId } from '../../../ui/components/dom-id.js';
+import { isHexColor } from '../../../../utils/hex-color.js';
+import { debounce } from '../../../../utils/debounce.js';
 
 /**
  * Quick Insights Panel
@@ -84,9 +87,6 @@ export class QuickInsights extends BaseAnalysisUI {
     this._cache = new Map();
     /** @type {CancellableJob|null} The insights being computed */
     this._job = null;
-
-    // Debounce timer for page changes
-    this._debounceTimer = null;
 
     // Request ID to track current computation (prevents stale renders)
     this._currentRequestId = 0;
@@ -292,12 +292,35 @@ export class QuickInsights extends BaseAnalysisUI {
     this._job?.cancel();
     this._job = null;
 
-    if (this._debounceTimer) {
-      clearTimeout(this._debounceTimer);
-      this._debounceTimer = null;
-    }
+    this._updateSoon.cancel();
 
     return this._currentRequestId;
+  }
+
+  /**
+   * Stopped while a change waits for it (`whenSettled`): Quick insights' own
+   * request goes too (its job canceled, its debounced update dropped).
+   * @override
+   * @protected
+   */
+  _stopInteractiveWork() {
+    super._stopInteractiveWork();
+    this._beginUpdateIntent();
+  }
+
+  /**
+   * The insights update once page changes settle: the one debounce, made
+   * when first asked for (an analysis is also made from its prototype).
+   * @private
+   */
+  get _updateSoon() {
+    this._updateSoonDebounce ??= debounce(() => {
+      this._trackInteractiveTask(
+        this.updateForSelectedPages(),
+        'Quick Insights update'
+      );
+    }, 150);
+    return this._updateSoonDebounce;
   }
 
   /**
@@ -331,14 +354,7 @@ export class QuickInsights extends BaseAnalysisUI {
     // is owed, not only once the debounced computation starts.
     this._setBusy(true);
 
-    // Debounce rapid changes
-    this._debounceTimer = setTimeout(() => {
-      this._debounceTimer = null;
-      this._trackInteractiveTask(
-        this.updateForSelectedPages(),
-        'Quick Insights update'
-      );
-    }, 150);
+    this._updateSoon();
   }
 
   /**
@@ -554,6 +570,17 @@ export class QuickInsights extends BaseAnalysisUI {
   async updateForSelectedPages() {
     const requestId = this._beginUpdateIntent();
 
+    // No dataset open: said as every analysis says it
+    // (`validateDataRequirements`), with no page choice to make (R9E-8).
+    const data = this.validateDataRequirements();
+    this._container?.querySelector('.insights-page-selector-section')?.toggleAttribute('hidden', !data.valid);
+    if (!data.valid) {
+      this._setBusy(false);
+      this._destroyFieldPickers();
+      this._contentContainer?.replaceChildren(createStatusLine({ tone: 'muted', text: data.error }).root);
+      return;
+    }
+
     // Get effective page IDs based on mode
     const pageIds = this._getEffectivePageIds();
 
@@ -575,7 +602,7 @@ export class QuickInsights extends BaseAnalysisUI {
     }
 
     // The request runs as a cancellable job: Cancel (in the panel or its
-    // notification) stops its reads and leaves a calm Cancelled with Run
+    // notification) stops its reads and leaves a calm Canceled with Run
     // again; a newer request supersedes it.
     const job = new CancellableJob({
       title: 'Quick insights',
@@ -630,7 +657,7 @@ export class QuickInsights extends BaseAnalysisUI {
       if (requestId !== this._currentRequestId) return;
       if (this._job === job) this._job = null;
       if (isCancellation(err)) {
-        // Cancelled, never a failure; a first pass shown stays, said to be one.
+        // Canceled, never a failure; a first pass shown stays, said to be one.
         job.cancel();
         if (progress.shown !== null) this._showCellsUsed(progress.shown, openCells, 'stopped');
         return;
@@ -666,7 +693,7 @@ export class QuickInsights extends BaseAnalysisUI {
   }
 
   /**
-   * Show how a job ended without insights: cancelled or failed, with Run
+   * Show how a job ended without insights: canceled or failed, with Run
    * again.
    * @param {CancellableJob} job
    * @private
@@ -941,7 +968,7 @@ export class QuickInsights extends BaseAnalysisUI {
    * @param {string[]} pageIds
    * @param {Record<string, { cellIndices: number[] }>} pageData
    * @param {AbortSignal} [signal]
-   * @returns {Promise<{ field: string, total: number, topCategories: { name: string, count: number, percent: string }[] } | null>}
+   * @returns {Promise<{ field: string, total: number, topCategories: { name: string, count: number, percent: number }[] } | null>}
    */
   async _summarizeCategoricalAcrossPages(fieldName, fieldData, pageIds, pageData, signal) {
     const categories = fieldData?.categories;
@@ -1011,17 +1038,19 @@ export class QuickInsights extends BaseAnalysisUI {
       topCategories: top.map(({ index, count }) => ({
         name: categories[index],
         count,
-        percent: ((count / total) * 100).toFixed(1)
+        percent: (count / total) * 100
       }))
     };
   }
 
   /**
    * Summarize continuous data aggregated across all pages.
-   * Uses the raw Float32 field array and exact page cell indices.
+   * Uses the raw field array and exact page cell indices: Float32Array, or
+   * Float64Array for a field kept exactly (an integer count past float32's
+   * range of exact integers, as the reader gives `n_genes`).
    * @private
    * @param {string} fieldName
-   * @param {{ values: Float32Array }} fieldData
+   * @param {{ values: Float32Array|Float64Array }} fieldData
    * @param {string[]} pageIds
    * @param {Record<string, { cellIndices: ArrayLike<number> }>} pageData
    * @param {AbortSignal} [signal]
@@ -1032,9 +1061,11 @@ export class QuickInsights extends BaseAnalysisUI {
     // Both passes walk every selected cell on this thread, so they hand the
     // event loop back between slices of a large selection.
     const yieldIfSliceSpent = createSlicedYield();
-    if (!(rawValues instanceof Float32Array)) {
+    // As the reader gives a continuous field (`BaseAnnDataAdapter`): float32 or float64 (found
+    // 2026-11-10: Suo's n_genes, float64, failed Quick insights).
+    if (!(rawValues instanceof Float32Array) && !(rawValues instanceof Float64Array)) {
       throw new TypeError(
-        `Continuous field "${fieldName}" requires a Float32Array values payload`
+        `Continuous field "${fieldName}" requires a Float32Array or Float64Array values payload`
       );
     }
 
@@ -1337,8 +1368,8 @@ export class QuickInsights extends BaseAnalysisUI {
           segment.className = 'insights-bar-segment';
           segment.style.width = `${cat.percent}%`;
           segment.style.left = `${cumPercent}%`;
-          segment.title = `${cat.name}: ${cat.percent}%`;
-          cumPercent += parseFloat(cat.percent);
+          segment.title = `${cat.name}: ${formatPercent(cat.percent, 1)}`;
+          cumPercent += cat.percent;
           barContainer.appendChild(segment);
         }
 
@@ -1350,7 +1381,7 @@ export class QuickInsights extends BaseAnalysisUI {
         for (const c of summary.topCategories.slice(0, 3)) {
           const span = document.createElement('span');
           span.className = 'cat-label';
-          span.textContent = `${c.name} ${c.percent}%`;
+          span.textContent = `${c.name} ${formatPercent(c.percent, 1)}`;
           labels.appendChild(span);
         }
         pageRow.appendChild(labels);
@@ -1411,7 +1442,7 @@ export class QuickInsights extends BaseAnalysisUI {
           <th>Field</th>
           <th>Mean</th>
           <th>Median</th>
-          <th title="Population standard deviation: divided by n, as numpy.std">SD (population)</th>
+          <th title="Population standard deviation: divided by n, as numpy.std">Pop. SD</th>
         </tr>
       `;
       table.appendChild(thead);
@@ -1684,7 +1715,7 @@ export class QuickInsights extends BaseAnalysisUI {
         typeof entry[0] !== 'string' ||
         entry[0].length === 0 ||
         typeof entry[1] !== 'string' ||
-        !/^#[0-9a-fA-F]{6}$/.test(entry[1])
+        !isHexColor(entry[1])
       ) {
         throw new TypeError(
           'Quick Insights custom colors must contain [pageId, color] string pairs'

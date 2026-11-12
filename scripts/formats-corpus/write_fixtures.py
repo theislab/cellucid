@@ -232,7 +232,7 @@ def write_loompy_3(out: Path) -> list[Path]:
     ))
     written.append(path)
 
-    # A neighbour graph, and a t-SNE stored as _tSNE1/_tSNE2 (LoomExperiment's names).
+    # A neighbor graph, and a t-SNE stored as _tSNE1/_tSNE2 (LoomExperiment's names).
     path = out / "graphs.loom"
     knn = sparse.random(CELLS, CELLS, density=0.1, random_state=31, format="coo")
     knn = ((knn + knn.T) / 2).tocoo()

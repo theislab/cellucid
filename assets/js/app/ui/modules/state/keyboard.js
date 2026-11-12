@@ -16,21 +16,7 @@
  */
 
 import { isApplePlatform } from './shared.js';
-
-/**
- * The input types a person types into, which have the browser's own undo of
- * their text. Every other input (range, checkbox, radio, color, file,
- * button, …) undoes nothing of its own.
- */
-const TEXT_INPUT_TYPES = new Set(['text', 'search', 'email', 'url', 'tel', 'password', 'number', 'date', 'time',
-  'datetime-local', 'month', 'week']);
-
-/** Whether `target` keeps its own undo (a text field), so the history leaves the keys to it. */
-export function hasOwnUndo(target) {
-  if (typeof target?.tagName !== 'string') return false;
-  if (target.isContentEditable === true || target.tagName === 'TEXTAREA') return true;
-  return target.tagName === 'INPUT' && TEXT_INPUT_TYPES.has((target.getAttribute('type') ?? 'text').toLowerCase());
-}
+import { isInKeyKeepingWidget, isTextEntry } from '../../../../utils/key-ownership.js';
 
 /**
  * Which history command a key press asks for, or null. Ctrl or Command with
@@ -54,10 +40,10 @@ function ownedElsewhere(event, ownerDocument) {
   if (event.defaultPrevented) return true;
   const target = event.target instanceof Element ? event.target : null;
   if (target !== null) {
-    if (hasOwnUndo(target)) return true;
-    if (target.closest('[role="menu"], [role="listbox"], [role="dialog"], dialog')) return true;
+    // A text field keeps its own undo; a menu or a dialog keeps its keys.
+    if (isTextEntry(target) || isInKeyKeepingWidget(target)) return true;
   }
-  return ownerDocument.querySelector('dialog[open], .confirm-dialog-overlay, [aria-modal="true"]:not([hidden]):not(.hidden)') !== null;
+  return ownerDocument.querySelector('dialog[open], [aria-modal="true"]:not([hidden]):not(.hidden)') !== null;
 }
 
 /**

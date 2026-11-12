@@ -22,6 +22,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { formatBytes } from '../assets/js/utils/format-units.js';
 
 import {
   getNotificationCenter,
@@ -240,17 +241,11 @@ test(
           ) / PEAK_BYTES_PER_POINT,
         );
         for (const expected of [
-          `${pointCount.toLocaleString('en-US')} points`,
-          `${Math.round(
-            MEASURED_CHROMIUM_HEAP_LIMIT_BYTES / MIB,
-          ).toLocaleString('en-US')} MiB`,
-          `${Math.round(
-            projectedBuildBytes(pointCount) / MIB,
-          ).toLocaleString('en-US')} MiB`,
-          `${Math.round(
-            measuredPreBuildBytes(pointCount) / MIB,
-          ).toLocaleString('en-US')} MiB`,
-          `${affordable.toLocaleString('en-US')} points`,
+          `${pointCount.toLocaleString('en-US')} cells`,
+          formatBytes(MEASURED_CHROMIUM_HEAP_LIMIT_BYTES),
+          formatBytes(projectedBuildBytes(pointCount)),
+          formatBytes(measuredPreBuildBytes(pointCount)),
+          `${affordable.toLocaleString('en-US')} cells`,
         ]) {
           assert.ok(
             error.message.includes(expected),
@@ -330,7 +325,7 @@ test('one byte less headroom refuses the same build', (t) => {
   enableLodAndRequest(refusing.renderer);
   assert.equal(errors.length, 1);
   assert.ok(
-    errors[0].includes(`level-of-detail index for ${pointCount.toLocaleString('en-US')} points`),
+    errors[0].includes(`level-of-detail index for ${pointCount.toLocaleString('en-US')} cells`),
     errors[0],
   );
   assert.equal(refusing.staged.length, 0);
@@ -393,7 +388,7 @@ test(
         assert.ok(error instanceof RangeError);
         assert.ok(
           error.message.includes(
-            `level-of-detail index for ${geometryPoints.toLocaleString('en-US')} points`,
+            `level-of-detail index for ${geometryPoints.toLocaleString('en-US')} cells`,
           ),
           error.message,
         );
@@ -468,6 +463,6 @@ test(
     inline.renderer.setAdaptiveLOD(true);
     inline.renderer._requestSpatialIndex({ kind: 'live' }, true);
     assert.equal(errors.length, 1);
-    assert.match(errors[0], /cannot build a level-of-detail index for 100,000,000 points/);
+    assert.match(errors[0], /The live view \(\dD\) cannot build a level-of-detail index for 100,000,000 cells/);
   },
 );

@@ -71,7 +71,7 @@ test('the choices are the mapped matrix, then every other usable matrix of the f
   const layer = createLayer(createState().state);
   assert.deepEqual(layer.getExpressionMatrices(), {
     choices: [
-      { value: 'mapped', label: 'Mapped (X)' },
+      { value: 'mapped', label: 'Mapped (X)', aliases: ['X'] },
       { value: 'layer:counts', label: "layers['counts'] · counts", counts: true },
       { value: 'raw', label: 'raw.X · 3 genes', counts: false },
     ],
@@ -82,7 +82,7 @@ test('the choices are the mapped matrix, then every other usable matrix of the f
 test('a dataset that cannot change its expression matrix lists only the mapped one, saying why', () => {
   const layer = createLayer(createState({ menu: null }).state);
   assert.deepEqual(layer.getExpressionMatrices(), {
-    choices: [{ value: 'mapped', label: 'Mapped (X)' }],
+    choices: [{ value: 'mapped', label: 'Mapped (X)', aliases: ['X'] }],
     reason: 'This dataset reads only its mapped expression matrix.',
   });
   const none = createLayer(createState({ expression: null }).state);
@@ -94,10 +94,10 @@ test('a choice resolves to what it reads: the mapped matrix through the shown ge
   const layer = createLayer(createState().state);
   assert.deepEqual(layer.resolveExpressionMatrix('mapped'), { matrix: 'X', read: null, label: 'Mapped (X)' });
   assert.deepEqual(layer.resolveExpressionMatrix('X'), { matrix: 'X', read: null, label: 'Mapped (X)' });
-  assert.deepEqual(layer.resolveExpressionMatrix('raw'), { matrix: 'raw', read: 'raw', label: 'raw' });
+  assert.deepEqual(layer.resolveExpressionMatrix('raw'), { matrix: 'raw', read: 'raw', label: 'raw.X' });
   assert.deepEqual(
     layer.resolveExpressionMatrix('layer:counts'),
-    { matrix: 'layer:counts', read: 'layer:counts', label: "layers['counts'] · counts, not normalised" }
+    { matrix: 'layer:counts', read: 'layer:counts', label: "layers['counts'] · counts" }
   );
   assert.throws(() => layer.resolveExpressionMatrix('layer:bad'), RangeError);
   assert.throws(() => layer.resolveExpressionMatrix('layer:absent'), RangeError);

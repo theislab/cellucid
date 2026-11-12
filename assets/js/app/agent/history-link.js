@@ -29,6 +29,17 @@
  *   or read what they changed are applied again, and one that needed them
  *   stays, marked as no longer applying, and is reported) and everything
  *   since the turn began (back to the step before it, kept for redo).
+ * - **What changed since an agent's last turn** (`historySeen`,
+ *   `historySinceSentence`): the steps in effect as a turn ends are kept; the
+ *   person's next message tells the model, in one sentence, which of them are
+ *   no longer in effect (its own turn undone, a step removed) and which steps
+ *   came in (the person's, another agent's, a notebook's), by their labels,
+ *   so it never reports as standing what the person took back (bug hunt
+ *   L3-15: after Undo turn the model said "the Ductal cells are still
+ *   hidden"); another history shown (a session file loaded beside, a saved
+ *   state, another dataset) is said as which one, where from, and its latest
+ *   steps (F270). What an agent saw is kept with its conversation (chat) or
+ *   for its connection (`bridge/agent-calls.js`). Steps only, never data.
  *
  * @module app/agent/history-link
  */
@@ -37,13 +48,16 @@ import { showConfirmDialog } from '../ui/components/confirm-dialog.js';
 import { getNotificationCenter } from '../notification-center.js';
 import { originOf } from '../history/exports/step-text.js';
 import { turnFacts } from '../history/turns.js';
+import { pathTo } from '../history/tree.js';
+import { quoteName } from '../actions/targets/names.js';
 import { getActions } from '../actions/index.js';
 import { countOutside, outsideText } from './presence/activity.js';
-import { formatCountOf } from '../../utils/format-units.js';
+import { countNoun, formatCountOf } from '../../utils/format-units.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
 let stepRevealer = null;
 let turnLink = null;
-const turnListeners = new Set();
+const turnListeners = createListenerSet('the chat\'s turns shown');
 
 /**
  * The steps of each turn of the tracker `tree` shows: `{inTree, onPath, last,
@@ -103,13 +117,12 @@ export function registerTurnLink(link) {
 
 /** The chat shows other turns now (another conversation): the history's panel draws its turns again. */
 export function turnsChanged() {
-  for (const listener of [...turnListeners]) listener();
+  turnListeners.notify();
 }
 
 /** Be told when the chat shows other turns (`turnsChanged`). Returns the unsubscribe. */
 export function subscribeTurns(listener) {
-  turnListeners.add(listener);
-  return () => turnListeners.delete(listener);
+  return turnListeners.add(listener);
 }
 
 /**
@@ -153,7 +166,8 @@ function pathShown(tree) {
  *
  * @param {object|null} tree - a live tracker
  * @param {string} turn
- * @returns {{agent: string, own: object[], others: object[], elsewhere: number}|null}
+ * @returns {{agent: string, own: object[], others: object[], elsewhere: number, othersWho: string}|null}
+ *   `othersWho`: whose the others are, in a few words (the dialog's)
  */
 export function turnUndoPlan(tree, turn) {
   // A step of no turn (the person's) is no turn's to undo.
@@ -165,35 +179,53 @@ export function turnUndoPlan(tree, turn) {
   const others = path.slice(at).filter(step => step.by.turn !== turn);
   let inTree = 0;
   for (const step of tree.steps.values()) if (step.by.turn === turn) inTree += 1;
-  return { agent: originOf(own[0].by).name, own, others, elsewhere: inTree - own.length };
+  const agent = originOf(own[0].by).name;
+  return { agent, own, others, elsewhere: inTree - own.length, othersWho: othersPhrase(tree, turn, agent, others) };
 }
 
-/** Whose the steps after the turn began are, in a few words ("2 of yours, 1 of ChatGPT's"). */
-function othersPhrase(agent, others) {
-  const counts = new Map();
+/**
+ * Whose the steps after the turn began are, in a few words ("2 of yours,
+ * 9 from 3 later turns of this chat, 1 of ChatGPT's"): the same agent's later
+ * turns of the same conversation are counted as such (L12-1: they read
+ * "9 from another Claude turn"), its turns elsewhere (another chat, a
+ * connector) as other turns.
+ */
+function othersPhrase(tree, turn, agent, others) {
+  const conversationOf = id => (id === null ? null : tree.turns?.get?.(id)?.conversation ?? null);
+  const chat = conversationOf(turn);
+  const groups = new Map();
   for (const step of others) {
     const origin = originOf(step.by);
-    const who = origin.key === 'person' ? 'of yours'
-      : origin.key === 'outside' ? 'not recorded as an action'
-        : origin.name === agent ? `from another ${agent} turn` : `of ${origin.name}'s`;
-    counts.set(who, (counts.get(who) ?? 0) + 1);
+    const sameAgent = origin.key !== 'person' && origin.key !== 'outside' && origin.name === agent;
+    const key = origin.key === 'person' ? 'person' : origin.key === 'outside' ? 'outside'
+      : sameAgent ? (chat !== null && conversationOf(step.by.turn) === chat ? 'chat' : 'agent') : `of ${origin.name}'s`;
+    if (!groups.has(key)) groups.set(key, { steps: 0, turns: new Set() });
+    const group = groups.get(key);
+    group.steps += 1;
+    if (step.by.turn !== null) group.turns.add(step.by.turn);
   }
-  return [...counts].map(([who, count]) => `${count} ${who}`).join(', ');
+  return [...groups].map(([key, { steps, turns }]) => {
+    if (key === 'person') return `${steps} of yours`;
+    if (key === 'outside') return `${steps} not recorded as an action`;
+    if (key === 'chat') return `${steps} from ${formatCountOf(turns.size, 'later turn')} of this chat`;
+    if (key === 'agent') return `${steps} from ${turns.size === 1 ? `another ${agent} turn` : formatCountOf(turns.size, `other ${agent} turn`)}`;
+    return `${steps} ${key}`;
+  }).join(', ');
 }
 
 /**
  * Ask the person how to undo a turn others acted after (history-v2
  * §3.3.10): `'own'` (only the turn's steps), `'since'` (everything since
  * it began) or null (neither).
- * @param {{agent: string, own: object[], others: object[], elsewhere: number}} plan
+ * @param {{agent: string, own: object[], others: object[], elsewhere: number, othersWho: string}} plan
  * @returns {Promise<'own'|'since'|null>}
  */
 export function askHowToUndoTurn(plan) {
-  const { agent, own, others, elsewhere } = plan;
+  const { agent, own, others, elsewhere, othersWho } = plan;
   const total = own.length + others.length;
   const them = own.length === 1 ? 'it' : 'them';
   const message = [
-    `${formatCountOf(others.length, 'change')} came after ${agent}'s turn began (${othersPhrase(agent, others)}).`,
+    `${formatCountOf(others.length, 'change')} came after ${agent}'s turn began (${othersWho}).`,
     `Only ${agent}'s ${formatCountOf(own.length, 'step')}: ${own.length === 1 ? 'it goes' : 'they go'} to Recently deleted, where ${own.length === 1 ? 'it' : 'they'} can be restored, and the later steps that needed ${them} are applied again without ${them}. A step that cannot be stays, marked as no longer applying.`,
     `All ${formatCountOf(total, 'step')} since: back to before ${agent}'s turn, kept for redo.`,
     ...(elsewhere > 0 ? [`${elsewhere} of its steps ${elsewhere === 1 ? 'is' : 'are'} on another branch and ${elsewhere === 1 ? 'stays' : 'stay'} there.`] : []),
@@ -279,7 +311,7 @@ function tellInNotification(note) {
  *   (`askHowToUndoTurn`); `run`: how the caller runs the change (busy, its
  *   failure reported; undefined when it failed); `tell`: what the person is
  *   told after (`turnUndoNote`; a notification); `catalog`: the actions whose words count what
- *   the turn did outside the state (the page's catalogue when left out)
+ *   the turn did outside the state (the page's catalog when left out)
  * @returns {Promise<{found: boolean, undone: boolean, how: 'end'|'own'|'since'|null, agent: string|null, steps: number, report: Array<{step: string, label: string, reason: string}>,
  *   outside: Array<{one: string, other: string, count: number}>}>}
  *   `found`: some of its steps are on the path shown; `how`: alone at the end, only its own, or everything since;
@@ -314,4 +346,234 @@ export async function undoAgentTurn(history, turn, { ask = askHowToUndoTurn, run
   const note = turnUndoNote(result);
   if (note !== null) tell(note, result);
   return result;
+}
+
+/**
+ * What a conversation knows of the history as its turn ends: the tracker
+ * and branch shown, each step in effect (on the path to the step shown, the
+ * opening left out) with its label and author, so a step removed later is
+ * still named, and the tracker's next step number (the steps made since,
+ * anywhere). Null without a tracker.
+ *
+ * A step someone else took while the turn ran (the person coloring
+ * mid-turn: numbered from `from`, the tracker's next step number as the
+ * turn began, and not of `ownTurns`) is not something the agent saw: it is
+ * left out of the steps seen and listed in `during`, so the next message
+ * tells it (bug hunt L18-4: it was in the snapshot, so never "new").
+ * The record is plain data, kept with the conversation (`chat/conversation.js`
+ * `transcriptOf`: a reload, a saved state or a shared session keeps what its
+ * agent last saw) and by an outside agent's connection (`bridge/agent-calls.js`);
+ * `isHistorySeen` checks one read back. It names the tracker (id, name) and its
+ * dataset, so the next message can say the history shown is another one
+ * (a session loaded beside, another dataset opened: F270).
+ * @param {object|null} tree - the tracker shown
+ * @param {{from?: number|null, ownTurns?: Set<string>, conversation?: string|null}} [turn] - `from`: the
+ *   tracker's next step number as the turn began (null: none known, every
+ *   step in effect counts as seen); `ownTurns`: the turns of the conversation;
+ *   `conversation`: the chat's conversation of that turn (a chat that follows
+ *   the tracker shown carries the record into the conversation it shows next)
+ * @returns {{tracker: string, name: string, dataset: {id: string|null, name: string|null},
+ *   branch: {id: string, name: string}|null, next: number,
+ *   steps: Array<{id: string, label: string, by: object}>, during: string[]}|null}
+ */
+export function historySeen(tree, { from = null, ownTurns = new Set(), conversation = null } = {}) {
+  if (!tree) return null;
+  const inEffect = pathTo(tree, tree.headId).filter(step => step.parent !== null).map(seenStep);
+  const tookDuring = step => from !== null && stepNumber(step.id) >= from && !(step.by.turn !== null && ownTurns.has(step.by.turn));
+  const branch = tree.branches?.get?.(tree.activeBranch) ?? null;
+  return {
+    tracker: tree.id,
+    name: typeof tree.name === 'string' ? tree.name : '',
+    dataset: { id: tree.dataset?.id ?? null, name: tree.dataset?.name ?? null },
+    branch: branch === null ? null : { id: branch.id, name: branch.name },
+    next: tree.nextStep ?? 0,
+    steps: inEffect.filter(step => !tookDuring(step)),
+    during: inEffect.filter(tookDuring).map(step => step.id),
+    ...(conversation === null ? {} : { conversation }),
+  };
+}
+
+const SEEN_KEYS = new Set(['tracker', 'name', 'dataset', 'branch', 'next', 'steps', 'during', 'conversation']);
+const isText = value => typeof value === 'string';
+const isTextOrNull = value => value === null || typeof value === 'string';
+
+/**
+ * Whether `value` is a `historySeen` record read back (a saved conversation's,
+ * a connection's): every field of its shape, nothing else trusted.
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isHistorySeen(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const { tracker, name, dataset, branch, next, steps, during, conversation } = value;
+  const isBy = by => by !== null && typeof by === 'object' && isText(by.origin) && isTextOrNull(by.agent) && isTextOrNull(by.turn);
+  return isText(tracker) && tracker.length > 0 && isText(name)
+    && dataset !== null && typeof dataset === 'object' && isTextOrNull(dataset.id) && isTextOrNull(dataset.name)
+    && (branch === null || (typeof branch === 'object' && isText(branch.id) && isText(branch.name)))
+    && Number.isInteger(next) && next >= 0
+    && Array.isArray(steps) && steps.every(step => step !== null && typeof step === 'object' && isText(step.id) && isText(step.label) && isBy(step.by))
+    && Array.isArray(during) && during.every(isText)
+    && (conversation === undefined || (isText(conversation) && conversation.length > 0))
+    && Object.keys(value).every(key => SEEN_KEYS.has(key));
+}
+
+/** A step id's number ("s12" → 12). */
+function stepNumber(id) {
+  return Number(String(id).slice(1));
+}
+
+function seenStep(step) {
+  return { id: step.id, label: step.label, by: { origin: step.by.origin, agent: step.by.agent ?? null, turn: step.by.turn ?? null } };
+}
+
+/** Whether `stepId` is on the path to `tipId` (the branch shown's tip): an undo there is redone by redo. */
+function onPathTo(tree, stepId, tipId) {
+  for (let step = tree.steps.get(tipId); step; step = step.parent === null ? null : tree.steps.get(step.parent)) {
+    if (step.id === stepId) return true;
+  }
+  return false;
+}
+
+/** Who took a step, as the agent of `ownTurns` is told it. */
+function authorOf(by, ownTurns) {
+  if (by.turn !== null && ownTurns.has(by.turn)) return { key: 'own', who: 'Your', name: 'you' };
+  if (by.origin === 'user') return { key: 'person', who: 'The person\'s', name: 'the person' };
+  if (by.origin === 'host') return { key: 'host', who: 'A notebook\'s', name: 'a notebook' };
+  return { key: `agent:${by.agent ?? ''}`, who: `${by.agent ?? 'Another agent'}'s`, name: by.agent ?? 'another agent' };
+}
+
+/** Labels quoted as data, one run of the same label said once with its count. */
+function labelList(steps) {
+  const runs = [];
+  for (const step of steps) {
+    const last = runs.at(-1);
+    if (last?.label === step.label) last.count += 1;
+    else runs.push({ label: step.label, count: 1 });
+  }
+  return runs.map(run => `${quoteName(run.label)}${run.count > 1 ? ` (${formatCountOf(run.count, 'time')})` : ''}`).join(', ');
+}
+
+/** Steps grouped by author, in order of their first step. */
+function byAuthor(steps, ownTurns) {
+  const groups = new Map();
+  for (const step of steps) {
+    const author = authorOf(step.by, ownTurns);
+    if (!groups.has(author.key)) groups.set(author.key, { who: author.who, name: author.name, steps: [] });
+    groups.get(author.key).steps.push(step);
+  }
+  return [...groups.values()];
+}
+
+/** How many labels of the steps in effect a switch names (the latest ones). */
+const SWITCH_LABELS = 5;
+
+/** A tracker and its dataset, as the model is told them. */
+function trackerWords(name, dataset, otherDataset) {
+  const named = quoteName(name === '' ? 'Tracker' : name);
+  return dataset !== null && dataset !== otherDataset ? `${named} of the dataset ${quoteName(dataset)}` : named;
+}
+
+/** Where a tracker came from, as the model is told it (a session file loaded, a replay), or null. */
+function startWords(tree) {
+  const start = tree.start ?? null;
+  if (start?.kind === 'import' && typeof start.from?.file === 'string') return `loaded from the session file ${quoteName(start.from.file)}`;
+  if (start?.kind === 'replay' && typeof start.from?.tracker?.name === 'string') return `a replay of ${quoteName(start.from.tracker.name)}`;
+  return null;
+}
+
+/**
+ * The history shown is another tracker than the one `seen` names (a session
+ * file loaded beside, a saved state opened, another dataset or tracker
+ * shown): which one, where it came from, and its steps in effect, compactly
+ * (a count by author, the latest labels), so the model never takes the
+ * history before for this one (F270, bug hunt L25-8's colleague: "same
+ * questions please" read as a first look).
+ */
+function switchSentence(tree, seen, ownTurns, { conversation = null } = {}) {
+  const now = historySeen(tree);
+  const parts = [`the history shown is now ${trackerWords(now.name, now.dataset.name, seen.dataset?.name ?? null)}`];
+  const from = startWords(tree);
+  if (from !== null) parts[0] += `, ${from}`;
+  parts[0] += ` (it was ${trackerWords(seen.name ?? '', seen.dataset?.name ?? null, now.dataset.name)})`;
+  if (now.steps.length === 0) {
+    parts.push('no step is in effect there yet');
+  } else {
+    const groups = byAuthor(now.steps, ownTurns).map(group => `${group.name} ${group.steps.length}`);
+    const latest = now.steps.slice(-SWITCH_LABELS);
+    parts.push(`${formatCountOf(now.steps.length, 'step')} ${countNoun(now.steps.length, 'is', 'are')} in effect there (by ${groups.join(', ')}); `
+      + `the ${latest.length === now.steps.length ? countNoun(latest.length, 'step', 'steps') : `latest ${latest.length}`}: ${labelList(latest)}`);
+  }
+  if (conversation !== null && seen.conversation !== undefined && seen.conversation !== conversation) {
+    parts.push(`this conversation is not the one of your last turn: that one stays with ${trackerWords(seen.name ?? '', seen.dataset?.name ?? null, now.dataset.name)}`);
+  }
+  return `Since your last turn the person changed what is shown: ${parts.join('; ')}. Read this history before relying on it; it is not the one your earlier replies spoke of.`;
+}
+
+/**
+ * What changed in the history since `seen` (`historySeen` as the agent's last
+ * turn ended), as one sentence for the model, or null when nothing did. On
+ * the same tracker: its steps undone, removed, taken by others (by label);
+ * another tracker shown (a session loaded beside, a saved state, another
+ * dataset): which, where from, and its steps in effect (`switchSentence`).
+ * `ownTurns`: the turns of the agent's conversation (or connection);
+ * `conversation`: the conversation this message is in, when `seen` was
+ * carried from another one (the chat followed the tracker shown).
+ * @param {object|null} tree - the tracker shown now
+ * @param {ReturnType<typeof historySeen>} seen
+ * @param {Set<string>} ownTurns
+ * @param {{conversation?: string|null}} [options]
+ * @returns {string|null}
+ */
+export function historySinceSentence(tree, seen, ownTurns, options = {}) {
+  if (!tree || !seen) return null;
+  if (seen.tracker !== tree.id) return switchSentence(tree, seen, ownTurns, options);
+  const nowSeen = historySeen(tree);
+  const now = nowSeen.steps;
+  const nowIds = new Set(now.map(step => step.id));
+  const seenIds = new Set(seen.steps.map(step => step.id));
+  const gone = seen.steps.filter(step => !nowIds.has(step.id));
+  const came = now.filter(step => !seenIds.has(step.id));
+  // Steps made since that are not in effect (taken on the branch the person then left).
+  const offPath = [...tree.steps.values()]
+    .filter(step => step.parent !== null && !nowIds.has(step.id) && stepNumber(step.id) >= seen.next)
+    .map(seenStep);
+  const switched = seen.branch !== null && nowSeen.branch !== null && seen.branch.id !== nowSeen.branch.id;
+  if (gone.length === 0 && came.length === 0 && offPath.length === 0 && !switched) return null;
+  const tip = tree.branches?.get?.(tree.activeBranch)?.tip ?? tree.headId;
+  const branchName = step => {
+    const id = tree.steps.get(step.id)?.branch;
+    return tree.branches?.get?.(id)?.name ?? null;
+  };
+  const parts = [];
+  if (switched) parts.push(`the branch shown is now ${quoteName(nowSeen.branch.name)} (it was ${quoteName(seen.branch.name)})`);
+  for (const group of byAuthor(gone, ownTurns)) {
+    const live = group.steps.filter(step => tree.steps.has(step.id));
+    const undone = live.filter(step => onPathTo(tree, step.id, tip));
+    const elsewhere = live.filter(step => !onPathTo(tree, step.id, tip));
+    const removed = group.steps.filter(step => !tree.steps.has(step.id));
+    if (undone.length > 0) parts.push(`${group.who} ${countNoun(undone.length, 'step')} ${labelList(undone)} ${countNoun(undone.length, 'was', 'were')} undone (kept for redo, no longer in effect)`);
+    const onBranches = new Map();
+    for (const step of elsewhere) {
+      const name = branchName(step);
+      if (!onBranches.has(name)) onBranches.set(name, []);
+      onBranches.get(name).push(step);
+    }
+    for (const [name, steps] of onBranches) {
+      parts.push(`${group.who} ${countNoun(steps.length, 'step')} ${labelList(steps)} ${countNoun(steps.length, 'stays', 'stay')} on ${name === null ? 'another branch' : `the branch ${quoteName(name)}`}, not in effect on the branch shown`);
+    }
+    if (removed.length > 0) parts.push(`${group.who} ${countNoun(removed.length, 'step')} ${labelList(removed)} ${countNoun(removed.length, 'was', 'were')} removed (to Recently deleted, no longer in effect)`);
+  }
+  // Taken by others while the last turn ran (`historySeen` `during`), then the steps made since.
+  const during = new Set(seen.during ?? []);
+  for (const group of byAuthor(came.filter(step => during.has(step.id)), ownTurns)) {
+    parts.push(`${group.who} ${countNoun(group.steps.length, 'step')} ${labelList(group.steps)} ${countNoun(group.steps.length, 'was', 'were')} taken while your last turn ran and ${countNoun(group.steps.length, 'is', 'are')} in effect`);
+  }
+  for (const group of byAuthor(came.filter(step => !during.has(step.id)), ownTurns)) {
+    parts.push(`${group.who} ${countNoun(group.steps.length, 'step')} ${labelList(group.steps)} ${countNoun(group.steps.length, 'is', 'are')} now in effect`);
+  }
+  for (const group of byAuthor(offPath, ownTurns)) {
+    const names = [...new Set(group.steps.map(branchName))];
+    parts.push(`${group.who} ${countNoun(group.steps.length, 'step')} ${labelList(group.steps)} ${countNoun(group.steps.length, 'was', 'were')} taken on ${names.length === 1 && names[0] !== null ? `the branch ${quoteName(names[0])}` : 'other branches'}, not the one shown`);
+  }
+  return `Since your last turn the history changed: ${parts.join('; ')}. Rely on the state as it is now, not on what your earlier replies said.`;
 }

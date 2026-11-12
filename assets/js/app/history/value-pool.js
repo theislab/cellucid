@@ -2,7 +2,7 @@
  * @fileoverview Domain values kept once, by content.
  *
  * A history refers to domain values by the SHA-256 of their canonical form,
- * so a value that comes back (undoing a recolour, toggling a filter twice)
+ * so a value that comes back (undoing a recolor, toggling a filter twice)
  * is stored once, and two steps show the same state exactly when their
  * hashes agree. Typed arrays are hashed over their bytes once each (they are
  * immutable once captured, `app/actions/domains.js`); the rest is canonical
@@ -13,14 +13,14 @@
  * hashes like the text "NaN" nor -0 like 0, and a value's own object may not
  * use either key (it would read as one of them).
  *
- * SHA-256 comes from `app/utils/sha256.js`, which answers outside a secure
+ * SHA-256 comes from `utils/sha256.js`, which answers outside a secure
  * context too (the Python package's plain-HTTP LAN address), where
  * `crypto.subtle` does not exist.
  *
  * @module app/history/value-pool
  */
 
-import { sha256Hex } from '../utils/sha256.js';
+import { sha256Hex } from '../../utils/sha256.js';
 
 const arrayDigests = new WeakMap();
 
@@ -185,7 +185,7 @@ export async function hashValue(value) {
  * A value nothing refers to any more goes: at a `prune` (the history names
  * every value it refers to), or at once when the history knows it made it
  * and nothing took it (`release`: a camera gesture's values merged into one
- * step, an action that changed nothing or was cancelled). A reader that
+ * step, an action that changed nothing or was canceled). A reader that
  * walks values across awaits (the autosave, a session file being written)
  * `hold`s the pool: a value released meanwhile stays readable until the
  * last hold ends.

@@ -17,7 +17,7 @@ const draw = (points, options = {}) => rasterizePoints({
 
 const alphaAt = (image, x, y) => image.pixels[(y * image.width + x) * 4 + 3];
 
-test('a point is a disc of the marker colour at the marker opacity', () => {
+test('a point is a disc of the marker color at the marker opacity', () => {
   const image = draw([[10.5, 5.5]]);
   assert.equal(image.width, 20);
   assert.equal(image.height, 10);

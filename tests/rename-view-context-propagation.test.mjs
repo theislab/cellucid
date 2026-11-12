@@ -89,7 +89,7 @@ test('a category rename republishes the kept view label and filter text it repla
   const snapshotPublication = published.findLast((entry) => entry.viewId === 'snap_1');
   assert.ok(snapshotPublication, 'the kept view must be republished');
   assert.deepEqual(snapshotPublication.meta.filtersText, ['leiden: hiding alpha']);
-  assert.equal(snapshotPublication.label, 'leiden • leiden: hiding alpha');
+  assert.equal(snapshotPublication.label, 'leiden: hiding alpha');
 
   // What the kept view publishes is exactly what replaying it computes.
   state.setActiveView('snap_1');

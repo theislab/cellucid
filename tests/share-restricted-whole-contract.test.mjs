@@ -7,13 +7,13 @@
  *   restricted to them (`restrictedAccess`): the entries indexed are every
  *   cell's, the view does no work of its own (no kept row's pointer read, no
  *   entry gathered), the matrix's reads are every cell's, and the values are the
- *   rows' own, bit for bit. A 50 % uniform share of a 4M-cell file took
+ *   rows' own, bit for bit. A 50% uniform share of a 4M-cell file took
  *   1.4x every cell's first gene on a link faster than decoding: its pass in
  *   store order gathered each kept row's entries out of the decoded chunks.
  * - **The choice weighs the work measured on the source** (`PassRates`,
  *   `wholeIsCheaper`): the index's own work per entry, the view's, and a
  *   gene's placement in open order on either path; before any is measured,
- *   a share keeping at least two thirds of the entries. A 50 % uniform
+ *   a share keeping at least two thirds of the entries. A 50% uniform
  *   share's first gene and marker genes took 1.3-1.7x on every stored row's
  *   index what they took on its own pass (Chromium, 10M cells).
  * - **Every stored row's index is kept as every cell's**: an opening of
@@ -215,7 +215,7 @@ test('a restricted column is the rows\' own, bit for bit: from the pass\'s colum
 });
 
 test('a restricted gene looks up only its entries on rows the segment opens: the rest are skipped by a bit, the answer the same as a lookup of each entry and a sort', async () => {
-  // A 50 % uniform share's markers looked up every stored row's entries in
+  // A 50% uniform share's markers looked up every stored row's entries in
   // the open rows' table (40 MB at 10M cells, a cache miss each): 5.2 s of
   // the reader's 11 s, traced. Half are of rows not open.
   const nStored = 20_000;

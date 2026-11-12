@@ -1,0 +1,40 @@
+{
+  "examples": [
+    {
+      "name": "Early",
+      "view": "View 1"
+    },
+    {
+      "name": null,
+      "view": "View 1"
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "oneOf": [
+          {
+            "minLength": 1,
+            "pattern": "^\\S(?:.*\\S)?$",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "view": {
+        "pattern": "^View [1-9][0-9]*$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "view",
+      "name"
+    ],
+    "type": "object"
+  },
+  "type": "view.rename",
+  "version": 1
+}

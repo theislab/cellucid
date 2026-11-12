@@ -29,6 +29,8 @@ function quickInsightsOwnershipHarness({ isVisible = () => true } = {}) {
   const insights = new QuickInsights({
     container: null,
     dataLayer: {
+      // A dataset is open (no dataset: `validateDataRequirements`, R9E-8).
+      state: { pointCount: 100 },
       getActiveHighlightPageId() {
         return 'page-1';
       },
@@ -64,6 +66,7 @@ function quickInsightsHarness({
   insights._hasUserSelectedCategoricalObsFields = true;
   insights._hasUserSelectedContinuousObsFields = true;
   insights.dataLayer = {
+    state: { pointCount: 100 },
     getPages() {
       return pages;
     },
@@ -258,6 +261,24 @@ test('Quick Insights computes one deterministic exact continuous contract at eve
   assert.equal(first.q3, 37_500);
 });
 
+test('Quick Insights summarizes a continuous field the reader gives as float64 (an integer count)', async () => {
+  // Found 2026-11-10 on Suo: n_genes arrives as a Float64Array and Quick insights failed with
+  // "requires a Float32Array values payload".
+  const values = Float64Array.from([16777217, 16777219, 3]);
+  const insights = Object.create(QuickInsights.prototype);
+  const summary = await insights._summarizeContinuousAcrossPages(
+    'n_genes', { values }, ['page-1'], { 'page-1': { cellIndices: Uint32Array.of(0, 1, 2) } },
+  );
+  assert.equal(summary.count, 3);
+  assert.equal(summary.min, 3);
+  // Exact past float32's integers (2^24 + 3 would read as 2^24 + 4 in float32).
+  assert.equal(summary.max, 16777219);
+  await assert.rejects(
+    insights._summarizeContinuousAcrossPages('n_genes', { values: Int32Array.of(1) }, ['page-1'], { 'page-1': { cellIndices: Uint32Array.of(0) } }),
+    /Float32Array or Float64Array/,
+  );
+});
+
 test('Quick Insights exposes only the current selected-pages and settings contract', async () => {
   const source = await readFile(
     new URL(
@@ -383,14 +404,13 @@ test('Quick Insights is aria-busy from an owed update until a result renders', (
     _contentContainer: null,
     _currentRequestId: 0,
     _job: null,
-    _debounceTimer: null,
     _pendingUpdateWhenVisible: false,
     _getEffectivePageIds: () => ['page-1'],
   });
 
   // An opened panel owes an update: busy before the debounce even starts.
   insights._triggerUpdate();
-  clearTimeout(insights._debounceTimer);
+  insights._updateSoon.cancel();
   assert.equal(attributes.get('aria-busy'), 'true');
 
   // Every terminal render settles the region.

@@ -53,7 +53,7 @@ import { measureOf } from '../../utils/machine.js';
 /** Entries of one slab of the index's work (`RowMajorColumnIndex`'s default; a scheduling choice). */
 const SLAB_ENTRIES = 1024 * 1024;
 
-/** The first segment's share of the rows, at least (a scheduling choice: the first colours after about this much of the work). */
+/** The first segment's share of the rows, at least (a scheduling choice: the first colors after about this much of the work). */
 const FIRST_SEGMENT_SHARE = 1 / 32;
 
 /**
@@ -358,7 +358,7 @@ export class PassRates {
  * counterpart's (the index's as the view's, one placement as the other);
  * neither measured, as many operations an entry as the index's, so a share
  * keeping at least two thirds of the entries reads every stored row's.
- * Measured in Chromium on a 10M-cell store (2026-10-31), a 50 % uniform
+ * Measured in Chromium on a 10M-cell store (2026-10-31), a 50% uniform
  * share's first gene and marker genes took 1.3-1.7x on every stored row's
  * index what they took on the share's own (CSR 7.7 / 11.6 s against 6.0 /
  * 8.0 s; Zarr 6.4 / 12.4 against 4.5 / 7.4 s): its genes' placement is the
@@ -410,7 +410,7 @@ function placeEntries(indices, values, openRows, openBits, start, out) {
  * (an eighth of a byte a stored row: 1.25 MB at 10M, held in a core's cache
  * where the open rows' table, 40 MB, is not). A gene's entries over every
  * stored row are tested against it, and only those of open rows looked up:
- * at a 50 % uniform share half the lookups, each a cache miss, are not made.
+ * at a 50% uniform share half the lookups, each a cache miss, are not made.
  *
  * @param {Uint32Array} fileRows
  * @param {number} nStored
@@ -742,7 +742,7 @@ export function segmentedColumns({ nRows, segments, together = () => false }) {
    * Each unbuilt segment's read of `gene`: all at once when their indexes
    * fit the memory budget together (`together`: their reads then go out
    * together and fill the link, instead of one segment's round trips after
-   * another's; on a 150 ms link a 1 % subsample's first gene took 2 x its
+   * another's; on a 150 ms link a 1% subsample's first gene took 2 x its
    * floor one segment at a time), else each one when the one before it is
    * done. Answered in row order either way.
    */

@@ -4,6 +4,8 @@
 
 import { getNotificationCenter } from '../../../notification-center.js';
 import { requireKeys } from '../../../../utils/exact-record.js';
+import { failureDetails, joinFailure, sayFailure } from '../../../../utils/errors.js';
+import { viewerHostWords } from '../../../../data/viewer-protocol.js';
 
 const DELIVERY_KEYS = new Set([
   'viewerHostSource',
@@ -45,14 +47,22 @@ function requireDelivery(options) {
   return options;
 }
 
-export function showSelectionDeliveryFailure(error, source) {
+/**
+ * Say that a selection the viewer kept did not reach its host, naming the
+ * host as `runtime` (`viewerHostSource.getHostRuntime()`) does.
+ *
+ * @param {unknown} error
+ * @param {string} source - The selection tool (`lasso`, `knn`, `proximity`)
+ * @param {string|null} runtime
+ */
+export function showSelectionDeliveryFailure(error, source, runtime) {
   const exactError = error instanceof Error
     ? error
     : new TypeError('Viewer host selection delivery rejected with a non-Error value');
   console.error(`[Highlight] ${source} selection delivery failed`, exactError);
   getNotificationCenter().error(
-    `Selection was saved locally, but Python notification failed: ${exactError.message}`,
-    { category: 'connectivity', duration: 8_000 }
+    `${joinFailure(`The selection is kept here, but ${viewerHostWords(runtime).name} was not told of it`, sayFailure(exactError))}`,
+    { ...failureDetails(exactError), category: 'connectivity', duration: 8_000 }
   );
 }
 

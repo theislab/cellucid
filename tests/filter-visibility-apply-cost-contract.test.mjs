@@ -356,7 +356,7 @@ test('a result is not adopted once its array was written again', () => {
   const { state, field } = categoryFilterState(codes.length, codes, [0]);
   state.computeGlobalVisibility();
   assert.deepEqual(Array.from(state.categoryTransparency), [0, 1, 1, 0]);
-  // A recolour writes the array outside a visibility pass (through the
+  // A recolor writes the array outside a visibility pass (through the
   // ownership module, as every writer does).
   state.categoryTransparency.fill(1);
   writableTransparencyOf(state);

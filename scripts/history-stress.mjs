@@ -136,10 +136,10 @@ function summaryOf(runs) {
       lines.push('');
     } else {
       lines.push(`## ${job.name} (${job.cells.toLocaleString('en')} cells)`, '');
-      lines.push('| kind | file B/step | steps chunk B/step | values B/step | arrays B/step | autosave B/step | rec p50 ms | hash p50 ms | autosave write p50 ms |');
-      lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+      lines.push('| kind | file B/step | of which turn record B/step | steps chunk B/step | values B/step | arrays B/step | autosave B/step | rec p50 ms | hash p50 ms | autosave write p50 ms |');
+      lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
       for (const [kind, k] of Object.entries(result)) {
-        lines.push(`| ${kind} | ${Math.round(k.fileBytesPerStep)} | ${Math.round(k.stepsChunkBytesPerStep)} | ${Math.round(k.valueBytesPerStep)} | ${Math.round(k.arrayBytesPerStep)} | ${Math.round(k.autosaveBytesPerStep)} | ${fmt(k.recording.recorder?.p50, 2)} | ${fmt(k.recording.hash?.p50, 2)} | ${fmt(k.autosaveWrite?.p50, 2)} |`);
+        lines.push(`| ${kind} | ${Math.round(k.fileBytesPerStep)} | ${Math.round(k.turnRecordBytesPerStep)} | ${Math.round(k.stepsChunkBytesPerStep)} | ${Math.round(k.valueBytesPerStep)} | ${Math.round(k.arrayBytesPerStep)} | ${Math.round(k.autosaveBytesPerStep)} | ${fmt(k.recording.recorder?.p50, 2)} | ${fmt(k.recording.hash?.p50, 2)} | ${fmt(k.autosaveWrite?.p50, 2)} |`);
       }
       lines.push('');
     }

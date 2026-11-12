@@ -1,6 +1,6 @@
 /**
  * The data-mapping groups beside the embeddings, end to end on a file opened
- * in the browser (`.h5ad` and Zarr ZIP): the neighbour graph (Phase E).
+ * in the browser (`.h5ad` and Zarr ZIP): the neighbor graph (Phase E).
  *
  * Fixture: `data-mapping-full` from `scripts/generate-data-mapping-fixtures.py`
  * (three graphs: `connectivities`, `scvi_connectivities` and an asymmetric
@@ -130,7 +130,7 @@ for (const [format, input, file] of [
       await expect.poll(() => page.evaluate(() => window._cellucidViewer.hasConnectivityData())).toBe(true);
       await expect.poll(() => edgeCount(page)).toBe(EXPECTED.knn.connectivities.n_edges);
       await select.selectOption('scvi_connectivities');
-      await expect(page.locator('.data-mapping-status')).toHaveText('Apply replaces the neighbour graph.');
+      await expect(page.locator('.data-mapping-status')).toHaveText('Apply replaces the neighbor graph.');
       await apply(page);
       await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');
       expect(await mappingGroup(page, 'knn')).toBe('scvi_connectivities');
@@ -191,7 +191,7 @@ for (const [format, input, file] of [
   });
 }
 
-async function colourByGene(page, name) {
+async function colorByGene(page, name) {
   const search = page.locator('#gene-expression-search');
   await search.click();
   await search.fill(name);
@@ -215,7 +215,7 @@ for (const [format, input, file] of [
   ['H5AD', '#user-data-file-input', FULL_H5AD],
   ['Zarr ZIP', '#user-data-file-input', FULL_ZARR],
 ]) {
-  test.describe(`${format}: gene names and expression change the gene list, keeping cells and the coloured gene`, () => {
+  test.describe(`${format}: gene names and expression change the gene list, keeping cells and the colored gene`, () => {
     // Two tests, one dataset load each, so neither runs into the other's
     // time budget on a slow runner; the second restores the session the
     // first saved.
@@ -231,7 +231,7 @@ for (const [format, input, file] of [
       // raw.X holds more genes than X: the file opens on raw, as Scanpy reads
       // genes, and the genes line says why.
       await expect(expression).toHaveValue('raw');
-      await expect(hint).toHaveText('Expression: raw, as Scanpy reads genes: it holds more genes than X.');
+      await expect(hint).toHaveText('Expression: raw.X, as Scanpy reads genes: it holds more genes than X.');
       // X is one choice away.
       await expression.selectOption('X');
       await apply(page);
@@ -252,13 +252,13 @@ for (const [format, input, file] of [
       await expect(hint).not.toContainText('Guessed');
       await expect(hint).not.toContainText('gene_symbols');
 
-      // A highlight and a filtered gene colouring are in place.
+      // A highlight and a filtered gene coloring are in place.
       await page.evaluate(() => {
         const state = window._cellucidState;
         state.ensureHighlightPage();
         state.addHighlightDirect({ type: 'annotation', label: 'kept', cellIndices: Uint32Array.of(1, 2, 3) });
       });
-      await colourByGene(page, 'ENSG00000000003');
+      await colorByGene(page, 'ENSG00000000003');
       const range = await page.evaluate(() => {
         const state = window._cellucidState;
         const stats = state.ensureContinuousMetadata(state.varData.fields[state.activeVarFieldIndex]).stats;
@@ -270,7 +270,7 @@ for (const [format, input, file] of [
 
       // Symbols instead of Ensembl ids: the same gene, now called LYZ.
       await names.selectOption('column:gene_symbols');
-      await expect(page.locator('.data-mapping-status')).toHaveText('Apply keeps each coloured gene it finds and closes analysis windows.');
+      await expect(page.locator('.data-mapping-status')).toHaveText('Apply keeps each colored gene it finds and closes analysis windows.');
       await apply(page);
       await expect(page.locator('.data-mapping-status')).toHaveText('Applied.');
       expect(await activeGene(page)).toEqual({ key: 'LYZ', index: 2, filter: range });
@@ -292,7 +292,7 @@ for (const [format, input, file] of [
       await expect(page.locator('#dataset-genes')).toHaveText('8');
 
       // A gene only raw has is dropped, and the panel says so.
-      await colourByGene(page, 'PPBP');
+      await colorByGene(page, 'PPBP');
       const downloadPromise = page.waitForEvent('download');
       await clickSaveSession(page);
       sessionPath = testInfo.outputPath('genes.cellucid-session');
@@ -300,14 +300,14 @@ for (const [format, input, file] of [
       await expression.selectOption('X');
       await apply(page);
       await expect(page.locator('.data-mapping-status')).toHaveText(
-        "Applied. 'PPBP' is not on the new gene list; its colouring was removed."
+        "Applied. 'PPBP' is not on the new gene list; its coloring was removed."
       );
       expect(await activeGene(page)).toBeNull();
 
       expect(errors).toEqual([]);
     });
 
-    test('a fresh open restores raw.X named by gene_symbols and the coloured gene', async ({ page }) => {
+    test('a fresh open restores raw.X named by gene_symbols and the colored gene', async ({ page }) => {
       const errors = collectBrowserErrors(page);
       await openFullFixture(page, input, file);
       const chooserPromise = page.waitForEvent('filechooser');

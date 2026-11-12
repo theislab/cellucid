@@ -1,11 +1,11 @@
 /**
  * The scale matrix's browser run: the whole app (Chromium) opens one store of
  * `scale-matrix.py` and exercises every feature on it, step by step, as a
- * person would — the default share, every cell, gene colouring, legends of
+ * person would — the default share, every cell, gene coloring, legends of
  * 10 and of 1,000,000 categories with a filter, differential expression,
- * markers, a gene signature, a dot plot, a kept view in 3-D, the neighbour
+ * markers, a gene signature, a dot plot, a kept view in 3-D, the neighbor
  * graph's edges, the velocity overlay, a session saved and restored, a figure
- * and a cell export, and Apply of 10 %. Each step records its time, the bytes
+ * and a cell export, and Apply of 10%. Each step records its time, the bytes
  * the store server sent, the peak resident memory of the renderer and GPU
  * processes, each JavaScript thread's peak heap and ArrayBuffer bytes (CDP),
  * the main thread's long tasks, what the one memory model
@@ -567,8 +567,8 @@ function pageAddress() {
   const share = shareCells === null ? '' : `&cells=${encodeURIComponent(shareCells)}${shareSample === null ? '' : `&sample=${shareSample}`}`;
   return `${APP}/?data=${encodeURIComponent(link)}${share}`;
 }
-/** A gene coloured, timed from the ask to its values in the page. */
-async function colourGene(name) {
+/** A gene colored, timed from the ask to its values in the page. */
+async function colorGene(name) {
   await page.waitForFunction(() => !window._cellucidState.areGenesPending?.() && window._cellucidState.varData.fields.length > 0, null, { timeout: 600_000 });
   const index = await fieldIndex('var', name);
   if (index < 0) throw new Error(`gene ${name} not listed`);
@@ -694,7 +694,7 @@ try {
   });
 
   // ---- the share grid's steps (`share-grid.mjs`) -----------------------
-  await step('gene-next', async () => { const result = await colourGene(geneNext); await quiet(); return result; });
+  await step('gene-next', async () => { const result = await colorGene(geneNext); await quiet(); return result; });
   await step('frames', async () => {
     // The view turned for 3 s (a drag across the canvas): each frame's
     // interval, with what the renderer drew (points, LOD level, draw calls).
@@ -856,7 +856,7 @@ try {
       s.addHighlightFromCategory(i, 1, 'obs');
       return created.id;
     });
-    // The gene coloured before (loaded) and two others, as a person scores genes they looked at.
+    // The gene colored before (loaded) and two others, as a person scores genes they looked at.
     const names = await page.evaluate(shown => [...new Set([shown, ...window._cellucidState.varData.fields.slice(0, 3).map(f => f.key)])].slice(0, 3), gene);
     await analysis('signature', { geneSets: [{ name: 'markers', genes: names }] }, 'Run gene signature', { selectedPages: [pageId] });
     return page.evaluate(() => ({ sets: window._comparisonModule.getUI('signature')._lastResult?.raw?.sets?.length ?? null }));
@@ -894,12 +894,12 @@ try {
   });
   await step('knn', async () => {
     // The k-NN tool on the graph the edges step read: a drag from the
-    // canvas centre to degree 10 (30 px a degree), its rows read from the
+    // canvas center to degree 10 (30 px a degree), its rows read from the
     // file by cell; the step lands when its expansion holds the degree.
     await (await reveal('.highlight-mode-btn[data-mode="knn"]')).click();
     await page.waitForTimeout(1000);
     // A seed: the first point of a grid over the canvas a cell is drawn under
-    // (with kept views the canvas is split, and its centre can be a gap).
+    // (with kept views the canvas is split, and its center can be a gap).
     const box = await page.locator('#glcanvas').boundingBox();
     const seed = await page.evaluate(({ left, top, width, height }) => {
       for (let row = 1; row < 12; row++) {
@@ -994,7 +994,7 @@ try {
     await opened(0, since);
     const firstFrameMs = Math.round(performance.now() - t0);
     const settledMs = Math.round((await settled()) - t0);
-    const gene1 = await colourGene(gene);
+    const gene1 = await colorGene(gene);
     const geneMs = Math.round(performance.now() - t0);
     await quiet();
     return { firstFrameMs, settledMs, geneMs, gene: gene1, ...(await state()) };
@@ -1002,7 +1002,7 @@ try {
   await step('revisit-de', differential, { timeout: 1_800_000 });
   await step('revisit-markers', markers, { timeout: 1_800_000 });
 
-  // ---- Apply 10 % -----------------------------------------------------
+  // ---- Apply 10% -----------------------------------------------------
   await step('apply-10', async () => {
     await setControl('#subsample-percent', '10');
     await (await reveal('#subsample-apply')).click();

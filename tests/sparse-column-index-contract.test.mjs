@@ -245,8 +245,8 @@ test('a gene withdrawn by its caller stops a build no one else waits for; the ne
   const read = index.column(3, { signal: controller.signal });
   const build = index.start();
   await until(() => pointerReads > 0, 'the build reading');
-  controller.abort(new DOMException('The person cancelled', 'AbortError'));
-  await assert.rejects(read, { name: 'AbortError', message: 'The person cancelled' });
+  controller.abort(new DOMException('The person canceled', 'AbortError'));
+  await assert.rejects(read, { name: 'AbortError', message: 'The person canceled' });
   await assert.rejects(build, error => error.indexStopped === true);
   assert.equal(index.phase, 'idle', 'the stopped build is forgotten');
   const readsWhenStopped = reads.indices;

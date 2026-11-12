@@ -21,8 +21,9 @@
  */
 
 import { createSamplePageId, parseSamplePageId } from './page-derivation-utils.js';
-import { formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { formatCount, formatCountOf, formatShare } from '../../../utils/format-units.js';
 import { getDataSourceManager } from '../../../data/data-source-manager.js';
+import { webStorage } from '../../../utils/web-storage.js';
 
 /**
  * How soon a first answer should come: the response time below which a
@@ -32,27 +33,33 @@ import { getDataSourceManager } from '../../../data/data-source-manager.js';
  */
 export const FIRST_ANSWER_TARGET_MS = 1000;
 
-const STORAGE_KEY = 'cellucid:analysis-cost:v2';
+const STORAGE_KEY = 'cellucid:analysis-cost:v3';
 
 /**
  * The measured cost of each analysis kind on this device: `fixedMs + perCellMs × cells`,
- * fitted from its last two passes of different sizes (one pass: all of its
- * time per cell), per unit of work: a run that reads genes records and asks
- * per gene (`units`), so a 30,000-gene run is not judged by a 2,000-gene one.
- * A kind is named with its source (`analysisCostKind`): a local file and a
- * link cost differently. Kept in memory and, as a convenience across visits,
- * in this browser's storage (never required).
+ * fitted from its last two passes of different sizes over the same work (one
+ * pass: all of its time per cell). The work is the genes a run reads
+ * (`units`): a cost is known only for the genes it was measured with. Per gene
+ * the time of a run falls the more genes it reads (a run's start, its workers
+ * and its first reads are paid once), so the time a run of 6 genes took says
+ * nothing of a run of 3,691: scaled per gene it once told an agent's
+ * permission card that a 1-second marker run would take 88 hours (live-7
+ * L25-1). A kind is named with its source (`analysisCostKind`): a local file
+ * and a link cost differently. Kept in memory and, as a convenience across
+ * visits, in this browser's storage (never required).
  */
 export class AnalysisCostModel {
   constructor({ storage = defaultStorage() } = {}) {
     this._storage = storage;
+    /** kind → passes `{cells, units, ms}`, the last two of each `units`. */
     this._passes = new Map();
     try {
       const saved = JSON.parse(storage?.getItem(STORAGE_KEY) ?? 'null');
       if (saved !== null && typeof saved === 'object') {
         for (const [kind, passes] of Object.entries(saved)) {
           if (Array.isArray(passes)) {
-            this._passes.set(kind, passes.filter(pass => Number.isFinite(pass?.cells) && pass.cells > 0 && Number.isFinite(pass?.ms) && pass.ms >= 0).slice(-2));
+            this._passes.set(kind, passes.filter(pass => Number.isFinite(pass?.cells) && pass.cells > 0
+              && Number.isFinite(pass?.units) && pass.units > 0 && Number.isFinite(pass?.ms) && pass.ms >= 0));
           }
         }
       }
@@ -64,9 +71,10 @@ export class AnalysisCostModel {
   /** Record a pass of `kind` over `cells` cells and `units` of work (genes) that took `ms`. */
   record(kind, cells, ms, units = 1) {
     if (!(cells > 0) || !(ms >= 0) || !(units > 0)) return;
-    const passes = (this._passes.get(kind) ?? []).filter(pass => pass.cells !== cells);
-    passes.push({ cells, ms: ms / units });
-    this._passes.set(kind, passes.slice(-2));
+    const all = this._passes.get(kind) ?? [];
+    const same = all.filter(pass => pass.units === units && pass.cells !== cells);
+    same.push({ cells, units, ms });
+    this._passes.set(kind, [...all.filter(pass => pass.units !== units), ...same.slice(-2)]);
     try {
       this._storage?.setItem(STORAGE_KEY, JSON.stringify(Object.fromEntries(this._passes)));
     } catch {
@@ -74,24 +82,34 @@ export class AnalysisCostModel {
     }
   }
 
-  /** `{fixedMs, perCellMs}` of `kind` for `units` of work, or null before any pass. */
+  /** `{fixedMs, perCellMs}` of `kind` for `units` of work, or null before any pass over that work. */
   cost(kind, units = 1) {
-    const passes = this._passes.get(kind) ?? [];
+    const passes = (this._passes.get(kind) ?? []).filter(pass => pass.units === units);
     if (passes.length === 0) return null;
-    if (passes.length === 1) return { fixedMs: 0, perCellMs: (units * passes[0].ms) / passes[0].cells };
+    if (passes.length === 1) return { fixedMs: 0, perCellMs: passes[0].ms / passes[0].cells };
     const [a, b] = passes;
     const perCellMs = Math.max(0, (b.ms - a.ms) / (b.cells - a.cells));
-    const fixedMs = Math.max(0, a.ms - perCellMs * a.cells);
-    return { fixedMs: units * fixedMs, perCellMs: units * perCellMs };
+    return { fixedMs: Math.max(0, a.ms - perCellMs * a.cells), perCellMs };
+  }
+
+  /**
+   * The cells the passes over `units` of work were measured on (the largest),
+   * or null before any: a cost fitted from one pass is all per cell, so it says
+   * how a smaller run scales (a first pass) but not a larger one.
+   */
+  measuredCells(kind, units = 1) {
+    const cells = (this._passes.get(kind) ?? []).filter(pass => pass.units === units).map(pass => pass.cells);
+    return cells.length === 0 ? null : Math.max(...cells);
+  }
+
+  /** How many passes over `units` of work were measured (0, 1 or 2). */
+  passCount(kind, units = 1) {
+    return (this._passes.get(kind) ?? []).filter(pass => pass.units === units).length;
   }
 }
 
 function defaultStorage() {
-  try {
-    return typeof localStorage === 'undefined' ? null : localStorage;
-  } catch {
-    return null;
-  }
+  return webStorage('localStorage');
 }
 
 /**
@@ -205,9 +223,7 @@ export function createCellSample(dataLayer, n, m) {
 export function describeCellsUsed(sample, n, state = null, genes = null) {
   const geneSample = genes ?? null;
   if (sample === null) return geneSample === null ? `Every cell: computed on all cells of its groups (${formatCountOf(n, 'open cell')}).` : null;
-  const percent = (100 * sample.m) / n;
-  const share = `${percent >= 1 ? percent.toFixed(1) : percent.toPrecision(2)}%`;
-  const lead = `First pass: each group's cells in a uniform sample of ${share} of the open cells (about ${formatCount(sample.m)} of ${formatCount(n)})`;
+  const lead = `First pass: each group's cells in a uniform sample of ${formatShare(sample.m, n)} of the open cells (about ${formatCount(sample.m)} of ${formatCount(n)})`;
   const every = geneSample === null ? 'every cell' : 'the cells genes are read for';
   if (state === 'refining') return `${lead} · refining on ${every}…`;
   if (state === 'stopped') return `${lead}. Stopped before ${every}; run again for all of them.`;
@@ -221,9 +237,9 @@ export function describeCellsUsed(sample, n, state = null, genes = null) {
  * Both passes are timed into the cost model under `kind`.
  *
  * A first pass that throws (a sample a group has too few cells in) is
- * skipped, unless the run was cancelled or superseded. `progress.shown` is
+ * skipped, unless the run was canceled or superseded. `progress.shown` is
  * the sample of the first pass on screen, if any, for a caller whose final
- * pass is cancelled or fails to say what is shown.
+ * pass is canceled or fails to say what is shown.
  *
  * @template T
  * @param {{

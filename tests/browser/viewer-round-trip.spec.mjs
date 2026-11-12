@@ -107,6 +107,7 @@ try:
         "python": plain(obs["cellucid_highlight__highlight_1"].tolist()),
         "lasso": plain(obs["cellucid_highlight__highlight_2"].tolist()),
         "annotation": plain(obs["annotation"].astype(object).tolist()),
+        "annotation_colors": list(adata.uns["annotation_colors"]),
         "leiden_nb": plain(obs["leiden_nb"].astype(object).tolist()),
         "score": plain(obs["score"].astype(float).tolist()),
         "gene_sets": adata.uns["cellucid"]["gene_sets"]["T"]["genes"],
@@ -191,8 +192,7 @@ test('columns and gene sets pushed from Python, highlights and labels made in th
       const results = createViewerHostResults({ state, viewerHostSource: source, getCellIdentity: () => identity });
       const handlers = createViewerHostCommandHandlers({
         getShownHostDataset: () => source.getShownHostDataset(),
-        getHostLabel: () => source.getHostLabel(),
-        getHostLanguage: () => source.getHostLanguage(),
+        getHostRuntime: () => source.getHostRuntime(),
         actions,
         // No session is pushed in this round trip.
         loadSession: async () => { throw new Error('No session is loaded here.'); },
@@ -217,13 +217,23 @@ test('columns and gene sets pushed from Python, highlights and labels made in th
       step: { id: expect.stringMatching(/^s[1-4]$/), label: 'Highlighted 3 cells as "From Python" on page "Page 2"' },
     });
 
-    // A person lassos two cells and labels the open cells.
-    await page.evaluate(() => {
+    // A person lassos two cells, labels the open cells and recolors T in the legend.
+    const openedB = await page.evaluate(async () => {
       const { state } = window.__roundTrip;
+      const { withCategoryColor } = await import('/assets/js/app/utils/category-state.js');
+      const { hexOfRgb01 } = await import('/assets/js/utils/hex-color.js');
       state.addHighlightDirect({ type: 'lasso', label: 'Lasso', cellIndices: Uint32Array.of(1, 3) });
       state.upsertUserDefinedCategoricalField({
         key: 'annotation', categories: ['B', 'T'], codes: Uint8Array.of(0, 1, 255, 0, 1),
       });
+      const annotation = state.getFields().find(field => field.key === 'annotation');
+      // As the legend's `setColorForCategory` changes it and says so; this
+      // page draws nothing, so the drawing step (the viewer's) is left out.
+      state.ensureCategoryMetadata(annotation);
+      withCategoryColor(annotation, 1, [0, 0.5, 0.5]);
+      state.emit('colors:changed', { field: annotation });
+      // B's color as the state gives it (`getColorForCategory`), never the field's own arrays.
+      return hexOfRgb01(state.getColorForCategory(annotation, 0));
     });
     child.stdin.write('\n');
     expect(await next()).toEqual({
@@ -231,6 +241,8 @@ test('columns and gene sets pushed from Python, highlights and labels made in th
       python: [true, false, true, null, false, true],
       lasso: [false, true, false, null, true, false],
       annotation: ['B', 'T', null, null, 'B', 'T'],
+      // The colors it is shown in (the result's colors): B as it opened, T as recolored.
+      annotation_colors: [openedB, '#008080'],
       leiden_nb: ['0', '1', '0', null, '1', '0'],
       score: [null, 2.5, null, null, 1.5, null],
       gene_sets: ['CD3E', 'CD3D'],

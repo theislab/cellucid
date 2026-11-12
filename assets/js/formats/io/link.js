@@ -86,7 +86,7 @@
  *   runs on every slot. The bandwidth measured is the whole link's, shared
  *   by every request in flight: a request of one round trip's worth of bytes
  *   (bandwidth x latency) already keeps the link busy for as long as its own
- *   round trip, so a longer one only serialises its bytes on one connection
+ *   round trip, so a longer one only serializes its bytes on one connection
  *   (over HTTP/1.1, behind nothing else) while other slots idle. Never
  *   shorter than the source's prior: on a fast link more, shorter requests
  *   only add per-request work and the copies that join their pieces. Where
@@ -338,7 +338,7 @@ const TRANSFER_BOUND = 3;
  * connection's, it made `requestPieceBytes` split the next plan finer, which
  * shared the link among more requests, whose deliveries were smaller again
  * (a 10M-cell export over an emulated 30 MB/s HTTP/2 link: 255 → 7,556
- * requests of 16-40 KB, +18 % time, +45 % CPU, the same bytes). A
+ * requests of 16-40 KB, +18% time, +45% CPU, the same bytes). A
  * measuring choice (the margin keeps a lone request a little below the
  * link's best for the link's).
  */
@@ -351,7 +351,7 @@ const CONNECTION_BOUND_SHARE = 0.8;
  * a link that carries more than a connection shows it many times over; one
  * delivery timed over a stretch little longer than the clock's tick (a
  * loopback host, bytes a cache had) can be any rate, and taken alone it
- * split every later plan of the page (a 1 % share's `.h5ad` export of a 10M
+ * split every later plan of the page (a 1% share's `.h5ad` export of a 10M
  * file on a local web host: 473 → 3,135 requests, 6.2 → 18.2 s, the same
  * bytes, after one such delivery). A measuring choice.
  */
@@ -671,7 +671,7 @@ export class LinkMeter {
 
   /**
    * One request of the burst being watched ended at `at` with `bytes`
-   * (null: failed or cancelled). The burst's (connections + 1)-th completion
+   * (null: failed or canceled). The burst's (connections + 1)-th completion
    * decides what it shows. @private
    */
   _burstEnded(burst, started, at, bytes) {
@@ -748,7 +748,7 @@ export class LinkMeter {
 
   /**
    * A request that began at `started` ended with `bytes` delivered (null
-   * when it failed or was cancelled: it measures nothing). `begun` is what
+   * when it failed or was canceled: it measures nothing). `begun` is what
    * `begin()` returned for it, when its round trip is timed from later (a
    * source that first asked the page for the bytes, `range-cache.js`): the
    * request belongs to the burst it began in, whenever it reached the host.
@@ -1103,7 +1103,7 @@ export class LinkMeter {
    * bytes each (a gene's counted entries) measured a disk at 141 MB/s, so a
    * gap of a few kilobytes looked dearer than another read, every gene was
    * read alone, and nothing larger was read to measure it again (a
-   * subsample's every gene, 1 % of 40,000 cells: 4,004 reads in 270 ms,
+   * subsample's every gene, 1% of 40,000 cells: 4,004 reads in 270 ms,
    * 534 in 150 ms with its chunk files' gaps read). @private
    */
   _pricedBytesPerMs() {

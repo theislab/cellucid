@@ -3,7 +3,7 @@
  * Write the relay's bundle (`relay/generated/bundle.js`) from the web app's
  * sources: the wire protocol shared with the tab
  * (`assets/js/app/agent/bridge/relay-protocol.js`: the wire, the bounds of a
- * result, the view card's resource), the action catalogue as
+ * result, the view card's resource), the action catalog as
  * MCP tools (what `tools/list` answers while no tab is connected), the agent
  * instructions, the Cellucid version and the page's canonical origin
  * (`index.html`).

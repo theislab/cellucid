@@ -33,10 +33,14 @@ import { clickSaveSession, clickLoadSession } from './helpers/session-buttons.mj
 const OTHER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'replay-other.h5ad');
 const CELL_TYPE = { source: 'obs', key: 'cell_type' };
 
-/** The steps taken on A, and why each that does not match on B is refused (null: it applies). */
+/**
+ * The steps taken on A, and why each that does not match on B is refused (null: it applies).
+ * Both open colored by cell_type (their first coloring, part of the opening): the first
+ * coloring of the workflow is a gene both have, a change on A and on B.
+ */
 const WORKFLOW = Object.freeze([
-  [['color.by', { field: CELL_TYPE }], null],
-  [['highlight.category', { field: CELL_TYPE, category: 'gamma' }], null],
+  [['color.by', { field: { source: 'var', key: 'GAPDH' } }], null],
+  [['highlight.category', { field: CELL_TYPE, categories: ['gamma'] }], null],
   [['filter.category.visibility', { field: CELL_TYPE, categories: ['beta'], visible: false }], /beta/],
   [['filter.category.visibility', { field: CELL_TYPE, categories: ['gamma'], visible: false }], null],
   [['color.category', { field: CELL_TYPE, category: 'alpha', color: '#ff0000' }], /alpha/],
@@ -91,7 +95,7 @@ function shownAndRecorded(page) {
   });
 }
 
-/** What the live view shows of the replayed workflow: hidden categories, colours, highlights, the field. */
+/** What the live view shows of the replayed workflow: hidden categories, colors, highlights, the field. */
 function liveState(page) {
   return page.evaluate(async () => {
     const { getStateDomains } = await import('/assets/js/app/actions/index.js');
@@ -208,7 +212,7 @@ test('a history recorded on one dataset replays on another, in a new tracker lin
   await takeSteps(page, [['color.by', { field: { source: 'obs', key: 'score' } }]]);
   await waitForPageAtRest(page);
   const own = (await trackerFacts(page)).active;
-  expect(own.steps.map(step => step.label)).toEqual(['Coloured by score']);
+  expect(own.steps.map(step => step.label)).toEqual(['Colored by score']);
   const startedOn = await shownAndRecorded(page);
   expect(startedOn.shown).toEqual(startedOn.recorded);
 

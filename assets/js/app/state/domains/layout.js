@@ -55,6 +55,7 @@
 import { StyleManager } from '../../../utils/style-manager.js';
 import { createUiControlSerializer, isAnalysisWindowSection } from '../../state-serializer/ui-controls.js';
 import { sameValue } from './same-value.js';
+import { reportUnreadSettings } from './unread-settings.js';
 
 const THEME_CONTROL_ID = 'theme-select';
 const SIDEBAR_WIDTH_VARIABLE = '--sidebar-user-width';
@@ -324,7 +325,10 @@ export function createLayoutDomain({ sidebar, getDockable, analysis, sidebarLayo
     const records = {};
     for (const [id, open] of Object.entries(value.sections)) records[`accordion:${id}`] = { type: 'details', open };
     if (value.theme !== null) records[THEME_CONTROL_ID] = { type: 'select', value: value.theme };
-    controls.restoreUIControls(records)();
+    // Read one control at a time: a section added or removed since the record was saved never
+    // fails the others (`readSavedControls`); what could not be used is said.
+    const read = controls.readSavedControls(records);
+    reportUnreadSettings([...read.unread, ...controls.restoreUIControls(read.controls)()]);
     const shown = readSidebar(sidebarLayout);
     if (shown.open !== value.sidebar.open) sidebarLayout.showSidebar(value.sidebar.open);
     if (shown.width !== value.sidebar.width) sidebarLayout.setSidebarWidth(value.sidebar.width);

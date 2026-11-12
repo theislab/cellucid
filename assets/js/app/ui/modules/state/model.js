@@ -14,30 +14,25 @@
 import { OUTSIDE_CHANGE_TYPE, originOf } from '../../../history/exports/step-text.js';
 import { countNoun, formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { idNumber } from '../../../history/model.js';
-
-/**
- * The keys of the history's graph (History v2 §3.9, §3.13), as the History
- * (i) tip lists them: one table, so the tip and the keys cannot drift.
- */
-export const GRAPH_SHORTCUTS = Object.freeze([
-  ['↑ ↓', 'move between rows (Shift: select several)'],
-  ['→ ←', 'open or close a branch, turn, group or run'],
-  ['Enter or double-click', 'show the step'],
-  ['Space or ›', 'open its details'],
-  ['Alt+↑ ↓', 'show the step before or after'],
-  ['F2', 'rename'],
-  ['Delete', 'delete (asks first)'],
-  ['Shift+F10', 'the row’s menu'],
-  ['[ ]', 'the previous or next fork'],
-  ['Ctrl/⌘+G', 'group the steps selected'],
-  ['Ctrl/⌘+Shift+B', 'branch from the step selected'],
-  ['/', 'search'],
-  ['Ctrl/⌘+Z, Ctrl/⌘+Shift+Z', 'undo, redo'],
-]);
+import { upperFirst } from '../../../../utils/text-case.js';
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
+
+/**
+ * What a saved state is, in the words every list of them uses (Load…,
+ * Stored, My datasets): a save by its name, an autosave by its latest step.
+ * Autosaves were "History kept in this browser" or "Autosave" alike in two
+ * of the three, so eight of them read the same (bug hunt L10-10).
+ *
+ * @param {{kind: 'autosave'|'named', name: string|null, lastStep?: string|null}} entry
+ * @returns {string}
+ */
+export function savedStateWords(entry) {
+  if (entry.kind === 'named') return `"${entry.name}"`;
+  return entry.lastStep != null ? `Autosave at “${entry.lastStep}”` : 'Autosave';
+}
 
 /**
  * How long ago `at` was, short for a row ("now", "4 min", "2 h", "3 d", then
@@ -116,7 +111,7 @@ export function modelName(model) {
   if (typeof model !== 'string' || model.length === 0) return null;
   const claude = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/i.exec(model);
   if (claude !== null) {
-    const family = claude[1].charAt(0).toUpperCase() + claude[1].slice(1);
+    const family = upperFirst(claude[1]);
     return `${family} ${claude[2]}${claude[3] === undefined ? '' : `.${claude[3]}`}`;
   }
   return model;
@@ -162,10 +157,21 @@ export function flagOf(step) {
   return { text: `${unmatched ? 'Did not match here' : 'No longer applies'}: ${reason}`, phrase };
 }
 
-/** "Camera ×6 · Layout ×2" for a folded run; a filtered run counts its steps. */
+/** The distinct changes a folded run names before it counts the rest. */
+const RUN_CHANGES_SHOWN = 2;
+
+/**
+ * A folded run says what its steps did, as their own rows do ("Hid T cells of
+ * cell_type · Showed T cells of cell_type"; "Moved the camera of View 1 ×6"),
+ * the same change once with how many times, and past the first few, how
+ * many more steps; a filtered run counts its steps.
+ */
 export function runLabel(row) {
   if (row.filtered) return `${formatCountOf(row.count, 'step')} hidden`;
-  const parts = row.categories.map(({ name, count }) => (count === 1 ? name : `${name} ×${count}`));
+  const shown = row.changes.slice(0, RUN_CHANGES_SHOWN);
+  const more = row.changes.slice(RUN_CHANGES_SHOWN).reduce((sum, { count }) => sum + count, 0);
+  const parts = shown.map(({ label, count }) => (count === 1 ? label : `${label} ×${count}`));
+  if (more > 0) parts.push(`${formatCountOf(more, 'more step')}`);
   return `${parts.join(' · ')}${row.off ? ' · not recorded now' : ''}`;
 }
 
@@ -202,7 +208,7 @@ export function describeRow(row, { view, now }) {
       const ago = formatAgo(step.at, now);
       const facts = [];
       if (step.bookmark) facts.push(`bookmarked “${step.bookmark}”`);
-      if ((step.notes?.length ?? 0) > 0) facts.push(step.notes.length === 1 ? 'has a note' : `has ${step.notes.length} notes`);
+      if ((step.notes?.length ?? 0) > 0) facts.push(step.notes.length === 1 ? 'has a note' : `has ${formatCountOf(step.notes.length, 'note')}`);
       const flag = flagOf(step);
       if (flag !== null) facts.push(flag.phrase);
       if (row.stale !== null) facts.push('stale');
@@ -225,7 +231,7 @@ export function describeRow(row, { view, now }) {
       const count = formatCountOf(row.count, 'step');
       const flags = [branch.id === view.mainBranch ? 'main' : null, branch.locked ? 'locked' : null].filter(Boolean);
       const what = row.continues ? `the rest of branch “${branch.name}”` : `branch “${branch.name}”`;
-      const name = [`${what[0].toUpperCase()}${what.slice(1)}, ${count}, last change ${ago.long}`, ...flags,
+      const name = [`${upperFirst(what)}, ${count}, last change ${ago.long}`, ...flags,
         row.forksInside > 0 ? `${formatCountOf(row.forksInside, 'branch', 'branches')} start from it` : null,
         row.expanded ? null : 'collapsed'].filter(Boolean).join(', ');
       return { label: branch.name, meta: `${count} · ${ago.short}`, badge: null, time: '', name, hint: `From step ${idNumber(row.base)}` };
@@ -245,7 +251,7 @@ export function describeRow(row, { view, now }) {
       const span = row.first === null ? '' : `${formatStepTime(row.first, now)}–${formatStepTime(row.last, now)}`;
       // The head inside the group, by its place among the group's steps (§3.15.2 "▣ QC · at 4 of 7").
       const at = row.headAt === null ? null : `at ${formatCount(row.headAt.index)} of ${formatCount(row.headAt.count)}`;
-      const starts = row.forksInside === 1 ? '1 branch starts inside' : `${formatCount(row.forksInside)} branches start inside`;
+      const starts = `${formatCountOf(row.forksInside, 'branch', 'branches')} ${row.forksInside === 1 ? 'starts' : 'start'} inside`;
       const name = [`Group “${row.group.name}”`, count, at, row.forksInside > 0 ? starts : null, row.expanded ? null : 'collapsed'].filter(Boolean).join(', ');
       return {
         label: row.group.name,

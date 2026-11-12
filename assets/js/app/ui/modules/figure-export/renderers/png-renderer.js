@@ -14,10 +14,19 @@
  * - Fails visibly if the exact WebGL2 point pass cannot be produced
  *
  * LAYOUT SYSTEM (IMPORTANT):
- * The payload.width and payload.height parameters represent the desired PLOT
- * CONTENT size, NOT the total output size. The actual PNG dimensions are
- * EXPANDED to accommodate legend, axes, and title without shrinking the plot.
- * This ensures the scientific visualization maintains its intended size.
+ * Every rectangle comes from `utils/layout.js`. A plot takes its view's
+ * aspect (or the framing crop's) and the view fills it: never letterboxed.
+ * The Figure Export panel's figure fills a width: payload.width is the
+ * figure's width in figure pixels (1/96 inch, from the panel's millimetres,
+ * `utils/figure-size.js`) and payload.height is null; the figure is exactly
+ * that wide at its own height (`fillSingleViewWidth`, `fillGridWidth`).
+ * A picture of a view gives a box instead (payload.height a number): for a
+ * single view the PLOT's bounding box, the plot the largest rectangle of the
+ * view's aspect inside it, and the PNG EXPANDED to hold legend, axes, and
+ * title around it; for a grid the figure's size, grown where its legends or
+ * a readable panel need more (`computeGridFigureLayout`). A legend is as large
+ * as its entries need; a figure larger than the browser's canvas can draw is
+ * refused before rendering (`utils/figure-canvas.js`), never cut.
  *
  * DPI SCALING:
  * - DPI affects pixel density, not the logical layout
@@ -40,19 +49,13 @@
  * @module ui/modules/figure-export/renderers/png-renderer
  */
 
-	import {
-	  computeSingleViewLayout,
-	  computeGridDims,
-	  computeGridPaneLayout,
-	  LAYOUT_CONSTANTS,
-	} from '../utils/layout.js';
+	import { computeFigureLayout } from '../utils/layout.js';
+	import { createFigureCanvas, browserDrawsCanvas } from '../utils/figure-canvas.js';
 	import { drawCanvasAxes } from '../components/axes-builder.js';
-	import {
-	  drawCanvasLegend,
-	  resolveSharedGridLegend,
-	} from '../components/legend-builder.js';
+	import { drawCanvasLegend } from '../components/legend-builder.js';
 	import { drawCanvasOrientationIndicator } from '../components/orientation-indicator.js';
 	import { drawCanvasCentroidOverlay } from '../components/centroid-overlay.js';
+	import { drawCanvasVectorFieldOf } from '../components/vector-field-figure.js';
 	import {
 	  buildReferenceGridModel,
 	  drawCanvasReferenceGrid,
@@ -63,21 +66,20 @@
 	  renderBackdropLookForPlot,
 	} from '../components/backdrop-look-export.js';
 	import {
-	  assertCropRect01,
-	  cropRect01ToPx,
-	  fitCropIntoRect,
-	  planCropRaster,
-	} from '../utils/crop.js';
+	  createPlotPlacement,
+	  figureSourceRect,
+	  planPlotRaster,
+	  sourceRect01,
+	} from '../utils/plot-fit.js';
 import {
   openFigureExportWorkerSession,
   pagePixelsInBands,
   pointRasterArgs,
   requestPngEncoding,
-  requestVisibleBounds,
+  requestDrawnCells,
 } from '../utils/figure-export-worker-client.js';
-import { hexToRgb01, rgb01ToHex } from '../utils/color-utils.js';
+import { hexOfRgb01, rgb01OfHex } from '../../../../../utils/hex-color.js';
 import { resolveFigureInk } from '../utils/figure-ink.js';
-	import { computeLetterboxedRect } from '../utils/letterbox.js';
 import { assertCameraState } from '../../../../../rendering/camera-state-contract.js';
 import {
   assertFigureExportPayload,
@@ -91,12 +93,13 @@ import {
   readProvenanceViews,
   unanimousFieldKey,
 } from '../utils/figure-provenance.js';
-import { panelLetter } from '../utils/panel-label.js';
+import { panelTitle } from '../utils/panel-label.js';
 import { scalePointDiameterToRaster } from '../utils/point-size.js';
 import { figurePointLayersOf } from '../utils/lod-membership.js';
 import {
   buildSelectionBadge,
   countHighlightedVisiblePoints,
+  drawCanvasSelectionBadge,
 } from '../utils/selection-badge.js';
 
 /**
@@ -107,7 +110,7 @@ import {
  * `dpi / 96`, so its edges land between device pixels (at 300 dpi a plot at
  * x = 82 starts at 256.25). A point raster drawn into that fractional
  * rectangle was resampled by the 2D canvas: every pixel of it was blended
- * with its neighbours (a quarter-pixel blur), and the bytes depended on how
+ * with its neighbors (a quarter-pixel blur), and the bytes depended on how
  * the browser resampled. On the macOS Firefox runners one unchanged view,
  * exported before and after a kept view came and went, differed by one level
  * at the same few antialiased point edges in every run. The raster is
@@ -156,50 +159,26 @@ function drawRasterAtDevicePixels(ctx, raster, deviceRect) {
 /**
  * Where a plot's point raster goes and how it is drawn.
  *
- * Unframed, the raster covers the plot's device pixels and letterboxes the
- * whole view (its letterbox scale in raster pixels per viewer pixel). Framed, it
- * covers only the crop's place in the plot (`fitCropIntoRect`) and draws
- * just the crop at those pixels (`planCropRaster`; the rasterizer's
- * `viewRect01`), so a frame is as sharp as an unframed figure of the same
- * size instead of a magnified part of one.
+ * The plot has its view's aspect (or the crop's), so the raster covers the
+ * plot's device pixels and draws the whole source — the view, or just the
+ * crop — at those pixels (`planPlotRaster`; the rasterizer's `viewRect01`):
+ * never letterboxed, and a frame is as sharp as an unframed figure of the
+ * same size instead of a magnified part of one.
  *
- * @param {number|null} zoomLimit - `exportSpriteZoomLimit()`, read in the
- *   worker; needed only for a crop
+ * @param {number} zoomLimit - `exportSpriteZoomLimit()`, read in the worker
  * @returns {{deviceRect: object, width: number, height: number, zoom: number,
- *   exact: boolean, viewRect01: object|null}}
+ *   exact: boolean, viewRect01: object}}
  */
-function planPointRaster(ctx, plotRect, crop01, renderState, zoomLimit) {
-  const viewportWidth = renderState.viewportWidth;
-  const viewportHeight = renderState.viewportHeight;
-  if (crop01 === null) {
-    const deviceRect = snapPlotRectToDevicePixels(ctx, plotRect);
-    const zoom = computeLetterboxedRect({
-      srcWidth: viewportWidth,
-      srcHeight: viewportHeight,
-      dstWidth: deviceRect.width,
-      dstHeight: deviceRect.height,
-    }).scale;
-    return {
-      deviceRect,
-      width: deviceRect.width,
-      height: deviceRect.height,
-      zoom,
-      exact: true,
-      viewRect01: null,
-    };
-  }
-  const deviceRect = snapPlotRectToDevicePixels(
-    ctx,
-    fitCropIntoRect({ crop01, viewportWidth, viewportHeight, destRect: plotRect })
-  );
-  const plan = planCropRaster({
-    crop01,
-    viewportWidth,
-    viewportHeight,
-    deviceRect,
+function planPointRaster(ctx, plotRect, crop, renderState, zoomLimit) {
+  const source = figureSourceRect({ renderState, crop });
+  const deviceRect = snapPlotRectToDevicePixels(ctx, plotRect);
+  const plan = planPlotRaster({
+    source,
+    deviceWidth: deviceRect.width,
+    deviceHeight: deviceRect.height,
     zoomLimit,
   });
-  return { deviceRect, ...plan, viewRect01: crop01 };
+  return { deviceRect, ...plan, viewRect01: sourceRect01(source) };
 }
 
 /** Copy a planned point raster onto its device pixels. */
@@ -208,7 +187,7 @@ function drawPointRaster(ctx, raster, plan) {
     drawRasterAtDevicePixels(ctx, raster, plan.deviceRect);
     return;
   }
-  // Only a crop zoomed past the GPU's sprite range is scaled at the copy.
+  // Only a raster zoomed past the GPU's sprite range is scaled at the copy.
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.drawImage(
@@ -221,28 +200,11 @@ function drawPointRaster(ctx, raster, plan) {
   ctx.restore();
 }
 
-function drawCanvasSelectionBadge(ctx, badge, fontFamily, fontSize, ink) {
-  ctx.save();
-  ctx.globalAlpha = 0.85;
-  ctx.fillStyle = ink.surface;
-  ctx.fillRect(badge.x, badge.y, badge.width, badge.height);
-  ctx.globalAlpha = 1;
-  ctx.strokeStyle = ink.frame;
-  ctx.lineWidth = 1;
-  ctx.strokeRect(badge.x, badge.y, badge.width, badge.height);
-  ctx.fillStyle = ink.surfaceInk;
-  ctx.font = `${fontSize}px ${fontFamily}`;
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'alphabetic';
-  ctx.fillText(badge.label, badge.textX, badge.textY);
-  ctx.restore();
-}
-
 function applyExportBackgroundToRenderState(renderState, background, backgroundColor) {
   if (!renderState) return renderState;
   if (background === 'viewer' || background === 'transparent') return renderState;
 
-  const rgb = hexToRgb01(backgroundColor);
+  const rgb = rgb01OfHex(backgroundColor);
   if (!rgb) return renderState;
 
   // Keep projection/camera matrices unchanged; only align fog + bg for shader output.
@@ -293,9 +255,12 @@ function applyExportBackgroundToRenderState(renderState, background, backgroundC
 /**
  * Render figure to PNG blob.
  *
- * IMPORTANT: The payload.width and payload.height are interpreted as the desired
- * PLOT CONTENT size. The actual PNG dimensions will be LARGER to accommodate
- * legend, axes, and title without shrinking the plot area.
+ * IMPORTANT: payload.width is the width the figure fills (payload.height
+ * null), or with payload.height a box: for a single view the desired PLOT
+ * CONTENT size, for a grid the figure's size. The PNG is LARGER
+ * where legend, axes, and title need it (see LAYOUT SYSTEM above), and is
+ * refused, with one sentence, when the browser cannot draw a canvas that
+ * large.
  *
  * @param {object} options
  * @param {any} options.payload
@@ -308,40 +273,25 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
   if (payload.format !== 'png') {
     throw new TypeError('PNG renderer requires payload.format exactly "png".');
   }
-  if (!Number.isInteger(payload?.width) || payload.width <= 0) {
-    throw new TypeError('PNG export width must be a positive integer');
-  }
-  if (!Number.isInteger(payload?.height) || payload.height <= 0) {
-    throw new TypeError('PNG export height must be a positive integer');
-  }
   if (!Number.isInteger(payload?.dpi) || payload.dpi < 72) {
     throw new TypeError('PNG export DPI must be an integer of at least 72');
   }
-  const desiredPlotWidth = payload.width;
-  const desiredPlotHeight = payload.height;
   const dpi = payload.dpi;
   const title = payload.title.trim();
   const opts = payload.options;
   const views = payload.views;
-  const viewerBgHex = rgb01ToHex(views[0].renderState.bgColor);
+  const viewerBgHex = hexOfRgb01(views[0].renderState.bgColor);
   if (viewerBgHex === null) {
     throw new Error('PNG export render state has no exact viewer background color.');
   }
 
   const fontFamily = opts.fontFamily;
   const baseFontSize = opts.fontSizePx;
-  const legendFontSize = opts.legendFontSizePx;
-  const tickFontSize = opts.tickFontSizePx;
-  const axisLabelFontSize = opts.axisLabelFontSizePx;
-  const titleFontSize = opts.titleFontSizePx;
   const centroidLabelFontSize = opts.centroidLabelFontSizePx;
   // Point size comes from the interactive viewer (WYSIWYG).
-  const includeAxes = opts.includeAxes;
   const includeLegend = opts.includeLegend;
-  const legendPosition = opts.legendPosition;
   const showOrientation = opts.showOrientation;
   const crop = opts.crop;
-  const crop01 = assertCropRect01(crop);
   const selectionMutedOpacity = opts.selectionMutedOpacity;
   const totalHighlighted = payload.selection.totalCount;
   const emphasizeSelection = opts.emphasizeSelection && totalHighlighted > 0;
@@ -373,62 +323,52 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
   const singleScientificState = singleView
     ? views[0].scientificState
     : null;
-  const singleLegendFieldKey = singleView && includeLegend
-    ? singleScientificState.fieldKey
-    : null;
   const singleLegendModel = singleView && includeLegend
     ? singleScientificState.legendModel
     : null;
 
-  // Compute actual output dimensions based on desired plot size and annotations
-  let canvasWidth, canvasHeight;
-  /** @type {ReturnType<typeof computeSingleViewLayout> | null} */
-  let singleLayout = null;
-  let singleAxesEligible = false;
+  // The figure's layout, the SVG's own (`computeFigureLayout`): its size,
+  // every rectangle, each plot's axes and each legend's plan.
+  const figureLayout = computeFigureLayout(payload);
+  const { single: singleLayout, grid } = figureLayout;
+  const layoutOf = (laid) => laid.single ?? laid.grid;
+  const canvasWidth = layoutOf(figureLayout).totalWidth;
+  const canvasHeight = layoutOf(figureLayout).totalHeight;
   let singleDim = 3;
   let singleNavMode = null;
   let singleCameraState = null;
 
   if (singleView) {
-    const view = views[0];
     singleCameraState = assertCameraState(
-      view.cameraState,
+      views[0].cameraState,
       `PNG camera state for "${singleViewId}"`
     );
     singleNavMode = singleCameraState.navigationMode;
     singleDim = singleScientificState.dimensionLevel;
-    singleAxesEligible = includeAxes;
-
-    singleLayout = computeSingleViewLayout({
-      width: desiredPlotWidth,
-      height: desiredPlotHeight,
-      title,
-      includeAxes: singleAxesEligible,
-      includeLegend,
-      legendPosition,
-      legendModel: singleLegendModel,
-      legendFontSizePx: legendFontSize
-    });
-
-    // Use expanded dimensions for canvas
-    canvasWidth = singleLayout.totalWidth;
-    canvasHeight = singleLayout.totalHeight;
-  } else {
-    // For multi-view, use the original dimensions (grid layout handles internally)
-    canvasWidth = desiredPlotWidth;
-    canvasHeight = desiredPlotHeight;
   }
 
   const scale = dpi / 96;
-  const pxW = Math.max(1, Math.round(canvasWidth * scale));
-  const pxH = Math.max(1, Math.round(canvasHeight * scale));
+  const devicePixels = (layout) => ({
+    width: Math.max(1, Math.round(layout.totalWidth * scale)),
+    height: Math.max(1, Math.round(layout.totalHeight * scale)),
+  });
+  const { width: pxW, height: pxH } = devicePixels({ totalWidth: canvasWidth, totalHeight: canvasHeight });
 
-  if (typeof document === 'undefined') {
-    throw new Error('PNG export requires an HTML document.');
-  }
-  const canvas = document.createElement('canvas');
-  canvas.width = pxW;
-  canvas.height = pxH;
+  // The browser's own canvas limit is the only limit on a figure's size: past
+  // it the export is refused before anything is rendered, never cut.
+  const canvas = createFigureCanvas({
+    width: pxW,
+    height: pxH,
+    legendCategoriesIfTooLarge: () => {
+      if (!includeLegend) return null;
+      const bare = devicePixels(layoutOf(computeFigureLayout(payload, { includeLegend: false })));
+      if (!browserDrawsCanvas(bare.width, bare.height)) return null;
+      const models = singleView
+        ? [singleLegendModel]
+        : [grid.sharedLegend?.model ?? null, ...grid.panes.map(pane => pane.legendModel)];
+      return Math.max(0, ...models.map(model => (model?.kind === 'category' ? (model.categories || []).length : 0)));
+    },
+  });
 
   const ctx = /** @type {CanvasRenderingContext2D|null} */ (canvas.getContext('2d', { alpha: true }));
   if (!ctx) throw new Error('Canvas 2D context unavailable');
@@ -437,10 +377,8 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
   /** @type {ImageBitmap[]} */
   const frames = [];
   try {
-  // Read once from the export's GL context: a crop's raster plan needs it.
-  const zoomLimit = crop01 === null
-    ? null
-    : await session.request('spriteZoomLimit', {});
+  // Read once from the export's GL context: every raster plan needs it.
+  const zoomLimit = await session.request('spriteZoomLimit', {});
   throwIfFigureExportAborted(signal);
   ctx.save();
   ctx.scale(scale, scale);
@@ -464,21 +402,16 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
     const renderState = view?.renderState || null;
     if (!renderState?.mvpMatrix) throw new Error('Figure export renderState missing for PNG render');
     const dim = view.scientificState.dimensionLevel;
-    const cameraState = assertCameraState(
+    assertCameraState(
       view.cameraState,
       `PNG camera state for "${String(view?.id || 'live')}"`
     );
-    const navMode = cameraState.navigationMode;
     const lodMembership = view.scientificState.lodMembership;
     // The order the pane draws at full detail (a reduced level draws a
     // prefix of it, `lodMembership.indices`).
     const drawOrder = view.scientificState.drawOrder;
     const pointDiameterViewportPx =
       renderState.pointSize * view.scientificState.lodSizeMultiplier;
-    const useCameraAxes =
-      dim > 2 &&
-      navMode !== 'planar' &&
-      Boolean(renderState.viewMatrix);
     const includeCentroidPoints = typeof opts.includeCentroidPoints === 'boolean'
       ? opts.includeCentroidPoints
       : Boolean(centroidFlags?.points);
@@ -489,15 +422,13 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       centroidColors.length === (centroidPositions.length / 3) * 4;
     const centroidDiameterViewportPx = renderState.pointSize * 4;
 
-    const visibleBounds = await requestVisibleBounds(session, {
-      camera: useCameraAxes,
+    const hasVisibleCells = await requestDrawnCells(session, {
       positions,
       dimension: dim,
       transparency,
       lodMembership,
       renderState,
       crop,
-      normTransform: view.scientificState.normTransform,
     });
     throwIfFigureExportAborted(signal);
 
@@ -516,7 +447,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       look = { lookRaster, lookRect };
     }
 
-    const rasterPlan = planPointRaster(ctx, plotRect, crop01, renderState, zoomLimit);
+    const rasterPlan = planPointRaster(ctx, plotRect, crop, renderState, zoomLimit);
     const renderStateForPoints = applyExportBackgroundToRenderState(
       renderState,
       background,
@@ -554,102 +485,16 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
     }));
     frames.push(raster);
     throwIfFigureExportAborted(signal);
-    return { visibleBounds, look, rasterPlan, raster };
+    return { hasVisibleCells, look, rasterPlan, raster };
   }
 
-  /** @type {object|null} */
-  let grid = null;
   /** @type {Array<Awaited<ReturnType<typeof preparePanel>>>} */
   const prepared = [];
   if (singleView) {
     prepared.push(await preparePanel(views[0], singleLayout.plotRect));
   } else {
-    const outerPadding = LAYOUT_CONSTANTS.OUTER_PADDING;
-    const titleHeight = title ? LAYOUT_CONSTANTS.TITLE_HEIGHT : 0;
-    const contentX = outerPadding;
-    const contentY = outerPadding + titleHeight;
-    const contentW = Math.max(1, canvasWidth - outerPadding * 2);
-    const contentH = Math.max(1, canvasHeight - outerPadding * 2 - titleHeight);
-    const { cols, rows } = computeGridDims(views.length || 1);
-    const gap = 16;
-
-    // One legend may stand for the whole grid only when the panels agree; a
-    // panel that disagrees keeps its own legend inside its cell (below).
-    const sharedLegend = includeLegend
-      ? resolveSharedGridLegend(views)
-      : null;
-    const wantsSharedLegend = sharedLegend !== null;
-    const minimumGridWidth = Math.min(
-      contentW,
-      cols * (includeAxes ? 150 : 96)
-    );
-    const minimumGridHeight = Math.min(
-      contentH,
-      rows * (includeAxes ? 150 : 96)
-    );
-    const availableRightLegendWidth =
-      contentW - gap - minimumGridWidth;
-    const availableBottomLegendHeight =
-      contentH - gap - minimumGridHeight;
-    const legendW =
-      wantsSharedLegend &&
-      legendPosition === 'right' &&
-      availableRightLegendWidth >= 96
-        ? Math.min(240, availableRightLegendWidth)
-        : 0;
-    const legendH =
-      wantsSharedLegend &&
-      legendPosition === 'bottom' &&
-      availableBottomLegendHeight >= 72
-        ? Math.min(140, availableBottomLegendHeight)
-        : 0;
-    const rendersSharedLegend = legendW > 0 || legendH > 0;
-    // Whatever the shared legend cannot say — because the panels disagree, or
-    // because the figure has no room for it beside the grid — is said per
-    // panel. A coloured figure without any legend cannot be read at all.
-    const rendersPanelLegends = includeLegend && !rendersSharedLegend;
-
-    const gridW = Math.max(1, contentW - (legendW ? (gap + legendW) : 0));
-    const gridH = Math.max(1, contentH - (legendH ? (gap + legendH) : 0));
-    const gridX = contentX;
-    const gridY = contentY;
-    const cellW = gridW / cols;
-    const cellH = gridH / rows;
-
-    const legendRect = rendersSharedLegend
-      ? (legendPosition === 'right'
-        ? { x: gridX + gridW + gap, y: gridY, width: legendW, height: gridH }
-        : { x: gridX, y: gridY + gridH + gap, width: gridW, height: legendH })
-      : null;
-
-    const panes = views.map((view, idx) => {
-      const panelLegendModel = rendersPanelLegends
-        ? view.scientificState.legendModel
-        : null;
-      const panelLegendFieldKey = rendersPanelLegends
-        ? view.scientificState.fieldKey
-        : null;
-      const col = idx % cols;
-      const row = Math.floor(idx / cols);
-      return {
-        panelLegendModel,
-        panelLegendFieldKey,
-        ...computeGridPaneLayout({
-          cellX: gridX + col * cellW,
-          cellY: gridY + row * cellH,
-          cellWidth: cellW,
-          cellHeight: cellH,
-          includeAxes,
-          fontSize: baseFontSize,
-          legendModel: panelLegendModel,
-          legendPosition,
-          legendFontSizePx: legendFontSize,
-        }),
-      };
-    });
-    grid = { outerPadding, contentW, sharedLegend, rendersSharedLegend, legendRect, panes };
     for (let idx = 0; idx < views.length; idx++) {
-      prepared.push(await preparePanel(views[idx], panes[idx].plotRect));
+      prepared.push(await preparePanel(views[idx], grid.panes[idx].plotRect));
     }
   }
 
@@ -673,7 +518,6 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
     const dim = singleDim;
     const cameraState = singleCameraState;
     const navMode = singleNavMode;
-    const axesEligible = singleAxesEligible;
     const includeCentroidPoints = typeof opts.includeCentroidPoints === 'boolean'
       ? opts.includeCentroidPoints
       : Boolean(centroidFlags?.points);
@@ -687,22 +531,20 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       centroidColors.length === (centroidPositions.length / 3) * 4;
 
     const layout = singleLayout;
-    const { visibleBounds, look, rasterPlan, raster } = prepared[0];
+    const { hasVisibleCells, look, rasterPlan, raster } = prepared[0];
 
-    if (title) {
-      const titleSize = Math.max(14, titleFontSize);
-      const tx = layout.titleRect ? (layout.titleRect.x + layout.titleRect.width / 2) : (layout.outerPadding + (layout.totalWidth - layout.outerPadding * 2) / 2);
+    if (layout.titleRect) {
+      const titleSize = layout.titleFontPx;
       ctx.save();
       ctx.fillStyle = ink.text;
       ctx.font = `${titleSize}px ${fontFamily}`;
       ctx.textBaseline = 'alphabetic';
       ctx.textAlign = 'center';
-      ctx.fillText(title, tx, (layout.titleRect?.y ?? layout.outerPadding) + titleSize);
+      ctx.fillText(title, layout.titleRect.x + layout.titleRect.width / 2, layout.titleRect.y + titleSize);
       ctx.restore();
     }
 
     const plotRect = layout.plotRect;
-    const hasVisibleCells = visibleBounds !== null;
 
     // Plot frame.
     ctx.strokeStyle = ink.frame;
@@ -733,16 +575,16 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
 
     ctx.restore();
 
+    // The vector field the view shows, as arrows on a grid, under the centroids.
+    drawCanvasVectorFieldOf(ctx, {
+      data, dimension: dim, renderState, plotRect, crop, ink, fontFamily,
+      fontSizePx: baseFontSize, haloColor: background === 'transparent' ? ink.halo : backgroundColor,
+      // Its key is the legend's rows; only a figure without a legend draws it in the plot.
+      inPlotKey: !layout.vectorKeyInLegend,
+    });
+
     if ((includeCentroidPoints || includeCentroidLabels) && renderState) {
-      const crop01 = assertCropRect01(crop);
-      const srcViewportW = Math.max(1, Math.round(renderState?.viewportWidth || 1));
-      const srcViewportH = Math.max(1, Math.round(renderState?.viewportHeight || 1));
-      const cropPx = cropRect01ToPx(crop01, srcViewportW, srcViewportH);
-      const cropW = cropPx ? cropPx.width : srcViewportW;
-      const cropH = cropPx ? cropPx.height : srcViewportH;
-      const plotScale = computeLetterboxedRect({ srcWidth: cropW, srcHeight: cropH, dstWidth: plotRect.width, dstHeight: plotRect.height }).scale;
-      const centroidDiameterViewportPx = Math.max(1, (Number(renderState?.pointSize || 5) * 4.0));
-      const centroidRadiusPlotPx = Math.max(0.5, (centroidDiameterViewportPx / 2) * plotScale);
+      const centroidDiameterViewportPx = renderState.pointSize * 4;
 
       drawCanvasCentroidOverlay({
         ctx,
@@ -755,7 +597,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         },
         renderState,
         plotRect,
-        pointRadiusPx: centroidRadiusPlotPx,
+        pointDiameterViewportPx: centroidDiameterViewportPx,
         crop,
         fontFamily,
         labelFontSizePx: centroidLabelFontSize,
@@ -769,6 +611,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       drawCanvasOrientationIndicator({
         ctx,
         plotRect,
+        plotScale: createPlotPlacement({ renderState, plotRect, crop }).scale,
         viewMatrix: renderState.viewMatrix,
         cameraState,
         fontFamily,
@@ -787,30 +630,25 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
     }
 
     // Legend.
-    if (includeLegend && layout.legendRect) {
+    if (layout.legendRect) {
       drawCanvasLegend({
         ctx,
         legendRect: layout.legendRect,
-        fieldKey: singleLegendFieldKey,
+        legendPlan: layout.legendPlan,
         model: singleLegendModel,
         fontFamily,
-        fontSize: legendFontSize,
         backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor,
         ink
       });
     }
 
-    // Axes (2D uses embedding coordinates; 3D uses camera-space coordinates).
-    if (axesEligible && visibleBounds !== null) {
+    // Axes: the rulers of what the plot shows, as the layout planned them.
+    if (layout.axes !== null && hasVisibleCells) {
       drawCanvasAxes({
         ctx,
         plotRect,
-        bounds: visibleBounds,
-        xLabel: opts.xLabel,
-        yLabel: opts.yLabel,
+        axes: layout.axes,
         fontFamily,
-        tickFontSize,
-        labelFontSize: axisLabelFontSize,
         color: ink.text
       });
     }
@@ -831,23 +669,24 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       ctx.restore();
     }
   } else {
-    const { outerPadding, contentW, sharedLegend, rendersSharedLegend, legendRect, panes } = grid;
+    const { sharedLegend, sharedLegendRect, sharedLegendPlan, panes } = grid;
 
-    if (title) {
-      const titleSize = Math.max(14, titleFontSize);
+    if (grid.titleRect) {
+      const titleSize = grid.titleFontPx;
       ctx.save();
       ctx.fillStyle = ink.text;
       ctx.font = `${titleSize}px ${fontFamily}`;
       ctx.textBaseline = 'alphabetic';
       ctx.textAlign = 'center';
-      ctx.fillText(title, outerPadding + contentW / 2, outerPadding + titleSize);
+      ctx.fillText(title, grid.titleRect.x + grid.titleRect.width / 2, grid.titleRect.y + titleSize);
       ctx.restore();
     }
 
     for (let idx = 0; idx < views.length; idx++) {
       const view = views[idx];
       const viewId = String(view?.id || 'live');
-      const viewLabel = String(view?.label || viewId);
+      // A panel is titled by its letter and the name its view was given (`view.rename`), else its label.
+      const viewTitle = panelTitle(view, idx);
       const data = view?.data || {};
       const transparency = data.transparency || null;
       const centroidPositions = data.centroidPositions || null;
@@ -855,15 +694,15 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       const centroidLabelTexts = Array.isArray(data.centroidLabelTexts) ? data.centroidLabelTexts : null;
       const centroidFlags = data.centroidFlags || null;
       const {
-        panelLegendModel,
-        panelLegendFieldKey,
+        legendModel: panelLegendModel,
+        legendPlan: panelLegendPlan,
         labelX,
         labelY,
         panelRect,
         plotRect,
         legendRect: panelLegendRect,
       } = panes[idx];
-      const { visibleBounds, look, rasterPlan, raster } = prepared[idx];
+      const { hasVisibleCells, look, rasterPlan, raster } = prepared[idx];
 
       ctx.save();
       ctx.beginPath();
@@ -893,7 +732,6 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       );
       const navMode = cameraState.navigationMode;
       const lodMembership = view.scientificState.lodMembership;
-      const hasVisibleCells = visibleBounds !== null;
       const includeCentroidPoints = typeof opts.includeCentroidPoints === 'boolean'
         ? opts.includeCentroidPoints
         : Boolean(centroidFlags?.points);
@@ -906,17 +744,17 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         centroidColors instanceof Uint8Array &&
         centroidColors.length === (centroidPositions.length / 3) * 4;
 
-      const srcViewportW = renderState.viewportWidth;
-      const srcViewportH = renderState.viewportHeight;
-      const cropPx = cropRect01ToPx(crop01, srcViewportW, srcViewportH);
-      const cropW = cropPx ? cropPx.width : srcViewportW;
-      const cropH = cropPx ? cropPx.height : srcViewportH;
-      const plotScale = computeLetterboxedRect({ srcWidth: cropW, srcHeight: cropH, dstWidth: plotRect.width, dstHeight: plotRect.height }).scale;
       const centroidDiameterViewportPx = renderState.pointSize * 4;
-      const centroidRadiusPlotPx = Math.max(0.5, (centroidDiameterViewportPx / 2) * plotScale);
 
       drawPointRaster(ctx, raster, rasterPlan);
       const centroidPointsRasterized = includeCentroidPoints && hasCentroidPoints;
+
+      // The vector field the panel shows, as arrows on a grid, under the centroids.
+      drawCanvasVectorFieldOf(ctx, {
+        data, dimension: dim, renderState, plotRect, crop, ink, fontFamily,
+        fontSizePx: baseFontSize, haloColor: background === 'transparent' ? ink.halo : backgroundColor,
+        inPlotKey: !panes[idx].vectorKeyInLegend,
+      });
 
       if (includeCentroidPoints || includeCentroidLabels) {
         drawCanvasCentroidOverlay({
@@ -930,7 +768,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
           },
           renderState,
           plotRect,
-          pointRadiusPx: centroidRadiusPlotPx,
+          pointDiameterViewportPx: centroidDiameterViewportPx,
           crop,
           fontFamily,
           labelFontSizePx: centroidLabelFontSize,
@@ -969,6 +807,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         drawCanvasOrientationIndicator({
           ctx,
           plotRect,
+          plotScale: createPlotPlacement({ renderState, plotRect, crop }).scale,
           viewMatrix: renderState.viewMatrix,
           cameraState,
           fontFamily,
@@ -978,7 +817,7 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         ctx.restore();
       }
 
-      if (includeAxes && visibleBounds !== null) {
+      if (panes[idx].axes !== null && hasVisibleCells) {
         ctx.save();
         ctx.beginPath();
         ctx.rect(
@@ -991,12 +830,8 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         drawCanvasAxes({
           ctx,
           plotRect,
-          bounds: visibleBounds,
-          xLabel: opts.xLabel,
-          yLabel: opts.yLabel,
+          axes: panes[idx].axes,
           fontFamily,
-          tickFontSize,
-          labelFontSize: axisLabelFontSize,
           color: ink.text,
         });
         ctx.restore();
@@ -1047,14 +882,13 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
         }
       }
 
-      if (panelLegendRect && panelLegendModel) {
+      if (panelLegendRect) {
         drawCanvasLegend({
           ctx,
           legendRect: panelLegendRect,
-          fieldKey: panelLegendFieldKey,
+          legendPlan: panelLegendPlan,
           model: panelLegendModel,
           fontFamily,
-          fontSize: legendFontSize,
           backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor,
           ink,
         });
@@ -1074,21 +908,20 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
       ctx.textAlign = 'left';
       ctx.textBaseline = 'alphabetic';
       ctx.fillText(
-        `${panelLetter(idx)}. ${viewLabel}`,
+        viewTitle,
         labelX,
         labelY
       );
       ctx.restore();
     }
 
-    if (rendersSharedLegend && legendRect) {
+    if (sharedLegendRect) {
       drawCanvasLegend({
         ctx,
-        legendRect,
-        fieldKey: sharedLegend.fieldKey,
+        legendRect: sharedLegendRect,
+        legendPlan: sharedLegendPlan,
         model: sharedLegend.model,
         fontFamily,
-        fontSize: legendFontSize,
         backgroundFill: background === 'transparent' ? 'transparent' : backgroundColor,
         ink
       });
@@ -1105,11 +938,10 @@ export async function renderFigureToPngBlob({ payload, signal = null }) {
   canvas.width = 0;
   canvas.height = 0;
   throwIfFigureExportAborted(signal);
-  const annotatedBlob = await requestPngEncoding(
-    session,
-    pixels,
-    buildPngTextMetadata(payload.meta, payload)
-  );
+  const annotatedBlob = await requestPngEncoding(session, pixels, {
+    text: buildPngTextMetadata(payload.meta, payload),
+    dpi
+  });
   throwIfFigureExportAborted(signal);
   return annotatedBlob;
   } finally {

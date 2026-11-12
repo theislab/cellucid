@@ -14,7 +14,7 @@
  * than one control; those pass this rule because the helper offers `for`, and
  * their heading form is documented at the helper. See
  * `tests/browser/community-annotation-vote-outcome.spec.mjs` for the
- * behavioural counterpart (clicking a caption focuses its control).
+ * behavioral counterpart (clicking a caption focuses its control).
  */
 
 import assert from 'node:assert/strict';
@@ -63,7 +63,7 @@ function annotationUiSources({
 
 /**
  * Read the full text of the `el('label', …)` call that starts at `openIndex`
- * (the index of its `(`), honouring nesting and string literals so a `)` in a
+ * (the index of its `(`), honoring nesting and string literals so a `)` in a
  * caption cannot truncate the call.
  */
 function readCallText(source, openIndex) {

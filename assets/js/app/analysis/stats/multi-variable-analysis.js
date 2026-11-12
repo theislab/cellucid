@@ -25,35 +25,18 @@ import { sharedCellCount } from '../shared/page-overlap.js';
 import { cellsReadFor, describeGroupInGeneSample, fillUnread, geneSampleUse } from '../shared/gene-sample-cells.js';
 import { SignaturePageScorer } from './signature-score.js';
 import { ucellContextBytesPerCell } from '../compute/ucell.js';
-import { pseudobulkGeneTest, pseudobulkUnits } from './pseudobulk.js';
+import { pairedUnits, pseudobulkLimma, pseudobulkUnits, unitLibrarySizes } from './pseudobulk.js';
+import { runScale, taskTransform, withCellScale } from '../compute/task-values.js';
 import { moduleScoreControls } from './module-score.js';
 import { geneMomentsOf } from '../compute/operation-handlers.js';
-import { geneMomentsFor, momentsMean, momentsStd } from '../shared/gene-moments-cache.js';
+import { geneMomentsFor, momentsMatrixOf, momentsMean, momentsStd } from '../shared/gene-moments-cache.js';
 import { createRunTunerFor, runGeneStream, taskGenes, visitGeneColumnsHere } from '../shared/gene-stream-runner.js';
 import { ANALYSIS_CONTEXT_BYTES_PER_CELL, analysisRunBudgetBytes, getWorkerPool } from '../compute/worker-pool.js';
 import { SIGNATURE_METHODS } from '../options/signature-options.js';
 import { startMemoryTracking } from '../shared/memory-tracker.js';
 import { registerResidentHolder } from '../../../data/memory-budget.js';
-import { cleanupAnalysisResources } from '../shared/resource-cleanup.js';
-import { cancel } from '../../../utils/abort.js';
-
-function cleanupPreservingAnalysisFailure(
-  operation,
-  hasAnalysisFailure,
-  analysisFailure
-) {
-  try {
-    operation();
-  } catch (cleanupFailure) {
-    if (hasAnalysisFailure) {
-      throw new AggregateError(
-        [analysisFailure, cleanupFailure],
-        'Analysis execution and cleanup both failed'
-      );
-    }
-    throw cleanupFailure;
-  }
-}
+import { abortReason, cancel } from '../../../utils/abort.js';
+import { geneValueLabel } from '../../../data/expression-transform.js';
 
 function requireCurrentPredicate(value, label) {
   if (value === undefined) return () => true;
@@ -194,7 +177,7 @@ async function acquireUcellLease(signal) {
   await previous;
   if (signal?.aborted) {
     release();
-    throw signal.reason;
+    throw abortReason(signal);
   }
   return release;
 }
@@ -217,7 +200,7 @@ function createDifferentialProgress({ total, onProgress, isCurrent, job }) {
     total,
     message: phaseIndex === 0
       ? `Analyzing genes (${formatCount(done)}/${formatCount(total)})`
-      : 'Applying multiple testing correction...'
+      : 'Applying multiple testing correction…'
   });
   const updates = createFrameThrottle(update => {
     if (!stopped && isCurrent() && onProgress) onProgress(update);
@@ -481,7 +464,7 @@ export class MultiVariableAnalysis {
               maxPlotPoints,
               colorIndices: pageColor?.cellIndices,
               colorValues: pageColor?.values,
-              // A categorical colour page holds codes: the plot is coloured by
+              // A categorical color page holds codes: the plot is colored by
               // their labels (null for a missing category).
               colorCategories: pageColor?.categories,
               colorMissingCode: pageColor?.missingCode
@@ -527,6 +510,10 @@ export class MultiVariableAnalysis {
             yValues: page.yPlot,
             xVariable: ownedVarX.key,
             yVariable: ownedVarY.key,
+            // What each axis's values are, as read (a gene's with its
+            // units when not as stored: "Ins1 · log1p(norm.)").
+            xLabel: geneValueLabel(dataX[0].variableInfo.name, dataX[0].variableInfo.values ?? null),
+            yLabel: geneValueLabel(dataY[0].variableInfo.name, dataY[0].variableInfo.values ?? null),
             sampled: page.sampled
           };
 
@@ -629,7 +616,7 @@ export class MultiVariableAnalysis {
       colorCategories !== undefined &&
       (!Array.isArray(colorCategories) || !Number.isSafeInteger(colorMissingCode))
     ) {
-      throw new TypeError('Categorical correlation colours need their categories and missing code');
+      throw new TypeError('Categorical correlation colors need their categories and missing code');
     }
     const hasColor =
       colorIndices !== undefined || colorValues !== undefined;
@@ -804,8 +791,17 @@ export class MultiVariableAnalysis {
    * @param {{name: string, codes: ArrayLike<number>, missingCode: number, minCellsPerSample: number}|null} [options.replicates=null] -
    *   A sample field: pseudobulk, each sample's cells of a group one
    *   observation (a sample with fewer than `minCellsPerSample` of them is
-   *   left out), Welch's t across them (`stats/pseudobulk.js`); `method`
-   *   and `pConvention` then do not apply
+   *   left out): every gene of the matrix summed per sample from the raw
+   *   stored values (whatever the expression transform), TMM + log-CPM when
+   *   the matrix holds counts, then limma's linear model with
+   *   empirical-Bayes moderation (`stats/pseudobulk.js`); `method`,
+   *   `pConvention` and the cells' values (the expression transform) then do not apply
+   * @param {{field: string, totals: ArrayLike<number>}|null} [options.cellTotals=null] -
+   *   Pseudobulk library sizes: each dataset cell's stored total count over
+   *   the whole transcriptome (the obs column `field`, e.g. `total_counts`;
+   *   NaN: none), summed per sample; null: each sample's summed counts over
+   *   every gene of the matrix (edgeR's default). Read only with
+   *   `replicates` on a matrix of counts
    * @param {number} [options.minCells=10] - Below it a group is flagged low n
    * @param {Function} [options.onProgress]
    * @param {Function} [options.isCurrent]
@@ -829,11 +825,19 @@ export class MultiVariableAnalysis {
       matrix = 'mapped',
       replicates = null,
       minCells = 10,
+      paired = false,
+      cellTotals = null,
       onProgress,
       job = null
     } = options;
     const signal = job?.signal ?? null;
     const { isCurrent, registerInvalidationCleanup } = resolveRequestOwnership(options, 'Differential expression');
+    if (cellTotals !== null && (
+      typeof cellTotals !== 'object' || typeof cellTotals.field !== 'string' ||
+      !(ArrayBuffer.isView(cellTotals.totals) || Array.isArray(cellTotals.totals))
+    )) {
+      throw new TypeError('Differential expression cellTotals must be null or { field, totals }');
+    }
     const pointCount = this.dataLayer?.state?.pointCount;
     if (!Number.isSafeInteger(pointCount) || pointCount <= 0) {
       throw new TypeError('Differential expression requires an exact positive dataset pointCount');
@@ -857,9 +861,10 @@ export class MultiVariableAnalysis {
     if (!['wilcox', 'ttest', 'ttest_overestim_var'].includes(method)) {
       throw new TypeError(`Unknown differential expression method: ${String(method)}`);
     }
-    // Genes whose test left out a sample for having too few cells with a
-    // value of the gene (pseudobulk only).
+    // Genes whose fit missed a sample for having too few cells with a value
+    // of the gene, and the pseudobulk fit's model (pseudobulk only).
     let genesWithUnmeasuredSamples = 0;
+    let pseudobulkModel = null;
     if (!['exact', 'normal', 'normal_tie'].includes(pConvention)) {
       throw new TypeError(`Unknown p-value convention: ${String(pConvention)}`);
     }
@@ -890,6 +895,35 @@ export class MultiVariableAnalysis {
     if (units !== null && (units.unitsA < 2 || units.unitsB < 2)) {
       throw new RangeError(`Pseudobulk needs at least 2 samples of ${replicates.name} with ${formatCountOf(replicates.minCellsPerSample, 'cell')} or more of each group`);
     }
+    // The run's values (Data mapping › Expression values,
+    // `DataLayer.runValues`): each cell's library size read before any gene
+    // is tested when they are normalized; genes read here come in them and
+    // the workers put delivered genes in them. Pseudobulk sums the raw
+    // stored values whatever the transform, and normalizes the samples
+    // itself (TMM + log-CPM for counts).
+    const holdsCounts = this.dataLayer.matrixHoldsCounts(matrix);
+    const values = units === null
+      ? await this.dataLayer.runValues(matrix, { readTo: geneSample?.cells ?? null, signal, owner: job?.id ?? null })
+      : null;
+    if (!isCurrent()) {
+      memScope.end({ method, stale: true });
+      return null;
+    }
+    // Pseudobulk library sizes: the samples' stored cell totals summed, or
+    // (none stored) their summed counts over every gene.
+    const unitLibraries = units === null || !holdsCounts || cellTotals === null ? null : unitLibrarySizes(units, cellTotals.totals);
+    // Paired: a sample (a donor) with cells in both groups is a pair, the
+    // others left out (`stats/pseudobulk.js` `pairedUnits`). The pairs are
+    // counted unpaired too, so the result says when a paired test is possible.
+    if (typeof paired !== 'boolean') throw new TypeError('Differential expression paired must be true or false');
+    if (paired && units === null) {
+      throw new RangeError('A paired test needs Replicates: the donor or sample field whose samples have cells in both groups');
+    }
+    const pairsFound = units === null ? null : pairedUnits(units);
+    const pairing = paired ? pairsFound : null;
+    if (pairing !== null && pairing.pairs < 2) {
+      throw new RangeError(`A paired test needs at least 2 samples of ${replicates.name} with ${formatCountOf(replicates.minCellsPerSample, 'cell')} or more in both groups; ${pairing.pairs} ${pairing.pairs === 1 ? 'has' : 'have'}`);
+    }
     const matrixLabel = this.dataLayer.resolveExpressionMatrix(matrix).label;
     const allGenes = await this.dataLayer.getGeneKeys(matrix);
     const geneKeys = requestedGeneList === null ? allGenes : [...requestedGeneList];
@@ -915,9 +949,12 @@ export class MultiVariableAnalysis {
     const lowN = [groupA, groupB].filter(group => group.cells.length < minCells).map(group => group.name);
     const testOptions = { pConvention, foldChange };
 
-    const progressTracker = createDifferentialProgress({ total: geneKeys.length, onProgress, isCurrent, job });
+    // Pseudobulk reads every gene of the matrix: its normalization and its
+    // variance moderation take them all, whichever are reported.
+    const streamGenes = units === null ? geneKeys : allGenes;
+    const progressTracker = createDifferentialProgress({ total: streamGenes.length, onProgress, isCurrent, job });
     job?.setPlan(
-      `${formatCountOf(geneKeys.length, 'gene')} in ${groupA.name} (${formatCountOf(groupASize, 'cell')}) vs ` +
+      `${formatCountOf(streamGenes.length, 'gene')} in ${groupA.name} (${formatCountOf(groupASize, 'cell')}) vs ` +
       `${groupB.name} (${formatCountOf(groupBSize, 'cell')})` +
       (units === null ? '' : `, ${formatCount(units.unitsA)} vs ${formatCountOf(units.unitsB, 'sample')}`)
     );
@@ -925,9 +962,6 @@ export class MultiVariableAnalysis {
 
     let computeManager = null;
     let route = null;
-    let didStartHeavyCompute = false;
-    let hasAnalysisFailure = false;
-    let analysisFailure;
     // Ends the run's reads at once when the request stops being current.
     const invalidated = new AbortController();
     if (registerInvalidationCleanup !== undefined) {
@@ -949,7 +983,6 @@ export class MultiVariableAnalysis {
       computeManager = await this._getComputeManager();
       if (!isCurrent()) return stale();
       const backend = computeManager.selectBackend(OperationType.COMPUTE_DIFFERENTIAL);
-      didStartHeavyCompute = true;
       const poolSize = backend === 'worker' ? computeManager.getStatus().worker.stats.poolSize : 1;
       // Computing in the workers, the genes go to them over a gene route:
       // their values never cross this thread.
@@ -970,7 +1003,10 @@ export class MultiVariableAnalysis {
         ) {
           throw new TypeError(`Differential expression backend returned invalid sample counts for "${gene}"`);
         }
-        const tested = row.nA >= 2 && row.nB >= 2 && Number.isFinite(row.pValue);
+        // Cells: at least 2 measured on each side. Samples: limma's
+        // moderated t, which a gene fit on one sample a side still has (its
+        // variance the prior's).
+        const tested = (units === null ? row.nA >= 2 && row.nB >= 2 : row.nA >= 1 && row.nB >= 1) && Number.isFinite(row.pValue);
         if (tested && (row.pValue < 0 || row.pValue > 1)) {
           throw new TypeError(`Differential expression backend returned invalid statistics for "${gene}"`);
         }
@@ -991,7 +1027,9 @@ export class MultiVariableAnalysis {
           ...(tested ? {} : {
             error: units === null
               ? `Too few measured cells (A: ${row.nA}, B: ${row.nB})`
-              : `Too few samples with a value (A: ${row.nA}, B: ${row.nB})`
+              : row.expressed === false
+                ? 'Not expressed in any sample compared'
+                : `Too few samples with a value (A: ${row.nA}, B: ${row.nB})`
           })
         };
       };
@@ -1044,27 +1082,30 @@ export class MultiVariableAnalysis {
               : { backend, signal }
           );
           tuner = createRunTunerFor(this.dataLayer, poolSize, geneKeys.length, { cells: subset.cells });
-          const completed = await runGeneStream({
+          // The genes come as blocks over the subset's positions: the
+          // factors of those cells, by position.
+          const completed = await withCellScale(computeManager, { scale: runScale(values, subset.cells), backend, signal }, scaleId => runGeneStream({
             dataLayer: this.dataLayer,
             genes: geneKeys,
             tuner,
             route,
             cells: subset.cells,
             matrix,
+            values,
             owner: job?.id ?? null,
             signal,
             stop: invalidated.signal,
             isCurrent,
             dispatch: (task, onTiming) => computeManager.execute(
               OperationType.COMPUTE_DIFFERENTIAL_OF_SUBSET,
-              { contextId, ...taskGenes(task), method, ...testOptions },
+              { contextId, ...taskGenes(task, taskTransform(values, scaleId)), method, ...testOptions },
               { ...onWorker(task), transfer: true, signal, onTiming }
             ),
             onResult: (task, batch) => {
               acceptBatch(task.genes, task.indices, batch);
               progressTracker.itemComplete(task.genes.length);
             }
-          });
+          }));
           if (!completed) return stale();
         } finally {
           await computeManager.broadcast(
@@ -1075,8 +1116,12 @@ export class MultiVariableAnalysis {
         }
       } else if (units !== null) {
         // One O(nnz) pass per gene sums it over each sample unit (the dot
-        // plot's per-group kernel, one group a unit); the sample-level test
-        // is a few numbers per unit, here.
+        // plot's per-group kernel, one group a unit), for every gene of the
+        // matrix; the fit takes them all at once (`stats/pseudobulk.js`).
+        const unitCount = units.unitCount;
+        const sums = new Float64Array(streamGenes.length * unitCount);
+        const measured = new Float64Array(streamGenes.length * unitCount);
+        const expressing = new Float64Array(streamGenes.length * unitCount);
         const contextId = `pseudobulk-${++differentialContextCounter}`;
         // Set inside the try: a cancel during the broadcast leaves the
         // context in the workers that already took it, so the clear is owed
@@ -1084,16 +1129,18 @@ export class MultiVariableAnalysis {
         try {
           await computeManager.broadcast(
             OperationType.GROUP_SUMMARY_SET_CONTEXT,
-            () => ({ contextId, cellGroup: units.cellUnit.slice(), groupCount: units.unitCount }),
+            () => ({ contextId, cellGroup: units.cellUnit.slice(), groupCount: unitCount }),
             { signal, retainAs: contextId }
           );
-          tuner = createRunTunerFor(this.dataLayer, poolSize, geneKeys.length);
+          tuner = createRunTunerFor(this.dataLayer, poolSize, streamGenes.length);
+          // Raw counts, whatever the expression transform: summed per sample.
           const completed = await runGeneStream({
             dataLayer: this.dataLayer,
-            genes: geneKeys,
+            genes: streamGenes,
             tuner,
             route,
             matrix,
+            values: null,
             owner: job?.id ?? null,
             signal,
             stop: invalidated.signal,
@@ -1104,20 +1151,11 @@ export class MultiVariableAnalysis {
               { ...onWorker(task), transfer: true, signal, onTiming }
             ),
             onResult: (task, summary) => {
-              const unitCount = summary.groupCount;
-              task.genes.forEach((gene, k) => {
-                const row = pseudobulkGeneTest(
-                  summary.sum.subarray(k * unitCount, (k + 1) * unitCount),
-                  summary.expressing.subarray(k * unitCount, (k + 1) * unitCount),
-                  summary.measured.subarray(k * unitCount, (k + 1) * unitCount),
-                  units.unitSide,
-                  foldChange,
-                  replicates.minCellsPerSample
-                );
-                // A sample with too few cells with a value of this gene (a
-                // modality that did not measure them) is out of its test.
-                if (row.nA + row.nB < units.unitCount) genesWithUnmeasuredSamples += 1;
-                acceptResult(gene, task.indices[k], row);
+              task.indices.forEach((index, k) => {
+                const from = k * unitCount;
+                sums.set(summary.sum.subarray(from, from + unitCount), index * unitCount);
+                measured.set(summary.measured.subarray(from, from + unitCount), index * unitCount);
+                expressing.set(summary.expressing.subarray(from, from + unitCount), index * unitCount);
               });
               progressTracker.itemComplete(task.genes.length);
             }
@@ -1130,6 +1168,41 @@ export class MultiVariableAnalysis {
             { releases: contextId }
           );
         }
+        if (!isCurrent()) return stale();
+        job?.step('Fitting the samples\' linear models');
+        const fitted = pseudobulkLimma({
+          sums, measured, expressing,
+          geneCount: streamGenes.length,
+          units,
+          pairOf: pairing === null ? null : pairing.pairOf,
+          counts: holdsCounts,
+          unitLibraries,
+          minCellsPerSample: replicates.minCellsPerSample,
+          foldChange
+        });
+        pseudobulkModel = fitted.model;
+        const fittedGenes = fitted.genes;
+        const indexOfGene = new Map(streamGenes.map((gene, index) => [gene, index]));
+        geneKeys.forEach((gene, index) => {
+          const at = indexOfGene.get(gene);
+          // A unit with too few cells with a value of this gene (a modality
+          // that did not measure them) is missing from its fit.
+          if (fittedGenes.missingUnits[at] > 0) genesWithUnmeasuredSamples += 1;
+          acceptResult(gene, index, {
+            meanA: fittedGenes.meanA[at],
+            meanB: fittedGenes.meanB[at],
+            pctA: fittedGenes.pctA[at],
+            pctB: fittedGenes.pctB[at],
+            log2FoldChange: fittedGenes.log2FoldChange[at],
+            pValue: fittedGenes.pValue[at],
+            statistic: fittedGenes.statistic[at],
+            score: fittedGenes.statistic[at],
+            auroc: NaN,
+            nA: fittedGenes.nA[at],
+            nB: fittedGenes.nB[at],
+            expressed: fittedGenes.expressed[at] === 1
+          });
+        });
       } else {
         // Genes read by column are split into the two groups where they are
         // tested: the groups cross to the compute threads once, one byte a
@@ -1147,26 +1220,27 @@ export class MultiVariableAnalysis {
               : { backend, signal }
           );
           tuner = createRunTunerFor(this.dataLayer, poolSize, geneKeys.length);
-          const completed = await runGeneStream({
+          const completed = await withCellScale(computeManager, { scale: runScale(values), backend, signal }, scaleId => runGeneStream({
             dataLayer: this.dataLayer,
             genes: geneKeys,
             tuner,
             route,
             matrix,
+            values,
             owner: job?.id ?? null,
             signal,
             stop: invalidated.signal,
             isCurrent,
             dispatch: (task, onTiming) => computeManager.execute(
               OperationType.COMPUTE_DIFFERENTIAL_OF_COLUMNS,
-              { contextId, ...taskGenes(task), method, ...testOptions },
+              { contextId, ...taskGenes(task, taskTransform(values, scaleId)), method, ...testOptions },
               { ...onWorker(task), transfer: true, signal, onTiming }
             ),
             onResult: (task, batch) => {
               acceptBatch(task.genes, task.indices, batch);
               progressTracker.itemComplete(task.genes.length);
             }
-          });
+          }));
           if (!completed) return stale();
         } finally {
           await computeManager.broadcast(
@@ -1205,7 +1279,8 @@ export class MultiVariableAnalysis {
           method: units === null ? method : 'pseudobulk',
           pConvention,
           correction,
-          foldChange,
+          // Pseudobulk counts: the group coefficient of log2-CPM.
+          foldChange: units !== null && holdsCounts ? { mode: 'log2cpm', base: null } : foldChange,
           matrix,
           matrixLabel,
           replicates: units === null
@@ -1219,8 +1294,23 @@ export class MultiVariableAnalysis {
               smallSamplesA: units.smallUnitsA,
               smallSamplesB: units.smallUnitsB,
               cellsInSmallSamples: units.cellsInSmallUnits,
-              genesWithUnmeasuredSamples
+              genesWithUnmeasuredSamples,
+              // Samples with cells in both groups, and whether they were tested paired.
+              samplesInBoth: pairsFound.pairs,
+              paired: pairing !== null,
+              // The fit (`stats/pseudobulk.js` `pseudobulkLimma`): design,
+              // library sizes and where from, TMM factors, limma's prior.
+              model: {
+                ...pseudobulkModel,
+                libraryField: pseudobulkModel.libraries === 'stored totals' ? cellTotals.field : null,
+                // JSON has no infinity: null is an infinite prior df.
+                priorDf: Number.isFinite(pseudobulkModel.priorDf) ? pseudobulkModel.priorDf : null
+              }
             },
+          counts: holdsCounts,
+          // The cells' values tested (null: as stored; pseudobulk: its raw
+          // counts, said by its model).
+          values: values === null ? null : values.record,
           // The cells genes are read for, and each group's share of them.
           geneSample: geneSampleUse(geneSample, [
             { name: groupA.name, used: groupA.cells.length, of: askedA.cells.length },
@@ -1240,8 +1330,6 @@ export class MultiVariableAnalysis {
       };
     } catch (error) {
       if (!isCurrent()) return stale();
-      hasAnalysisFailure = true;
-      analysisFailure = error;
       progressTracker.stop();
       memScope.end({ method, error: error.message });
       throw error;
@@ -1249,16 +1337,6 @@ export class MultiVariableAnalysis {
       // Queued on each worker behind the run's tasks.
       if (route !== null) {
         void route.close().catch(error => console.warn('[DifferentialExpression] Closing the gene route failed:', error));
-      }
-      if (didStartHeavyCompute) {
-        cleanupPreservingAnalysisFailure(
-          () => cleanupAnalysisResources({
-            dataLayer: this.dataLayer,
-            dataLayerCleanup: 'expired'
-          }),
-          hasAnalysisFailure,
-          analysisFailure
-        );
       }
     }
   }
@@ -1291,7 +1369,14 @@ export class MultiVariableAnalysis {
    *
    * @param {Object} options
    * @param {Array<{name: string, genes: string[]}>} options.geneSets
-   * @param {string[]} options.pageIds
+   * @param {string[]} [options.pageIds] - The highlight pages scored; or
+   * @param {Array<{id: string, name: string, cellIndices: Uint32Array}>} [options.groups] -
+   *   the groups scored (the categories of a field, "Group by"), each its
+   *   cells ascending: exactly one of `pageIds` and `groups`
+   *   The genes are scored in the mapped matrix's values (Data mapping ›
+   *   Expression values, `DataLayer.runValues`); UCell ranks the genes
+   *   within each cell, which a per-cell scaling and the log leave as they
+   *   are, so it reads the values as stored
    * @param {'mean'|'median'|'mean_z'|'module'|'ucell'} [options.method='mean']
    * @param {number} [options.controlSize=50]
    * @param {number} [options.bins=25]
@@ -1307,7 +1392,8 @@ export class MultiVariableAnalysis {
     }
     const {
       geneSets,
-      pageIds,
+      pageIds = null,
+      groups = null,
       method = 'mean',
       controlSize = 50,
       bins = 25,
@@ -1332,11 +1418,26 @@ export class MultiVariableAnalysis {
       memScope.end({ error: 'No genes' });
       throw new TypeError('Signature gene sets must each hold distinct gene keys');
     }
+    if ((pageIds === null) === (groups === null)) {
+      memScope.end({ error: 'Invalid pages' });
+      throw new TypeError('Signature scoring takes its pages or its groups, one of them');
+    }
+    if (groups !== null && (
+      !Array.isArray(groups) || groups.length === 0 ||
+      groups.some(group => typeof group?.id !== 'string' || group.id.length === 0 || typeof group.name !== 'string' ||
+        group.name.length === 0 || !(group.cellIndices instanceof Uint32Array)) ||
+      new Set(groups.map(group => group.id)).size !== groups.length
+    )) {
+      memScope.end({ error: 'Invalid groups' });
+      throw new TypeError('Signature groups must each have a distinct id, a name and their cells');
+    }
     if (
-      !Array.isArray(pageIds) ||
-      pageIds.length === 0 ||
-      pageIds.some(pageId => typeof pageId !== 'string' || pageId.length === 0) ||
-      new Set(pageIds).size !== pageIds.length
+      pageIds !== null && (
+        !Array.isArray(pageIds) ||
+        pageIds.length === 0 ||
+        pageIds.some(pageId => typeof pageId !== 'string' || pageId.length === 0) ||
+        new Set(pageIds).size !== pageIds.length
+      )
     ) {
       memScope.end({ error: 'Invalid pages' });
       throw new TypeError('Signature page IDs must be unique non-empty strings');
@@ -1356,10 +1457,8 @@ export class MultiVariableAnalysis {
     }
 
     const sets = geneSets.map(set => ({ name: set.name, genes: [...set.genes] }));
-    const ownedPageIds = [...pageIds];
+    const ownedPageIds = pageIds === null ? null : [...pageIds];
     const signal = job?.signal ?? null;
-    let hasAnalysisFailure = false;
-    let analysisFailure;
     const stale = () => {
       memScope.end({ method, stale: true });
       return null;
@@ -1371,7 +1470,9 @@ export class MultiVariableAnalysis {
       // is scored on its cells among them, and the result says so.
       const geneSample = await this.dataLayer.geneCellsOf('mapped');
       if (!isCurrent()) return stale();
-      const asked = this.dataLayer.getPageCells(ownedPageIds);
+      const asked = ownedPageIds !== null
+        ? this.dataLayer.getPageCells(ownedPageIds)
+        : groups.map(group => ({ pageId: group.id, pageName: group.name, cellIndices: group.cellIndices }));
       const pages = asked.map(page => ({ ...page, cellIndices: cellsReadFor(page.cellIndices, geneSample) }));
       const sampleUse = geneSampleUse(geneSample, asked.map((page, p) => ({ name: page.pageName, used: pages[p].cellIndices.length, of: page.cellIndices.length })));
       const readCells = geneSample?.cells ?? null;
@@ -1381,6 +1482,16 @@ export class MultiVariableAnalysis {
         throw new RangeError(`The gene signature needs cells with gene values: ${asked
           .map(page => describeGroupInGeneSample(page.pageName, 0, page.cellIndices.length, geneSample)).join('; ')}`);
       }
+
+      // The run's values (Data mapping › Expression values): the cells'
+      // library sizes before any gene is read when they are normalized.
+      // UCell's within-cell ranks do not change with them: it reads the
+      // values as stored.
+      const values = method === 'ucell'
+        ? null
+        : await this.dataLayer.runValues('mapped', { readTo: readCells, signal, owner: job?.id ?? null });
+      if (!isCurrent()) return stale();
+      const valuesRecordOfRun = values === null ? null : values.record;
 
       if (method === 'ucell') {
         const scored = await this._ucellScores({ sets, pages, maxRank, job, isCurrent, registerInvalidationCleanup, readTo: readCells ?? pointCount });
@@ -1396,7 +1507,7 @@ export class MultiVariableAnalysis {
           out.push({ ...set, controlGenes: [], constantGenes: [], pages: pagesOut });
         }
         memScope.end({ sets: out.length, method });
-        return { sets: out, geneSample: sampleUse };
+        return { sets: out, geneSample: sampleUse, values: valuesRecordOfRun };
       }
 
       // Module score: every gene's mean over all cells, its bins, each
@@ -1404,7 +1515,7 @@ export class MultiVariableAnalysis {
       let controlsBySet = sets.map(() => []);
       if (method === 'module') {
         const allGenes = this.dataLayer.getAvailableVariables('gene_expression').map(gene => gene.key);
-        const moments = await this._ensureGeneMoments(allGenes, { job, isCurrent, readCells });
+        const moments = await this._ensureGeneMoments(allGenes, { job, isCurrent, readCells, values });
         if (moments === null || !isCurrent()) return stale();
         controlsBySet = sets.map(set => moduleScoreControls({
           genes: allGenes,
@@ -1437,6 +1548,7 @@ export class MultiVariableAnalysis {
         dataLayer: this.dataLayer,
         genes,
         visit,
+        values,
         owner: job?.id ?? null,
         signal,
         isCurrent,
@@ -1450,7 +1562,7 @@ export class MultiVariableAnalysis {
       const zOf = new Map();
       if (method === 'mean_z') {
         job?.step('Reading genes');
-        const kept = geneMomentsFor(this.dataLayer.getDatasetGeneration());
+        const kept = geneMomentsFor(this.dataLayer.getDatasetGeneration(), momentsMatrixOf(valuesRecordOfRun));
         const setGenes = [...new Set(sets.flatMap(set => set.genes))];
         const momentsOfGene = new Map(setGenes.map(gene => [gene, kept.get(gene)]));
         const completed = await visitGenes(setGenes.filter(gene => momentsOfGene.get(gene) === null), async (gene, column) => {
@@ -1546,23 +1658,12 @@ export class MultiVariableAnalysis {
         out.push({ name: set.name, genes: scoredGenes, controlGenes, constantGenes, pages: pagesOut });
       }
 
-      memScope.end({ genes: union.length, pages: ownedPageIds.length, sets: sets.length, method });
-      return { sets: out, geneSample: sampleUse };
+      memScope.end({ genes: union.length, pages: asked.length, sets: sets.length, method });
+      return { sets: out, geneSample: sampleUse, values: valuesRecordOfRun };
     } catch (error) {
-      hasAnalysisFailure = true;
-      analysisFailure = error;
       if (!isCurrent()) return stale();
       memScope.end({ method, error: error.message });
       throw error;
-    } finally {
-      cleanupPreservingAnalysisFailure(
-        () => cleanupAnalysisResources({
-          dataLayer: this.dataLayer,
-          dataLayerCleanup: 'expired'
-        }),
-        hasAnalysisFailure,
-        analysisFailure
-      );
     }
   }
 
@@ -1572,12 +1673,13 @@ export class MultiVariableAnalysis {
    * step, in the analysis workers.
    *
    * @param {string[]} genes
-   * @param {{job?: Object|null, isCurrent: () => boolean, readCells?: number|null}} options -
-   *   `readCells`: genes are read for the first open cells only (their moments are over those)
+   * @param {{job?: Object|null, isCurrent: () => boolean, readCells?: number|null, values?: Object|null}} options -
+   *   `readCells`: genes are read for the first open cells only (their moments are over those);
+   *   `values`: the run's (`DataLayer.runValues`), the moments' values
    * @returns {Promise<Map<string, {mean: number, m2: number, nonZero: number, n: number}>|null>}
    */
-  async _ensureGeneMoments(genes, { job = null, isCurrent, readCells = null }) {
-    const cache = geneMomentsFor(this.dataLayer.getDatasetGeneration());
+  async _ensureGeneMoments(genes, { job = null, isCurrent, readCells = null, values = null }) {
+    const cache = geneMomentsFor(this.dataLayer.getDatasetGeneration(), momentsMatrixOf(values === null ? null : values.record));
     const missing = cache.missing(genes);
     if (missing.length > 0) {
       job?.step('Reading every gene once for its mean');
@@ -1594,17 +1696,18 @@ export class MultiVariableAnalysis {
       let done = 0;
       let completed;
       try {
-        completed = await runGeneStream({
+        completed = await withCellScale(computeManager, { scale: runScale(values), backend, signal }, scaleId => runGeneStream({
           dataLayer: this.dataLayer,
           genes: missing,
           tuner,
           route,
+          values,
           owner: job?.id ?? null,
           signal,
           isCurrent,
           dispatch: (task, onTiming) => computeManager.execute(
             OperationType.COMPUTE_GENE_MOMENTS,
-            { ...taskGenes(task), readCells },
+            { ...taskGenes(task, taskTransform(values, scaleId)), readCells },
             { ...(task.worker === null ? { backend } : { backend, worker: task.worker }), transfer: true, signal, onTiming }
           ),
           onResult: (task, { moments }) => {
@@ -1612,7 +1715,7 @@ export class MultiVariableAnalysis {
             done += task.genes.length;
             job?.items(done, missing.length, 'genes');
           }
-        });
+        }));
       } finally {
         if (route !== null) {
           void route.close().catch(error => console.warn('[GeneMoments] Closing the gene route failed:', error));
@@ -1711,6 +1814,8 @@ export class MultiVariableAnalysis {
             dataLayer: this.dataLayer,
             genes: here,
             visit: (_gene, column) => { hereEntries.push(entriesInCells(column, start, end)); },
+            // As stored, as every delivered gene is: the ranks are within each cell.
+            values: null,
             owner,
             signal,
             isCurrent,
@@ -1751,6 +1856,7 @@ export class MultiVariableAnalysis {
           tuner,
           route,
           split: route === null ? null : bounds,
+          values: null,
           owner,
           signal,
           stop: invalidated.signal,
@@ -1800,7 +1906,7 @@ export class MultiVariableAnalysis {
       if (route !== null) {
         void route.close().catch(error => console.warn('[Signature] Closing the gene route failed:', error));
       }
-      // A run that stopped before UCELL_FINISH (cancelled, superseded or
+      // A run that stopped before UCELL_FINISH (canceled, superseded or
       // failed) leaves each worker its part's state (`ucellContextBytesPerCell`
       // a cell): released here, ahead of the next run's context.
       for (let w = 0; w < maxW; w++) {

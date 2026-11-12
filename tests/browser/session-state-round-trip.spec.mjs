@@ -206,8 +206,9 @@ test('a saved session restores to the exact state it recorded', async (
     const defaults = panel.exportSessionSettings();
     panel.importSessionSettings({
       ...defaults,
-      width: 1234,
-      height: 777,
+      // A width of one's own, in millimetres (the figure fills it at its own height).
+      sizePreset: 'custom',
+      width: 150.5,
       xLabel: 'UMAP one',
       dpi: 600,
     });
@@ -232,7 +233,7 @@ test('a saved session restores to the exact state it recorded', async (
   ).toBe(true);
   expect(layout.theme).toBe('dark');
   expect(Object.hasOwn(settings.controls, 'hp-antialias')).toBe(false);
-  expect(settings.figureExport).toMatchObject({ width: 1234, height: 777, xLabel: 'UMAP one', dpi: 600 });
+  expect(settings.figureExport).toMatchObject({ sizePreset: 'custom', width: 150.5, xLabel: 'UMAP one', dpi: 600 });
   expect(Object.hasOwn(settings.controls, 'highlight-mode')).toBe(false);
   expect(views.views.length).toBeGreaterThan(1);
 
@@ -323,14 +324,14 @@ test('a saved session restores to the exact state it recorded', async (
   ).toEqual([]);
 });
 
-test('a session saved while a view is coloured by a continuous field loads back', async (
+test('a session saved while a view is colored by a continuous field loads back', async (
   { page },
   testInfo,
 ) => {
   // The continuous legend rebuilds its range sliders with generated ids on
   // every render. A session that recorded those ids named controls no fresh
   // page has, and loading it was refused ("Session UI control … does not
-  // exist"). What the sliders show is the field's own filter and colour
+  // exist"). What the sliders show is the field's own filter and color
   // range, which the core state saves; the legend is not a control inventory.
   const browserErrors = [];
   page.on('pageerror', error => browserErrors.push(`page: ${error.stack || error.message}`));

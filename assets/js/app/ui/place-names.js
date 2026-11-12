@@ -51,8 +51,10 @@ export const PLACES = Object.freeze({
   vectorField: place('Vector field', { heading: 'vector-field-title' }),
   // Places the page builds itself, headed with these names: the legend's
   // range of a continuous field (`legend-renderer.js`), the community
-  // annotation panel's columns (`community-annotation/controls-panel.js`).
+  // annotation panel's columns (`community-annotation/controls-panel.js`),
+  // Data mapping's expression transform (`data-mapping/expression-values.js`).
   visibleRange: place('Visible range', {}),
+  expressionValues: place('Expression values', {}),
   annotatedColumns: place('Annotated columns', {}),
 });
 

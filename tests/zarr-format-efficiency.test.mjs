@@ -1,6 +1,6 @@
 /**
  * The Zarr reader is efficient in requests, bytes and work: reads touch only
- * the chunks they need, go out together (merged where neighbours, parallel
+ * the chunks they need, go out together (merged where neighbors, parallel
  * otherwise), share chunks between concurrent reads, keep partly used
  * decoded chunks for the next read, and read sharded arrays by range.
  * Sources here record every request and add latency, as a web host would,
@@ -163,7 +163,7 @@ test('a range read touches only its chunks, in merged parallel requests', async 
   for (const [start, end] of source.calls) {
     assert.ok(start >= first && end <= last, `request [${start}, ${end}) is within the needed chunks`);
   }
-  // Chunks 15..19 of one chunk row are neighbours in the archive: at most one
+  // Chunks 15..19 of one chunk row are neighbors in the archive: at most one
   // request per chunk row; on this link (round trips, no bandwidth cost) the
   // rows' gaps are worth fetching too, so they may be one request.
   assert.ok(source.calls.length <= 3, `${source.calls.length} requests`);
@@ -181,7 +181,7 @@ test('a column read of a 5000-chunk array goes out at once and decodes only its 
   assert.equal(column[1999], 1999 * BIG.cols + 777);
   assert.equal(root.stats().chunksDecoded, 100);
   // At most a request per chunk; on this link (round trips, little bandwidth
-  // cost) neighbouring chunks' gaps are fetched with them, so far fewer
+  // cost) neighboring chunks' gaps are fetched with them, so far fewer
   // requests go out. Whether the gaps pay depends on the bandwidth measured
   // while the archive opened: when they do not, the hundred requests go out
   // together. None starts beyond the link's concurrency, which begins at the
@@ -333,6 +333,79 @@ test('a web host store\'s objects are kept in the page for the tab under its met
   assert.equal(chunkRequests(), fetched);
 });
 
+test('a web host store asks for an absent object once: a re-read, another opening of the same version and a reader with no page cache take its absence as known', async t => {
+  // Zarr writers leave out a chunk that holds only the fill value (a 0-d scalar
+  // equal to it, a run of zeros), and a web host answers it 404; the sample
+  // stores' `uns['cellucid']['priority']['seed']` is one. Measured 2026-11-10:
+  // the default sample asked for it 11 times at start, once per growth step.
+  const { createByteRangeCache } = await import('../assets/js/data/byte-range-cache.js');
+  const { adoptRangeCachePort } = await import('../assets/js/formats/io/range-cache.js');
+  const zarray = (shape, chunks) => ({ zarr_format: 2, shape, chunks, dtype: '<i4', compressor: null, fill_value: 0, filters: null, order: 'C' });
+  const metadata = {
+    '.zgroup': { zarr_format: 2 },
+    's/.zarray': zarray([], []),
+    'a/.zarray': zarray([8], [4]),
+  };
+  const entries = new Map(Object.entries(metadata).map(([key, value]) => [key, json(value)]));
+  entries.set('.zmetadata', json({ zarr_consolidated_format: 1, metadata }));
+  // Chunk a/0 stored; a/1 and s/0 left out (they hold only the fill value).
+  entries.set('a/0', new Uint8Array(Int32Array.from([1, 2, 3, 4]).buffer));
+  const log = [];
+  let etag = '"v1"';
+  const fetch = async (url, init = {}) => {
+    const key = decodeURIComponent(new URL(url).pathname.replace(/^\/host\//, ''));
+    log.push(key);
+    const bytes = entries.get(key);
+    const headers = etag === null ? {} : { ETag: etag };
+    if (bytes === undefined) return new Response(null, { status: 404, headers });
+    return new Response(bytes, { status: 200, headers });
+  };
+  const asked = key => log.filter(entry => entry === key).length;
+  const readBoth = async root => [Number(await root.get('s').read()), Array.from(await root.get('a').read())];
+  const expected = [0, [1, 2, 3, 4, 0, 0, 0, 0]];
+
+  // No page cache (a reader before its port is adopted, a test realm): the store itself remembers.
+  const alone = await openZarr(httpStore('https://example.test/host/', { fetch }));
+  assert.deepEqual(await readBoth(alone), expected);
+  assert.deepEqual(await readBoth(alone), expected);
+  assert.equal(asked('s/0'), 1, `the absent scalar asked once by one store: ${JSON.stringify(log)}`);
+  assert.equal(asked('a/1'), 1, `the absent chunk asked once by one store: ${JSON.stringify(log)}`);
+
+  const cache = createByteRangeCache({ budgetBytes: 64 << 20 });
+  const { port1, port2 } = new MessageChannel();
+  cache.connect(port1);
+  adoptRangeCachePort(port2);
+  t.after(() => {
+    adoptRangeCachePort(null);
+    port1.close();
+  });
+  log.length = 0;
+  const first = await openZarr(httpStore('https://example.test/host/', { fetch }));
+  assert.deepEqual(await readBoth(first), expected);
+  assert.equal(asked('s/0') + asked('a/1'), 2);
+  await settle();
+  // Another opening of the same version (a catalog's listing, then the opening;
+  // a progressive opening's next step): its absence is the page's, not asked again.
+  log.length = 0;
+  const second = await openZarr(httpStore('https://example.test/host/', { fetch }));
+  assert.deepEqual(await readBoth(second), expected);
+  assert.equal(asked('s/0') + asked('a/1'), 0, `another opening: ${JSON.stringify(log)}`);
+  // Rewritten (another validator): what was absent may be written now, so it is asked again.
+  etag = '"v2"';
+  log.length = 0;
+  const rewritten = await openZarr(httpStore('https://example.test/host/', { fetch }));
+  assert.deepEqual(await readBoth(rewritten), expected);
+  assert.equal(asked('s/0') + asked('a/1'), 2);
+  // A host naming no version: nothing kept beyond the one store.
+  etag = null;
+  await settle();
+  await readBoth(await openZarr(httpStore('https://example.test/host/', { fetch })));
+  await settle();
+  log.length = 0;
+  await readBoth(await openZarr(httpStore('https://example.test/host/', { fetch })));
+  assert.equal(asked('s/0') + asked('a/1'), 2);
+});
+
 test('a read across shards asks for every shard index before any inner chunk, each index once', async () => {
   const entries = await corpusEntries('v3/cases.zarr');
   const log = [];
@@ -478,10 +551,10 @@ test('a chunk still being read when its store closes is not kept', async () => {
   assert.equal(root.stats().cachedChunkBytes, 0);
 });
 
-test('the decoded-chunk cache keeps to its budget, least recently used first, and never keeps an entry larger than it', async () => {
-  const { ByteLru } = await import('../assets/js/formats/zarr/cache.js');
-  assert.throws(() => new ByteLru(-1), TypeError);
-  const cache = new ByteLru(64);
+test('the decoded-chunk cache (Zarr and HDF5 alike) keeps to its budget, least recently used first, and never keeps an entry larger than it', async () => {
+  const { ByteCache } = await import('../assets/js/formats/io/byte-cache.js');
+  assert.throws(() => new ByteCache(-1), TypeError);
+  const cache = new ByteCache(64);
   cache.set('a', 'A', 16);
   cache.set('b', 'B', 16);
   cache.set('c', 'C', 16);
@@ -489,7 +562,7 @@ test('the decoded-chunk cache keeps to its budget, least recently used first, an
   cache.set('d', 'D', 32);
   assert.deepEqual([...cache.entries.keys()], ['c', 'a', 'd']);
   assert.equal(cache.bytes, 64);
-  cache.set('e', 'E', 65);
+  assert.equal(cache.set('e', 'E', 65), false, 'an entry larger than the budget is not kept');
   assert.equal(cache.get('e'), undefined);
   assert.equal(cache.bytes, 64);
   cache.clear();

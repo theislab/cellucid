@@ -21,6 +21,23 @@ function observeProductErrors(page) {
   return errors;
 }
 
+/**
+ * Whether a person can reach this dialog now: focus can enter it. A modal
+ * `<dialog>` makes everything outside the topmost one inert (a dialog under
+ * another included), and an inert control does not take focus. Focus goes
+ * back where it was.
+ */
+function reachable(dialog) {
+  return dialog.evaluate(element => {
+    const probe = element.querySelector('.community-annotation-modal-close, button');
+    const before = document.activeElement;
+    probe.focus();
+    const reached = document.activeElement === probe;
+    if (before instanceof HTMLElement) before.focus();
+    return reached;
+  });
+}
+
 async function prepareVotingHarness(page, { suggestionCount = 27 } = {}) {
   await page.evaluate(async count => {
     const { getCommunityAnnotationSession } = await import(
@@ -241,37 +258,24 @@ test('CAP voting exposes every bounded item and applies current results atomical
   });
 
   await prepareVotingHarness(page);
-  const primary = page.locator('.community-annotation-modal-overlay');
-  expect(await page.evaluate(() => (
-    window.__capVotingBackgroundSnapshot.every(({ element }) => {
-      if (element.id === 'notification-center') {
-        const activeDocument = document.querySelector(
-          '.community-annotation-modal-overlay [role="document"]'
-        );
-        return (
-          activeDocument?.contains(element) === true &&
-          !element.hasAttribute('aria-hidden') &&
-          !element.hasAttribute('inert')
-        );
-      }
-      return (
-        element.getAttribute('aria-hidden') === 'true' &&
-        element.hasAttribute('inert')
-      );
-    })
-  ))).toBe(true);
-  await page.evaluate(() => {
+  const primary = page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)');
+  // A modal <dialog>: the page behind it is inert (the browser's), and the
+  // notification cards live inside it, where they are not.
+  expect(await primary.evaluate(dialog => dialog.open && dialog.matches(':modal'))).toBe(true);
+  await expect(primary.locator('#notification-center')).toHaveCount(1);
+  await expect.poll(() => reachable(primary)).toBe(true);
+  // A control added to the page while the dialog is open is out of reach too.
+  const dynamicBackground = page.locator('#modal-dynamic-background-contract');
+  expect(await page.evaluate(() => {
     const sentinel = document.createElement('button');
     sentinel.id = 'modal-dynamic-background-contract';
-    sentinel.setAttribute('aria-hidden', 'false');
-    sentinel.setAttribute('inert', 'sentinel-owned');
     document.body.appendChild(sentinel);
-  });
-  const dynamicBackground = page.locator(
-    '#modal-dynamic-background-contract'
-  );
-  await expect(dynamicBackground).toHaveAttribute('aria-hidden', 'true');
-  await expect(dynamicBackground).toHaveAttribute('inert', '');
+    const before = document.activeElement;
+    sentinel.focus();
+    const reached = document.activeElement === sentinel;
+    if (before instanceof HTMLElement) before.focus();
+    return reached;
+  })).toBe(false);
   await page.evaluate(async () => {
     const { getNotificationCenter } = await import(
       '/assets/js/app/notification-center.js'
@@ -318,7 +322,7 @@ test('CAP voting exposes every bounded item and applies current results atomical
     page.locator('.confirm-dialog #notification-center')
   ).toHaveCount(1);
   await page.keyboard.press('Escape');
-  await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(0);
+  await expect(page.locator('dialog.confirm-dialog')).toHaveCount(0);
   await expect(primary.locator('#notification-center')).toHaveCount(1);
   await expect(initialPrimaryClose).toBeFocused();
   const cards = primary.locator('.community-annotation-suggestion-card');
@@ -344,11 +348,11 @@ test('CAP voting exposes every bounded item and applies current results atomical
   await cards.first().getByRole('button', {
     name: 'View all 31 comments',
   }).click();
-  let secondary = page.locator('.community-annotation-secondary-overlay');
+  let secondary = page.locator('.community-annotation-details-dialog');
   await expect(secondary.locator('.community-annotation-comment'))
     .toHaveCount(25);
   await expect(
-    secondary.locator('[role="document"] #notification-center')
+    secondary.locator('#notification-center')
   ).toHaveCount(1);
   await expect(secondary.getByText(/Page 1 of 2 · 31 comments/)).toBeVisible();
   await secondary.getByRole('button', { name: 'Next' }).click();
@@ -401,7 +405,7 @@ test('CAP voting exposes every bounded item and applies current results atomical
   });
   await expect(rebuiltCommentsOpener).toBeVisible();
   await secondary.getByRole('button', { name: 'Close' }).click();
-  await expect(primary).not.toHaveAttribute('aria-hidden');
+  await expect.poll(() => reachable(primary)).toBe(true);
   await expect(rebuiltCommentsOpener).toBeFocused();
 
   let firstCard = cards.first();
@@ -565,54 +569,49 @@ test('CAP voting exposes every bounded item and applies current results atomical
   await firstCard.getByRole('button', {
     name: 'Merge suggestion',
   }).click();
-  await expect(primary).toHaveAttribute('aria-hidden', 'true');
-  await expect(primary).toHaveAttribute('inert', '');
+  await expect.poll(() => reachable(primary)).toBe(false);
   await expect(
     page.locator('.confirm-dialog #notification-center')
   ).toHaveCount(1);
   await page.locator('.confirm-dialog-confirm').click();
-  await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(0);
-  await expect(primary).not.toHaveAttribute('aria-hidden');
+  await expect(page.locator('dialog.confirm-dialog')).toHaveCount(0);
+  await expect.poll(() => reachable(primary)).toBe(true);
   await expect(primary.locator('#notification-center')).toHaveCount(1);
   const viewMerged = primary.getByRole('button', {
     name: 'View merged (1)',
   });
   await expect(viewMerged).toBeVisible();
   await viewMerged.click();
-  await expect(primary).toHaveAttribute('aria-hidden', 'true');
-  await expect(primary).toHaveAttribute('inert', '');
-  secondary = page.locator('.community-annotation-secondary-overlay');
+  await expect.poll(() => reachable(primary)).toBe(false);
+  secondary = page.locator('.community-annotation-details-dialog');
   await expect(secondary).toBeVisible();
   let detachButton = secondary.getByRole('button', { name: 'Detach' });
   await detachButton.click();
-  await expect(secondary).toHaveAttribute('aria-hidden', 'true');
-  await expect(secondary).toHaveAttribute('inert', '');
-  await expect(primary).toHaveAttribute('aria-hidden', 'true');
+  await expect.poll(() => reachable(secondary)).toBe(false);
+  await expect.poll(() => reachable(primary)).toBe(false);
   await expect(
     page.locator('.confirm-dialog #notification-center')
   ).toHaveCount(1);
   await page.keyboard.press('Escape');
-  await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(0);
+  await expect(page.locator('dialog.confirm-dialog')).toHaveCount(0);
   await expect(secondary).toBeVisible();
-  await expect(secondary).not.toHaveAttribute('aria-hidden');
-  await expect(secondary).not.toHaveAttribute('inert');
-  await expect(primary).toHaveAttribute('aria-hidden', 'true');
+  await expect.poll(() => reachable(secondary)).toBe(true);
+  await expect.poll(() => reachable(primary)).toBe(false);
   await expect(
-    secondary.locator('[role="document"] #notification-center')
+    secondary.locator('#notification-center')
   ).toHaveCount(1);
   await expect(detachButton).toBeFocused();
   await secondary.getByRole('button', { name: 'Close' }).click();
-  await expect(primary).not.toHaveAttribute('aria-hidden');
-  await expect(primary).not.toHaveAttribute('inert');
+  await expect.poll(() => reachable(primary)).toBe(true);
   await expect(primary.locator('#notification-center')).toHaveCount(1);
   await expect(viewMerged).toBeFocused();
 
   await viewMerged.click();
-  secondary = page.locator('.community-annotation-secondary-overlay');
+  secondary = page.locator('.community-annotation-details-dialog');
   detachButton = secondary.getByRole('button', { name: 'Detach' });
   await detachButton.click();
   await page.locator('.confirm-dialog-confirm').click();
-  await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(0);
+  await expect(page.locator('dialog.confirm-dialog')).toHaveCount(0);
   await expect(primary.getByRole('button', {
     name: 'View merged (1)'
   })).toHaveCount(0);
@@ -657,8 +656,6 @@ test('CAP voting exposes every bounded item and applies current results atomical
     })
   ));
   expect(backgroundRestorationMismatches).toEqual([]);
-  await expect(dynamicBackground).toHaveAttribute('aria-hidden', 'false');
-  await expect(dynamicBackground).toHaveAttribute('inert', 'sentinel-owned');
   await dynamicBackground.evaluate(element => element.remove());
   expect(productErrors).toEqual([]);
 });
@@ -710,18 +707,18 @@ test('owned confirms cannot survive destroy, replacement, sign-out, or dataset s
   await prepareVotingHarness(page, { suggestionCount: 1 });
 
   const openDeleteConfirm = async () => {
-    const primary = page.locator('.community-annotation-modal-overlay');
+    const primary = page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)');
     await expect(primary).toBeVisible();
     await primary.locator('.community-annotation-suggestion-card').first()
       .locator('.community-annotation-suggestion-actions').first()
       .getByRole('button', { name: 'Delete', exact: true }).click();
-    await expect(page.locator('.confirm-dialog-overlay')).toBeVisible();
-    await expect(primary).toHaveAttribute('aria-hidden', 'true');
+    await expect(page.locator('dialog.confirm-dialog')).toBeVisible();
+    await expect.poll(() => reachable(primary)).toBe(false);
   };
   const expectNoTransientDialogs = async () => {
-    await expect(page.locator('.confirm-dialog-overlay')).toHaveCount(0);
+    await expect(page.locator('dialog.confirm-dialog')).toHaveCount(0);
     await expect(
-      page.locator('.community-annotation-secondary-overlay')
+      page.locator('.community-annotation-details-dialog')
     ).toHaveCount(0);
   };
   const reopen = async () => {
@@ -737,14 +734,14 @@ test('owned confirms cannot survive destroy, replacement, sign-out, or dataset s
   await openDeleteConfirm();
   await page.evaluate(() => window.__capVotingModal.close());
   await expectNoTransientDialogs();
-  await expect(page.locator('.community-annotation-modal-overlay'))
+  await expect(page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)'))
     .toHaveCount(0);
 
   await reopen();
   await openDeleteConfirm();
   await reopen();
   await expectNoTransientDialogs();
-  await expect(page.locator('.community-annotation-modal-overlay'))
+  await expect(page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)'))
     .toHaveCount(1);
 
   await openDeleteConfirm();
@@ -758,7 +755,7 @@ test('owned confirms cannot survive destroy, replacement, sign-out, or dataset s
     ));
   });
   await expectNoTransientDialogs();
-  await expect(page.locator('.community-annotation-modal-overlay'))
+  await expect(page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)'))
     .toHaveCount(0);
 
   await page.evaluate(async () => {
@@ -771,7 +768,7 @@ test('owned confirms cannot survive destroy, replacement, sign-out, or dataset s
     ));
   });
   await reopen();
-  const finalPrimary = page.locator('.community-annotation-modal-overlay');
+  const finalPrimary = page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)');
   await finalPrimary.getByPlaceholder('Label (required)').last()
     .fill('Pending context CAP');
   await finalPrimary.getByRole('button', { name: 'Search CAP' }).click();
@@ -789,7 +786,7 @@ test('owned confirms cannot survive destroy, replacement, sign-out, or dataset s
   });
   releasePendingCap();
   await expectNoTransientDialogs();
-  await expect(page.locator('.community-annotation-modal-overlay'))
+  await expect(page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)'))
     .toHaveCount(0);
   await expect(page.locator('.cap-search-results')).toHaveCount(0);
 
@@ -818,7 +815,7 @@ test('owned confirms cannot survive destroy, replacement, sign-out, or dataset s
     getGitHubAuthSession().signOut();
   });
   await expectNoTransientDialogs();
-  await expect(page.locator('.community-annotation-modal-overlay'))
+  await expect(page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)'))
     .toHaveCount(0);
   expect(productErrors).toEqual([]);
 });
@@ -828,7 +825,7 @@ test('inline comment Escape cancels only the editor and drafts survive session r
 }) => {
   const productErrors = observeProductErrors(page);
   await prepareVotingHarness(page, { suggestionCount: 2 });
-  const primary = page.locator('.community-annotation-modal-overlay');
+  const primary = page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)');
   const cards = primary.locator('.community-annotation-suggestion-card');
   await expect(cards).toHaveCount(2);
   const preview = cards
@@ -931,7 +928,7 @@ test('open inline edits of existing items survive session re-renders', async ({
 }) => {
   const productErrors = observeProductErrors(page);
   await prepareVotingHarness(page, { suggestionCount: 2 });
-  const primary = page.locator('.community-annotation-modal-overlay');
+  const primary = page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)');
   const cards = primary.locator('.community-annotation-suggestion-card');
   await expect(cards).toHaveCount(2);
   const ids = await page.evaluate(async () => {
@@ -1042,7 +1039,7 @@ test('open inline edits of existing items survive session re-renders', async ({
   await cardFor(ids.first)
     .getByRole('button', { name: /View all \d+ comments/ })
     .click();
-  const secondary = page.locator('.community-annotation-secondary-overlay');
+  const secondary = page.locator('.community-annotation-details-dialog');
   const expanded = secondary.locator('.community-annotation-comment');
   await expect(expanded).toHaveCount(25);
   await expanded.nth(24).getByRole('button', { name: 'Edit', exact: true })
@@ -1076,7 +1073,7 @@ test('an open merge note edit survives merged-suggestion re-renders', async ({
 }) => {
   const productErrors = observeProductErrors(page);
   await prepareVotingHarness(page, { suggestionCount: 2 });
-  const primary = page.locator('.community-annotation-modal-overlay');
+  const primary = page.locator('.community-annotation-dialog:not(.community-annotation-details-dialog)');
   await page.evaluate(async () => {
     const { getCommunityAnnotationSession } = await import(
       '/assets/js/app/community-annotations/session.js'
@@ -1093,7 +1090,7 @@ test('an open merge note edit survives merged-suggestion re-renders', async ({
     });
   });
   await primary.getByRole('button', { name: 'View merged (1)' }).click();
-  const secondary = page.locator('.community-annotation-secondary-overlay');
+  const secondary = page.locator('.community-annotation-details-dialog');
   const mergeRow = secondary.locator('.community-annotation-merge-row');
   await expect(mergeRow).toHaveCount(1);
   await mergeRow.getByRole('button', { name: 'Edit', exact: true }).click();

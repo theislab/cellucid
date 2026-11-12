@@ -139,9 +139,9 @@ Google Drive API → Quotas** after launch.
 7. **Publisher verification** (optional, for work accounts): verify the custom
    domain `cellucid.com` in the tenant (DNS TXT), set it as the app's
    publisher domain, join the Microsoft AI Cloud Partner Program (an
-   organisation, with an email at that domain), then enter the Partner One ID
+   organization, with an email at that domain), then enter the Partner One ID
    under **Branding & properties**, signed in with the work account and MFA.
-   Without it, organisations with risk-based step-up consent block their users
+   Without it, organizations with risk-based step-up consent block their users
    from consenting; `Files.Read.All` needs an administrator under Microsoft's
    default consent policy either way. Seen 2026-10-25: Helmholtz Zentrum
    München's tenant answered the very first sign-in (`Files.Read`, `openid`,
@@ -209,7 +209,7 @@ signs in in a hidden window and closes it before the callback is reached
 7. Microsoft, work tenant with the default consent policy: a colleague's file
    asks for **Ask for access**, Microsoft shows "Need admin approval", and the
    administrator's consent then lets it open; a guest opening another
-   organisation's file.
+   organization's file.
 8. Microsoft: a personal "anyone" link opened by a work account, and the
    reverse.
 9. Microsoft: within the page, the sign-in renews without a click for 24

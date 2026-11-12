@@ -11,7 +11,7 @@ import { after, before, test } from 'node:test';
 import worker, { RelayApproval, RelayPairing } from '../relay/worker.js';
 import { RELAY_BUNDLE } from '../relay/generated/bundle.js';
 import { resultDataText } from '../assets/js/app/agent/bridge/relay-protocol.js';
-import { TAB_CALL_WAIT_MS } from '../relay/pairing.js';
+import { TAB_CALL_WAIT_MS, TAB_RECONNECT_WAIT_MS } from '../relay/pairing.js';
 import { installWorkersRuntime, relayEnvironment } from './helpers/relay-runtime.mjs';
 import {
   APP_ORIGIN,
@@ -22,6 +22,7 @@ import {
   modern,
   send,
   serveTab,
+  tabRequest,
   tabSecret,
 } from './helpers/relay-flow.mjs';
 
@@ -36,6 +37,27 @@ async function connected() {
   const env = freshEnv();
   const { tokens, tab, clientId } = await connectAgent(worker, env);
   return { env, token: tokens.access_token, tab, clientId };
+}
+
+/**
+ * `pending` once the relay's wait for a closed tab to come back is over.
+ *
+ * The wait ends at a fixed moment, the tab's leaving plus
+ * `TAB_RECONNECT_WAIT_MS` (`pairing.js` `targetSoon`), so the clock (mocked by
+ * the caller, Date and setTimeout) is moved past it once: a request already
+ * waiting is woken by its timer, and one that reaches the wait later finds it
+ * over. The request's own work before that (its token verified on the thread
+ * pool) takes the real time it takes and is simply awaited.
+ *
+ * The clock was moved on by the whole wait at every turn of the event loop
+ * until the request answered: turns pass in microseconds, real work does
+ * not, and on a slow runner the mocked clock ran past the access token's
+ * hour before the token was read, so the answer was a refused token and not
+ * the one under test (Windows, Node 22, nightly run 43141748516).
+ */
+function pastReconnectWait(t, pending) {
+  t.mock.timers.tick(TAB_RECONNECT_WAIT_MS);
+  return pending;
 }
 
 async function rpc(env, token, message, headers) {
@@ -113,16 +135,19 @@ test('a result passes its _meta to the card; a picture over a chat\'s bound is r
   assert.match(huge.content[0].text, /^The picture was 10485764 characters of base64, more than a chat accepts \(10485760\)\. Ask for a smaller picture\.$/);
 });
 
-test('tools/list: the bundled catalogue and cellucid_status while no tab is connected, the tab\'s own list when one is', async () => {
+test('tools/list: the bundled catalogue and cellucid_status while no tab is connected, the tab\'s own list when one is', async t => {
   const env = freshEnv();
   const { tokens, tab } = await connectAgent(worker, env);
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
   tab.socket.close(1000, 'gone');
   await tab.socket.settle();
-  const alone = await rpc(env, tokens.access_token, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
+  const alone = await pastReconnectWait(t, rpc(env, tokens.access_token, { jsonrpc: '2.0', id: 1, method: 'tools/list' }));
   assert.deepEqual(alone.body.result.tools, [...RELAY_BUNDLE.tools, RELAY_BUNDLE.statusTool]);
+  t.mock.timers.reset();
 
   const live = await connectTab(worker, env);
   serveTab(live.socket, { tools: TAB_TOOLS });
+  await focus(live.socket);
   const listed = await rpc(env, tokens.access_token, { jsonrpc: '2.0', id: 2, method: 'tools/list' });
   assert.deepEqual(listed.body.result.tools, [...TAB_TOOLS, RELAY_BUNDLE.statusTool]);
   const cursor = await rpc(env, tokens.access_token, { jsonrpc: '2.0', id: 3, method: 'tools/list', params: { cursor: 'x' } });
@@ -159,11 +184,13 @@ test('tools/call reaches the tab as the connection\'s agent and returns the tab\
   assert.equal(badArgs.body.error.code, -32602);
 });
 
-test('tools/call without a tab says how to connect one; an unknown tool is a protocol error with or without a tab', async () => {
+test('tools/call without a tab says how to connect one; an unknown tool is a protocol error with or without a tab', async t => {
   const { env, token, tab } = await connected();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
   tab.socket.close(1000, 'gone');
   await tab.socket.settle();
-  const offline = await rpc(env, token, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'history_get', arguments: {} } });
+  const offline = await pastReconnectWait(t, rpc(env, token, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'history_get', arguments: {} } }));
+  t.mock.timers.reset();
   assert.equal(offline.body.result.isError, true);
   assert.match(offline.body.result.content[0].text, /No Cellucid tab is connected/);
   const unknownOffline = await rpc(env, token, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'nope', arguments: {} } });
@@ -171,11 +198,12 @@ test('tools/call without a tab says how to connect one; an unknown tool is a pro
 
   const live = await connectTab(worker, env);
   serveTab(live.socket, { handler: call => ({ error: { code: 'unknown-tool', message: `Cellucid has no tool "${call.tool}"` } }) });
+  await focus(live.socket);
   const unknownLive = await rpc(env, token, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'nope', arguments: {} } });
   assert.deepEqual(unknownLive.body.error, { code: -32602, message: 'Unknown tool: nope' });
 });
 
-test('cellucid_status answers from the relay: connected or not, and which tab receives the calls', async () => {
+test('cellucid_status answers from the relay: connected or not, and which tab receives the calls', async t => {
   const { env, token, tab } = await connected();
   await focus(tab.socket, { focused: true, dataset: 'Pancreas (Baron)', version: '0.9.6' });
   const status = await rpc(env, token, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'cellucid_status', arguments: {} } });
@@ -190,9 +218,10 @@ test('cellucid_status answers from the relay: connected or not, and which tab re
   await focus(tab.socket, { focused: true, dataset: hostile, version: '0.9.6' });
   const marked = (await rpc(env, token, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'cellucid_status', arguments: {} } })).body.result.content[0].text;
   assert.equal(marked, resultDataText(JSON.stringify({ connected: true, agent: 'Claude', tabs: [{ receivesCalls: true, focused: true, visible: true, dataset: hostile, cellucidVersion: '0.9.6' }] })));
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
   tab.socket.close(1000, 'gone');
   await tab.socket.settle();
-  const noneText = (await rpc(env, token, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'cellucid_status', arguments: {} } })).body.result.content[0].text;
+  const noneText = (await pastReconnectWait(t, rpc(env, token, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'cellucid_status', arguments: {} } }))).body.result.content[0].text;
   const none = JSON.parse(noneText.slice(RELAY_BUNDLE.protocol.resultData.open.length, -RELAY_BUNDLE.protocol.resultData.close.length));
   assert.equal(none.connected, false);
   assert.match(none.advice, /open Cellucid/);
@@ -309,9 +338,10 @@ test('a tab that closes during a call, or answers too much or nonsense, gets the
   tab.socket.close(1001, 'page hidden');
   const closed = (await pending).body.result;
   assert.equal(closed.isError, true);
-  assert.match(closed.content[0].text, /closed or lost its connection/);
+  assert.match(closed.content[0].text, /closed, was reloaded or lost its connection before it answered, so whether this call was done is not known/);
 
   const live = await connectTab(worker, env, { secret: tabSecret(1) });
+  await focus(live.socket);
   const limit = RELAY_BUNDLE.protocol.resultTextChars;
   const answers = [
     { result: { content: [{ type: 'text', text: 'x'.repeat(limit + 1) }], isError: false } },
@@ -337,6 +367,36 @@ test('a tab that closes during a call, or answers too much or nonsense, gets the
   assert.equal(full.content[0].text.length, limit);
 });
 
+test('a call or a status made while the tab reloads waits for it to be back, and runs there (L26-5)', async () => {
+  const { env, token, tab } = await connected();
+  await focus(tab.socket);
+  tab.socket.close(1001, 'reloading');
+  await tab.socket.settle();
+  // During the reload: a status and a call arrive with no tab connected.
+  const status = rpc(env, token, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'cellucid_status', arguments: {} } });
+  const call = rpc(env, token, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'history_get', arguments: {} } });
+  for (let i = 0; i < 20; i += 1) await new Promise(resolve => setImmediate(resolve));
+  // The page is back: it connects, then says which dataset it shows.
+  const back = await connectTab(worker, env, { secret: tabSecret(1) });
+  const calls = serveTab(back.socket, { handler: () => ({ result: { content: [{ type: 'text', text: 'ran in the reloaded tab' }], isError: false } }) });
+  await focus(back.socket, { dataset: 'Pancreas' });
+  const report = (await status).body.result.content[0].text;
+  assert.match(report, /"connected":true/);
+  assert.equal((await call).body.result.content[0].text, 'ran in the reloaded tab');
+  assert.equal(calls.length, 1);
+});
+
+test('a tab that closed for good is said so once the wait for it to come back is over', async t => {
+  const { env, token, tab } = await connected();
+  await focus(tab.socket);
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: Date.now() });
+  tab.socket.close(1001, 'closed');
+  await tab.socket.settle();
+  assert.ok(TAB_RECONNECT_WAIT_MS < TAB_CALL_WAIT_MS, 'the wait for a tab ends well before a call\'s');
+  const answer = await pastReconnectWait(t, rpc(env, token, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'history_get', arguments: {} } }));
+  assert.match(answer.body.result.content[0].text, /No Cellucid tab is connected/);
+});
+
 test('the caller going away, or an MCP cancellation, stops the call in the tab', async () => {
   const { env, token, tab } = await connected();
   const calls = serveTab(tab.socket);
@@ -350,15 +410,46 @@ test('the caller going away, or an MCP cancellation, stops the call in the tab',
   while (calls.length === 0) await new Promise(resolve => setImmediate(resolve));
   controller.abort();
   const answer = await (await pending).json();
-  assert.match(answer.result.content[0].text, /cancelled/);
+  assert.match(answer.result.content[0].text, /^The call was canceled\.$/);
   assert.ok(tab.socket.messages().some(message => message.type === 'cancel' && message.id === calls[0].id));
 
   const second = rpc(env, token, { jsonrpc: '2.0', id: 41, method: 'tools/call', params: { name: 'history_get', arguments: {} } }, { 'MCP-Protocol-Version': '2025-06-18' });
   while (calls.length === 1) await new Promise(resolve => setImmediate(resolve));
   const cancelled = await rpc(env, token, { jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 41, reason: 'user' } }, { 'MCP-Protocol-Version': '2025-06-18' });
   assert.equal(cancelled.status, 202);
-  assert.match((await second).body.result.content[0].text, /cancelled/);
+  assert.match((await second).body.result.content[0].text, /^The call was canceled\.$/);
   assert.ok(tab.socket.messages().some(message => message.type === 'cancel' && message.id === calls[1].id));
+});
+
+test('a connection removed in Cellucid while its call runs: the call is stopped in the tab and the agent told, other connections untouched', { timeout: 20_000 }, async () => {
+  const { env, token, tab } = await connected();
+  const other = await connectAgent(worker, env, { tab });
+  const calls = serveTab(tab.socket);
+  const call = (accessToken, id) => rpc(env, accessToken, { jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'history_get', arguments: {} } });
+  const removedCall = call(token, 1);
+  while (calls.length < 1) await new Promise(resolve => setImmediate(resolve));
+  const keptCall = call(other.tokens.access_token, 2);
+  while (calls.length < 2) await new Promise(resolve => setImmediate(resolve));
+  const [first, second] = calls;
+  assert.notEqual(first.grant, second.grant);
+  // Manage… > Remove, for the first call's connection.
+  assert.equal((await tabRequest(tab.socket, { type: 'disconnect', grant: first.grant })).value.removed, true);
+  const answer = (await removedCall).body.result;
+  assert.equal(answer.isError, true);
+  assert.match(answer.content[0].text, /removed in Cellucid while this call ran/);
+  assert.ok(tab.socket.messages().some(message => message.type === 'cancel' && message.id === first.id), 'the tab is told to stop the call');
+  // The other connection's call goes on and is answered as usual.
+  assert.ok(!tab.socket.messages().some(message => message.type === 'cancel' && message.id === second.id));
+  tab.socket.send(JSON.stringify({ type: 'result', id: second.id, result: { content: [{ type: 'text', text: 'kept' }], isError: false } }));
+  assert.equal((await keptCall).body.result.content[0].text, 'kept');
+  // The removed connection's next request: its token no longer works.
+  assert.equal((await call(token, 3)).status, 401);
+  // Forget this browser while the other connection's call runs: it is stopped and answered the same way.
+  const forgottenCall = call(other.tokens.access_token, 4);
+  while (calls.length < 3) await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await tabRequest(tab.socket, { type: 'forget' })).value.forgotten, true);
+  assert.match((await forgottenCall).body.result.content[0].text, /removed in Cellucid while this call ran/);
+  assert.ok(tab.socket.messages().some(message => message.type === 'cancel' && message.id === calls[2].id));
 });
 
 test('2026-07-28 requests: metadata in the body, mirrored in headers; mismatches, missing metadata and unknown versions are refused', async () => {
@@ -427,9 +518,18 @@ test('subscriptions/listen is acknowledged with no notification types and closed
   const response = await mcp(worker, env, token, listen.message, listen.headers);
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('Content-Type'), 'text/event-stream');
+  // The relay's headers, as on every other answer.
+  assert.equal(response.headers.get('Cache-Control'), 'no-store');
+  assert.equal(response.headers.get('X-Content-Type-Options'), 'nosniff');
+  assert.equal(response.headers.get('Referrer-Policy'), 'no-referrer');
   const events = (await response.text()).trim().split('\n\n').map(block => JSON.parse(block.split('\n').find(line => line.startsWith('data: ')).slice(6)));
   assert.deepEqual(events[0], { jsonrpc: '2.0', method: 'notifications/subscriptions/acknowledged', params: { _meta: { 'io.modelcontextprotocol/subscriptionId': 7 }, notifications: {} } });
   assert.deepEqual(events[1], { jsonrpc: '2.0', id: 7, result: { resultType: 'complete', _meta: { 'io.modelcontextprotocol/subscriptionId': 7 } } });
+  // A Cellucid page (an allowed origin) reads it, as it reads every other answer of the endpoint.
+  const fromPage = await mcp(worker, env, token, listen.message, { ...listen.headers, Origin: 'https://www.cellucid.com' });
+  assert.equal(fromPage.status, 200);
+  assert.equal(fromPage.headers.get('Access-Control-Allow-Origin'), 'https://www.cellucid.com');
+  assert.equal(fromPage.headers.get('Vary'), 'Origin');
 });
 
 test('malformed messages, batches, other methods and content types are refused with the JSON-RPC error that says why', async () => {
@@ -478,15 +578,15 @@ test('/tab: only a Cellucid page that proves a tab secret connects; an older pag
   const env = freshEnv();
   const upgrade = headers => send(worker, env, '/tab', { headers });
   const secret = tabSecret(5);
-  assert.equal((await upgrade({ Origin: APP_ORIGIN, 'Sec-WebSocket-Protocol': `cellucid-relay.1, cellucid-secret.${secret}` })).status, 426);
-  assert.equal((await upgrade({ Upgrade: 'websocket', Origin: 'https://evil.example', 'Sec-WebSocket-Protocol': `cellucid-relay.1, cellucid-secret.${secret}` })).status, 403);
-  assert.equal((await upgrade({ Upgrade: 'websocket', 'Sec-WebSocket-Protocol': `cellucid-relay.1, cellucid-secret.${secret}` })).status, 403);
-  for (const protocols of ['cellucid-relay.1', `cellucid-secret.${secret}`, 'cellucid-relay.1, cellucid-secret.short', `cellucid-relay.1, cellucid-secret.${secret}, cellucid-secret.${tabSecret(6)}`]) {
+  assert.equal((await upgrade({ Origin: APP_ORIGIN, 'Sec-WebSocket-Protocol': `cellucid-relay.2, cellucid-secret.${secret}` })).status, 426);
+  assert.equal((await upgrade({ Upgrade: 'websocket', Origin: 'https://evil.example', 'Sec-WebSocket-Protocol': `cellucid-relay.2, cellucid-secret.${secret}` })).status, 403);
+  assert.equal((await upgrade({ Upgrade: 'websocket', 'Sec-WebSocket-Protocol': `cellucid-relay.2, cellucid-secret.${secret}` })).status, 403);
+  for (const protocols of ['cellucid-relay.2', `cellucid-secret.${secret}`, 'cellucid-relay.2, cellucid-secret.short', `cellucid-relay.2, cellucid-secret.${secret}, cellucid-secret.${tabSecret(6)}`]) {
     assert.equal((await upgrade({ Upgrade: 'websocket', Origin: APP_ORIGIN, 'Sec-WebSocket-Protocol': protocols })).status, 400, protocols);
   }
 
   const { socket, response } = await connectTab(worker, env, { secret });
-  assert.equal(response.headers.get('Sec-WebSocket-Protocol'), 'cellucid-relay.1');
+  assert.equal(response.headers.get('Sec-WebSocket-Protocol'), 'cellucid-relay.2');
   // The pairing is named by an HMAC of the secret, never by the secret.
   const [name] = env.PAIRING.objects.keys();
   assert.match(name, /^[0-9a-f]{64}$/);
@@ -504,9 +604,9 @@ test('/tab: only a Cellucid page that proves a tab secret connects; an older pag
   await socket.settle();
   assert.equal(socket.closeEvent.code, 1003);
 
-  const older = await send(worker, env, '/tab', { headers: { Upgrade: 'websocket', Origin: APP_ORIGIN, 'Sec-WebSocket-Protocol': `cellucid-relay.0, cellucid-secret.${secret}` } });
+  const older = await send(worker, env, '/tab', { headers: { Upgrade: 'websocket', Origin: APP_ORIGIN, 'Sec-WebSocket-Protocol': `cellucid-relay.1, cellucid-secret.${secret}` } });
   assert.equal(older.status, 101);
-  assert.deepEqual(older.webSocket.messages()[0], { type: 'welcome', protocol: 1 });
+  assert.deepEqual(older.webSocket.messages()[0], { type: 'welcome', protocol: 2 });
   assert.deepEqual(older.webSocket.closeEvent, { code: 4400, reason: 'protocol' });
 });
 

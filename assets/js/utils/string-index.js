@@ -12,14 +12,9 @@
  * @module utils/string-index
  */
 
-const EMPTY = -1;
+import { fnv1a32 } from './fnv1a.js';
 
-/** FNV-1a, 32 bits, over a string's UTF-16 code units. */
-function hashOf(text) {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
-  return hash >>> 0;
-}
+const EMPTY = -1;
 
 export class StringIndex {
   /**
@@ -69,7 +64,7 @@ export class StringIndex {
    */
   find(text) {
     const mask = this._slots.length - 1;
-    for (let slot = hashOf(text) & mask; ; slot = (slot + 1) & mask) {
+    for (let slot = fnv1a32(text) & mask; ; slot = (slot + 1) & mask) {
       const entry = this._slots[slot];
       if (entry === EMPTY) return EMPTY;
       if (this.keys[entry] === text) return entry;
@@ -95,7 +90,7 @@ export class StringIndex {
    * @returns {number}
    */
   intern(text) {
-    const hash = hashOf(text);
+    const hash = fnv1a32(text);
     let mask = this._slots.length - 1;
     let slot = hash & mask;
     for (; ; slot = (slot + 1) & mask) {

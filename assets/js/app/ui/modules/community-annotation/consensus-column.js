@@ -21,9 +21,10 @@
  * @module ui/modules/community-annotation/consensus-column
  */
 
-import { annotationCategories, annotationFieldKey, fieldByAnnotationKey } from '../../../community-annotations/field-names.js';
+import { annotationCategories, annotationKeyable, annotationFieldKey, fieldByAnnotationKey } from '../../../community-annotations/field-names.js';
 import { categoryLabel } from '../../../actions/targets/names.js';
 import { exactLabelForCompare } from '../../../community-annotations/wire-contract.js';
+import { failureDetails, joinFailure, sayFailure } from '../../../../utils/errors.js';
 
 /**
  * Where the votes the session holds came from: the repository and branch it
@@ -105,12 +106,9 @@ export function consensusColumnStatus(state, session) {
       continue;
     }
     const categories = annotationCategories(source.field);
-    try {
-      session.setFieldCategories(operation.fieldKey, categories);
-    } catch {
-      // Categories the session cannot key (not text): nothing it holds is of them.
-      continue;
-    }
+    // Categories the repository cannot key (`annotationKeyable`): nothing it holds is of them.
+    if (!annotationKeyable(categories)) continue;
+    session.setFieldCategories(operation.fieldKey, categories);
     const now = outcomesNow(session, operation.fieldKey, categories, operation.settings);
     const built = new Map(operation.outcomes.map(entry => [entry.category, entry]));
     let changed = 0;
@@ -174,7 +172,7 @@ export function createConsensusColumnApplier({ state, session, notifications, ac
     try {
       await state.ensureFieldLoaded?.(found.index, { silent: true });
     } catch (err) {
-      notifications.error(err?.message || 'Failed to load field for consensus', { category: 'annotation' });
+      notifications.error(`${joinFailure(`The field for the consensus could not be loaded`, sayFailure(err))}`, { category: 'annotation', ...failureDetails(err) });
       return;
     }
 

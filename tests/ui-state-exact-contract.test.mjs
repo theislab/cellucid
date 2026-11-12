@@ -57,6 +57,7 @@ import {
 } from '../assets/js/app/utils/categorical-ops.js';
 import { colorsOf, drawn, rgbAt, visibleOf } from './helpers/category-state.mjs';
 import { withCategoryColor, withCategoryVisibility } from '../assets/js/app/utils/category-state.js';
+import { getCategoryColor } from '../assets/js/data/palettes.js';
 
 /**
  * A v3 dataset whose one embedding is the 2D item "X_umap_2d" (the layout key
@@ -311,7 +312,7 @@ test('field overlay actions reject before mutation and preserve exact loader fai
       newKey: 'score_copy',
       retry: true,
     }),
-    /Field duplicate options may contain only: newKey \(unexpected: retry\)/i,
+    /Field duplicate options may contain only: newKey, signal \(unexpected: retry\)/i,
   );
   assert.equal(loadCalls, 0);
 
@@ -465,19 +466,25 @@ test('category builder previews exact membership and rejects invalid draft label
       overlapCount: 1,
       uncoveredCount: 1,
       pageCounts: [2, 1],
-      intersectionRows: [{ mask: 3, count: 1 }],
+      intersectionRows: [{ key: '0+1', count: 1 }],
     },
   );
 
   builder._droppedPages[0].label = '';
   assert.match(
     builder._getPageLabelValidationError(),
-    /Page 1.*non-empty trimmed label/i,
+    /^Page 1: "" cannot be a category label: a label is a non-empty text\.$/,
   );
   builder._droppedPages[0].label = ' A ';
   assert.match(
     builder._getPageLabelValidationError(),
-    /Page 1.*non-empty trimmed label/i,
+    /^Page 1: " A " cannot be a category label: it starts or ends with a space; give it without\.$/,
+  );
+  // One line: a line break is refused here as the action refuses it (R9A-8).
+  builder._droppedPages[0].label = 'A\nB';
+  assert.match(
+    builder._getPageLabelValidationError(),
+    /^Page 1: "A\nB" cannot be a category label: it holds the control character U\+000A/,
   );
   builder._droppedPages[0].label = 'A';
   assert.equal(builder._getPageLabelValidationError(), null);
@@ -1116,6 +1123,7 @@ test('highlight-page fields require exact labels and serialize the valid current
         }],
       },
     ],
+    getHighlightPageColor: pageId => ({ activated: '#dc2626', resting: '#16a34a' })[pageId],
     dimensionManager: residentLayoutManager(Float32Array.from([
           0, 0,
           1, 0,
@@ -1168,6 +1176,12 @@ test('highlight-page fields require exact labels and serialize the valid current
     { pageId: 'activated', label: 'Activated' },
     { pageId: 'resting', label: 'Resting' },
   ]);
+  // Each page's category opens in its page's color (F124: one color for one
+  // page, as the builder previews it); the cells on no page take the category
+  // palette's color of their place. A session keeps them.
+  const hex = rgb => `#${rgb.map(channel => Math.round(channel * 255).toString(16).padStart(2, '0')).join('')}`;
+  assert.deepEqual(created.field.palette.map(hex), ['#dc2626', '#16a34a', hex(getCategoryColor(2))]);
+  assert.deepEqual(item.palette, ['#dc2626', '#16a34a', hex(getCategoryColor(2))]);
 });
 
 test('intersection fields require every exact user label and never invent or rename categories', () => {
@@ -1190,6 +1204,7 @@ test('intersection fields require every exact user label and never invent or ren
         }],
       },
     ],
+    getHighlightPageColor: () => '#2563eb',
     dimensionManager: residentLayoutManager(Float32Array.from([
           0, 0,
           1, 0,
@@ -1211,13 +1226,13 @@ test('intersection fields require every exact user label and never invent or ren
 
   assert.throws(
     () => registry.createFromPages(options, state),
-    /identify every current overlap mask exactly once/i,
+    /name every combination of pages that holds cells exactly once/i,
   );
   assert.equal(registry.getAllFields().length, 0);
 
   const created = registry.createFromPages({
     ...options,
-    intersectionLabels: { 3: 'Both' },
+    intersectionLabels: { '0+1': 'Both' },
   }, state);
   assert.deepEqual(
     created.field.categories,
@@ -1231,7 +1246,7 @@ test('intersection fields require every exact user label and never invent or ren
   assert.throws(
     () => duplicateRegistry.createFromPages({
       ...options,
-      intersectionLabels: { 3: 'A' },
+      intersectionLabels: { '0+1': 'A' },
     }, state),
     /duplicates a category label/i,
   );

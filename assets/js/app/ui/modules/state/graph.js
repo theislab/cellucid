@@ -35,7 +35,9 @@ import { layoutGraph, rowOfStep, revealPlan, selectedSteps } from './graph-layou
 import { describeRow, rowGlyph } from './model.js';
 import { isPanelShown } from '../../core/visibility-gate.js';
 import { StyleManager } from '../../../../utils/style-manager.js';
+import { isValueEntry } from '../../../../utils/key-ownership.js';
 import { idNumber } from '../../../history/model.js';
+import { debounce } from '../../../../utils/debounce.js';
 
 /** Rows drawn beyond the view on each side. */
 const OVERSCAN = 8;
@@ -124,7 +126,6 @@ export function createGraph({ container, where, handlers, expandAll = false, now
   let lastHead = null;
   /** The width the labels last wrapped at: the tree's, and whether the scrollbar strip is kept clear. */
   let lastWidth = '';
-  let hintTimer = null;
   let lastTap = { key: null, at: 0 };
   /** When a double tap last showed a row: the dblclick a browser may send for the same taps is not a second. */
   let tapShownAt = -Infinity;
@@ -236,7 +237,13 @@ export function createGraph({ container, where, handlers, expandAll = false, now
     time.setAttribute('aria-hidden', 'true');
     const tools = ownerDocument.createElement('span');
     tools.className = 'hg-tools';
-    line.append(rail, toggle, flags, label, meta, badge, time, tools);
+    // The row's words wrap within their own column; its buttons keep one line
+    // at the row's end, in the same place on every kind of row (a turn's ↗ and
+    // details went onto a line of their own under a long label).
+    const words = ownerDocument.createElement('span');
+    words.className = 'hg-words';
+    words.append(toggle, flags, label, meta, badge, time);
+    line.append(rail, words, tools);
     element.append(line);
     return { element, signature: null, parts: { line, rail, toggle, flags, label, meta, badge, time, tools } };
   }
@@ -257,6 +264,11 @@ export function createGraph({ container, where, handlers, expandAll = false, now
     button.title = label;
     button.innerHTML = html;
     for (const [key, value] of Object.entries(data)) button.dataset[key] = value;
+    // A tool that opens a menu says so, and whether it is open (`openMenu` keeps it).
+    if (data.action === 'menu') {
+      button.setAttribute('aria-haspopup', 'menu');
+      button.setAttribute('aria-expanded', 'false');
+    }
     return button;
   }
 
@@ -266,7 +278,8 @@ export function createGraph({ container, where, handlers, expandAll = false, now
     element.dataset.kind = row.kind;
     element.dataset.position = row.position ?? '';
     element.dataset.dim = String(row.dim);
-    element.id = `${container.id}-row-${row.key.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    // Never two hyphens together: that separator is a minted id's (`dom-id.js`).
+    element.id = `${container.id}-row-${row.key.replace(/[^a-zA-Z0-9_-]|-(?=-)/g, '_')}`;
     element.setAttribute('aria-level', String(row.level));
     element.setAttribute('aria-setsize', String(row.setSize));
     element.setAttribute('aria-posinset', String(row.posInSet));
@@ -337,7 +350,7 @@ export function createGraph({ container, where, handlers, expandAll = false, now
     if (current.length !== tools.length || current.some((element, index) => element !== tools[index])) parts.tools.replaceChildren(...tools);
   }
 
-  /** One of a row's buttons (`action`), kept by the row's parts and only relabelled when it is written again. */
+  /** One of a row's buttons (`action`), kept by the row's parts and only relabeled when it is written again. */
   function rowTool(parts, className, label, html, action) {
     parts.buttons ??= new Map();
     let button = parts.buttons.get(action);
@@ -370,8 +383,13 @@ export function createGraph({ container, where, handlers, expandAll = false, now
     const overflows = offsets[rows.length] > container.clientHeight;
     if (container.hasAttribute('data-overflows') !== overflows) container.toggleAttribute('data-overflows', overflows);
     const width = `${container.clientWidth}${overflows ? ' less the strip' : ''}`;
-    if (width !== lastWidth) {
-      // Labels wrap again at another width: every height is measured afresh.
+    const rewrapped = width !== lastWidth;
+    if (rewrapped) {
+      // Labels wrap again at another width: every height is measured afresh,
+      // the drawn rows' below as well as the rows written again (a row whose
+      // words did not change kept the one-line height until it was, so a
+      // label that wraps at the new width overlapped the row under it and
+      // the last row was cut off by the tree's own height).
       lastWidth = width;
       heights.clear();
       computeOffsets();
@@ -436,7 +454,7 @@ export function createGraph({ container, where, handlers, expandAll = false, now
         moved = Math.min(moved, indexOf.get(key));
       }
     };
-    for (const key of changed) measure(key);
+    for (const key of rewrapped ? [...drawn.keys()] : changed) measure(key);
     if (detailsKey !== null && drawn.has(detailsKey)) measure(detailsKey);
     if (moved < rows.length) {
       // Keep the first row in view where it was while the rows above settle.
@@ -499,8 +517,9 @@ export function createGraph({ container, where, handlers, expandAll = false, now
     }
     // What the details show, without the clock's words (a row's "4 m ago" moves on by itself).
     const words = signatureOf(row, { ...describeRow(row, { view, now: 0 }), time: '', name: '' });
+    // A field of the details in use (`utils/key-ownership.js`), or a note being written, keeps them as they are.
     const editing = detailsElement !== null && ((detailsElement.contains(ownerDocument.activeElement)
-      && /^(INPUT|TEXTAREA|SELECT)$/.test(ownerDocument.activeElement.tagName))
+      && isValueEntry(ownerDocument.activeElement))
       || detailsElement.querySelector('.history-note-editor') !== null);
     if (detailsElement === null || ((detailsSignature !== words || detailsStale) && !editing)) {
       detailsStale = false;
@@ -773,9 +792,23 @@ export function createGraph({ container, where, handlers, expandAll = false, now
 
   // The hover hint (a fine pointer only): the exact time, who acted, and how the row works.
   const finePointer = ownerDocument.defaultView?.matchMedia?.('(hover: hover) and (pointer: fine)') ?? null;
+  // The hint shows once the pointer rested on a row for HINT_DELAY_MS.
+  const showHintSoon = debounce(hit => {
+    const words = describeRow(hit.row, { view, now: now() });
+    hint.textContent = `${words.hint ? `${words.hint} · ` : ''}Double-click to show · › details`;
+    hint.dataset.key = hit.row.key;
+    const box = hit.element.getBoundingClientRect();
+    const host = container.getBoundingClientRect();
+    // Under the row's first line, or over the row when that would leave the graph's box.
+    const under = box.top - host.top + Math.min(box.height, baseHeight);
+    StyleManager.setVariable(hint, '--hg-hint-top', `${container.offsetTop + under}px`);
+    hint.hidden = false;
+    if (under + hint.offsetHeight > host.height) {
+      StyleManager.setVariable(hint, '--hg-hint-top', `${container.offsetTop + Math.max(0, box.top - host.top - hint.offsetHeight)}px`);
+    }
+  }, HINT_DELAY_MS);
   function hideHint() {
-    if (hintTimer !== null) clearTimeout(hintTimer);
-    hintTimer = null;
+    showHintSoon.cancel();
     hint.hidden = true;
   }
   container.addEventListener('pointerover', event => {
@@ -784,20 +817,7 @@ export function createGraph({ container, where, handlers, expandAll = false, now
     if (hit === null || hit.row.kind === 'paused' || detailsElement?.contains(event.target)) { hideHint(); return; }
     if (hint.dataset.key === hit.row.key && !hint.hidden) return;
     hideHint();
-    hintTimer = setTimeout(() => {
-      const words = describeRow(hit.row, { view, now: now() });
-      hint.textContent = `${words.hint ? `${words.hint} · ` : ''}Double-click to show · › details`;
-      hint.dataset.key = hit.row.key;
-      const box = hit.element.getBoundingClientRect();
-      const host = container.getBoundingClientRect();
-      // Under the row's first line, or over the row when that would leave the graph's box.
-      const under = box.top - host.top + Math.min(box.height, baseHeight);
-      StyleManager.setVariable(hint, '--hg-hint-top', `${container.offsetTop + under}px`);
-      hint.hidden = false;
-      if (under + hint.offsetHeight > host.height) {
-        StyleManager.setVariable(hint, '--hg-hint-top', `${container.offsetTop + Math.max(0, box.top - host.top - hint.offsetHeight)}px`);
-      }
-    }, HINT_DELAY_MS);
+    showHintSoon(hit);
   }, { signal });
   container.addEventListener('pointerleave', hideHint, { signal });
   container.addEventListener('pointerdown', hideHint, { signal });
@@ -820,7 +840,7 @@ export function createGraph({ container, where, handlers, expandAll = false, now
      * here moves the history: the details of the row left close, and the
      * step shown is scrolled into view.
      * @param {import('./history-source.js').TrackerView|null} next
-     * @param {object} options - `layoutGraph` options: filter, offDomains, effectOf, categoryOf
+     * @param {object} options - `layoutGraph` options: filter, offDomains, effectOf
      */
     render(next, options) {
       if ((next?.id ?? null) !== trackerId) {

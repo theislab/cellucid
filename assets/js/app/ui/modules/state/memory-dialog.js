@@ -16,6 +16,7 @@
  */
 
 import { wireAppDialog } from '../../components/app-dialog.js';
+import { createButton } from '../../components/controls.js';
 import { formatBytes } from '../../../../utils/format-units.js';
 import { idNumber } from '../../../history/model.js';
 
@@ -110,11 +111,13 @@ export function createMemoryDialog({ dialog, shown, domainName, reveal, openDele
       size.textContent = formatBytes(part.bytes);
       item.append(words, size);
       if (part.kind === 'step' && part.tracker === view?.id && view.step(part.step) !== undefined) {
-        const show = doc.createElement('button');
-        show.type = 'button';
-        show.className = 'btn btn-compact history-memory-show';
-        show.textContent = 'Show';
-        show.setAttribute('aria-label', `Show step ${idNumber(part.step)} (${part.label})`);
+        // A row of the list: its action is quiet.
+        const show = createButton({
+          label: 'Show',
+          variant: 'quiet',
+          ariaLabel: `Show step ${idNumber(part.step)} (${part.label})`,
+          className: 'history-memory-show',
+        });
         show.addEventListener('click', () => {
           app.close();
           reveal(part.step);

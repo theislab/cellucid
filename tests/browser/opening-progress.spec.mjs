@@ -39,9 +39,16 @@ test('a link opening at startup is shown over the empty viewer, and Cancel start
   await expect(overlay.locator('.opening-detail')).toHaveText(/\d s$|\d ms$/);
 
   await overlay.getByRole('button', { name: 'Cancel' }).click();
-  await expect(overlay).toBeHidden();
+  // The opening's panel is gone, and with no dataset shown the empty viewer
+  // says so in its place a quarter of a second later (`drawEmpty`,
+  // `EMPTY_AFTER_MS`). The moment between the two, the overlay hidden, is not
+  // waited for: a slow runner looked after it had passed (Windows Chromium,
+  // nightly run 43141748516).
+  await expect(overlay.getByRole('button', { name: 'Cancel' })).toHaveCount(0);
+  await expect(page.locator('.opening-overlay[data-state="empty"] .opening-title')).toHaveText('No dataset open');
+  await expect(overlay.getByRole('button', { name: 'Show Open data' })).toBeVisible();
   await expect(
-    page.locator('#notification-center .notification-info').filter({ hasText: `Opening ${FIXTURE} was cancelled.` }),
+    page.locator('#notification-center .notification-info').filter({ hasText: `Opening ${FIXTURE} was canceled.` }),
   ).toHaveCount(1);
   release();
   // Cellucid starts without the dataset, its controls live.
@@ -85,10 +92,31 @@ test('a file opened while a dataset is shown is a notification with Cancel, clos
   const running = seen.filter(entry => entry.type === 'progress' && entry.text.includes('Opening current-ui-smoke.zarr.zip'));
   expect(running.every(entry => entry.cancel)).toBe(true);
   expect(seen.some(entry => entry.type === 'error')).toBe(false);
-  await expect(page.locator('#notification-center .notification-success').filter({ hasText: 'User data ready: 120 cells' })).toHaveCount(1);
+  await expect(page.locator('#notification-center .notification-success').filter({ hasText: /Opened .+: 120 cells/ })).toHaveCount(1);
   // The overlay is for the empty viewer only.
   await expect(page.locator('.opening-overlay')).toBeHidden();
   await expect(page.locator('#dataset-cells')).toHaveText('120');
+});
+
+test('a refused file\'s card goes when the next opening begins, so it never reads as the dataset shown failing', async ({ page }) => {
+  // Found 2026-11-10: a refused .loom's card stayed on screen through thirteen later openings.
+  await page.goto(`/?${PINNED}data=${encodeURIComponent(FIXTURE)}`, { waitUntil: 'domcontentloaded' });
+  await openCollapsedPanels(page);
+  await expect(page.locator('#dataset-cells')).toHaveText('120');
+  const errors = page.locator('#notification-center .notification-error');
+  await chooseFiles(page.locator('#user-data-file-input'), {
+    name: 'damaged.loom', mimeType: 'application/octet-stream', buffer: Buffer.from('not an HDF5 file at all'),
+  });
+  await expect(errors.filter({ hasText: 'not a valid HDF5 file' })).toHaveCount(1);
+  // A file of a kind Cellucid does not open is refused before any opening
+  // begins; its card goes the same way (R9U-13: it outlived two datasets).
+  await chooseFiles(page.locator('#user-data-file-input'), {
+    name: 'table.csv', mimeType: 'text/csv', buffer: Buffer.from('a,b\n1,2\n'),
+  });
+  await expect(errors.filter({ hasText: 'is not a file Cellucid can open' })).toHaveCount(1);
+  await chooseFiles(page.locator('#user-data-file-input'), ARCHIVE_FILE);
+  await expect(page.locator('#notification-center .notification-success').filter({ hasText: /Opened .+: 120 cells/ })).toHaveCount(1);
+  await expect(errors).toHaveCount(0);
 });
 
 // A reader that never answers (WebKit once deadlocked its thread inside a

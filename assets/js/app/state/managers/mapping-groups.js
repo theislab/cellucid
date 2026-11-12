@@ -1,5 +1,5 @@
 /**
- * @fileoverview The data-mapping groups beside the embeddings: the neighbour
+ * @fileoverview The data-mapping groups beside the embeddings: the neighbor
  * graph, the modality (a dataset of several feature spaces only), gene
  * names, expression matrix, each matrix's log1p, the highly variable genes,
  * latent space and vector fields. Gene names, expression, log1p and the
@@ -37,6 +37,7 @@ import {
   defaultExpression,
   defaultHighlyVariable,
   defaultLog1p,
+  expressionMatrixName,
   highlyVariableCandidates,
   vectorFieldKeys,
 } from '../../../data/data-mapping.js';
@@ -70,7 +71,9 @@ import {
 } from '../../../data/dataset-mapping.js';
 import { sameJson } from '../../utils/same-json.js';
 import { formatCount, formatCountOf } from '../../../utils/format-units.js';
-import { cancelled } from '../../../utils/abort.js';
+import { awaitWithSignal, cancelled } from '../../../utils/abort.js';
+import { transformKey } from '../../../data/expression-transform.js';
+import { shownTransformOf } from './expression-values.js';
 
 /** The groups beside the embeddings, in the order a transaction applies them. */
 const MAPPING_GROUPS = Object.freeze([
@@ -83,6 +86,9 @@ const MAPPING_GROUPS = Object.freeze([
   'log1p',
   'highlyVariable',
 ]);
+
+/** The groups read within a modality, and on the axis of its expression matrix. */
+const EXPRESSION_GROUPS = Object.freeze(['expression', 'geneNames', 'log1p', 'highlyVariable']);
 
 const RUNTIME_METHODS = Object.freeze([
   'getBaseUrl',
@@ -133,6 +139,19 @@ const STAGE_OF_GROUP = Object.freeze({
   highlyVariable: 'genes',
 });
 
+/**
+ * The highly variable genes a dataset opening on `expression` of one scope
+ * (the dataset's, or a modality's) starts with (`defaultHighlyVariable`).
+ * @param {Object} scope
+ * @param {string|null} expression
+ * @returns {string|null}
+ */
+function defaultHighlyVariableOf(scope, expression) {
+  if (expression === null) return null;
+  const columns = expression === 'raw' ? scope.raw?.var?.columns : scope.var?.columns;
+  return columns === undefined ? null : defaultHighlyVariable(columns).highlyVariable;
+}
+
 function formatGeneCount(count) {
   return `${formatCountOf(count, 'gene')}`;
 }
@@ -157,9 +176,8 @@ function expressionHoldsCounts(scope, expression) {
  */
 function describeExpression(scope, expression) {
   const counts = expressionHoldsCounts(scope, expression) ? ' · counts' : '';
-  if (expression === 'X') return `X${counts}`;
-  if (expression === 'raw') return `raw.X · ${formatGeneCount(scope.raw.n_vars)}${counts}`;
-  return `layers['${expression.slice('layer:'.length)}']${counts}`;
+  const genes = expression === 'raw' ? ` · ${formatGeneCount(scope.raw.n_vars)}` : '';
+  return `${expressionMatrixName(expression)}${genes}${counts}`;
 }
 
 /**
@@ -195,7 +213,7 @@ export class DataStateMappingGroupMethods {
   }
 
   /**
-   * The neighbour graph in use: null for none, else its edge count (null
+   * The neighbor graph in use: null for none, else its edge count (null
    * while a graph read straight from a file is not counted yet).
    *
    * @returns {{edges: number|null}|null}
@@ -483,13 +501,31 @@ export class DataStateMappingGroupMethods {
    * clause ("this dataset does not have", "this dataset cannot use (not
    * symmetric ...)", "cannot be changed for this dataset"), or null.
    *
+   * The expression groups are read in a context: gene names and the highly
+   * variable genes on the var axis of an expression matrix (`raw.var` for
+   * `raw`), and all of them within a modality. `mapping` is the mapping the
+   * value belongs to, whose matrix and modality are that context (a session's
+   * saved mapping, one asked of `mapping.set`); without it, the context
+   * pending (`_withPendingExpression`, `withMappingModality`), else the
+   * mapping shown. A value the mapping shown holds is usable in the mapping
+   * shown's own context only: `highly_variable` of `X` is not a column of
+   * `raw.var`.
+   *
    * @param {string} group
    * @param {unknown} value
+   * @param {Object|null} [mapping]
    * @returns {string|null}
    */
-  describeMappingChoiceRefusal(group, value) {
+  describeMappingChoiceRefusal(group, value, mapping = null) {
+    if (mapping !== null) {
+      return this._withPendingExpression(
+        mapping.expression ?? null,
+        () => this.describeMappingChoiceRefusal(group, value),
+        mapping.modality ?? null
+      );
+    }
     const current = this.dataMapping;
-    if (sameJson(current?.[group], value)) return null;
+    if (sameJson(current?.[group], value) && !this._expressionContextDiffers(group)) return null;
     if (!this.canChangeMappingGroup(group)) {
       return UNCHANGEABLE_GROUP_CLAUSE;
     }
@@ -517,7 +553,7 @@ export class DataStateMappingGroupMethods {
       return names !== null && names.includes(value) ? null : 'this dataset does not have';
     }
     if (group === 'expression' || group === 'geneNames' || group === 'highlyVariable') {
-      const expression = this._pendingExpression ?? this.dataMapping.expression;
+      const expression = this._pendingExpression !== undefined ? this._pendingExpression : this.dataMapping.expression;
       const choices = group === 'expression'
         ? this.getMappingGroupChoices('expression')
         : group === 'geneNames'
@@ -581,11 +617,7 @@ export class DataStateMappingGroupMethods {
         // The modality is refused first; its expression groups mean nothing here.
         continue;
       }
-      const refusal = this._withPendingExpression(
-        next.expression,
-        () => this.describeMappingChoiceRefusal(group, next[group]),
-        next.modality
-      );
+      const refusal = this.describeMappingChoiceRefusal(group, next[group], next);
       if (refusal === null) continue;
       if (refusal === UNCHANGEABLE_GROUP_CLAUSE) {
         return `This mapping changes the ${MAPPING_GROUP_LABELS[group]}, which ${UNCHANGEABLE_GROUP_CLAUSE}.`;
@@ -647,8 +679,50 @@ export class DataStateMappingGroupMethods {
   }
 
   /**
-   * Run `read` with gene-name choices taken from the axis of `expression`,
-   * of `modality` (a multimodal dataset's) when given.
+   * The gene list and the matrix's own gene loader `mapping` maps (its
+   * modality, matrix and gene names), read without changing what is shown:
+   * what the genes stage installs, and what pricing the change reads
+   * (`expression-values.js` `mappingTotalsCost`).
+   *
+   * @param {Object} mapping - With an expression matrix
+   * @returns {Promise<{geneList: Object, varFieldLoader: Function}>}
+   */
+  async mappingVarLoaderOf(mapping) {
+    const runtime = this._requireMappingRuntime();
+    const candidates = this.getMappingCandidates();
+    const axisRoute = expressionAxisRoute(candidates, mapping.expression, mapping.modality ?? null);
+    const namesRoute = axisRoute === null ? null : geneNamesRoute(candidates, axisRoute, mapping.geneNames);
+    if (axisRoute === null || namesRoute === null) {
+      throw new RangeError('This dataset does not have the expression matrix or gene names this mapping names.');
+    }
+    const url = `${runtime.getBaseUrl()}${mappingGeneListPath(axisRoute, namesRoute)}`;
+    const geneList = await loadGeneList(url, {});
+    const varFieldLoader = createVarFieldLoader(url, {
+      pointCount: geneList.n_points,
+      mapping: varLoaderMappingOf(mapping),
+    });
+    return { geneList, varFieldLoader };
+  }
+
+  /**
+   * Whether `group` is read now in another context than the mapping shown's:
+   * the expression groups within a pending modality, and gene names and the
+   * highly variable genes on the axis of a pending expression matrix.
+   * @private
+   */
+  _expressionContextDiffers(group) {
+    if (!EXPRESSION_GROUPS.includes(group)) return false;
+    const current = this.dataMapping;
+    const modality = this._pendingModality ?? null;
+    if (modality !== null && modality !== (current?.modality ?? null)) return true;
+    return (group === 'geneNames' || group === 'highlyVariable')
+      && this._pendingExpression !== undefined
+      && this._pendingExpression !== (current?.expression ?? null);
+  }
+
+  /**
+   * Run `read` with gene-name choices taken from the axis of `expression`
+   * (null: no matrix), of `modality` (a multimodal dataset's) when given.
    * @private
    */
   _withPendingExpression(expression, read, modality = undefined) {
@@ -708,10 +782,78 @@ export class DataStateMappingGroupMethods {
       raw: scope.raw === null || scope.raw.X === null ? null : scope.raw.X,
       layers: scope.layers.filter(layer => layer.usable),
     });
-    const { highlyVariable } = expression === null
-      ? { highlyVariable: null }
-      : defaultHighlyVariable(expression === 'raw' ? scope.raw.var.columns : scope.var.columns);
-    return { expression, geneNames: 'index', log1p, highlyVariable };
+    return { expression, geneNames: 'index', log1p, highlyVariable: defaultHighlyVariableOf(scope, expression) };
+  }
+
+  /**
+   * The mapping `changes` make of `base`, with the groups that follow the
+   * modality and the expression matrix moved with them when `changes` does
+   * not name them: the one rule of the panel's menus and of `mapping.set`
+   * (an agent's or a notebook's change naming only the matrix).
+   *
+   * - Another modality: its default expression matrix and log1p, its var
+   *   index for names, and its highly variable genes, each as a dataset
+   *   opening with that modality would (`defaultModalityGroups`).
+   * - Another expression matrix: the gene names keep their column when the
+   *   new matrix's var axis has one of that name (`X` and every layer share
+   *   `var`, `raw` has `raw.var`), else take its var index; the highly
+   *   variable genes keep their column likewise, else take the new axis's
+   *   default (`highly_variable` when it is true/false there), as opening on
+   *   that matrix would. On the same axis none stays none.
+   *
+   * A modality or matrix the dataset does not have is left as named, for the
+   * mapping's refusal to name it.
+   *
+   * @param {Object} base - The mapping changed (the one shown, with what is staged)
+   * @param {Object} changes - The groups named, by the mapping's keys
+   * @returns {Object} The whole next mapping
+   */
+  followMappingChanges(base, changes) {
+    const next = { ...base, ...changes };
+    const named = group => Object.hasOwn(changes, group);
+    const candidates = this.getMappingCandidates();
+    if (candidates === null || !this.canChangeMappingGroup('expression')) return next;
+    if (named('modality') && !sameJson(changes.modality, base.modality)) {
+      const scope = modalityScope(candidates, next.modality ?? null)?.scope;
+      if (scope === undefined || !(modalityNames(candidates) ?? []).includes(next.modality)) return next;
+      const defaults = this.defaultModalityGroups(next.modality);
+      if (!named('expression')) next.expression = defaults.expression;
+      if (!named('log1p')) next.log1p = defaults.log1p;
+      if (!named('geneNames')) next.geneNames = 'index';
+      if (!named('highlyVariable')) next.highlyVariable = defaultHighlyVariableOf(scope, next.expression);
+      return next;
+    }
+    if (!named('expression') || sameJson(changes.expression, base.expression)) return next;
+    const scope = modalityScope(candidates, next.modality ?? null)?.scope;
+    if (scope === undefined || (next.expression !== null && expressionAxisRoute(candidates, next.expression, next.modality ?? null) === null)) {
+      return next;
+    }
+    return this._withPendingExpression(next.expression, () => {
+      const offers = (choices, value) => choices.some(choice => choice.value === value && choice.usable);
+      if (!named('geneNames') && !offers(this.getGeneNameChoices(next.expression), next.geneNames)) {
+        next.geneNames = 'index';
+      }
+      if (!named('highlyVariable')
+        && !(next.highlyVariable !== null && offers(this.getHighlyVariableChoices(next.expression), next.highlyVariable))) {
+        const axisMoved = base.expression === null || next.expression === null
+          || (base.expression === 'raw') !== (next.expression === 'raw');
+        next.highlyVariable = axisMoved ? defaultHighlyVariableOf(scope, next.expression) : null;
+      }
+      return next;
+    }, next.modality ?? null);
+  }
+
+  /**
+   * Whether the expression matrix `mapping` maps holds counts (an integer
+   * dtype, or whole non-negative first values, as its menu says
+   * "· counts"); false with none, or when not probed.
+   *
+   * @param {Object|null} mapping
+   * @returns {boolean}
+   */
+  mappingMatrixHoldsCounts(mapping) {
+    if (mapping?.expression == null || this.getMappingCandidates() === null) return false;
+    return this.withMappingModality(mapping.modality ?? null, () => expressionHoldsCounts(this._expressionScope(), mapping.expression));
   }
 
   /** The modality expression choices are read from now: the pending one, else the mapping's. @private */
@@ -731,13 +873,18 @@ export class DataStateMappingGroupMethods {
    *
    * @param {Object} current
    * @param {Object} next
-   * @param {{requireCurrent: () => void}} owner - Throws once the dataset
-   *   the mapping was asked of is no longer the one shown; checked after
-   *   every stage's reads and before every commit step, so a refusal is
-   *   recorded on, and a step published to, only that dataset.
+   * @param {{requireCurrent: () => void, heavy?: ((estimate: Object) => Promise<void>)|null, signal?: AbortSignal|null}} owner - `requireCurrent`
+   *   throws once the dataset the mapping was asked of is no longer the one
+   *   shown; checked after every stage's reads and before every commit step,
+   *   so a refusal is recorded on, and a step published to, only that
+   *   dataset. `heavy`: asks for heavy work a stage finds (the cells' totals
+   *   of another matrix, normalized values: `expression-values.js`
+   *   `cellTotalsForChange`), the action's `ctx.heavy`; null for the person.
+   *   `expression`: the Expression values the genes stage shows the matrix
+   *   in (`applyDataMapping`), else the ones asked now.
    * @returns {Promise<{changed: boolean, commit: () => Promise<void>, rollback: () => Promise<Error[]>}>}
    */
-  async _stageMappingGroups(current, next, { requireCurrent }) {
+  async _stageMappingGroups(current, next, { requireCurrent, heavy = null, expression = undefined, signal = null }) {
     const steps = [];
     const staged = new Set();
     for (const group of MAPPING_GROUPS) {
@@ -752,7 +899,8 @@ export class DataStateMappingGroupMethods {
         );
       }
       try {
-        steps.push(await stage.call(this, next, current));
+        // Stopped, a stage's reads are left (they publish nothing) and nothing more is staged.
+        steps.push(await awaitWithSignal(stage.call(this, next, current, { heavy, expression }), signal));
         requireCurrent();
       } catch (error) {
         requireCurrent();
@@ -816,7 +964,7 @@ function refusedGroup(stageName, error, next) {
  */
 const GROUP_STAGES = Object.freeze({
   /**
-   * The neighbour graph: its summary is read (and, in the browser, the graph
+   * The neighbor graph: its summary is read (and, in the browser, the graph
    * itself extracted and checked) before anything changes; commit hands the
    * connectivity owner the new graph, rollback the previous one.
    */
@@ -899,9 +1047,12 @@ const GROUP_STAGES = Object.freeze({
   /**
    * The gene list: an AnnData file's gene names and expression matrix are
    * read through `var/{axis}/{names}`. Only the genes a
-   * view is coloured by are read now; the rest load on demand.
+   * view is colored by are read now; the rest load on demand. Normalized
+   * values of a matrix whose cells' totals are not kept yet read them first
+   * (asked for as heavy work by `heavy`, `cellTotalsForChange`), so the
+   * change, not a later read, sums the matrix.
    */
-  async genes(next, current) {
+  async genes(next, current, { heavy = null, expression = undefined } = {}) {
     const runtime = this._requireMappingRuntime();
     let geneList;
     let varFieldLoader;
@@ -916,36 +1067,44 @@ const GROUP_STAGES = Object.freeze({
       sameMatrix = false;
       sameAxis = false;
     } else {
-      const candidates = this.getMappingCandidates();
-      const axisRoute = expressionAxisRoute(candidates, next.expression, next.modality ?? null);
-      const namesRoute = axisRoute === null ? null : geneNamesRoute(candidates, axisRoute, next.geneNames);
-      if (axisRoute === null || namesRoute === null) {
-        throw new RangeError('This dataset does not have the expression matrix or gene names this mapping names.');
-      }
-      const url = `${runtime.getBaseUrl()}${mappingGeneListPath(axisRoute, namesRoute)}`;
-      geneList = await loadGeneList(url, {});
-      varFieldLoader = createVarFieldLoader(url, {
-        pointCount: geneList.n_points,
-        mapping: varLoaderMappingOf(next),
-      });
+      ({ geneList, varFieldLoader } = await this.mappingVarLoaderOf(next));
       const sameModality = next.modality === current.modality;
       sameMatrix = sameModality && next.expression === current.expression;
       sameAxis = sameModality && current.expression !== null
         && (current.expression === 'raw') === (next.expression === 'raw');
     }
+    // The expression transform asked (with the mapping, or now), as the new
+    // matrix takes it; a matrix keeps its cells' totals in this dataset
+    // (`matrixLineage`).
+    const asked = expression ?? this.getExpressionTransform();
+    const transform = this.shownTransformFor(next, asked);
+    const unitsChanged = transformKey(transform) !== transformKey(shownTransformOf(this.varFieldLoader));
+    const lineage = varFieldLoader === null ? null : this.matrixLineage(next, geneList.fields);
+    if (transform.normalize && lineage !== null) await this.cellTotalsForChange({ base: varFieldLoader, lineage, heavy });
     const step = await this.stageVarAxisReplacement({
       geneList,
       varFieldLoader,
       sameAxis,
-      sameMatrix,
+      // A gene's values carried over only in the units they were read in.
+      sameMatrix: sameMatrix && !unitsChanged,
+      transform,
+      lineage,
+      unitsChanged,
     });
+    const askedBefore = this.getExpressionTransform();
     return {
-      commit() {
+      commit: () => {
         step.commit();
+        // Values asked with the mapping (a restore's) are the ones asked now.
+        if (transformKey(asked) !== transformKey(askedBefore)) {
+          this._expressionTransform = asked;
+          this.emit('expression:changed', { asked, shown: transform, dropped: step.dropped });
+        }
         runtime.resetGeneAnalysis();
       },
-      rollback() {
+      rollback: () => {
         step.rollback();
+        this._expressionTransform = askedBefore;
       },
     };
   },

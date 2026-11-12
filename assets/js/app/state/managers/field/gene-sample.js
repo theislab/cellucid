@@ -32,7 +32,7 @@
 
 import { isContinuousValues } from '../../../../data/continuous-values.js';
 import { columnFormOf, filledForm, noteColumnForm } from '../../../../data/column-forms.js';
-import { isCancellation } from '../../../../utils/abort.js';
+import { cancel, isCancellation } from '../../../../utils/abort.js';
 
 /**
  * How many cells a read takes within `ms`, from the reads measured
@@ -171,7 +171,12 @@ export class FieldGeneSampleMethods {
   /**
    * What reading genes for the first `target` open cells costs beyond the
    * gene sample (`AnnDataReader.geneSampleCost`): bytes, time, the index's
-   * memory; null when there is no sample.
+   * memory; null when there is no sample. With normalized values whose
+   * cells' totals are summed over the matrix, the totals of the cells added
+   * are part of it (`totals`, added into `bytes` and `ms`:
+   * `expression-values.js` `shownCellTotalsCost`), so what a person is shown,
+   * what an agent is asked about and what the gene time spends all count
+   * them.
    *
    * @param {number} [target] - Open cells; every one by default
    * @param {{geneTime?: {ms: number, spentBytes: number, spentRequests?: number}|null}} [options] -
@@ -182,7 +187,15 @@ export class FieldGeneSampleMethods {
     const loader = this.varFieldLoader ?? null;
     const descriptor = this._geneSampleDriver();
     if (this.getGeneSample() === null || loader === null || descriptor === null || typeof loader.geneSampleCost !== 'function') return null;
-    return loader.geneSampleCost(descriptor, target, options);
+    const cost = await loader.geneSampleCost(descriptor, target, options);
+    const totals = cost === null ? null : (await this.shownCellTotalsCost?.({ readTo: Math.min(this.pointCount, target) })) ?? null;
+    if (totals === null) return cost;
+    return {
+      ...cost,
+      bytes: cost.bytes == null ? null : cost.bytes + (totals.bytes ?? 0),
+      ms: cost.ms == null ? null : cost.ms + (totals.ms ?? 0),
+      totals: { ms: totals.ms, bytes: totals.bytes, what: totals.what },
+    };
   }
 
   /**
@@ -190,25 +203,31 @@ export class FieldGeneSampleMethods {
    * steps: after each, every loaded gene's values on the cells added are
    * read (from the index just built) and the gene shown is drawn again
    * (`onStep(sample, cells)` then). What is read stays when `signal` stops
-   * the rest.
+   * the rest. `heavy`: an action's `ctx.heavy`, asked before the cells'
+   * totals of normalized values are summed for the cells to read.
    *
    * @param {number} [target]
-   * @param {{signal?: AbortSignal|null, onStep?: ((sample: Object|null, cells: number) => void)|null}} [options]
+   * @param {{signal?: AbortSignal|null, onStep?: ((sample: Object|null, cells: number) => void)|null,
+   *   topUp?: boolean, heavy?: ((estimate: Object) => Promise<void>)|null}} [options]
    * @returns {Promise<Object|null>} The gene sample now (null: every open cell)
    */
-  async readGenesForMoreCells(target = this.pointCount, { signal = null, onStep = null, topUp = false } = {}) {
+  async readGenesForMoreCells(target = this.pointCount, { signal = null, onStep = null, topUp = false, heavy = null } = {}) {
     const loader = this.varFieldLoader ?? null;
     const descriptor = this._geneSampleDriver();
     // A person's growth takes over from one filling the gene time
     // (`topUpGeneSample`): it stops, keeping what it read.
     const running = this._geneSampleGrowth ?? null;
     if (running !== null && running.topUp && !topUp) {
-      running.controller.abort(Object.assign(new Error('Genes are read for the cells you asked for instead.'), { name: 'AbortError' }));
+      cancel(running.controller, 'superseded', 'Genes are read for the cells you asked for instead.');
       await running.settled;
     }
     const start = this.getGeneSample();
     if (start === null || loader === null || descriptor === null) return start;
     if (this._geneSampleGrowth != null) throw new Error('Genes are being read for more cells already.');
+    // Normalized values: the cells' totals of every cell to read first, asked
+    // for as heavy work by an action's `heavy` (`prepareCellTotals`); each
+    // step then finds them kept.
+    if (heavy !== null) await this.prepareCellTotals?.({ readTo: Math.min(this.pointCount, target), signal, heavy });
     // A count the person chose from here on: no longer the gene time's.
     if (!topUp) this._geneSampleTopUp = null;
     const generation = this._datasetGeneration ?? 0;
@@ -226,6 +245,9 @@ export class FieldGeneSampleMethods {
     const fill = cells => {
       filling = filling.then(async () => {
         if ((this._datasetGeneration ?? 0) !== generation || cells <= filled) return;
+        // Normalized values: the cells' totals of the cells added first, one
+        // pass for every gene filled (`expression-values.js`).
+        await this.prepareCellTotals?.({ readTo: cells, signal });
         await this._fillGeneRows(filled, cells, signal);
         filled = cells;
         growth.cells = cells;
@@ -395,7 +417,7 @@ export class FieldGeneSampleMethods {
     if (topUp !== null && topUp.held !== true) this._geneSampleTopUp = { ...topUp, held: true };
     const running = this._geneSampleGrowth ?? null;
     if (running === null || !running.topUp) return null;
-    running.controller.abort(Object.assign(new Error('An analysis reads genes on the cells read so far.'), { name: 'AbortError' }));
+    cancel(running.controller, 'superseded', 'An analysis reads genes on the cells read so far.');
     return running.settled;
   }
 
@@ -415,7 +437,7 @@ export class FieldGeneSampleMethods {
     const growth = this._geneSampleGrowth ?? null;
     if (growth !== null && growth.topUp) {
       topUp.yielded = true;
-      growth.controller.abort(Object.assign(new Error('A gene was asked for: genes for more cells wait for it.'), { name: 'AbortError' }));
+      cancel(growth.controller, 'superseded', 'A gene was asked for: genes for more cells wait for it.');
     }
     let done = false;
     return () => {
@@ -438,7 +460,7 @@ export class FieldGeneSampleMethods {
 
   /** Stop reading genes for more cells: what is read stays. */
   stopReadingGenesForMoreCells() {
-    this._geneSampleGrowth?.controller.abort(Object.assign(new Error('Reading genes for more cells was stopped.'), { name: 'AbortError' }));
+    cancel(this._geneSampleGrowth?.controller, 'user', 'Reading genes for more cells was stopped.');
   }
 
   /** The sample of this dataset grown to fill its gene time (`topUpGeneSample`), or null. @private */

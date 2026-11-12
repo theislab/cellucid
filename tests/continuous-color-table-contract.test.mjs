@@ -16,7 +16,7 @@ import { BENEATH_ALPHA_BYTE } from '../assets/js/rendering/alpha-visibility.js';
 /**
  * The per-cell rule the table-driven kernel must reproduce byte for byte.
  * The alpha byte carries no visibility (the transparency does): 255, and
- * BENEATH_ALPHA_BYTE for the no-value grey, drawn beneath the colored cells.
+ * BENEATH_ALPHA_BYTE for the no-value gray, drawn beneath the colored cells.
  */
 function referenceColors(values, domain, colormap) {
   const n = values.length;
@@ -76,7 +76,7 @@ test('continuous colors equal the per-cell rule for every colormap, scale and do
   const n = 4096;
   const raw = seededValues(n, 7, 120);
   for (let i = 0; i < n; i += 97) raw[i] = Number.NaN;
-  for (let i = 5; i < n; i += 31) raw[i] = raw[i - 1]; // repeated neighbours
+  for (let i = 5; i < n; i += 31) raw[i] = raw[i - 1]; // repeated neighbors
   const domains = [
     { min: 0, max: 100, scale: 'linear' },
     { min: 20, max: 40, scale: 'linear' }, // most values outside: clamped
@@ -168,7 +168,7 @@ test('a gene\'s cells at the scale floor are drawn neutral; the rest keep the co
   writeContinuousColors(plain, values, domain, colormap);
   const floored = new Uint8Array(values.length * 4);
   writeContinuousColors(floored, values, { ...domain, neutralAtOrBelow: 0 }, colormap);
-  // The no-value grey is drawn beneath the expressing cells (BENEATH_ALPHA_BYTE).
+  // The no-value gray is drawn beneath the expressing cells (BENEATH_ALPHA_BYTE).
   const gray = [NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, NEUTRAL_GRAY_UINT8, BENEATH_ALPHA_BYTE];
   for (const cell of [0, 1, 4, 5]) assert.deepEqual([...floored.subarray(cell * 4, cell * 4 + 4)], gray, `cell ${cell}`);
   for (const cell of [2, 3]) assert.deepEqual([...floored.subarray(cell * 4, cell * 4 + 4)], [...plain.subarray(cell * 4, cell * 4 + 4)], `cell ${cell}`);

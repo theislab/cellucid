@@ -17,6 +17,7 @@
 import { formatAgo } from './model.js';
 import { idNumber } from '../../../history/model.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
+import { ICONS, createIconButton } from '../../components/controls.js';
 
 /** Branches past which the picker offers a search. */
 const SEARCH_FROM = 8;
@@ -46,6 +47,7 @@ export function createBranchPicker({ box, button, ops, now = () => Date.now() })
   tracker.type = 'button';
   tracker.className = 'btn btn-compact history-tracker-btn';
   tracker.setAttribute('aria-haspopup', 'menu');
+  tracker.setAttribute('aria-expanded', 'false');
   const map = doc.createElement('button');
   map.type = 'button';
   map.className = 'btn btn-compact';
@@ -120,12 +122,9 @@ export function createBranchPicker({ box, button, ops, now = () => Date.now() })
         button.focus({ preventScroll: true });
         if (!current || view.headId !== branch.tip) ops.switchBranch(branch.id);
       });
-      const more = doc.createElement('button');
-      more.type = 'button';
-      more.className = 'icon-btn history-branch-more';
-      more.setAttribute('aria-label', `Branch “${branch.name}”: actions`);
-      more.title = more.getAttribute('aria-label');
-      more.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>';
+      const more = createIconButton({ label: `Branch “${branch.name}”: actions`, icon: ICONS.more, className: 'history-branch-more' });
+      more.setAttribute('aria-haspopup', 'menu');
+      more.setAttribute('aria-expanded', 'false');
       more.addEventListener('click', () => ops.branchMenu(branch.id, more));
       item.append(pick, more);
       return item;
@@ -135,7 +134,7 @@ export function createBranchPicker({ box, button, ops, now = () => Date.now() })
       (item?.querySelector(focused.more ? '.history-branch-more' : '.history-branch-pick') ?? list.querySelector('button') ?? search)?.focus({ preventScroll: true });
     }
     archived.hidden = hidden.length === 0;
-    archived.textContent = `${showArchived ? '▾' : '▸'} ${formatCountOf(hidden.length, 'archived')}`;
+    archived.textContent = `${showArchived ? '▾' : '▸'} ${formatCountOf(hidden.length, 'archived', 'archived')}`;
     archived.setAttribute('aria-expanded', String(showArchived));
   }
 
@@ -174,7 +173,7 @@ export function createBranchPicker({ box, button, ops, now = () => Date.now() })
   doc.addEventListener('pointerdown', event => {
     if (box.hidden || !(event.target instanceof Node)) return;
     if (box.contains(event.target) || button.contains(event.target)) return;
-    if (event.target instanceof Element && event.target.closest('.history-popup-menu, dialog[open]') !== null) return;
+    if (event.target instanceof Element && event.target.closest('.popup-menu, dialog[open]') !== null) return;
     setOpen(false);
   }, { signal, capture: true });
   map.addEventListener('click', () => ops.openMap(map), { signal });

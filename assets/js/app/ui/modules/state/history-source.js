@@ -21,7 +21,7 @@
  * (the Keep / Discard card's answer for the next move). A core that does not
  * keep one yet reads as none.
  *
- * **Acts.** Every operation the panel offers is a catalogue action
+ * **Acts.** Every operation the panel offers is a catalog action
  * (`app/actions/definitions/history.js`), dispatched as the person's
  * (origin `user`) through the page's dispatcher, the same path an agent, a
  * notebook and a replay take (History v2 §6 test 3). The panel never calls a
@@ -158,13 +158,14 @@ export function createTrackerView(tracker, history = null) {
     /** How many steps branch `branchId` has, the opening not counted (as everywhere in the panel). */
     branchStepCount: branchId => view.ownSteps(branchId).filter(step => step.parent !== null).length,
     /**
-     * The results stale at the step shown (§3.4): step id → `{cause, inputs}`
-     * (`cause`: the first step after it that changed an input, or null;
-     * `inputs`: the domains, or `history`, that differ).
+     * The results stale at the step shown (§3.4): step id → `{cause, inputs,
+     * causes}` (`cause`: the first step after it that changed an input, or
+     * null; `inputs`: the domains, or `history`, that differ; `causes`: each
+     * input's own cause, F156).
      */
     stale: () => once('stale', () => {
       const read = typeof history?.stale === 'function' && view.tracker === history.active ? history.stale() : [];
-      return new Map(read.map(entry => [entry.step.id, { cause: entry.cause ?? null, inputs: entry.inputs ?? [] }]));
+      return new Map(read.map(entry => [entry.step.id, { cause: entry.cause ?? null, inputs: entry.inputs ?? [], causes: entry.causes ?? {} }]));
     }),
     /** While paused, what a move would ask about: `{domains, remembered}`, or null (nothing to ask). */
     pausedChanges: () => once('paused', () => {
@@ -197,7 +198,7 @@ export function redoTarget(view) {
 }
 
 // ---------------------------------------------------------------------------
-// Acting: catalogue actions as the person's.
+// Acting: catalog actions as the person's.
 
 /**
  * The one way the panel acts: a history action dispatched as the person's.
@@ -211,11 +212,13 @@ export function createHistoryActions(dispatch) {
     /**
      * @param {string} type - `history.*`
      * @param {object} [params]
+     * @param {{signal?: AbortSignal|null}} [how] - What stops it besides the person (the action a
+     *   report's picture steps are made for: its Stop ends the jump under way)
      * @returns {Promise<unknown>} the action's outcome
      */
-    async act(type, params = {}) {
+    async act(type, params = {}, { signal = null } = {}) {
       if (!type.startsWith('history.')) throw new RangeError(`The State panel acts only through history actions, not "${type}"`);
-      const { outcome } = await dispatch(type, params, { origin: 'user' });
+      const { outcome } = await dispatch(type, params, signal === null ? { origin: 'user' } : { origin: 'user', signal });
       return outcome;
     },
   });
@@ -358,7 +361,7 @@ export function squashProblem(view, from, to) {
   return plainSentence(HISTORY_SENTENCES.forksInside({ names: inside.map(each => each.name), upTo }));
 }
 
-/** "5 steps, from “Hid gamma” to “Coloured by score”" for a list of steps. */
+/** "5 steps, from “Hid gamma” to “Colored by score”" for a list of steps. */
 export function stepSpan(steps) {
   if (steps.length === 0) return 'No steps';
   if (steps.length === 1) return `1 step, “${steps[0].label}”`;

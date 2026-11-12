@@ -30,7 +30,7 @@ test('a subsample is recorded and read back exactly', () => {
   const record = captureCellSubsetRecord(managerWith({ nObs: SPEC.nObs, kept: KEPT, spec: SPEC }));
   assert.deepEqual(Object.keys(record).sort(), ['digest', 'kept', 'spec']);
   assert.equal(record.digest, cellSetDigest(SPEC.nObs, KEPT));
-  // Neighbouring cells encode as one byte each: blocks of 64 at 12 % cost about 1.2 bytes a cell.
+  // Neighboring cells encode as one byte each: blocks of 64 at 12% cost about 1.2 bytes a cell.
   assert.ok(Buffer.from(record.kept, 'base64').length < SPEC.k * 1.3);
   const decoded = decodeCellSubsetRecord(JSON.parse(JSON.stringify(record)), 'cells');
   assert.deepEqual(decoded.kept, KEPT);

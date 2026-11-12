@@ -14,7 +14,7 @@
  * worker that does not come back from a cancelled task is replaced
  * (below).
  *
- * Cancelling is not a failure. A task whose `signal` aborts is rejected with
+ * Canceling is not a failure. A task whose `signal` aborts is rejected with
  * the signal's `AbortError` at once, wherever it is:
  *
  * - queued (or waiting for its dispatch turn), it is never sent;
@@ -47,13 +47,15 @@ import { debug, debugError } from '../shared/debug-utils.js';
 import { analysisWorkerCount } from '../shared/performance-config.js';
 import { openCellCount, registerResidentHolder, residencyBudgetBytes } from '../../../data/memory-budget.js';
 import { registerIdleWorkers } from '../../../workers/idle-retirement.js';
-import { onAbort, abortReason, cancelled } from '../../../utils/abort.js';
+import { onAbort, abortReason, cancelled, requireSignalOrNull } from '../../../utils/abort.js';
 import { requireClonedRecord, requireKeys } from '../../../utils/exact-record.js';
 import { dataWorkerScript } from '../../../../workers/scripts.js';
 import { startWorker } from '../../../workers/worker-script.js';
 import { explainWorkerFailure, noteWorkerScript, workerFailureReason } from '../../../workers/worker-failure.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { fromWire } from '../../../utils/error-wire.js';
+import { InternalError } from '../../../utils/errors.js';
+import { yieldToMacrotask } from '../../../utils/yield-macrotask.js';
 
 const POOL_OPTION_KEYS = new Set(['poolSize']);
 
@@ -160,9 +162,7 @@ function validateExecutionOptions(options, allowedKeys = EXECUTION_OPTION_KEYS) 
   requireKeys(options, [], allowedKeys, 'Worker execution options');
 
   const signal = options.signal === undefined ? null : options.signal;
-  if (signal !== null && !(signal instanceof AbortSignal)) {
-    throw new TypeError('Worker execution signal must be an AbortSignal or null');
-  }
+  requireSignalOrNull(signal, 'Worker execution signal');
   const transfer = options.transfer === undefined ? true : options.transfer;
   if (typeof transfer !== 'boolean') {
     throw new TypeError('Worker execution transfer must be exactly boolean');
@@ -373,7 +373,7 @@ export class WorkerPool {
         // One worker per task: each module worker's construction runs on
         // the page's thread, so a pool built in one loop holds it for the
         // sum of them.
-        if (index > 0) await new Promise(resolve => setTimeout(resolve, 0));
+        if (index > 0) await yieldToMacrotask();
         if (this._lifecycle !== 'initializing') throw this._terminalError;
         acknowledgements.push(this._spawnWorker(index));
       }
@@ -425,7 +425,7 @@ export class WorkerPool {
     ) {
       this._fail(
         new TypeError(
-          `Analysis worker ${workerIndex} returned an invalid INIT acknowledgement`
+          `Analysis worker ${workerIndex} returned an invalid INIT acknowledgment`
         )
       );
       return;
@@ -438,7 +438,7 @@ export class WorkerPool {
     ) {
       this._fail(
         new Error(
-          `Analysis worker ${workerIndex} returned an unexpected INIT acknowledgement`
+          `Analysis worker ${workerIndex} returned an unexpected INIT acknowledgment`
         )
       );
       return;
@@ -699,7 +699,7 @@ export class WorkerPool {
         continue;
       }
       if (task.state === 'settled') {
-        // Cancelled while waiting for its turn: the reserved worker is free.
+        // Canceled while waiting for its turn: the reserved worker is free.
         this.workerStates[workerIndex] = 'idle';
         queueMicrotask(() => this._processQueue(workerIndex));
         continue;
@@ -929,7 +929,7 @@ export class WorkerPool {
           this._replacements.count += 1;
           this._replacements.lastMs = ms;
           this._replacements.totalMs += ms;
-          debug('WorkerPool', `Replaced worker ${index} after a cancelled task in ${ms.toFixed(1)} ms`);
+          debug('WorkerPool', `Replaced worker ${index} after a canceled task in ${ms.toFixed(1)} ms`);
         };
         if (last === null) {
           recordCost();
@@ -1148,7 +1148,7 @@ export function getWorkerPool(options) {
   if (poolInstance === null) {
     poolInstance = new WorkerPool(options);
   } else if (options !== undefined) {
-    throw new Error('WorkerPool singleton options are accepted only at creation');
+    throw new InternalError('WorkerPool singleton options are accepted only at creation');
   }
   return poolInstance;
 }

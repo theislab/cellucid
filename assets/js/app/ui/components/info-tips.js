@@ -6,7 +6,7 @@
  * what it does, when to reach for it (and what it costs), and how it
  * interacts with the settings around it. It ends with one or more links to
  * the documentation page that explains it fully. Facts here are read from the
- * code that implements them, not from older copy; when behaviour changes, the
+ * code that implements them, not from older copy; when behavior changes, the
  * tip changes with it.
  *
  * Markup in static HTML names its tip with `data-info-tip="<key>"` on the
@@ -21,7 +21,7 @@
  */
 
 import { PLACES, placePath } from '../place-names.js';
-import { GRAPH_SHORTCUTS } from '../modules/state/model.js';
+import { shortcutGroup, shortcutKeysText } from '../onboarding/shortcut-table.js';
 
 export const DOCS_BASE_URL = 'https://docs.cellucid.com/en/latest/user_guide/web_app/';
 
@@ -46,7 +46,7 @@ const TIPS = {
   'dataset': {
     title: 'Dataset',
     body: [
-      'The dataset that is open: its name, cells and genes, where it is read from (format and host) and its description. Details lists its source, citation, file, size, obs fields, embeddings, layers, raw, neighbour graph, latent space and vector fields.',
+      'The dataset that is open: its name, cells and genes, where it is read from (format and host) and its description. Details lists the rest: its source and citation, the file (format, size, how it is read and, for a file read whole, where it is kept), its cells and genes, obs fields, embeddings, modality, layers, raw, neighbor graph, latent space and vector fields.',
       'Data read in place from a host shows how much has been read so far, and a read made again is said in a notification. This tab holds what was read. For the next visit, this browser keeps the downloaded parts, the gene index and any converted copy, but only when the source names the file\'s version, and never for data served from this computer or a notebook. Stored lists them; Manage… removes them.',
       'Sessions and community annotations are tied to this dataset’s identity, so they only restore onto the same dataset.',
     ],
@@ -58,14 +58,14 @@ const TIPS = {
   'data-mapping': {
     title: 'Data mapping',
     body: [
-      'Which stored arrays this dataset is drawn from: the embeddings views can show -- any number, of any mix of 1D, 2D and 3D -- the neighbour graph, the gene names and expression matrix, the latent space of outlier filters and the vector fields.',
+      'Which stored arrays this dataset is drawn from: the embeddings views can show -- any number, of any mix of 1D, 2D and 3D -- the neighbor graph, the gene names and expression matrix, the latent space of outlier filters and the vector fields.',
       'A dataset (an `.h5ad` or Zarr store opened in the browser, from a link or the samples, served by `cellucid serve`, or shown from a notebook) can use any of its `obsm` arrays (at any 1 to 3 of their columns), `obsp` graphs and expression matrices.',
       'A file without a UMAP opens on a best guess, marked guessed. Sessions record the mapping and restore it.',
       'Collapsed, its header says what is mapped in one line (the embeddings on and each dimension\'s default); click it to change the mapping. Whether it is open is remembered in this browser.',
     ],
     links: [
       doc('Data mapping', 'b_data_loading/13_data_mapping', 'at-a-glance'),
-      doc('Best guess', 'b_data_loading/13_data_mapping', 'files-without-a-umap-the-best-guess'),
+      doc('Best guess', 'b_data_loading/13_data_mapping', 'the-default-of-each-dimension-and-the-best-guess'),
     ],
   },
 
@@ -87,16 +87,27 @@ const TIPS = {
     title: 'Genes',
     body: [
       'Expression: the matrix gene values are read from, `X`, a layer such as `counts`, or `raw.X` (which has its own, often longer, gene list). Gene names: the var index or any var column of text, categories or integers, such as `gene_symbols` beside an Ensembl index.',
-      'A missing name takes the gene’s var-index name, and repeated names are made unique (`MATR3`, `MATR3-1`), as in AnnData. A view coloured by a gene keeps it with its colour range and filter: other names for the same matrix keep its column, and `raw.X` finds it by name. A gene missing from the new list loses its colouring. Analysis windows close.',
+      'A missing name takes the gene’s var-index name, and repeated names are made unique (`MATR3`, `MATR3-1`), as in AnnData. A view colored by a gene keeps it with its color range and filter: other names for the same matrix keep its column, and `raw.X` finds it by name. A gene missing from the new list loses its coloring. Analysis windows close.',
     ],
     links: [
       doc('Genes', 'b_data_loading/13_data_mapping', 'genes-and-expression'),
     ],
   },
+  'data-mapping-expression-values': {
+    title: 'Expression values',
+    body: [
+      'Normalize to library size: each cell’s values scaled to 10,000 counts, x · 10,000 / the cell’s total. Log transform: ln(1 + x), after the normalization when both are on. Together they are scanpy’s normalize_total(target_sum=1e4) then log1p, and Seurat’s LogNormalize. Without them, a mean, a fold change or a test on raw counts mostly measures each cell’s sequencing depth.',
+      'One setting for the whole app: colors, the legend (its units), filters, highlights by value, the cell card, an agent’s reads and every analysis that reads genes. Obs fields never change. Pseudobulk differential expression always sums each sample’s raw counts and normalizes the samples itself (TMM, log-CPM).',
+      'A cell’s total is the obs column the file names (prepare() writes total_counts), else a column named like one (n_counts, nCount_RNA), else the sum of every gene, read once and kept: the line under the switch says which, and what that reads. Offered for a matrix of counts only; off by default, so a first look reads nothing more. A view colored by a gene keeps it; its color range and filter are dropped, being in the old units.',
+    ],
+    links: [
+      doc('Expression values', 'b_data_loading/13_data_mapping', 'expression-values'),
+    ],
+  },
   'data-mapping-latent': {
     title: 'Latent space',
     body: [
-      'The `obsm` space (scVI, PCA) where a categorical field’s outlier filter measures each cell’s distance to its category’s centre; the filter hides the farthest share of each category.',
+      'The `obsm` space (scVI, PCA) where a categorical field’s outlier filter measures each cell’s distance to its category’s center; the filter hides the farthest share of each category.',
       'Apply reads nothing: an outlier filter in use is measured again in the new space, with progress and Cancel, and keeps its threshold. A space with a missing value is refused when it is first read. The space a file stores outlier distances for is marked “outliers stored” and filters at once. None turns outlier filters off.',
     ],
     links: [
@@ -116,13 +127,13 @@ const TIPS = {
     ],
   },
   'data-mapping-knn': {
-    title: 'Neighbour graph',
+    title: 'Neighbor graph',
     body: [
       'The graph KNN edges and the KNN selection tool use: any square `obsp` matrix with one row per cell, such as `connectivities` from `sc.pp.neighbors()` or `<key>_connectivities` from `neighbors(key_added=…)`.',
       'Apply reads and checks the graph first. It must be symmetric, with a zero diagonal and no negative or missing weight; a graph that is not, such as `distances`, is refused and stays unavailable. Shown edges are redrawn from the new graph. None turns them off.',
     ],
     links: [
-      doc('Neighbour graph', 'b_data_loading/13_data_mapping', 'neighbour-graph'),
+      doc('Neighbor graph', 'b_data_loading/13_data_mapping', 'neighbor-graph'),
       doc('KNN drag', 'f_highlighting_selection/02_selection_tools_document_each_tool', 'tool-4-knn-drag-alt-click-drag-degree'),
     ],
   },
@@ -136,7 +147,7 @@ const TIPS = {
           'Genes read for: of the cells open, how many each gene is read for. It shows only for a file stored cell by cell, where a gene is first read for a sample of the open cells.',
         ],
       },
-      'Collapsed, its header says both in one line ("100 % cells · genes 6 %"); click it to change them. Whether it is open is remembered in this browser, never in a session or the address. The legend of a gene and an analysis\'s gene sample line open it at Genes read for.',
+      'Collapsed, its header says both in one line ("100% cells · genes 6%"; while a large dataset is still growing to its cells, "100% cells · reading 197K"); click it to change them. Whether it is open is remembered in this browser, never in a session or the address. The legend of a gene and an analysis\'s gene sample line open it at Genes read for.',
     ],
     links: [
       doc('Subsampled loading', 'b_data_loading/21_subsampled_loading', 'cells-to-open'),
@@ -166,10 +177,10 @@ const TIPS = {
   'agent-connect': {
     title: 'Claude and ChatGPT',
     body: [
-      'Claude and ChatGPT can work in Cellucid in this browser: read the open dataset, colour, filter, highlight, run analyses and explain what they find. Each step they take is kept in the history, labelled as theirs, and one click undoes their whole turn; before a large download they ask you here.',
+      'Claude and ChatGPT can work in Cellucid in this browser: read the open dataset, color, filter, highlight, run analyses and explain what they find. Each step they take is kept in the history, labeled as theirs, and one click undoes their whole turn; before a large download they ask you here.',
       { list: [
         'Copy the connector address and add it in Claude (Customize › Connectors › Add custom connector) or in ChatGPT (as a custom connector).',
-        'Claude or ChatGPT opens a page with a code and Open Cellucid to approve. That link brings you here to Allow or Deny. With Cellucid open on another device, type the code under Code from another device.',
+        'Claude or ChatGPT opens a page with a code and Open Cellucid to approve. That link brings you here to Allow or Deny; in a Cellucid tab already open in the same browser, you can type the code under Connect code instead. Only the browser that shows the page can approve: a code or link from someone else connects nothing.',
         'Manage… lists the agents connected through this browser: Remove ends one; Forget this browser ends them all.',
       ] },
       'The Cellucid relay passes the agent\'s requests to this tab and the answers back. It keeps no account and no chat, and no dataset bytes pass through it. Every Cellucid tab of this browser shares the connection; requests go to the one used last.',
@@ -207,11 +218,11 @@ const TIPS = {
   subsample: {
     title: 'Cells to open',
     body: [
-      'How much of a dataset is read. At 100 % every cell is; below it, a share of the cells, chosen by a seed, and everything (the view, filters, analyses, genes, exports) works on those cells alone. Over a network, less is downloaded: only the parts of the file that hold the chosen cells.',
+      'How much of a dataset is read. At 100% every cell is; below it, a share of the cells, chosen by a seed, and everything (the view, filters, analyses, genes, exports) works on those cells alone. Over a network, less is downloaded: only the parts of the file that hold the chosen cells.',
       {
         list: [
           'File default: on a file Cellucid wrote, Uniform with the file\'s own seed; on any other file, Blocks. Either way only about the chosen share of the file is read.',
-          'Blocks: whole runs of neighbouring cells, aligned to how the file stores them, so parts holding only left-out cells are never read. Cells stored next to each other (often of one sample) come together; Details says how far its categories are from every cell\'s.',
+          'Blocks: whole runs of neighboring cells, aligned to how the file stores them, so parts holding only left-out cells are never read. Cells stored next to each other (often of one sample) come together; Details says how far its categories are from every cell\'s.',
           'Uniform: every cell equally likely. Except on a file Cellucid wrote, with its own seed, it reads more of the file, and Details says how much. A smaller share keeps a subset of the cells a larger one keeps, with the same seed (as Blocks does).',
           'Stratified: every category of a field in proportion, or the same count of each (Same count per category).',
           'Spatial: on a grid over an embedding, dense regions are thinned and sparse ones kept.',
@@ -243,7 +254,7 @@ const TIPS = {
       'Open… offers two choices, because a browser dialog picks files or one folder, never both:',
       {
         list: [
-          'File…: an `.h5ad`, `.rds`, `.rda`/`.RData`, `.h5mu`, `.loom` or 10x Cell Ranger `.h5` file, or a `.zarr.zip` archive holding one AnnData or MuData Zarr store. An `.h5seurat` file is recognised and refused, with the line that converts it.',
+          'File…: an `.h5ad`, `.rds`, `.rda`/`.RData`, `.h5mu`, `.loom` or 10x Cell Ranger `.h5` file, or a `.zarr.zip` archive holding one AnnData or MuData Zarr store. An `.h5seurat` file is recognized and refused, with the line that converts it.',
           'Folder…: a `.zarr` store folder (AnnData, as `cellucid.prepare()` and `cellucid_prepare()` write it, or MuData Zarr), a Cell Ranger outs/ folder, whose UMAP and t-SNE are read with its matrix, or a MatrixMarket folder (a `matrix.mtx` with its features and barcodes). Choose the folder itself.',
         ],
       },
@@ -295,11 +306,13 @@ const TIPS = {
   'history': {
     title: 'History',
     body: [
-      'Every change to the dataset shown is a step: colouring, filters, labels, highlights, views, analyses, the camera and the layout. Steps of an agent (Claude, ChatGPT) or a notebook (Python, R) carry its name; an agent’s turn is one row you can undo at once.',
+      'Every change to the dataset shown is a step: coloring, filters, labels, highlights, views, analyses, the camera and the layout. Steps of an agent (Claude, ChatGPT) or a notebook (Python, R) carry its name; an agent’s turn is one row you can undo at once.',
       'Click a row to select it, double-click to show that step, and › to open its details (who, when, the code, what changed, notes, and its actions). Acting after going back starts a branch: the steps you left stay, as a ⑂ row where they part. Runs of camera and panel steps fold into one row (Camera ×6); undo still goes step by step.',
       'Shift+click selects several steps of one line: Group (▣) names them as one node and keeps every step; Merge into one step (⧉) replaces them with their net change. Recording can be paused from the status line: changes still apply, and resuming keeps them as one step.',
       'Keys in the history:',
-      { list: GRAPH_SHORTCUTS.map(([keys, does]) => `${keys}: ${does}`) },
+      // From the one shortcut table (`ui/onboarding/shortcut-table.js`), with undo and redo.
+      { list: [...shortcutGroup('history').rows, ...shortcutGroup('general').rows.filter(row => /^(Undo|Redo)/.test(row.label))]
+        .map(row => `${shortcutKeysText(row)}: ${row.label}`) },
     ],
     links: [
       doc('The history', 'm_state_history/01_the_history', 'the-history-graph'),
@@ -312,7 +325,7 @@ const TIPS = {
     title: 'Camera moves',
     body: [
       'On (the default), every camera move and change of navigation is a step. Off, camera moves make no step, and undo, redo and jumps leave the camera where it is; the steps still keep each view, so a tour, Compare and a shared file show it.',
-      'It never touches the analysis: colours, filters, labels and results are always recorded. It is a setting of this browser, for every dataset; turned on again, the next move is recorded.',
+      'It never touches the analysis: colors, filters, labels and results are always recorded. It is a setting of this browser, for every dataset; turned on again, the next move is recorded.',
     ],
     links: [
       doc('History settings', 'm_state_history/05_recording_groups_notes_and_cleanup', 'history-settings'),
@@ -407,7 +420,7 @@ const TIPS = {
   'history-memory': {
     title: 'History memory',
     body: [
-      'The history keeps every value of every step in memory, and what Recently deleted holds, so any step comes back exactly; nothing is dropped to make room. Values are kept once, however many steps share them, so most steps cost nothing; large cell sets (a brush over many cells, hidden cells) and analysis results cost the most.',
+      'The history keeps every value of every step in memory, and what Recently deleted holds, so any step comes back exactly; nothing is dropped to make room. Values are kept once, however many steps share them, so most steps cost nothing; large cell sets (a selection of many cells, hidden cells) and analysis results cost the most.',
       'When the history passes what this device has room for, the status line says so and names the largest parts. Each step’s part has Show; Recently deleted… empties what it keeps; merging steps into one keeps only their net change.',
     ],
     links: [
@@ -463,7 +476,7 @@ const TIPS = {
       'What agents may do in this tab without asking you: the chat bar\'s, and Claude or ChatGPT connected to Cellucid (their tool list says it too). Reading the dataset is always allowed.',
       {
         list: [
-          'Changes in this tab: colour, filter, highlight, views, new fields, analyses (each a step the history can undo), and opening another dataset (its history stays kept).',
+          'Changes in this tab: color, filter, highlight, views, new fields, analyses (each a step the history can undo), and opening another dataset (its history stays kept).',
           'Heavy work: what this device and connection, as measured, would take longer than about 10 s to do (a long analysis, reading genes for many cells, opening many cells).',
           'Pausing the history: changes still apply, recorded later as one step.',
           'What cannot be undone: writing a file, deleting what was saved, a large download, publishing.',
@@ -491,11 +504,23 @@ const TIPS = {
     ],
   },
 
+  'agent-chat-cache': {
+    title: 'Prompt cache',
+    body: [
+      'Every call to Claude sends its instructions, the tools and the conversation so far. Claude keeps them cached between calls, so each call costs a small part of a fresh one.',
+      'Kept 5 minutes (the default) is cheapest while you keep chatting. Kept 1 hour costs more when a chat starts (about 1.6 times the 5-minute write) and spares the full price again after a pause of more than 5 minutes: choose it when you think between messages.',
+      'Claude reuses a copy it already holds: chosen within 5 minutes of a chat kept for 5 minutes, the hour starts only after that copy lapses, so the first long pause still pays the full price once. Choose it before you start.',
+    ],
+    links: [
+      doc('Chat settings', 'g_agents/01_chat_bar', 'settings'),
+    ],
+  },
+
   // ---------------------------------------------------------- Visualization
   'display': {
     title: 'Display',
     body: [
-      'Theme sets the colours of the interface, light or dark. Background sets what is drawn behind the cells: a grid box, a studio floor that becomes dotted paper in 2D and in level views, or plain white or black.',
+      'Theme sets the colors of the interface, light or dark. Background sets what is drawn behind the cells: a grid box, a studio floor that becomes dotted paper in 2D and in level views, or plain white or black.',
       'Both apply at once and are saved in sessions.',
     ],
     links: [
@@ -517,7 +542,7 @@ const TIPS = {
   'shader-quality': {
     title: 'Shader quality',
     body: [
-      'Changes what a point looks like. Full adds lighting and fog. Sculpted shades every point as a soft-lit, glossy ball with smooth edges and its legend colour at the centre, keeps fog, and holds highlighted cells still instead of pulsing them. Light drops lighting and fog, Ultra-light draws squares instead of round dots.',
+      'Changes what a point looks like. Full adds lighting and fog. Sculpted shades every point as a soft-lit, glossy ball with smooth edges and its legend color at the center, keeps fog, and holds highlighted cells still instead of pulsing them. Light drops lighting and fog, Ultra-light draws squares instead of round dots.',
       'It barely changes speed. In 3D views depth testing discards most hidden points before shading. 2D views are drawn without depth and every quality draws them without a discard, so on a dense million-cell 2D embedding with antialiasing on the qualities measured within a few percent of one another (one Apple M1 Pro).',
       `For speed in 3D, reach for point size, filtering or ${PLACES.performance.name} below instead.`,
     ],
@@ -595,13 +620,13 @@ const TIPS = {
   'connectivity': {
     title: 'Connectivity',
     body: [
-      `Draws the dataset’s neighbour graph as lines between cells. It is available when the dataset has one; for an AnnData file, choose the graph under ${placePath(PLACES.session, PLACES.dataMapping)}.`,
+      `Draws the dataset’s neighbor graph as lines between cells. It is available when the dataset has one; for an AnnData file, choose the graph under ${placePath(PLACES.session, PLACES.dataMapping)}.`,
       'Only edges between visible cells are drawn, so filters thin the graph too. Max edges caps how many are drawn; on large datasets keep it low to stay fast.',
     ],
     links: [
       doc('Connectivity edges', 'c_core_interactions/07_screenshots', 'connectivity-edges'),
       doc('Name a graph when serving', 'b_data_loading/04_server_tutorial', 'launch-choices-what-the-viewer-opens-on'),
-      doc('Choose a graph', 'b_data_loading/13_data_mapping', 'neighbour-graph'),
+      doc('Choose a graph', 'b_data_loading/13_data_mapping', 'neighbor-graph'),
     ],
   },
   'vector-field': {
@@ -653,7 +678,7 @@ const TIPS = {
     body: [
       `The embedding the selected view shows: any one turned on under ${placePath(PLACES.session, PLACES.dataMapping)}, of any dimension. Two views can show two 3D embeddings, or a 3D and a 2D one.`,
       'Keys 1, 2 and 3 show that dimension’s default in the selected view; pressed again, they step through its other embeddings.',
-      'Every view shows the same cells, so a highlight or selection in one appears in all. Colouring, filters, camera, navigation mode, centroid labels and vector fields stay with each view. Sessions keep each view’s embedding.',
+      'Every view shows the same cells, so a highlight or selection in one appears in all. Coloring, filters, camera, navigation mode, centroid labels and vector fields stay with each view. Sessions keep each view’s embedding.',
     ],
     links: [
       doc('Several embeddings at once', 'b_data_loading/13_data_mapping', 'several-embeddings-at-once'),
@@ -664,7 +689,7 @@ const TIPS = {
   'multiview': {
     title: 'Views',
     body: [
-      'Keep view adds a view: a copy of the selected one, as many as you like. Each row says what its view shows and the field it is coloured by; select a row, then change what it shows, its colouring or its filters -- they stay with that view only.',
+      'Keep view adds a view: a copy of the selected one, as many as you like. Each row says what its view shows and the field it is colored by; select a row, then change what it shows, its coloring or its filters -- they stay with that view only.',
       'Grid compare shows all views side by side; Edit selected view shows the selected one large.',
       'Every view is drawn each frame, so on large datasets turn on Level of detail before keeping several. Views of one embedding share its GPU buffers.',
     ],
@@ -689,7 +714,7 @@ const TIPS = {
   'color-by': {
     title: 'Color by',
     body: [
-      'One field colours the selected view at a time. Categorical obs are labels such as cell types; continuous obs are numbers such as scores; gene expression reads one gene from the expression matrix.',
+      'One field colors the selected view at a time. Categorical obs are labels such as cell types; continuous obs are numbers such as scores; gene expression reads one gene from the expression matrix.',
       'Choosing a field in one list clears the others. The buttons beside each list duplicate, rename, delete or clear the field; deleted fields can be restored below.',
     ],
     links: [
@@ -700,8 +725,8 @@ const TIPS = {
   'legend': {
     title: 'Legend',
     body: [
-      'For a categorical field: tick a category to show or hide its cells, click a swatch to change its colour, and rename, merge or delete categories. Centroids mark the centre of each category on the plot.',
-      'For a continuous field: pick a colour map and drag the range to rescale colours or filter cells.',
+      'For a categorical field: tick a category to show or hide its cells, click a swatch to change its color, and rename, merge or delete categories. Centroids mark the center of each category on the plot.',
+      'For a continuous field: pick a color map and drag the range to rescale colors or filter cells.',
       'Hiding a category or narrowing a range is a filter on the selected view. Click a category\'s count to keep only that many of its cells, a random sample with a fixed seed; type all to show every cell again.',
     ],
     links: [
@@ -714,10 +739,10 @@ const TIPS = {
     title: 'Deleted fields',
     body: [
       'A deleted field, or the column a rename, merge or category deletion replaced, waits here until you decide. Restore brings it back exactly as it was.',
-      'Confirm deletion removes it for good and frees its memory; it cannot be restored afterwards. Fields waiting here are saved with the session.',
+      'Delete for good… removes it and frees its memory; it cannot be restored afterwards. Fields waiting here are saved with the session.',
     ],
     links: [
-      doc('Deleted fields', 'd_fields_coloring_legends/02_field_selector_ux', 'deleted-fields-panel-restore-vs-confirm-deletion'),
+      doc('Deleted fields', 'd_fields_coloring_legends/02_field_selector_ux', 'deleted-fields-panel-restore-vs-delete-for-good'),
     ],
   },
   'create-categorical': {
@@ -765,7 +790,7 @@ const TIPS = {
     title: 'Correlation',
     body: [
       'How two variables move together within each selected page: a scatter plot of X against Y, and the correlation r with its p-value per page. Choose X and Y (an obs field or a gene) and the pages, then press Run.',
-      'Only cells with a value for both count. Colour by a categorical field (More options) to look for groups that drive the relationship.',
+      'Only cells with a value for both count. Color by a categorical field (More options) to look for groups that drive the relationship.',
     ],
     links: [
       doc('Correlation mode', 'h_analysis/05_analysis_mode_correlation_analysis', 'what-correlation-mode-is-for'),
@@ -832,10 +857,21 @@ const TIPS = {
   'analysis-fold-change': {
     title: 'Fold change',
     body: [
-      'Automatic: when the data mapping reads the matrix as log1p (Values; from uns[\'log1p\'], unless its stored values could not be log1p), the means are taken back from log1p, log2((expm1(a) + 1e-9) / (expm1(b) + 1e-9)) as scanpy computes logfoldchanges; otherwise log2 of the means as stored, with a small pseudocount and a shift for negative values.',
+      'Automatic: when the values are log1p — the counts normalized by the analysis (Normalize counts), or a matrix the data mapping reads as log1p (Values; from uns[\'log1p\'], unless its stored values could not be log1p) — the means are taken back from log1p, log2((expm1(a) + 1e-9) / (expm1(b) + 1e-9)) as scanpy computes logfoldchanges; otherwise log2 of the means as stored, with a small pseudocount and a shift for negative values.',
+      'Pseudobulk on counts: the group coefficient of the samples’ log2-CPM in limma’s linear model (paired: within donors).',
     ],
     links: [
       doc('Statistics', 'h_analysis/06_analysis_mode_differential_expression_de', 'statistics-exact-implementation'),
+    ],
+  },
+  'analysis-paired': {
+    title: 'Pair samples across groups',
+    body: [
+      'When the same donors gave cells to both groups (two organs of one fetus), the donor is a blocking factor of the linear model (limma, ~ donor + group): each donor’s own level is taken out before the groups are compared. Donors in one group only are left out.',
+      'Replicates must name the donor (or the sample shared by both groups). The result says how many are in both groups, paired or not.',
+    ],
+    links: [
+      doc('Paired samples', 'h_analysis/06_analysis_mode_differential_expression_de', 'paired-samples'),
     ],
   },
   'analysis-expression-matrix': {
@@ -853,7 +889,7 @@ const TIPS = {
     title: 'Replicates',
     body: [
       'None (cells): every cell is an observation, as scanpy’s rank_genes_groups tests.',
-      'A sample field (pseudobulk): each sample’s cells of a group are one observation, its mean expression; the test is Welch’s t between the two groups’ samples. Cells of one sample are not independent, so this is the test to trust when the groups come from different donors or conditions. Each group needs cells in at least 2 samples; no variance moderation (limma, edgeR, DESeq2) is applied.',
+      'A sample field (pseudobulk): each sample’s cells of a group are one observation. A matrix of counts is summed per sample from the raw counts (whatever the expression transform), normalized with edgeR’s TMM and taken as log-CPM; any other matrix gives each sample’s mean. Each gene is fit with limma (~ group) and its variance moderated by empirical Bayes over every gene (eBayes, trend = TRUE). Cells of one sample are not independent, so this is the test to trust when the groups come from different donors or conditions. Each group needs cells in at least 2 samples.',
     ],
     links: [
       doc('Replicates', 'h_analysis/06_analysis_mode_differential_expression_de', 'replicates-pseudobulk'),
@@ -926,6 +962,15 @@ const TIPS = {
     links: [
       doc('Gene sets', 'h_analysis/07_analysis_mode_gene_signature', 'gene-sets'),
       doc('Genes not in the dataset', 'h_analysis/07_analysis_mode_gene_signature', 'genes-not-in-the-dataset'),
+    ],
+  },
+  'signature-group-by': {
+    title: 'Group by',
+    body: [
+      'Pages: the highlight pages chosen above are scored and compared. A field: each of its categories in the chosen cells is scored and compared in one run (a program per cell type or stage), with no highlight page made; Groups to score keeps some of them.',
+    ],
+    links: [
+      doc('Group by', 'h_analysis/07_analysis_mode_gene_signature', 'group-by-a-field'),
     ],
   },
   'signature-methods': {
@@ -1036,7 +1081,7 @@ const TIPS = {
   'cell-info': {
     title: 'Cell info',
     body: [
-      'Shows a card for the cell under the pointer: its value of the field the view is coloured by and, for a continuous field, where that value sits on the colour scale. For a categorical field it counts the cells of that category visible in the view, which are exactly the cells selecting the category would pick. It works in every view of a grid.',
+      'Shows a card for the cell under the pointer: its value of the field the view is colored by and, for a continuous field, where that value sits on the color scale. For a categorical field it counts the cells of that category visible in the view, which are exactly the cells selecting the category would pick. It works in every view of a grid.',
       'On a touch screen, press and hold a cell. The card stays until the next touch.',
       'It is on by default. It never loads a field and never redraws the plot, and it waits while the camera moves. On a view of 250,000 cells or more the lookup walks a spatial index, built once in a worker (the first hover starts it): until it is ready the card says it is preparing the lookup, and names the cell as soon as it is.',
     ],
@@ -1048,8 +1093,8 @@ const TIPS = {
   'cell-info-categories': {
     title: 'Show recent fields',
     body: [
-      'Adds the cell’s label in up to four other categorical fields you have recently coloured by, so you can read, for example, its cluster, batch and sample while the view is coloured by cell type.',
-      'Recent means already in memory: a field is listed once you have coloured by it in this session. Hovering never loads a field, which keeps the card free on large datasets.',
+      'Adds the cell’s label in up to four other categorical fields you have recently colored by, so you can read, for example, its cluster, batch and sample while the view is colored by cell type.',
+      'Recent means already in memory: a field is listed once you have colored by it in this session. Hovering never loads a field, which keeps the card free on large datasets.',
     ],
     links: [
       doc('Cell info', 'd_fields_coloring_legends/08_cell_info', 'what-the-card-shows'),
@@ -1070,10 +1115,10 @@ const TIPS = {
   'gene-read': {
     title: 'Genes read for',
     body: [
-      'How many of the open cells a gene is read for, as a share of them. It is not Cells to open: that chooses which cells are on the map; this, among the cells open, how many each gene has a value for. 100 % is every open cell, however few Cells to open opened.',
+      'How many of the open cells a gene is read for, as a share of them. It is not Cells to open: that chooses which cells are on the map; this, among the cells open, how many each gene has a value for. 100% is every open cell, however few Cells to open opened.',
       'It shows only for a file stored cell by cell (sparse CSR, or dense in blocks of whole cells), where one gene of every cell reads the whole matrix: a gene is first read for a sample of the open cells, sized so the first gene takes about 20 seconds on this connection.',
-      'The slider stops at the share read now, then 1, 5, 10, 25, 50 and 100 % above it (up to the most cells whose gene index fits this device). The line under it says the cells and what reading them downloads and takes, at the connection\'s speed as measured now. Read reads genes for them: the cells read are kept and only the added ones are read, in steps that double; Stop keeps what is read.',
-      'It applies to every gene: the colouring, analyses (their results are then marked Stale) and exports. A session saved after it reads the same cells again when it opens.',
+      'The slider stops at the share read now, then 1, 5, 10, 25, 50 and 100% above it (up to the most cells whose gene index fits this device). The line under it says the cells and what reading them downloads and takes, at the connection\'s speed as measured now. Read reads genes for them: the cells read are kept and only the added ones are read, in steps that double; Stop keeps what is read.',
+      'It applies to every gene: the coloring, analyses (their results are then marked Stale) and exports. A session saved after it reads the same cells again when it opens.',
     ],
     links: [
       doc('Genes read for', 'b_data_loading/21_subsampled_loading', 'genes-read-for'),
@@ -1083,8 +1128,8 @@ const TIPS = {
   'zero-gray': {
     title: 'Gray for zero',
     body: [
-      'Off (the default): a gene\'s 0 is a value like any other, drawn in the colour scale\'s lowest colour.',
-      'On: the cells where the gene is 0 are drawn in a gray made from the background (a step darker than a light one, a step lighter than a dark one), beneath the cells that express it, so the colours show only where it is expressed.',
+      'Off (the default): a gene\'s 0 is a value like any other, drawn in the color scale\'s lowest color.',
+      'On: the cells where the gene is 0 are drawn in a gray made from the background (a step darker than a light one, a step lighter than a dark one), beneath the cells that express it, so the colors show only where it is expressed.',
       'For genes with no negative value (scaled data has none of this). On a log scale 0 has no logarithm and is gray either way. It is saved with the session, and figures, kept views and the cell card draw what the view draws.',
     ],
     links: [
@@ -1116,7 +1161,7 @@ const TIPS = {
     title: 'Live filtering',
     body: [
       'On: cells outside the visible range are hidden as you drag the sliders.',
-      'Off: drag freely, then press Filter to apply the range once. This is smoother on large datasets, where every drag step refilters millions of cells.',
+      'Off: drag freely, then press Filter to apply the range once. This is smoother on large datasets, where every drag step refilters millions of cells. It stays off for every field and view until you turn it on.',
     ],
     links: [
       doc('Live filtering vs Filter', 'd_fields_coloring_legends/03_color_by_behavior', 'live-filtering-vs-filter-performance-predictability'),
@@ -1136,7 +1181,7 @@ const TIPS = {
   'outlier-filter': {
     title: 'Outlier filter',
     body: [
-      'Hides cells far from the centre of their category in a latent space (an `obsm` array such as scVI or PCA), not in the 2D/3D layout. The value is a share of each category: at 95% the farthest 5% of every category are hidden; at 100% nothing is.',
+      'Hides cells far from the center of their category in a latent space (an `obsm` array such as scVI or PCA), not in the 2D/3D layout. The value is a share of each category: at 95% the farthest 5% of every category are hidden; at 100% nothing is.',
       'Without a latent space the filter is one button, Choose latent space, which opens ' + PLACES.dataMapping.name + ' (“Outliers in”) with this file’s candidate arrays; its title names them. A file written by `prepare()` or `cellucid_prepare()` with a latent space stores every categorical field’s distances, so the filter works at once; for any other file the first use reads the latent space once to compute them, with progress and Cancel, and says how much it reads.',
       'Only categories of at least 10 cells are measured (a file or launch can set another number, `centroid_min_points`). The filter applies to the active field in the selected view.',
     ],
@@ -1155,7 +1200,7 @@ const TIPS = {
       {
         list: [
           'Annotation: the clicked cell’s category, or a value range, on the field of the view you click in.',
-          'KNN drag: neighbours of the clicked cell through the graph; drag further for more steps. Graph status appears in notifications.',
+          'KNN drag: neighbors of the clicked cell through the graph; drag further for more steps. Graph status appears in notifications.',
           'Proximity drag: cells within a radius of the clicked cell in 3D; drag to widen it.',
           'Lasso: cells inside a drawn outline. Rotate and draw again to intersect, carving out a 3D region.',
         ],
@@ -1183,20 +1228,20 @@ const TIPS = {
     title: 'Keyframes',
     body: [
       'Save position records the camera of the focused view as a keyframe. With two or more, a playback bar appears over the plot.',
-      'Each keyframe’s time to the next can be set, or left to auto, where Default speed decides it. Keyframes are saved in sessions.',
+      'Under each keyframe: its hold, the seconds the camera rests there before moving on (empty for none), then its time to the next, set or left to auto, where Default speed decides it. Keyframes are saved in sessions.',
     ],
     links: [
-      doc('Camera path playback', 'c_core_interactions/02_camera_controls_advanced', 'camera-path-playback-is-opt-in'),
+      doc('Camera path keyframes', 'c_core_interactions/08_camera_path', 'the-keyframes-list'),
     ],
   },
   'playback': {
     title: 'Playback',
     body: [
-      'How the camera travels between keyframes: Catmull-Rom gives a smooth curve through every keyframe, Linear straight segments; SLERP turns smoothly; easing slows the start or end of each move.',
+      'How the camera travels between keyframes: Catmull-Rom gives a smooth curve through every keyframe, Linear straight segments; SLERP turns smoothly; easing is how the path starts and ends (from rest, to rest, or moving); every transition keeps its time.',
       'Loop repeats the path. Autoplay starts a ready path at once; it is off by default, and a restored session plays only if it was saved with Autoplay on.',
     ],
     links: [
-      doc('Camera path playback', 'c_core_interactions/02_camera_controls_advanced', 'camera-path-playback-is-opt-in'),
+      doc('Camera path playback', 'c_core_interactions/08_camera_path', 'playback-settings'),
     ],
   },
   'default-speed': {
@@ -1205,7 +1250,7 @@ const TIPS = {
       'How fast the camera travels between keyframes whose timing is auto. Keyframes with a set duration keep it.',
     ],
     links: [
-      doc('Camera path playback', 'c_core_interactions/02_camera_controls_advanced', 'camera-path-playback-is-opt-in'),
+      doc('Camera path playback', 'c_core_interactions/08_camera_path', 'playback-settings'),
     ],
   },
 
@@ -1213,8 +1258,8 @@ const TIPS = {
   'figure-export': {
     title: 'Figure export',
     body: [
-      'Saves the view as it is drawn: the same cells, colours, filters and camera, with an optional title, axes, legend and highlighted selection.',
-      'SVG keeps text and the legend editable for a paper figure; with hundreds of thousands of points, its hybrid strategy rasterises the points so the file stays manageable. PNG is a raster at the DPI you choose and opens anywhere.',
+      'Saves the view as it is drawn: the same cells, colors, filters and camera, with an optional title, axes, legend and highlighted selection.',
+      'SVG keeps text and the legend editable for a paper figure; with hundreds of thousands of points, its hybrid strategy rasterizes the points so the file stays manageable. PNG is a raster at the DPI you choose and opens anywhere.',
       'Layers it cannot draw block the export with a message: connectivity edges, the vector field and volumetric smoke. Turn them off, or switch the render mode to points, first.',
     ],
     links: [
@@ -1227,8 +1272,8 @@ const TIPS = {
   'shortcuts-general': {
     title: 'General shortcuts',
     body: [
-      'Shortcuts act on the focused view, and never while you are typing in a field. Press ? to open this panel from anywhere.',
-      'Ctrl/⌘+Z and Shift+Ctrl/⌘+Z undo and redo steps of the history, also with a slider or checkbox focused; a text field keeps its own undo. `/` opens the agent chat.',
+      'Shortcuts act on the focused view. A text field or a list keeps the keys typed in it, and a dialog keeps its own; after a slider, a checkbox or a button the keys work at once. Press ? to open this panel from anywhere.',
+      'Ctrl/⌘+Z and Shift+Ctrl/⌘+Z (or Ctrl+Y, except on a Mac) undo and redo steps of the history, also with a slider or checkbox focused; a text field keeps its own undo. `/` opens the agent chat.',
     ],
     links: [
       doc('Camera shortcuts', 'c_core_interactions/02_camera_controls_advanced', 'keyboard-shortcuts-that-affect-camera-navigation'),
@@ -1259,6 +1304,24 @@ const TIPS = {
     ],
     links: [
       doc('Free-fly controls', 'c_core_interactions/02_camera_controls_advanced', 'free-fly-controls'),
+    ],
+  },
+  'shortcuts-history': {
+    title: 'History list keys',
+    body: [
+      'With a row of the History list focused (click one, or Tab to the list). They act on that row; the History (i) lists them too.',
+    ],
+    links: [
+      doc('The history', 'm_state_history/01_the_history', 'the-history-graph'),
+    ],
+  },
+  'shortcuts-move': {
+    title: 'Moving by keys',
+    body: [
+      'What you can drag, you can move by keys the same way: a panel floated or docked, a highlight page into Create categorical and its order, a legend category onto another to merge them. Focus its handle, pick it up, choose where it goes (each place is announced), and drop it there.',
+    ],
+    links: [
+      doc('Keyboard shortcuts', 'o_accessibility_privacy_security/03_keyboard_shortcuts', 'moving-by-keys'),
     ],
   },
   'shortcuts-selection': {
@@ -1377,6 +1440,16 @@ const TIPS = {
   },
 
   // ------------------------------------------------------- Cite and Share
+  'group-categories': {
+    title: 'Group categories',
+    body: [
+      'Makes a new categorical field whose categories are groups of this field\'s: type the group each category joins (a lineage from cell types: Ductal and Ngn3 low EP into Progenitor). Categories given the same group become one, colored as the first of them.',
+      'A category left empty keeps its name, or, with Others into, joins that category. The field it is made from stays as it is; the new one is shown, and one Undo removes it.',
+    ],
+    links: [
+      doc('Group categories', 'd_fields_coloring_legends/02_field_selector_ux', 'group-categories-into-a-new-field'),
+    ],
+  },
   'cite': {
     title: 'Citing Cellucid',
     body: [
@@ -1392,7 +1465,7 @@ const TIPS = {
     title: 'Share link',
     body: [
       'A link to www.cellucid.com that reopens this dataset for anyone, carrying only what picks the dataset.',
-      `It reopens the dataset, not your view of it: to share the camera, colours, filters and highlights, write a session file with ${placePath(PLACES.state, PLACES.sessionFile)} › Share… and send it with the link.`,
+      `It reopens the dataset, not your view of it: to share the camera, colors, filters and highlights, write a session file with ${placePath(PLACES.state, PLACES.sessionFile)} › Share… and send it with the link.`,
       'Only a sample, a link to published data (in its public form: what granted access is left out) or a server other people can reach has a link; a file from disk, a notebook or a server on localhost does not.',
     ],
     links: [
@@ -1465,10 +1538,19 @@ const TIPS = {
   'composition-test': {
     title: 'Test',
     body: [
-      'Each cell type is tested across samples: logit proportions with Welch’s t-test or ANOVA (as propeller, without its empirical-Bayes moderation, so more conservative with few samples), ranks of proportions (Wilcoxon or Kruskal-Wallis), or centred log-ratios.',
+      'Each cell type is tested across samples: logit proportions with Welch’s t-test or ANOVA (as propeller, without its empirical-Bayes moderation, so more conservative with few samples), ranks of proportions (Wilcoxon or Kruskal-Wallis), or centered log-ratios.',
       'At least two samples per condition are needed.',
     ],
     links: [doc('Tests', 'h_analysis/12_analysis_mode_composition', 'tests'), doc('Without samples', 'h_analysis/12_analysis_mode_composition', 'without-samples')],
+  },
+  'composition-paired': {
+    title: 'Pair samples across conditions',
+    body: [
+      'When the same samples (donors) have cells in both of two conditions, each is a pair: logit and centered log-ratio take Student’s t of each donor’s difference (scipy ttest_rel; propeller’s and limma’s design blocked by donor, without the moderation), ranks the Wilcoxon signed-rank test (R wilcox.test, paired). Samples in one condition only are left out.',
+      'Each cell type is tested over the pairs holding any of its cells: a pair without it on either side says nothing about it. A type in fewer than 3 such pairs is not tested.',
+      'Pairing needs exactly two conditions among the chosen cells and at least 3 samples in both: choose a page holding the two.',
+    ],
+    links: [doc('Paired samples', 'h_analysis/12_analysis_mode_composition', 'paired-samples')],
   },
   'composition-correction': {
     title: 'Multiple testing',
@@ -1539,7 +1621,7 @@ const TIPS = {
     title: 'OneDrive sign-in',
     body: [
       'OneDrive serves no file without a sign-in, even one shared with anyone. What Cellucid gets: permission to read your files and the files shared with you, used only for the file you open.',
-      'A work or school account opening a colleague’s file needs one more permission, which many organisations let only an administrator approve, once for everyone.',
+      'A work or school account opening a colleague’s file needs one more permission, which many organizations let only an administrator approve, once for everyone.',
       'Where the data goes: your browser reads the file straight from Microsoft; the file and the sign-in never pass through a Cellucid server. What is kept: the sign-in, for this tab, about an hour; it renews itself for up to 24 hours until a reload, then one click signs in again. Microsoft cannot revoke it: Sign out forgets it; to remove Cellucid\'s access, account.live.com/consent/Manage or myapps.microsoft.com.',
     ],
     links: [

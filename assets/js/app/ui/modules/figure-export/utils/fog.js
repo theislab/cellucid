@@ -5,7 +5,7 @@
  * The viewer's `full` point shader thins every point with distance from the
  * camera (`HP_VS_FULL`, `rendering/shaders/high-perf-shaders.js`, with the
  * one fog model of `rendering/shaders/fog-shaders.js`); the `sculpted` one is
- * opaque, and fades its colour toward the fog colour instead
+ * opaque, and fades its color toward the fog color instead
  * (`HP_FS_SCULPTED`), which a figure sets to its paper. Fog is on by default —
  * `fogDensity` starts at 0.5 — and it is the strongest depth cue a 3D scatter
  * has: near points read saturated and opaque, far points fade into whatever
@@ -13,15 +13,15 @@
  *
  * The PNG and hybrid-SVG paths run that shader, so they carry the cue. The
  * `full-vector` and `optimized-vector` SVG strategies project points in
- * JavaScript and used to emit every circle at its raw colour, producing a
+ * JavaScript and used to emit every circle at its raw color, producing a
  * figure in which foreground and background cells are indistinguishable. That
  * is not a cosmetic simplification: it flattens the depth axis of the data.
  *
  * WHAT IS AND IS NOT REPRODUCED
  * Reproduced exactly: the Beer-Lambert transmittance and the opacity it
  * leaves a point (`fogOpacityAt`). Fog thins a point toward what is behind it
- * rather than tinting it, so a circle keeps its colour and fades into the
- * paper, whatever colour the paper is.
+ * rather than tinting it, so a circle keeps its color and fades into the
+ * paper, whatever color the paper is.
  *
  * Not reproduced: the sphere-impostor lighting term (`u_lightingStrength`),
  * which varies across each point sprite and has no flat-disc equivalent. It is
@@ -41,7 +41,7 @@ import { SHADER_QUALITY_TRAITS } from '../../../../../rendering/shader-quality.j
 /**
  * @typedef {object} FogEvaluator
  * @property {boolean} fadesAlpha - Fog thins the point (`applyFogAlpha`);
- *   false: it is opaque and fog mixes its colour (`applyFogChannel`).
+ *   false: it is opaque and fog mixes its color (`applyFogChannel`).
  * @property {number} fogR - 0..255
  * @property {number} fogG - 0..255
  * @property {number} fogB - 0..255
@@ -50,7 +50,7 @@ import { SHADER_QUALITY_TRAITS } from '../../../../../rendering/shader-quality.j
 
 /**
  * Build the fog evaluator for one render state, or null when the state carries
- * no fog at all — in which case the shader's own output is the raw colour and
+ * no fog at all — in which case the shader's own output is the raw color and
  * an unfogged vector circle is already exact.
  *
  * @param {object|null} renderState

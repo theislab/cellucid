@@ -104,7 +104,7 @@ class FakeElement {
 }
 
 /**
- * A centre whose only stubbed part is the DOM, so every duration decision runs
+ * A center whose only stubbed part is the DOM, so every duration decision runs
  * for real and is recorded as the schedule request it produces.
  */
 function createRecordingCenter(t) {
@@ -216,7 +216,7 @@ test('the types that are safe to time out keep the times they had', t => {
   // Once its card is on screen (NOTICE_AFTER_MS), a completion is a success
   // card that times out like one.
   center._reveal(center.notifications.get(active));
-  center.complete(active, 'User data ready: 2K cells');
+  center.complete(active, 'Opened sample: 2K cells');
   assert.equal(resolvedDuration(scheduled, active), 4000);
 });
 
@@ -322,8 +322,10 @@ test('a restore failure the serializer already published is not announced twice'
 
   // The mark is only meaningful if it is set exactly where a failure reaches
   // the screen, and nowhere else.
+  // A load's failure reaches the screen through its line (`restoreLine`: the
+  // download tracker's failDownload; a starting view's failure its caller says).
   const publications = [
-    ...serializer.matchAll(/notifications\.failDownload\([\s\S]*?\);/g),
+    ...serializer.matchAll(/\bline\.fail\([\s\S]*?\);/g),
   ];
   // The bundle restore publishes a canceled and a failed outcome.
   assert.ok(

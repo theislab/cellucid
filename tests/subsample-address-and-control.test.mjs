@@ -5,7 +5,7 @@
  *   exactly: never cells fitted to this device (`autoFit`), nor a restored
  *   set its specification no longer gives (`reproduced: false`); the paths
  *   that open the same cells again (a page restored from the back/forward
- *   cache, a cancelled reading undone) carry both, so the address stays
+ *   cache, a canceled reading undone) carry both, so the address stays
  *   right after them (`url-state.js`, `subsample-plan.js` `kept` mode);
  * - the control keeps the open subsample's exact count until the share is
  *   edited: the percentage it shows is rounded for display
@@ -132,7 +132,7 @@ test('auto-fit counts each modality by the share of the cells it measures, and a
   assert.equal(fit.limit, 'columnIndex');
   assert.equal(fit.neededBytes, rna + adt, 'the root X is the RNA modality\'s: counted once');
   assert.equal(fit.k, Math.floor((budget - fixed) / perCell));
-  // At k kept cells (ADT holding its 40 % share of them) the indexes fit; one more would not.
+  // At k kept cells (ADT holding its 40% share of them) the indexes fit; one more would not.
   assert.ok(fixed + perCell * fit.k <= budget);
   assert.ok(fixed + perCell * (fit.k + 1) > budget);
   // Without the modality's share (every ADT entry per kept cell), k would be smaller.
@@ -180,7 +180,7 @@ test('the control keeps the open subsample\'s exact count until the share is edi
     let reopened = 0;
     let asked = null;
     const control = initSubsampleControl({ dom, state, getCellSubset: () => subset, reopen: async cellSubset => { reopened++; asked = cellSubset; return { shown: false, inPlace: false }; } });
-    // 12.35 % is shown (12.3457 rounded), which alone would be 123,500 cells.
+    // 12.35% is shown (12.3457 rounded), which alone would be 123,500 cells.
     assert.equal(dom.percent.value, '12.35');
     assert.equal(dom.apply.disabled, true, 'nothing changed: nothing to apply');
     // A seed-only change: Apply opens the same count with the new seed.
@@ -213,7 +213,7 @@ test('the control keeps the open subsample\'s exact count until the share is edi
 });
 
 test('the control is the person\'s again once the new cells are open, while what was shown comes back on them', async () => {
-  // A view coloured by a gene reads that gene again for the new cells (on a
+  // A view colored by a gene reads that gene again for the new cells (on a
   // 2.3M-cell atlas, tens of seconds: the Apply button stayed disabled with
   // "All 2,282,447 cells" chosen until it was in). The cells being open,
   // another share can be applied at once; the earlier restoring then says
@@ -375,7 +375,7 @@ test('the control says one short line, and every fact behind it is a row of its 
     assert.equal(representationFact({ field: 'cell_type', largestDeviation: 0, category: 'B' }).value, 'cell_type: every category keeps its share');
     const priority = openCellsFacts({ ...fitted, autoFit: null, prioritySeed: 4, matrixChunkShare: 0.62 }, {});
     assert.match(priority.find(row => row.label === 'Stored order').title, /^This file is stored in priority order: uniform with its seed \(4\) reads only the share/);
-    assert.equal(priority.find(row => row.label === 'Matrix read').value, '62 % for 10 % of the cells');
+    assert.equal(priority.find(row => row.label === 'Matrix read').value, '62% for 10% of the cells');
     assert.equal(openCellsFacts({ ...fitted, reproduced: false }, {}).find(row => row.label === 'Cells').title, "These are the session's own cells; its settings no longer give exactly these.");
     assert.equal(openCellsFacts({ ...fitted, kept: null, note: 'This dataset has no field x, so its subsample is its default method instead of stratified' }, {})[0].label, 'Note');
     // Genes read for a sample of the open cells, sized by a gene's read
@@ -385,7 +385,7 @@ test('the control says one short line, and every fact behind it is a row of its 
       geneCost: [{ label: 'A gene reads', value: 'only its own values', title: null }],
     });
     assert.equal(timed.find(row => row.label === 'Genes read').value, '40,000 of 227,535 open cells');
-    assert.equal(timed.find(row => row.label === 'Sized to').value, 'a gene in about 20 s here');
+    assert.equal(timed.find(row => row.label === 'Sized to').value, 'a gene in ~20 s here');
     assert.match(timed.find(row => row.label === 'Sized to').title, /for the first gene of raw\.X, the matrix genes are read from/, 'names the matrix it priced');
     assert.ok(timed.some(row => row.label === 'Stored'), 'the layout rows follow');
     assert.ok(!timed.some(row => row.label === 'A gene reads'), 'said once');
@@ -438,7 +438,7 @@ test('a share is read as typed in any locale: a decimal point or comma, never a 
   assert.equal(parseDecimalText('12.5'), 12.5);
   assert.equal(parseDecimalText('12,5'), 12.5, 'a German or Turkish decimal comma');
   assert.equal(parseDecimalText('9,969'), 9.969, 'never nine thousand');
-  assert.equal(parseDecimalText(' 40 % '), 40);
+  assert.equal(parseDecimalText(' 40% '), 40);
   assert.equal(parseDecimalText('12,'), 12, 'half typed');
   assert.equal(parseDecimalText(',5'), 0.5);
   assert.equal(parseDecimalText('2e-7'), 2e-7, 'as the box writes a tiny share');

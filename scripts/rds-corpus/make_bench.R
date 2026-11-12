@@ -1,7 +1,7 @@
 # A Seurat v5 object of a given size for the transcoder benchmark
-# (scripts/rds-corpus/README.md): counts and log-normalised data
+# (scripts/rds-corpus/README.md): counts and log-normalized data
 # (dgCMatrix), scale.data for 2,000 variable genes, PCA (50), UMAP, an SNN
-# graph of 30 neighbours per cell, and meta.data. Not committed.
+# graph of 30 neighbors per cell, and meta.data. Not committed.
 #
 # Usage: Rscript make_bench.R <cells> <out.rds> [genes-per-cell] [scaled-genes] [compress]
 # (scaled-genes: the genes of scale.data, 2000 by default, 0 for none;

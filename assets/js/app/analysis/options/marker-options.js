@@ -23,7 +23,8 @@
  * @module analysis/options/marker-options
  */
 
-import { defineOptions } from './option-schema.js';
+import { CELL_SCOPE_MEANS, defineOptions } from './option-schema.js';
+import { defaultCellTypeField } from './composition-options.js';
 import { compileGenePattern, GENE_FAMILIES } from '../shared/gene-sets.js';
 import { formatCount } from '../../../utils/format-units.js';
 
@@ -36,6 +37,7 @@ import { formatCount } from '../../../utils/format-units.js';
 export function matrixOption(group) {
   return {
     key: 'matrix', kind: 'select', label: 'Expression matrix', tip: 'analysis-expression-matrix', group,
+    means: 'mapped (the Data mapping\'s), X, raw or layer:<name>; the result says when it holds counts',
     default: 'mapped',
     defaultText: 'The mapped matrix',
     choices: context => context?.expressionMatrices?.choices ?? null,
@@ -90,6 +92,8 @@ export function geneFilterOptions(group) {
   return [
     {
       key: 'excludeGenes', kind: 'flags', label: 'Exclude genes', tip: 'analysis-gene-filters', group,
+      // An agent sent gene names here ("Exclude genes has no choice \"GSC\"", live-7 L25-5).
+      means: 'gene families by name: mito (MT-), ribo (RPS, RPL), hemo (hemoglobins); genes by name go in excludePattern',
       default: [],
       choices: context => Object.entries(GENE_FAMILIES).map(([value, family]) => ({
         value,
@@ -98,6 +102,7 @@ export function geneFilterOptions(group) {
     },
     {
       key: 'excludePattern', kind: 'text', label: 'Exclude pattern', tip: 'analysis-gene-filters', group,
+      means: 'a regular expression of the gene names to leave out, for example ^(GSC|CRABP1)$',
       default: '',
       check: value => compileGenePattern(value).error,
     },
@@ -139,8 +144,8 @@ export const MARKER_OPTIONS = defineOptions({
   options: [
     {
       key: 'groupBy', kind: 'select', label: 'Group by', tip: 'marker-genes-group-by', group: 'essentials',
-      default: context => context?.categoricalFields?.[0]?.key ?? '',
-      defaultText: 'The first categorical field with two or more categories',
+      default: defaultCellTypeField,
+      defaultText: 'The coloring field when it is not named like a sample, else the best field named like a cell type, annotation, lineage or cluster, else the first not named like a sample',
       choices: context => (context?.categoricalFields ?? []).map(field => ({ value: field.key, label: field.key })),
     },
     {
@@ -153,6 +158,7 @@ export const MARKER_OPTIONS = defineOptions({
     },
     {
       key: 'referenceGroup', kind: 'select', label: 'Reference group', tip: 'marker-genes-reference', group: 'essentials',
+      means: 'a category of Group by, by name (empty: the largest)',
       default: '',
       defaultText: 'The largest group',
       when: record => record.compareAgainst === 'group',
@@ -167,6 +173,7 @@ export const MARKER_OPTIONS = defineOptions({
     },
     {
       key: 'cells', kind: 'select', label: 'Cells', tip: 'analysis-groups-and-cells', group: 'groups',
+      means: CELL_SCOPE_MEANS,
       default: 'all',
       defaultText: 'All cells',
       choices: cellScopeChoices,

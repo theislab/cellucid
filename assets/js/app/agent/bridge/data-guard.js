@@ -25,7 +25,7 @@
  *   `tests/agent-data-guard.test.mjs` fails until it is.
  *
  * **A file the person receives is not sent to the provider.** An export
- * (`figure.export`, `cells.export`, `field.export`, `history.report`,
+ * (`figure.export`, `cells.export`, `field.export`, `analysis.export`, `history.report`,
  * `history.share`) writes its file to the person's computer through the
  * browser; what the agent is told is its name, its size and counts
  * (`OUTSIDE_RESULTS`), so it runs with the switch on (owner decision
@@ -34,13 +34,13 @@
  *
  * **Groups an agent shaped** by naming cells (`../data-scope.js`
  * `createShapeTracker`) are refused as the groups of a value summary
- * (`SHAPED_INPUTS`): a field summarised by such a field, an analysis
+ * (`SHAPED_INPUTS`): a field summarized by such a field, an analysis
  * computed on such a page or grouped by such a field. Groups of the
- * dataset's categories and groups the person made stay summarisable.
+ * dataset's categories and groups the person made stay summarizable.
  *
  * What it does not do: a summary of a very small group the person or the
  * data defines (a narrow range, a filter, a rare category) can still reveal
- * its cells' values. The switch is not anonymisation, and every place that
+ * its cells' values. The switch is not anonymization, and every place that
  * describes it says so (`SUMMARIES_ONLY_CAVEAT`); no group size is made up.
  *
  * @module app/agent/bridge/data-guard
@@ -50,6 +50,7 @@ import { quoteName } from '../../actions/targets/names.js';
 import { ANALYSIS_MODES } from '../../analysis/options/analysis-modes.js';
 import { isSteplessEffect } from '../../actions/catalog.js';
 import { SUMMARIES_ONLY_LABEL, SUMMARIES_ONLY_PLACE } from '../data-scope.js';
+import { setOwnDataProperty } from '../../../utils/exact-record.js';
 
 /** The reads whose results are values of single cells, each with what it would send. */
 export const CELL_LEVEL_READS = Object.freeze({
@@ -57,16 +58,20 @@ export const CELL_LEVEL_READS = Object.freeze({
   'view.picture': 'a picture of the plot, which draws each cell',
 });
 
-/** The reads (and the dataset opening) whose results are names, counts, settings and statistics of groups. */
+/** The reads (and the dataset and saved-state openings) whose results are names, counts, settings and statistics of groups. */
 export const SUMMARY_READS = Object.freeze(new Set([
   'dataset.summary', 'fields.list', 'field.categories', 'genes.search', 'field.summary', 'views.state',
-  'settings.list', 'layout.get', 'datasets.list', 'dataset.open',
-  'analysis.list', 'analysis.result', 'analysis.cancel',
+  // Where groups sit (means and spreads) and the cameras framing them; the camera path's keyframes.
+  'camera.framing', 'camera-path.get',
+  'settings.list', 'figure-export.get', 'layout.get', 'datasets.list', 'dataset.open', 'history.saved.open',
+  'analysis.list', 'analysis.result',
   // An analysis's settings (`analysis.<name>.get`, one per analysis with options).
   ...ANALYSIS_MODES.filter(mode => mode.options !== null).map(mode => `analysis.${mode.name}.get`),
   'history.get', 'history.summary', 'history.step', 'history.diff', 'history.stale', 'history.search',
   'history.methods', 'history.pseudocode', 'history.saved.list',
   'stored.list', 'annotation.suggestions',
+  // Where each category's arrows lead: means and shares over its cells.
+  'vector-field.summary',
 ]));
 
 /**
@@ -78,7 +83,7 @@ export const SUMMARY_READS = Object.freeze(new Set([
 export const OUTSIDE_RESULTS = Object.freeze(new Set([
   'history.share', 'history.save', 'history.saved.delete', 'history.report', 'history.anndata.save',
   'my-datasets.forget', 'dataset.share-link', 'stored.remove',
-  'figure.export', 'cells.export', 'field.export', 'annotation.vote', 'annotation.suggest',
+  'figure.export', 'cells.export', 'field.export', 'analysis.export', 'annotation.publish',
 ]));
 
 /** Whether an action answers with its result rather than a step (a read, a move of the history, a dataset opened, an act outside the state). */
@@ -95,8 +100,9 @@ function answersWithResult(definition) {
 export function resultDataOf(definition) {
   if (Object.hasOwn(CELL_LEVEL_READS, definition.type)) return 'cells';
   if (SUMMARY_READS.has(definition.type) || OUTSIDE_RESULTS.has(definition.type)) return 'summaries';
-  // A move or an edit of the history answers with ids, labels and notes.
-  if (definition.effect === 'history') return 'summaries';
+  // A move or an edit of the history answers with ids, labels and notes;
+  // a stop of work under way (`control`), with whether it stopped.
+  if (definition.effect === 'history' || definition.effect === 'control') return 'summaries';
   // A change answers with its step and a short note of what changed; one that declares a result returns data, and is classified first.
   if (!answersWithResult(definition)) return definition.result === null || definition.result === undefined ? 'summaries' : null;
   return null;
@@ -125,7 +131,7 @@ export function summariesOnlyRefusal(definition, scope) {
  */
 function refusalSentence(definition, why) {
   return `The person set this dataset to “${SUMMARIES_ONLY_LABEL}” in Cellucid, so “${definition.title}” was not done: ${why}. `
-    + 'Work from names, counts and summaries of groups the dataset or the person defines (the categories of a field, a field summarised per category, the analyses\' results); '
+    + 'Work from names, counts and summaries of groups the dataset or the person defines (the categories of a field, a field summarized per category, the analyses\' results); '
     + `the person can change it in Cellucid (${SUMMARIES_ONLY_PLACE}). Do not try again.`;
 }
 
@@ -166,11 +172,12 @@ export function withoutSingleCellStatistics(type, json) {
     if (value === null || typeof value !== 'object') return value;
     const out = {};
     for (const [key, item] of Object.entries(value)) {
+      // A key is the data's own (a category named `__proto__` too): an own property, never the prototype.
       if (keys.has(key) && (typeof item === 'number' || item === null)) {
         if (item !== null) leftOut.add(key);
-        out[key] = null;
+        setOwnDataProperty(out, key, null);
       } else {
-        out[key] = walk(item);
+        setOwnDataProperty(out, key, walk(item));
       }
     }
     if (rule.columns && Array.isArray(out.columns) && Array.isArray(out.rows)) {
@@ -201,7 +208,8 @@ export function statisticsLeftOutNote(names) {
  * call, as the same agent), checked with the result.
  */
 export const SHAPED_INPUTS = Object.freeze({
-  'field.summary': Object.freeze({ fields: params => [params.by?.key] }),
+  'field.summary': Object.freeze({ fields: params => [params.by?.key, params.within?.field?.key].filter(key => key !== undefined) }),
+  'vector-field.summary': Object.freeze({ fields: params => [params.by?.key] }),
   'analysis.result': Object.freeze({
     inputs: params => [{ type: `analysis.${params.analysis}.get`, params: params.in === undefined ? {} : { in: params.in } }],
   }),
@@ -233,7 +241,7 @@ export function shapedRefusal(definition, params, scope, inputs = []) {
   const shapedPage = named.find(name => scope.shaped.page(name));
   const what = shapedField !== undefined ? `the field ${quoteName(shapedField)}` : shapedPage !== undefined ? `the page ${quoteName(shapedPage)}` : null;
   if (what === null) return null;
-  return refusalSentence(definition, `it would summarise values over ${what}, whose groups an agent made by naming cells`);
+  return refusalSentence(definition, `it would summarize values over ${what}, whose groups an agent made by naming cells`);
 }
 
 /** The sentence when what a value summary was computed on cannot be read (it is not sent). */

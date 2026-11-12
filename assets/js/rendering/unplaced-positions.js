@@ -17,7 +17,7 @@
  *   holds `UNPLACED_GPU_POSITION` for them (`positionsForGpu`, made only for
  *   a geometry that has unplaced cells, for the upload alone), and every
  *   vertex shader that reads a cell's position rejects it before
- *   rasterisation (`UNPLACED_GLSL`): no per-frame work beyond the compare,
+ *   rasterization (`UNPLACED_GLSL`): no per-frame work beyond the compare,
  *   and nothing per cell is kept.
  *
  * @module rendering/unplaced-positions
@@ -37,7 +37,7 @@ export const UNPLACED_GPU_POSITION = 3.0e38;
  */
 export const UNPLACED_GLSL = `
 // A cell its embedding does not place (rendering/unplaced-positions.js):
-// rejected before rasterisation.
+// rejected before rasterization.
 bool isUnplacedPosition(vec3 position) { return abs(position.x) > 1.0e38; }
 `;
 

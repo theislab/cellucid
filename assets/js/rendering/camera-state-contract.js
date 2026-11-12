@@ -223,3 +223,62 @@ export function createDefaultCameraPose() {
     },
   };
 }
+
+/**
+ * A complete camera state for an orbit or planar pose, with the free-fly pose
+ * kept in step the way the viewer keeps it (`syncFreeflyFromOrbit`): the eye
+ * the mode puts the camera at, looking at the target. Orbit puts the eye at
+ * target + radius·(sinφ·cosθ, cosφ, sinφ·sinθ) (y up); planar on the +z
+ * side of the target, looking down -z at the x–y plane.
+ *
+ * @param {{navigationMode: 'orbit'|'planar', target: number[], radius: number, theta: number, phi: number}} pose
+ * @returns {{navigationMode: string, orbit: object, freefly: object}}
+ */
+export function cameraStateForOrbitPose({ navigationMode, target, radius, theta, phi }) {
+  if (navigationMode !== 'orbit' && navigationMode !== 'planar') {
+    throw new RangeError(`An orbit pose is navigated by orbit or planar; received ${String(navigationMode)}.`);
+  }
+  const offset = navigationMode === 'planar'
+    ? [0, 0, radius]
+    : [radius * Math.sin(phi) * Math.cos(theta), radius * Math.cos(phi), radius * Math.sin(phi) * Math.sin(theta)];
+  const forward = offset.map(value => -value / radius);
+  return assertCameraState({
+    navigationMode,
+    orbit: { radius, targetRadius: radius, theta, phi, target: [target[0], target[1], target[2]] },
+    freefly: {
+      position: [target[0] + offset[0], target[1] + offset[1], target[2] + offset[2]],
+      yaw: Math.atan2(forward[2], forward[0]),
+      pitch: Math.asin(Math.max(-1, Math.min(1, forward[1]))),
+    },
+  }, 'Orbit camera pose');
+}
+
+/**
+ * The camera with its free-fly pose in step with its orbit pose, for an
+ * orbit or planar camera whose free-fly pose is not: one composed by hand
+ * (an agent's keyframe, which can only guess the free-fly eye). A keyframe
+ * keeps both poses and a cross-mode transition flies the free-fly one, so
+ * a guessed one made the camera jump. The pose the mode drives is kept as
+ * given; a free-fly camera, and one already in step (every camera the
+ * viewer reports: `getCameraState` derives the pose its mode does not
+ * drive), is returned as it is.
+ *
+ * @param {{navigationMode: string, orbit: object, freefly: object}} camera  An exact camera state.
+ * @returns {{navigationMode: string, orbit: object, freefly: object}}
+ */
+export function cameraInStep(camera) {
+  if (camera.navigationMode === 'free') return camera;
+  const { freefly } = cameraStateForOrbitPose({
+    navigationMode: camera.navigationMode,
+    target: camera.orbit.target,
+    radius: camera.orbit.radius,
+    theta: camera.orbit.theta,
+    phi: camera.orbit.phi,
+  });
+  const scale = Math.max(1, camera.orbit.radius);
+  const angle = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+  const inStep = freefly.position.every((value, axis) => Math.abs(value - camera.freefly.position[axis]) <= 1e-4 * scale)
+    && angle(freefly.yaw, camera.freefly.yaw) <= 1e-4
+    && Math.abs(freefly.pitch - camera.freefly.pitch) <= 1e-4;
+  return inStep ? camera : { navigationMode: camera.navigationMode, orbit: camera.orbit, freefly };
+}

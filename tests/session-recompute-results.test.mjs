@@ -18,7 +18,7 @@ import { leftOutResultOf } from '../assets/js/app/analysis/shared/analysis-resul
 function provenance(open) {
   return {
     dataset: 'd1', cells: { digest: `cells-${open}`, method: null, of: 60, open, seed: null }, genesReadFor: null,
-    mapping: null, pages: [], visible: null, options: { groupBy: 'cell_type' },
+    mapping: null, values: 'raw', pages: [], visible: null, options: { groupBy: 'cell_type' },
   };
 }
 

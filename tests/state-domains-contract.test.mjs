@@ -252,7 +252,7 @@ test('fields are named by their dataset key or their user id, so a rename change
   assert.equal(findField(owner, { source: 'obs', key: 'clusters' }), null);
 });
 
-test('filters and colours record only what differs from a field\'s opening state, each in its own domain', () => {
+test('filters and colors record only what differs from a field\'s opening state, each in its own domain', () => {
   const field = { key: 'cell_type', kind: 'category', categories: ['B', 'T', 'NK'] };
   assert.equal(captureFieldFilter(field, 'obs'), null);
   // Opened: its defaults filled in. Still nothing.
@@ -276,7 +276,7 @@ test('filters and colours record only what differs from a field\'s opening state
   score._colormapId = 'viridis';
   assert.equal(captureFieldFilter(score, 'obs'), null);
   assert.equal(captureFieldColors(score, 'obs'), null);
-  // A narrower filter is the filter's; the colour range, measured against
+  // A narrower filter is the filter's; the color range, measured against
   // the data and not the filter, is unchanged.
   score._continuousFilter = { min: 1, max: 4 };
   assert.deepEqual(captureFieldFilter(score, 'obs'), { field: { source: 'obs', key: 'score' }, range: { min: 1, max: 4 } });
@@ -290,7 +290,7 @@ test('filters and colours record only what differs from a field\'s opening state
   });
 });
 
-test('filters and colours restore exactly, view by view, and leave what matches alone', async () => {
+test('filters and colors restore exactly, view by view, and leave what matches alone', async () => {
   const { state, viewer } = stateOfSixCells();
   let refreshed = 0;
   const filters = createFiltersDomain({ state, viewer, refreshUi: () => { refreshed++; } });
@@ -303,25 +303,25 @@ test('filters and colours restore exactly, view by view, and leave what matches 
   state.applyContinuousFilter(1, 1, 4);
   state.setContinuousColormap(1, 'magma');
   const filtered = filters.capture();
-  const coloured = colors.capture();
+  const colored = colors.capture();
   assert.deepEqual(filtered.views[0].map(entry => Object.keys(entry).sort()), [['field', 'hidden'], ['field', 'range']]);
   assert.deepEqual([...state.categoryTransparency], [1, 0, 1, 1, 0, 1].map((shown, i) => shown && state.obsData.fields[1].values[i] >= 1 && state.obsData.fields[1].values[i] <= 4 ? 1 : 0));
 
   await filters.restore(empty);
   assert.deepEqual(filters.capture(), empty);
-  assert.deepEqual(colors.capture(), coloured, 'restoring filters leaves colours alone');
+  assert.deepEqual(colors.capture(), colored, 'restoring filters leaves colors alone');
   assert.deepEqual([...state.categoryTransparency], [1, 1, 1, 1, 1, 1]);
   await colors.restore({ views: [[]] });
   assert.deepEqual(colors.capture(), { views: [[]] });
   assert.equal(state.obsData.fields[1]._colormapId, 'viridis');
 
   await filters.restore(filtered);
-  await colors.restore(coloured);
+  await colors.restore(colored);
   assert.deepEqual(filters.capture(), filtered);
-  assert.deepEqual(colors.capture(), coloured);
+  assert.deepEqual(colors.capture(), colored);
   const before = refreshed;
   await filters.restore(filtered);
-  await colors.restore(coloured);
+  await colors.restore(colored);
   assert.equal(refreshed, before, 'a restore of what is shown changes nothing');
   await assert.rejects(filters.restore({ views: [[], []] }), /for 2 views, and 1 is shown/);
   await assert.rejects(
@@ -357,7 +357,7 @@ test('the active field and the cells hidden by hand restore by name and by origi
   assert.equal(state.getActiveField(), state.obsData.fields[0]);
   await active.restore({ views: [null] });
   assert.equal(state.activeFieldSource, null);
-  assert.deepEqual(active.describe({ views: [null] }, { views: [{ source: 'obs', key: 'cell_type' }] }), ['coloured by cell_type']);
+  assert.deepEqual(active.describe({ views: [null] }, { views: [{ source: 'obs', key: 'cell_type' }] }), ['colored by cell_type']);
 
   assert.deepEqual([...visibility.capture().views[0]], []);
   state.setCellVisibility(Uint32Array.of(0, 5), false);
@@ -469,7 +469,7 @@ test('field overlays: user fields come and go in every view, their codes by orig
   await overlays.restore(empty);
   assert.deepEqual(overlays.capture(), empty);
   assert.deepEqual(state.obsData.fields.map(field => field.key), ['cell_type', 'score']);
-  assert.equal(state.activeFieldSource, null, 'a view coloured by a field that went is coloured by nothing');
+  assert.equal(state.activeFieldSource, null, 'a view colored by a field that went is colored by nothing');
 
   // And forward again: the same ids, codes and values.
   await overlays.restore(made);
@@ -482,7 +482,7 @@ test('field overlays: user fields come and go in every view, their codes by orig
     'Field "score" shown as "Score"', 'Annotation "annotation" made', 'Field "pushed" made',
   ]);
 
-  // A category renamed in the user field's definition: a view's recolour of
+  // A category renamed in the user field's definition: a view's recolor of
   // a category it still has is carried by label.
   state.setColorForCategory(back, 1, [1, 0, 0]);
   const renamedDefinition = structuredClone(made);
@@ -495,11 +495,11 @@ test('field overlays: user fields come and go in every view, their codes by orig
   assert.deepEqual(captureFieldColors(carried, 'obs').colors, [{ category: 'y', color: '#ff0000' }]);
 });
 
-test('field overlays: a user field a view shows as itself takes a definition with other categories, its colours carried by label', async () => {
+test('field overlays: a user field a view shows as itself takes a definition with other categories, its colors carried by label', async () => {
   // A category deleted into "unassigned" makes "cell_type (edited)": the
   // registry's template is the very field the view shows. Putting back a
   // definition whose categories differ (another category deleted, then the
-  // step before shown) must not keep the colours of the categories it had.
+  // step before shown) must not keep the colors of the categories it had.
   const { state, viewer } = stateOfSixCells();
   const overlays = createFieldOverlaysDomain({ state, viewer, refreshUi: () => {} });
   state.setActiveField(0);
@@ -508,6 +508,11 @@ test('field overlays: a user field a view shows as itself takes a definition wit
   const edited = state.getActiveField();
   assert.equal(edited.key, 'cell_type (edited)');
   assert.equal(state.getUserDefinedFieldsRegistry().getField(edited._userDefinedId), edited, 'the view shows the template itself');
+  // [T, NK, unassigned]: NK keeps its #ad50e0, the palette color of Unassigned's place, so
+  // Unassigned takes the first palette color told apart from T's red and NK's (F111: it
+  // was NK's color, two categories in one).
+  assert.deepEqual([...edited.categories], ['T', 'NK', 'unassigned']);
+  assert.deepEqual([...edited._categoryColors], [255, 0, 0, 0xad, 0x50, 0xe0, 0xff, 0x99, 0x00]);
   const once = overlays.capture();
   const categoriesOnce = [...edited.categories];
   state.deleteCategoryToUnassigned(state.activeFieldIndex, edited.categories.indexOf('NK'), { editInPlace: true, unassignedLabel: 'unassigned' });
@@ -517,7 +522,11 @@ test('field overlays: a user field a view shows as itself takes a definition wit
   const back = state.getActiveField();
   assert.deepEqual([...back.categories], categoriesOnce);
   assert.ok(sameValue(overlays.capture(), once));
-  assert.deepEqual(captureFieldColors(back, 'obs').colors, [{ category: 'T', color: '#ff0000' }], 'T keeps the red it was given');
+  assert.deepEqual(captureFieldColors(back, 'obs').colors, [
+    { category: 'T', color: '#ff0000' },
+    // Kept by label: the color it was given beside NK (above), not its place's.
+    { category: 'unassigned', color: '#ff9900' },
+  ], 'T keeps the red it was given');
 });
 
 test('gene sets, the data mapping and the camera path restore whole', async () => {
@@ -709,10 +718,13 @@ test('the views domain checks what it put back and names what did not come back'
   const flags = { points: false, labels: false };
   let locked = false;
   let honoursCentroids = true;
+  let liveName = null;
   const viewer = {
     getSnapshotViews: () => [],
     getViewLayout: () => ({ mode: 'grid', activeId: 'live', liveViewHidden: false }),
     getCentroidFlags: () => ({ ...flags }),
+    getViewName: () => liveName,
+    setViewName: (id, name) => { liveName = name; },
     setShowCentroidPoints: on => { if (honoursCentroids) flags.points = on; },
     setShowCentroidLabels: on => { if (honoursCentroids) flags.labels = on; },
     getCamerasLocked: () => locked,
@@ -740,6 +752,25 @@ test('the views domain checks what it put back and names what did not come back'
     honoursCentroids = true;
     await assert.rejects(views.restore({ ...shown, focus: 3, camerasLinked: true }), /focused view to restore, 3, is not among the 1 view/);
     assert.equal(locked, false, 'the camera link is as it was');
+
+    // A view's name (`view.rename`): only a named view's entry has the key,
+    // so an unnamed value is the value it was before views had names.
+    await views.restore(shown);
+    assert.equal(Object.hasOwn(views.capture().views[0], 'name'), false, 'an unnamed view has no name key');
+    const named = structuredClone(shown);
+    named.views[0].name = 'Early';
+    await views.restore(named);
+    assert.equal(liveName, 'Early', 'the name is put back on its view');
+    assert.deepEqual(views.capture(), named);
+    assert.deepEqual(views.describe(shown, named), ['View 1 named "Early"']);
+    assert.deepEqual(views.describe(named, shown), ['View 1 no longer named "Early"']);
+    // Other lines name the view with its name at the later value.
+    assert.deepEqual(views.describe(shown, { ...named, views: [{ ...named.views[0], centroids: { points: true, labels: false } }] }),
+      ['View 1 "Early": centroids shown', 'View 1 named "Early"']);
+    await views.restore(shown);
+    assert.equal(liveName, null, 'Undo of the name takes it away');
+    await assert.rejects(views.restore({ ...shown, views: [{ ...shown.views[0], name: ' two\nlines ' }] }), /a name, when it has one, as one line of text/);
+    assert.equal(liveName, null, 'a bad name changes nothing');
   });
 });
 

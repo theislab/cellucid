@@ -34,12 +34,12 @@ async function openPreparedDataset(page) {
 }
 
 /**
- * Colour by `cell_type` and wait until the field is actually live.
+ * Color by `cell_type` and wait until the field is actually live.
  *
  * The field loads asynchronously; an Alt gesture issued before the state holds
  * it lands in a pane colored by no field and selects nothing.
  */
-async function colourByCellType(page) {
+async function colorByCellType(page) {
   await page.locator('#categorical-field').selectOption({ label: 'cell_type' });
   await expect(page.locator('.legend-item')).toHaveCount(3);
   // An annotation press reads the pressed pane's field from the state, so
@@ -140,7 +140,7 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await openPreparedDataset(page);
-    await colourByCellType(page);
+    await colorByCellType(page);
     const points = await findCellPoints(page, 4);
 
     // Annotation
@@ -202,7 +202,10 @@ test(
     const productErrors = observeProductErrors(page);
     await openPreparedDataset(page);
 
-    // The fixture loads with no colouring field, which is when Alt+click is inert.
+    // The fixture opens colored by its cell types (`first-coloring.js`);
+    // with no coloring field Alt+click is inert.
+    await expect(page.locator('#categorical-field option:checked')).toHaveText('cell_type');
+    await page.locator('#categorical-field').selectOption({ label: 'None' });
     await expect(page.locator('#categorical-field')).toHaveValue('-1');
     await expect(page.locator('#continuous-field')).toHaveValue('-1');
     await expect(page.locator(TOOL_HINT)).toContainText(
@@ -240,7 +243,7 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await openPreparedDataset(page);
-    await colourByCellType(page);
+    await colorByCellType(page);
     const points = await findCellPoints(page, 1);
 
     await armSelection(page, 'annotation', () => altClick(page, points[0]));
@@ -274,7 +277,7 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await openPreparedDataset(page);
-    await colourByCellType(page);
+    await colorByCellType(page);
     await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
 
     const polygon = [
@@ -305,7 +308,7 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await openPreparedDataset(page);
-    await colourByCellType(page);
+    await colorByCellType(page);
     const points = await findCellPoints(page, 2);
 
     await armSelection(page, 'annotation', () => altClick(page, points[0]));
@@ -413,7 +416,7 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await openPreparedDataset(page);
-    await colourByCellType(page);
+    await colorByCellType(page);
     const cell = (await findCellPoints(page, 1))[0];
     const empty = await findEmptyPoint(page);
 
@@ -465,7 +468,7 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await openPreparedDataset(page);
-    await colourByCellType(page);
+    await colorByCellType(page);
     await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
 
     await armSelection(page, 'lasso', () => altDraw(page, [
@@ -526,7 +529,7 @@ test(
   async ({ page }) => {
     const productErrors = observeProductErrors(page);
     await openPreparedDataset(page);
-    await colourByCellType(page);
+    await colorByCellType(page);
     await page.locator('.highlight-mode-btn[data-mode="lasso"]').click();
 
     const modeButton = page.locator('.highlight-mode-btn[data-mode="knn"]');

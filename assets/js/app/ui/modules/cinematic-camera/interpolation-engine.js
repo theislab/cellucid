@@ -5,10 +5,37 @@
  * (spherical linear interpolation) for rotational angles.  All functions are
  * dependency-free — no gl-matrix, no DOM.
  *
+ * **Time is honored.** Each keyframe is reached at its time on the timeline:
+ * the sum of the transitions and holds before it (`transitionDuration`, or
+ * the automatic pace; `hold`). A transition of 5 s takes 5 s, a hold of 2 s
+ * rests the camera at its keyframe for 2 s before the next transition, and
+ * the transport bar's keyframe marks (with their rest spans) are where the
+ * camera is at each keyframe (`resolvePathTiming`).
+ *
+ * **Easing is how the path starts and ends**: from rest (`ease-in`), to rest
+ * (`ease-out`), both (`ease-in-out`), or moving at once and to the last
+ * frame (`linear`). It never stretches one transition at another's expense.
+ * (Until 0.9.8 it warped the whole timeline, so a 5 s transition in the
+ * middle of an eased path played in 2.6 s and the first one took twice its
+ * time, and the bar's marks were not where the keyframes were.)
+ *
+ * **The Catmull-Rom spline is the cinematic one**: a cubic through every
+ * keyframe whose velocity is continuous across keyframes, with tangents
+ * scaled by the keyframes' times (so uneven transition times do not jolt the
+ * speed at a keyframe) and clamped where a coordinate turns (the monotone
+ * cubic of Fritsch and Carlson, as animation tools' "auto clamped" tangents):
+ * no coordinate overshoots the keyframes on either side of it. The camera
+ * therefore never comes closer to the data than the keyframes it moves
+ * between (the radius is interpolated in log space and never dips below its
+ * neighbors), never tilts past a keyframe's elevation (so it never crosses
+ * a pole and flips), and at a keyframe that holds the camera eases into it,
+ * rests for the hold, and eases out (a hold is the keyframe twice on the
+ * plan's timeline, `stops`; a keyframe saved twice in a row rests the same way).
+ *
  * @module ui/modules/cinematic-camera/interpolation-engine
  */
 
-import { assertCameraKeyframe } from './keyframe-store.js';
+import { assertCameraKeyframe, keyframeHold } from './keyframe-store.js';
 
 const POSITION_METHODS = new Set(['catmull-rom', 'linear', 'bezier']);
 const ROTATION_METHODS = new Set(['slerp', 'linear']);
@@ -21,28 +48,38 @@ const CAMERA_PATH_OPTION_KEYS = [
 ];
 
 // ---------------------------------------------------------------------------
-// Easing functions
+// Easing: how the path starts and ends
 // ---------------------------------------------------------------------------
 
-function easeLinear(t) {
-  return t;
-}
-function easeInOut(t) {
-  return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-}
-function easeIn(t) {
-  return t * t;
-}
-function easeOut(t) {
-  return 1 - (1 - t) * (1 - t);
+const EASINGS = new Set(['linear', 'ease-in-out', 'ease-in', 'ease-out']);
+
+/** Whether the path starts from rest. */
+function easesIn(easing) {
+  return easing === 'ease-in' || easing === 'ease-in-out';
 }
 
-const EASING = {
-  'linear': easeLinear,
-  'ease-in-out': easeInOut,
-  'ease-in': easeIn,
-  'ease-out': easeOut
-};
+/** Whether the path comes to rest at its end. */
+function easesOut(easing) {
+  return easing === 'ease-out' || easing === 'ease-in-out';
+}
+
+/**
+ * The progress through one transition of a per-transition method (linear
+ * positions, Bezier, SLERP, linear angles): the first transition starts from
+ * rest when the path eases in, the last ends at rest when it eases out, and
+ * the speed where an eased transition meets the next is the speed of a
+ * linear one (the curves' slope there is 1), so no keyframe jolts.
+ *
+ * @param {number} t  0..1 through segment `segIndex` of `segmentCount`.
+ */
+function easeSegment(t, segIndex, segmentCount, easing) {
+  const from = segIndex === 0 && easesIn(easing);
+  const to = segIndex === segmentCount - 1 && easesOut(easing);
+  if (from && to) return t * t * (3 - 2 * t);
+  if (from) return t * t * (2 - t);
+  if (to) return 1 - (1 - t) * (1 - t) * (1 + t);
+  return t;
+}
 
 function assertKeyframes(keyframes) {
   if (!Array.isArray(keyframes)) {
@@ -79,7 +116,7 @@ export function assertCameraPathOptions(options) {
   if (!ROTATION_METHODS.has(options.rotationMethod)) {
     throw new RangeError(`Unsupported camera path rotation method: ${String(options.rotationMethod)}.`);
   }
-  if (!Object.hasOwn(EASING, options.easing)) {
+  if (!EASINGS.has(options.easing)) {
     throw new RangeError(`Unsupported camera path easing: ${String(options.easing)}.`);
   }
   if (typeof options.loop !== 'boolean') {
@@ -105,55 +142,101 @@ function lerpAngle(a, b, t) {
   return a + d * t;
 }
 
-/** Catmull-Rom on a single scalar. */
-function catmullRomScalar(p0, p1, p2, p3, t) {
-  const t2 = t * t;
-  const t3 = t2 * t;
-  return 0.5 * (
-    2 * p1 +
-    (-p0 + p2) * t +
-    (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
-    (-p0 + 3 * p1 - 3 * p2 + p3) * t3
-  );
+/** The shortest turn from `base` to `value`, as an angle near `base`. */
+function unwrapAngle(base, value) {
+  let d = value - base;
+  d -= Math.round(d / (2 * Math.PI)) * 2 * Math.PI;
+  return base + d;
 }
 
 /**
- * Catmull-Rom for a strictly positive scale.
+ * The tangents (per second) of a time-honored, clamped cubic through
+ * `values` at `times`: the monotone cubic of Fritsch and Carlson (as
+ * Fritsch–Butland weighted), so no value overshoots its neighbors, and a
+ * value equal to a neighbor (a hold) has a zero tangent. The ends start
+ * from rest or end at rest when the path eases there, else move at the
+ * first or last transition's own rate.
  *
- * Camera radii are multiplicative quantities. Interpolating their logarithms
- * retains Catmull-Rom smoothness without allowing a valid positive path to
- * cross through zero.
+ * @param {number[]} values
+ * @param {number[]} times  Increasing.
+ * @param {boolean} restAtStart
+ * @param {boolean} restAtEnd
+ * @returns {number[]}
  */
-function catmullRomPositiveScalar(p0, p1, p2, p3, t, label) {
-  const logValue = catmullRomScalar(
-    Math.log(p0),
-    Math.log(p1),
-    Math.log(p2),
-    Math.log(p3),
-    t
-  );
-  const value = Math.exp(logValue);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new RangeError(`${label} interpolation exceeded the finite positive camera range.`);
+function clampedTangents(values, times, restAtStart, restAtEnd, periodic = false) {
+  const n = values.length;
+  const tangents = new Array(n).fill(0);
+  if (n < 2) return tangents;
+  const slopes = [];
+  for (let i = 0; i < n - 1; i++) {
+    slopes.push((values[i + 1] - values[i]) / (times[i + 1] - times[i]));
   }
-  return value;
+  const clamped = (before, after, hBefore, hAfter) => {
+    if (before * after <= 0) return 0;
+    const wBefore = 2 * hAfter + hBefore;
+    const wAfter = hAfter + 2 * hBefore;
+    return (wBefore + wAfter) / (wBefore / before + wAfter / after);
+  };
+  for (let i = 1; i < n - 1; i++) {
+    tangents[i] = clamped(slopes[i - 1], slopes[i], times[i] - times[i - 1], times[i + 1] - times[i]);
+  }
+  if (periodic) {
+    // The seam of a seamless loop: the last transition flows into the first.
+    const seam = clamped(slopes[n - 2], slopes[0], times[n - 1] - times[n - 2], times[1] - times[0]);
+    tangents[0] = seam;
+    tangents[n - 1] = seam;
+    return tangents;
+  }
+  tangents[0] = restAtStart ? 0 : slopes[0];
+  tangents[n - 1] = restAtEnd ? 0 : slopes[n - 2];
+  return tangents;
 }
 
-/** Catmull-Rom for an angle — unwrap neighbours before spline evaluation. */
-function catmullRomAngle(p0, p1, p2, p3, t) {
-  // Unwrap each neighbour against its adjacent, already unwrapped control
-  // point, so every hop takes the shortest way round. Unwrapping p3 against
-  // p1 instead folds any p1→p3 span of half a turn or more the short way,
-  // and the spline then overshoots each keyframe and backs up.
-  const unwrap = (base, val) => {
-    let d = val - base;
-    d -= Math.round(d / (2 * Math.PI)) * 2 * Math.PI;
-    return base + d;
-  };
-  const u0 = unwrap(p1, p0);
-  const u2 = unwrap(p1, p2);
-  const u3 = unwrap(u2, p3);
-  return catmullRomScalar(u0, p1, u2, u3, t);
+/** A cubic Hermite segment from `p0` (tangent `m0`) to `p1` (tangent `m1`) lasting `h`, at `s` in 0..1. */
+function hermite(p0, p1, m0, m1, h, s) {
+  const s2 = s * s;
+  const s3 = s2 * s;
+  return (2 * s3 - 3 * s2 + 1) * p0 +
+    (s3 - 2 * s2 + s) * h * m0 +
+    (-2 * s3 + 3 * s2) * p1 +
+    (s3 - s2) * h * m1;
+}
+
+/**
+ * One coordinate of every keyframe as a clamped time spline: its values
+ * (angles unwrapped so each hop turns the short way), and their tangents.
+ */
+function spline(keyframes, times, read, { angle = false, log = false, restAtStart, restAtEnd, periodic = false }) {
+  const values = [];
+  for (let i = 0; i < keyframes.length; i++) {
+    let value = read(keyframes[i]);
+    if (log) value = Math.log(value);
+    if (angle && i > 0) value = unwrapAngle(values[i - 1], value);
+    values.push(value);
+  }
+  return Object.freeze({
+    values: Object.freeze(values),
+    tangents: Object.freeze(clampedTangents(values, times, restAtStart, restAtEnd, periodic)),
+    log
+  });
+}
+
+function splineAt(channel, times, segIndex, s, label) {
+  const i = segIndex;
+  const value = hermite(
+    channel.values[i],
+    channel.values[i + 1],
+    channel.tangents[i],
+    channel.tangents[i + 1],
+    times[i + 1] - times[i],
+    s
+  );
+  if (!channel.log) return value;
+  const scale = Math.exp(value);
+  if (!Number.isFinite(scale) || scale <= 0) {
+    throw new RangeError(`${label} interpolation exceeded the finite positive camera range.`);
+  }
+  return scale;
 }
 
 // ---------------------------------------------------------------------------
@@ -345,15 +428,44 @@ function segmentDurations(keyframes, speed) {
   return durations;
 }
 
+/** The timeline of an already-validated path (`resolvePathTiming`). */
+function pathTiming(keyframes, speed) {
+  const transitions = segmentDurations(keyframes, speed);
+  const holds = keyframes.map(keyframeHold);
+  const arrivals = [];
+  const departures = [];
+  let at = 0;
+  for (let i = 0; i < keyframes.length; i++) {
+    arrivals.push(at);
+    at += holds[i];
+    departures.push(at);
+    if (i < transitions.length) at += transitions[i];
+  }
+  return Object.freeze({
+    transitions: Object.freeze(transitions),
+    holds: Object.freeze(holds),
+    arrivals: Object.freeze(arrivals),
+    departures: Object.freeze(departures),
+    total: at
+  });
+}
+
 /**
- * Compute the duration of each segment.
+ * The path's timeline: each transition's seconds (set, or paced by the
+ * speed), each keyframe's hold, when the camera reaches each keyframe and
+ * when it leaves it (after its hold), and the whole length. The one source
+ * of a path's times: playback, the transport bar's marks, the Camera path
+ * panel and `camera-path.get` all read it.
+ *
  * @param {import('./keyframe-store.js').Keyframe[]} keyframes
  * @param {number} autoPaceSpeed  Positive finite units/s for auto-paced segments.
- * @returns {number[]} Array of durations (seconds), length = keyframes.length - 1.
+ * @returns {Readonly<{transitions: number[], holds: number[], arrivals: number[],
+ *   departures: number[], total: number}>} Seconds; `transitions` has
+ *   `keyframes.length - 1` entries, the others one per keyframe.
  */
-export function resolveSegmentDurations(keyframes, autoPaceSpeed) {
+export function resolvePathTiming(keyframes, autoPaceSpeed) {
   assertKeyframes(keyframes);
-  return segmentDurations(keyframes, assertAutoPaceSpeed(autoPaceSpeed));
+  return pathTiming(keyframes, assertAutoPaceSpeed(autoPaceSpeed));
 }
 
 /**
@@ -374,15 +486,72 @@ export function resolveSegmentDurations(keyframes, autoPaceSpeed) {
 export function createCameraPathPlan(keyframes, options) {
   assertKeyframes(keyframes);
   assertCameraPathOptions(options);
-  const durations = segmentDurations(keyframes, options.autoPaceSpeed);
+  const timing = pathTiming(keyframes, options.autoPaceSpeed);
+  // The timeline the camera follows: every keyframe at its arrival, and a
+  // keyframe that holds once more at its departure. Between the two copies
+  // the camera rests; each other span is a transition (`stopMoves`).
+  const stops = [];
+  const stopTimes = [];
+  const stopMoves = [];
+  for (let i = 0; i < keyframes.length; i++) {
+    stops.push(keyframes[i]);
+    stopTimes.push(timing.arrivals[i]);
+    if (timing.holds[i] > 0) {
+      stopMoves.push(null);
+      stops.push(keyframes[i]);
+      stopTimes.push(timing.departures[i]);
+    }
+    if (i < timing.transitions.length) stopMoves.push(i);
+  }
   return Object.freeze({
     keyframes: Object.freeze(keyframes.slice()),
-    durations: Object.freeze(durations),
-    totalDuration: durations.reduce((sum, value) => sum + value, 0),
+    durations: timing.transitions,
+    holds: timing.holds,
+    times: timing.arrivals,
+    departures: timing.departures,
+    totalDuration: timing.total,
+    stops: Object.freeze(stops),
+    stopTimes: Object.freeze(stopTimes),
+    stopMoves: Object.freeze(stopMoves),
     positionMethod: options.positionMethod,
     rotationMethod: options.rotationMethod,
     easing: options.easing,
-    autoPaceSpeed: options.autoPaceSpeed
+    autoPaceSpeed: options.autoPaceSpeed,
+    loop: options.loop,
+    splines: options.positionMethod === 'catmull-rom' && stops.length >= 2
+      ? cameraSplines(stops, stopTimes, options.easing, isSeamlessLoop(keyframes, options))
+      : null
+  });
+}
+
+/**
+ * Whether the path loops seamlessly: it loops, moves at a constant pace
+ * (linear easing: nothing rests at the seam), and ends where it starts (the
+ * return to start), so its last transition flows into its first with no
+ * change of speed or direction at the seam.
+ */
+function isSeamlessLoop(keyframes, options) {
+  return options.loop && options.easing === 'linear' && keyframes.length >= 3 &&
+    sameCameraPose(keyframes[0], keyframes[keyframes.length - 1]);
+}
+
+/**
+ * Every coordinate of both camera poses as a clamped time spline (module
+ * overview): the orbit's target, radius (in log space), azimuth and
+ * elevation, and the free-fly position, yaw and pitch. Built once per plan.
+ */
+function cameraSplines(keyframes, times, easing, periodic) {
+  const ends = { restAtStart: easesIn(easing), restAtEnd: easesOut(easing), periodic };
+  const channel = (read, kind = {}) => spline(keyframes, times, read, { ...ends, ...kind });
+  return Object.freeze({
+    target: Object.freeze([0, 1, 2].map(axis => channel(kf => kf.orbit.target[axis]))),
+    radius: channel(kf => kf.orbit.radius, { log: true }),
+    targetRadius: channel(kf => kf.orbit.targetRadius, { log: true }),
+    theta: channel(kf => kf.orbit.theta, { angle: true }),
+    phi: channel(kf => kf.orbit.phi),
+    position: Object.freeze([0, 1, 2].map(axis => channel(kf => kf.freefly.position[axis]))),
+    yaw: channel(kf => kf.freefly.yaw, { angle: true }),
+    pitch: channel(kf => kf.freefly.pitch)
   });
 }
 
@@ -438,35 +607,24 @@ export function interpolatePlannedCameraState(plan, globalT) {
   if (globalT === 0) return buildCameraState(keyframes[0]);
   if (globalT === 1) return buildCameraState(keyframes[n - 1]);
 
-  const durations = plan.durations;
-
-  // Apply easing to GLOBAL progress so the overall path eases in/out smoothly.
-  // Per-segment easing would cause visible stuttering at every keyframe boundary
-  // (each segment independently decelerates then re-accelerates).
-  const easingFn = EASING[plan.easing];
-  const easedT = easingFn(globalT);
-  const absTime = easedT * plan.totalDuration;
-
-  // Find segment
-  let cumulative = 0;
-  let segIndex = 0;
-  for (let i = 0; i < durations.length; i++) {
-    if (cumulative + durations[i] >= absTime || i === durations.length - 1) {
+  // Time is honored: each keyframe is reached at its own time, and rests
+  // there for its hold.
+  const times = plan.stopTimes;
+  const absTime = globalT * plan.totalDuration;
+  let segIndex = times.length - 2;
+  for (let i = 0; i < times.length - 1; i++) {
+    if (absTime <= times[i + 1]) {
       segIndex = i;
       break;
     }
-    cumulative += durations[i];
   }
+  const move = plan.stopMoves[segIndex];
+  const a = plan.stops[segIndex];
+  const b = plan.stops[segIndex + 1];
 
-  let localT = (absTime - cumulative) / durations[segIndex];
-  localT = Math.max(0, Math.min(1, localT));
-
-  const posMethod = plan.positionMethod;
-  const rotMethod = plan.rotationMethod;
-
-  const modeA = keyframes[segIndex].navigationMode;
-  const modeB = keyframes[Math.min(segIndex + 1, n - 1)].navigationMode;
-  const isCrossMode = modeA !== modeB;
+  // A hold, or two keyframes with the same camera: the camera rests there.
+  if (move === null || sameCameraPose(a, b)) return buildCameraState(a);
+  const localT = Math.max(0, Math.min(1, (absTime - times[segIndex]) / plan.durations[move]));
 
   // Cross-mode segments always use freefly (world-space) interpolation because
   // both representations are synced at capture time, giving every keyframe valid
@@ -477,78 +635,66 @@ export function interpolatePlannedCameraState(plan, globalT) {
   // Same-mode segments use their native interpolation:
   //   orbit/planar → spherical (theta, phi, target, radius)
   //   freefly      → world-space (position, yaw, pitch)
-  if (isCrossMode || modeA === 'free') {
-    return interpolateFreefly(keyframes, segIndex, localT, posMethod, rotMethod);
+  const segment = {
+    plan,
+    i: segIndex,
+    s: localT,
+    // Per-transition methods ease the path's first and last transitions.
+    t: easeSegment(localT, move, plan.durations.length, plan.easing)
+  };
+  if (a.navigationMode !== b.navigationMode || a.navigationMode === 'free') {
+    return interpolateFreefly(segment);
   }
-  return interpolateOrbit(keyframes, segIndex, localT, posMethod, rotMethod, modeA);
+  return interpolateOrbit(segment, a.navigationMode);
+}
+
+/** Whether two keyframes hold the same camera (a hold, when consecutive). */
+function sameCameraPose(a, b) {
+  return a.navigationMode === b.navigationMode &&
+    a.orbit.radius === b.orbit.radius &&
+    a.orbit.targetRadius === b.orbit.targetRadius &&
+    a.orbit.theta === b.orbit.theta &&
+    a.orbit.phi === b.orbit.phi &&
+    a.orbit.target.every((value, axis) => value === b.orbit.target[axis]) &&
+    a.freefly.yaw === b.freefly.yaw &&
+    a.freefly.pitch === b.freefly.pitch &&
+    a.freefly.position.every((value, axis) => value === b.freefly.position[axis]);
 }
 
 // ---------------------------------------------------------------------------
 // Orbit / Planar interpolation
 // ---------------------------------------------------------------------------
 
-function interpolateOrbit(keyframes, segIndex, t, posMethod, rotMethod, mode) {
-  const kf = keyframes;
-  const i = segIndex;
-  const n = kf.length;
+/**
+ * @typedef {Object} Segment
+ * @property {Readonly<Object>} plan
+ * @property {number} i  The transition: from stop i to stop i + 1 of the plan's
+ *   timeline (`plan.stops`: the keyframes, a keyframe that holds twice).
+ * @property {number} s  Time through it, 0..1 (the time splines' parameter).
+ * @property {number} t  Progress through it for per-transition methods, eased
+ *   on the path's first and last transitions (`easeSegment`).
+ */
+
+/** @param {Segment} segment */
+function interpolateOrbit(segment, mode) {
+  const { plan, i, s, t } = segment;
+  const kf = plan.stops;
   const a = kf[i];
-  const b = kf[Math.min(i + 1, n - 1)];
+  const b = kf[i + 1];
+  const splines = plan.splines;
 
-  // --- Position (target) ---
-  let target;
-  if (posMethod === 'catmull-rom' && n >= 2) {
-    const p0 = getOrbitTarget(kf, i - 1);
-    const p1 = getOrbitTarget(kf, i);
-    const p2 = getOrbitTarget(kf, i + 1);
-    const p3 = getOrbitTarget(kf, i + 2);
-    target = [
-      catmullRomScalar(p0[0], p1[0], p2[0], p3[0], t),
-      catmullRomScalar(p0[1], p1[1], p2[1], p3[1], t),
-      catmullRomScalar(p0[2], p1[2], p2[2], p3[2], t)
-    ];
-  } else if (posMethod === 'bezier' && n >= 2) {
-    target = bezierVec3(kf, i, t, 'orbit');
+  // --- Position (target) and distance ---
+  let target, radius, targetRadius;
+  if (splines !== null) {
+    target = splines.target.map(channel => splineAt(channel, plan.stopTimes, i, s, 'Camera path target'));
+    radius = splineAt(splines.radius, plan.stopTimes, i, s, 'Camera path radius');
+    targetRadius = splineAt(splines.targetRadius, plan.stopTimes, i, s, 'Camera path target radius');
   } else {
-    const tA = a.orbit.target;
-    const tB = b.orbit.target;
-    target = [lerp(tA[0], tB[0], t), lerp(tA[1], tB[1], t), lerp(tA[2], tB[2], t)];
-  }
-
-  // --- Radius ---
-  let radius, targetRadius;
-  if (posMethod === 'catmull-rom' && n >= 2) {
-    const r0 = getOrbitScalar(kf, i - 1, 'radius');
-    const r1 = getOrbitScalar(kf, i, 'radius');
-    const r2 = getOrbitScalar(kf, i + 1, 'radius');
-    const r3 = getOrbitScalar(kf, i + 2, 'radius');
-    radius = catmullRomPositiveScalar(
-      r0,
-      r1,
-      r2,
-      r3,
-      t,
-      'Camera path radius'
-    );
-
-    const tr0 = getOrbitScalar(kf, i - 1, 'targetRadius');
-    const tr1 = getOrbitScalar(kf, i, 'targetRadius');
-    const tr2 = getOrbitScalar(kf, i + 1, 'targetRadius');
-    const tr3 = getOrbitScalar(kf, i + 2, 'targetRadius');
-    targetRadius = catmullRomPositiveScalar(
-      tr0,
-      tr1,
-      tr2,
-      tr3,
-      t,
-      'Camera path target radius'
-    );
-  } else {
-    const rA = a.orbit.radius;
-    const rB = b.orbit.radius;
-    radius = lerp(rA, rB, t);
-    const trA = a.orbit.targetRadius;
-    const trB = b.orbit.targetRadius;
-    targetRadius = lerp(trA, trB, t);
+    target = plan.positionMethod === 'bezier'
+      ? bezierVec3(kf, i, t, 'orbit')
+      : [0, 1, 2].map(axis => lerp(a.orbit.target[axis], b.orbit.target[axis], t));
+    radius = lerp(a.orbit.radius, b.orbit.radius, t);
+    targetRadius = lerp(a.orbit.targetRadius, b.orbit.targetRadius, t);
   }
 
   // --- Rotation (theta, phi) ---
@@ -557,24 +703,11 @@ function interpolateOrbit(keyframes, segIndex, t, posMethod, rotMethod, mode) {
     // Planar mode: theta/phi are fixed
     theta = a.orbit.theta;
     phi = a.orbit.phi;
-  } else if (rotMethod === 'slerp') {
-    if (posMethod === 'catmull-rom' && n >= 2) {
-      // Use Catmull-Rom on angles for consistency with position spline.
-      // Boundary-mirrored accessors handle n=2 (degrades to linear) and n=3 correctly.
-      theta = catmullRomAngle(
-        getOrbitScalar(kf, i - 1, 'theta'),
-        getOrbitScalar(kf, i, 'theta'),
-        getOrbitScalar(kf, i + 1, 'theta'),
-        getOrbitScalar(kf, i + 2, 'theta'),
-        t
-      );
-      phi = catmullRomAngle(
-        getOrbitScalar(kf, i - 1, 'phi'),
-        getOrbitScalar(kf, i, 'phi'),
-        getOrbitScalar(kf, i + 1, 'phi'),
-        getOrbitScalar(kf, i + 2, 'phi'),
-        t
-      );
+  } else if (plan.rotationMethod === 'slerp') {
+    if (splines !== null) {
+      // The time splines turn with the position splines.
+      theta = splineAt(splines.theta, plan.stopTimes, i, s, 'Camera path azimuth');
+      phi = splineAt(splines.phi, plan.stopTimes, i, s, 'Camera path elevation');
     } else {
       const res = slerpAngles(
         a.orbit.theta, a.orbit.phi,
@@ -614,51 +747,30 @@ function interpolateOrbit(keyframes, segIndex, t, posMethod, rotMethod, mode) {
 // Freefly interpolation
 // ---------------------------------------------------------------------------
 
-function interpolateFreefly(keyframes, segIndex, t, posMethod, rotMethod) {
-  const kf = keyframes;
-  const i = segIndex;
-  const n = kf.length;
+/** @param {Segment} segment */
+function interpolateFreefly(segment) {
+  const { plan, i, s, t } = segment;
+  const kf = plan.stops;
   const a = kf[i];
-  const b = kf[Math.min(i + 1, n - 1)];
+  const b = kf[i + 1];
+  const splines = plan.splines;
 
   // --- Position ---
   let position;
-  if (posMethod === 'catmull-rom' && n >= 2) {
-    const p0 = getFreeflyPos(kf, i - 1);
-    const p1 = getFreeflyPos(kf, i);
-    const p2 = getFreeflyPos(kf, i + 1);
-    const p3 = getFreeflyPos(kf, i + 2);
-    position = [
-      catmullRomScalar(p0[0], p1[0], p2[0], p3[0], t),
-      catmullRomScalar(p0[1], p1[1], p2[1], p3[1], t),
-      catmullRomScalar(p0[2], p1[2], p2[2], p3[2], t)
-    ];
-  } else if (posMethod === 'bezier' && n >= 2) {
+  if (splines !== null) {
+    position = splines.position.map(channel => splineAt(channel, plan.stopTimes, i, s, 'Camera path position'));
+  } else if (plan.positionMethod === 'bezier') {
     position = bezierVec3(kf, i, t, 'freefly');
   } else {
-    const pA = a.freefly.position;
-    const pB = b.freefly.position;
-    position = [lerp(pA[0], pB[0], t), lerp(pA[1], pB[1], t), lerp(pA[2], pB[2], t)];
+    position = [0, 1, 2].map(axis => lerp(a.freefly.position[axis], b.freefly.position[axis], t));
   }
 
   // --- Rotation (yaw, pitch) ---
   let yaw, pitch;
-  if (rotMethod === 'slerp') {
-    if (posMethod === 'catmull-rom' && n >= 2) {
-      yaw = catmullRomAngle(
-        getFreeflyScalar(kf, i - 1, 'yaw'),
-        getFreeflyScalar(kf, i, 'yaw'),
-        getFreeflyScalar(kf, i + 1, 'yaw'),
-        getFreeflyScalar(kf, i + 2, 'yaw'),
-        t
-      );
-      pitch = catmullRomAngle(
-        getFreeflyScalar(kf, i - 1, 'pitch'),
-        getFreeflyScalar(kf, i, 'pitch'),
-        getFreeflyScalar(kf, i + 1, 'pitch'),
-        getFreeflyScalar(kf, i + 2, 'pitch'),
-        t
-      );
+  if (plan.rotationMethod === 'slerp') {
+    if (splines !== null) {
+      yaw = splineAt(splines.yaw, plan.stopTimes, i, s, 'Camera path yaw');
+      pitch = splineAt(splines.pitch, plan.stopTimes, i, s, 'Camera path pitch');
     } else {
       const res = slerpAngles(
         a.freefly.yaw, a.freefly.pitch,
@@ -677,9 +789,7 @@ function interpolateFreefly(keyframes, segIndex, t, posMethod, rotMethod) {
   // are reasonable if the next segment switches back to orbit rendering.
   // Place the synthetic target along the freefly look direction at a blended
   // radius so the transition to orbit (which always looks at target) is smooth.
-  const rA = a.orbit.radius;
-  const rB = b.orbit.radius;
-  const syncRadius = lerp(rA, rB, t);
+  const syncRadius = lerp(a.orbit.radius, b.orbit.radius, t);
   const cosP = Math.cos(pitch);
   const syncTarget = [
     position[0] + syncRadius * cosP * Math.cos(yaw),
@@ -718,13 +828,15 @@ function bezierVec3(keyframes, segIndex, t, mode) {
   const next = getVec(keyframes, j);
   const nextNext = getVec(keyframes, j + 1);
 
-  // Auto control points (C1 continuous)
-  const c0 = [
+  // Auto control points (C1 continuous); a keyframe next to a hold (the same
+  // place twice) is left and entered at rest.
+  const same = (u, v) => u[0] === v[0] && u[1] === v[1] && u[2] === v[2];
+  const c0 = same(prev, curr) ? curr : [
     curr[0] + (next[0] - prev[0]) / 6,
     curr[1] + (next[1] - prev[1]) / 6,
     curr[2] + (next[2] - prev[2]) / 6
   ];
-  const c1 = [
+  const c1 = same(next, nextNext) ? next : [
     next[0] - (nextNext[0] - curr[0]) / 6,
     next[1] - (nextNext[1] - curr[1]) / 6,
     next[2] - (nextNext[2] - curr[2]) / 6
@@ -739,7 +851,7 @@ function bezierVec3(keyframes, segIndex, t, mode) {
 }
 
 // ---------------------------------------------------------------------------
-// Spline boundary accessors (mirror extrapolation)
+// Bezier boundary accessors (mirror extrapolation)
 // ---------------------------------------------------------------------------
 
 function getOrbitTarget(kf, idx) {
@@ -757,21 +869,6 @@ function getOrbitTarget(kf, idx) {
   return kf[idx].orbit.target;
 }
 
-function getOrbitScalar(kf, idx, prop) {
-  const n = kf.length;
-  if (idx < 0) {
-    const a = kf[0].orbit[prop];
-    const b = kf[Math.min(1, n - 1)].orbit[prop];
-    return 2 * a - b;
-  }
-  if (idx >= n) {
-    const a = kf[n - 1].orbit[prop];
-    const b = kf[Math.max(0, n - 2)].orbit[prop];
-    return 2 * a - b;
-  }
-  return kf[idx].orbit[prop];
-}
-
 function getFreeflyPos(kf, idx) {
   const n = kf.length;
   if (idx < 0) {
@@ -785,21 +882,6 @@ function getFreeflyPos(kf, idx) {
     return [2 * a[0] - b[0], 2 * a[1] - b[1], 2 * a[2] - b[2]];
   }
   return kf[idx].freefly.position;
-}
-
-function getFreeflyScalar(kf, idx, prop) {
-  const n = kf.length;
-  if (idx < 0) {
-    const a = kf[0].freefly[prop];
-    const b = kf[Math.min(1, n - 1)].freefly[prop];
-    return 2 * a - b;
-  }
-  if (idx >= n) {
-    const a = kf[n - 1].freefly[prop];
-    const b = kf[Math.max(0, n - 2)].freefly[prop];
-    return 2 * a - b;
-  }
-  return kf[idx].freefly[prop];
 }
 
 // ---------------------------------------------------------------------------

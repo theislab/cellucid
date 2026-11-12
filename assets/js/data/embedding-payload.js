@@ -15,7 +15,7 @@
  * and names the first (`firstUnplaced`). Only an embedding that places no
  * cell is refused for it.
  *
- * - normalized (the default): Cellucid's one rule -- centred per axis, one
+ * - normalized (the default): Cellucid's one rule -- centered per axis, one
  *   `2 / max(axis ranges)` scale for every axis, computed at the stored
  *   precision and rounded to float32 once. The display transform of the
  *   result is the identity.
@@ -709,7 +709,7 @@ export class EmbeddingPayloads {
         const { positions, transform, bounds, unplacedCount, firstUnplaced } = await handoff;
         return { positions, transform, bounds, unplacedCount, firstUnplaced };
       } catch (error) {
-        // The vector field's read was cancelled: this one reads for itself.
+        // The vector field's read was canceled: this one reads for itself.
         if (!isCancellation(error) || signal?.aborted) throw error;
       }
     }
@@ -826,7 +826,7 @@ export class EmbeddingPayloads {
       try {
         return await known;
       } catch (error) {
-        // Another caller's read was cancelled: this one reads for itself.
+        // Another caller's read was canceled: this one reads for itself.
         if (!isCancellation(error) || signal?.aborted) throw error;
       }
     }

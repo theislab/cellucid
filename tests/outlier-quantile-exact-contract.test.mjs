@@ -105,7 +105,7 @@ for (const format of ['H5AD', 'Zarr ZIP']) {
 }
 
 test('the rule: centre, distance, the share at that distance or closer', () => {
-  // Category 0: four cells on a line at 0, 1, 1, 4 (centre 1.5, distances
+  // Category 0: four cells on a line at 0, 1, 1, 4 (center 1.5, distances
   // 1.5, 0.5, 0.5, 2.5); the tie at 0.5 shares the larger rank.
   // Category 1: two cells, under minPoints. Code 9: missing.
   const latent = Float32Array.from([0, 0, 1, 0, 1, 0, 4, 0, 7, 7, 8, 8, 3, 3]);

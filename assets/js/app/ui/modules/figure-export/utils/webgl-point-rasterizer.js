@@ -67,6 +67,8 @@ import {
   HP_FS_LIGHT_NO_DEPTH,
   HP_FS_ULTRALIGHT,
   NO_DEPTH_MAX_DIMENSION,
+  HIGHLIGHT_COLOR,
+  HIGHLIGHT_RING_COLOR,
   HIGHLIGHT_STYLES_BY_QUALITY,
   HP_VS_HIGHLIGHT,
   HP_FS_HIGHLIGHT,
@@ -78,7 +80,8 @@ import {
 import { writeFogUniforms } from '../../../../../rendering/shaders/fog-shaders.js';
 import { enterOpaquePointBlending } from '../../../../../rendering/high-perf/gl-point-draw-state.js';
 import { PointStore, SegmentedVertexArray } from '../../../../../rendering/high-perf/point-store-segments.js';
-import { assertCropRect01 } from './crop.js';
+import { assertNormalizedRect01 } from './crop.js';
+import { POINT_SPRITE_MAX_PX, gpuPointSizeMax } from '../../../../../rendering/point-sprite.js';
 import {
   describeShaderQualities,
   SHADER_QUALITY_TRAITS,
@@ -95,7 +98,6 @@ import { allocateLargeArray } from '../../../../../utils/large-arrays.js';
 import { BENEATH_ALPHA_BYTE, UNREAD_ALPHA_BYTE, requireColorAlphaMeaning } from '../../../../../rendering/alpha-visibility.js';
 import { isUnplacedCell, positionsForGpu } from '../../../../../rendering/unplaced-positions.js';
 const DEFAULT_ALPHA_THRESHOLD = POINT_VISIBILITY_THRESHOLD;
-const DEFAULT_HIGHLIGHT_COLOR = [0.4, 0.85, 1.0];
 
 
 function highlightValueToAlphaByte(value) {
@@ -189,6 +191,7 @@ function buildHighlightOverlayBuffers({
  * @property {number} fov
  * @property {number} pointSize
  * @property {number} sizeAttenuation
+ * @property {number} pointSizeMax - the cap the viewer drew the pane with (rendering/point-sprite.js)
  * @property {number} [lightingStrength]
  * @property {number} [fogDensity]
  * @property {number} fogNear
@@ -214,7 +217,7 @@ const rasterContexts = new Map();
 
 /**
  * One pass's points on the GPU as the viewer holds them: segmented position
- * and colour stores (`rendering/high-perf/point-store-segments.js`), one
+ * and color stores (`rendering/high-perf/point-store-segments.js`), one
  * buffer a segment, drawn through one vertex array a segment, so no single
  * buffer limits how many points a figure draws. Returns what to draw and
  * delete.
@@ -240,7 +243,7 @@ function uploadPointPass(gl, positions, dimension, colors, count, label) {
     if (code !== gl.NO_ERROR) throw new RangeError(`${refusal} (WebGL error 0x${code.toString(16)}).`);
   };
   pass.positions.allocate(count, dimension * 4, gl.STATIC_DRAW, allocate, `${label} positions`, positions.subarray(0, count * dimension));
-  pass.colors.allocate(count, 4, gl.STATIC_DRAW, allocate, `${label} colours`, colors.subarray(0, count * 4));
+  pass.colors.allocate(count, 4, gl.STATIC_DRAW, allocate, `${label} colors`, colors.subarray(0, count * 4));
   pass.arrays.setStores(pass.positions, pass.colors, dimension);
   return pass;
 }
@@ -249,7 +252,7 @@ function uploadPointPass(gl, positions, dimension, colors, count, label) {
  * Draw every point of a pass, one draw a segment in order, its layers
  * (`packBuffers`) as the pane draws them: the first `unread` points (cells
  * not read) with `setUnread(true)` (flat, their own size, no depth writes),
- * then the next `beneath` (a field's no-value grey) yielding in depth as the
+ * then the next `beneath` (a field's no-value gray) yielding in depth as the
  * pane's beneath pass does (`setYield`, `u_yieldDepth`), then the rest.
  */
 function drawPointPass(pass, count, { unread = 0, beneath = 0 } = {}, { setYield = null, setUnread = null } = {}) {
@@ -402,31 +405,25 @@ function shrinkRasterCanvas(canvas) {
   canvas.height = 1;
 }
 
-// Viewer sprites are clamped at this many pixels (HP_VS_*: u_pointSizeMax
-// is never below it).
-const VIEWER_POINT_SIZE_MAX = 128;
 
 let spriteZoomLimit = null;
 
 /**
  * The largest raster scale (export pixels per viewer pixel) at which every
  * sprite the viewer can draw still fits this GPU's point-size range
- * (`ALIASED_POINT_SIZE_RANGE`): a 128-pixel viewer sprite drawn larger than
- * the driver allows would be clamped smaller than the view it reproduces.
- * Read once, from the export context of the thread that draws.
+ * (`ALIASED_POINT_SIZE_RANGE`): a viewer sprite at the cap
+ * (`POINT_SPRITE_MAX_PX`, or the GPU's own largest point where smaller,
+ * rendering/point-sprite.js) drawn larger than the driver allows would be
+ * clamped smaller than the view it reproduces. Read once, from the export
+ * context of the thread that draws.
  *
  * @returns {number}
  */
 export function exportSpriteZoomLimit() {
   if (spriteZoomLimit !== null) return spriteZoomLimit;
   const { gl } = acquireRasterContext(false);
-  const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
-  const driverMax = Array.isArray(range) || ArrayBuffer.isView(range)
-    ? Number(range[1])
-    : Number.NaN;
-  spriteZoomLimit = Number.isFinite(driverMax) && driverMax > 0
-    ? Math.max(1, driverMax / VIEWER_POINT_SIZE_MAX)
-    : 1;
+  const driverMax = gpuPointSizeMax(gl);
+  spriteZoomLimit = driverMax === null ? 1 : Math.max(1, driverMax / POINT_SPRITE_MAX_PX);
   return spriteZoomLimit;
 }
 
@@ -539,7 +536,7 @@ function pickShaderSources(shaderQuality, dimension) {
 
 /**
  * Pack colors into a new Uint8Array so we can:
- * - inject transparency into alpha channel (a cell's colour carries no
+ * - inject transparency into alpha channel (a cell's color carries no
  *   visibility; a marker's alpha byte is its opacity: `colorAlpha`)
  * - optionally apply selection emphasis (mute non-selected)
  * - compact an active LOD membership before GPU upload/draw
@@ -553,7 +550,7 @@ function pickShaderSources(shaderQuality, dimension) {
  * @param {1|2|3} options.dimension - Components per position; the packed
  *   positions keep it, and the shader's vec3 input receives 0 for the rest.
  * @param {Uint8Array} options.colors
- * @param {'layer'|'opacity'} options.colorAlpha - What the colours' alpha
+ * @param {'layer'|'opacity'} options.colorAlpha - What the colors' alpha
  *   byte is (`requireColorAlphaMeaning`): the cells' layer (beneath cells
  *   lead, counted in `beneath`) or a marker's opacity.
  * @param {Uint8Array|null} options.transparency
@@ -565,7 +562,7 @@ function pickShaderSources(shaderQuality, dimension) {
  * @param {number} options.selectionMutedOpacity
  * @param {number} [options.alphaThreshold]
  * @param {FigurePointLayers|null} [options.pointLayers] - Cells not read take
- *   its colour and lead the sequence; the read layers hold every read cell
+ *   its color and lead the sequence; the read layers hold every read cell
  *   when the pane drew them at every level.
  * @returns {{ positions: Float32Array; colors: Uint8Array; count: number; unread: number; beneath: number; dimension: number }}
  */
@@ -583,7 +580,7 @@ function packBuffers({
   alphaThreshold,
   pointLayers = null,
 }) {
-  const alphaIsLayer = requireColorAlphaMeaning(colorAlpha, 'Figure-export packed colours') === 'layer';
+  const alphaIsLayer = requireColorAlphaMeaning(colorAlpha, 'Figure-export packed colors') === 'layer';
   const n = positions.length / dimension;
   const admittedIndices = drawnSequence(lodMembership, drawOrder, alphaIsLayer ? colors : null, pointLayers?.readEveryLevel === true);
   const unreadRgb = pointLayers === null ? null : pointLayers.unreadColor.map(channel => Math.round(channel * 255));
@@ -598,7 +595,7 @@ function packBuffers({
   const mutedAlpha = selectionMutedOpacity;
   let cursor = 0;
   // The layers lead the sequence bottom first (`drawnSequence`): cells not
-  // read, then the grey beneath.
+  // read, then the gray beneath.
   let unread = 0;
   let beneath = 0;
 
@@ -628,7 +625,7 @@ function packBuffers({
       }
     } else if (alphaIsLayer && layer === BENEATH_ALPHA_BYTE) {
       beneath++;
-      // The grey of the cells with no value, made from the figure's paper.
+      // The gray of the cells with no value, made from the figure's paper.
       if (zeroRgb !== null) {
         r = zeroRgb[0];
         g = zeroRgb[1];
@@ -700,30 +697,31 @@ function packBuffers({
  * @param {boolean} [options.emphasizeSelection=false]
  * @param {number} [options.selectionMutedOpacity=0.15]
  * @param {number} [options.alphaThreshold=0.01]
- * @param {{x: number, y: number, width: number, height: number}|null} [options.viewRect01]
- *   A sub-rectangle of the viewport (normalized, top-left origin) to draw
- *   over the whole output, at the output's resolution -- a cropped figure
- *   drawn at its own pixels rather than a magnified part of the whole view.
- *   The caller sizes the output to the rectangle's aspect and scales point
- *   sizes by the same zoom. Null draws the whole viewport, letterboxed.
+ * @param {{x: number, y: number, width: number, height: number}} options.viewRect01
+ *   The figure's source (`sourceRect01` in `plot-fit.js`): the whole
+ *   viewport `{0, 0, 1, 1}` or the framing crop (normalized, top-left
+ *   origin), drawn over the whole output at the output's resolution -- a
+ *   cropped figure at its own pixels rather than a magnified part of the
+ *   whole view, and never letterboxed. The caller sizes the output to the
+ *   source's aspect (`planPlotRaster`) and scales point sizes by the same
+ *   zoom.
  * @returns {ImageBitmap} The frame, `outputWidthPx` × `outputHeightPx`, with
  *   premultiplied alpha; the caller owns it and closes it.
  */
 /**
- * The largest sprite this export may ask the shader to draw.
+ * The largest sprite this export may ask the shader to draw: the cap the
+ * viewer drew the pane with (`renderState.pointSizeMax`), times the raster's
+ * scale, within this GPU's largest point.
  *
  * @param {WebGL2RenderingContext} gl
+ * @param {number} viewerCap - the pane's `pointSizeMax`, in viewport pixels.
  * @param {number} rasterScale - export pixels per source viewport pixel.
  * @returns {number}
  */
-function exportPointSizeMax(gl, rasterScale) {
-  const scaled = VIEWER_POINT_SIZE_MAX * Math.max(1, rasterScale);
-  const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
-  const driverMax = Array.isArray(range) || ArrayBuffer.isView(range)
-    ? Number(range[1])
-    : Number.NaN;
-  if (!Number.isFinite(driverMax) || driverMax <= 0) return scaled;
-  return Math.min(scaled, driverMax);
+function exportPointSizeMax(gl, viewerCap, rasterScale) {
+  const scaled = viewerCap * Math.max(1, rasterScale);
+  const driverMax = gpuPointSizeMax(gl);
+  return driverMax === null ? scaled : Math.min(scaled, driverMax);
 }
 
 export function rasterizePointsWebgl({
@@ -742,13 +740,10 @@ export function rasterizePointsWebgl({
   emphasizeSelection = false,
   selectionMutedOpacity = 0.15,
   alphaThreshold = DEFAULT_ALPHA_THRESHOLD,
-  viewRect01 = null,
+  viewRect01,
   pointLayers = null,
 }) {
   requireFigurePointLayers(pointLayers, 'Figure-export point layers');
-  const viewRect = viewRect01 === null
-    ? null
-    : assertCropRect01({ enabled: true, ...viewRect01 });
   if (!renderState || typeof renderState !== 'object') {
     throw new TypeError('Figure-export renderState is required.');
   }
@@ -846,6 +841,14 @@ export function rasterizePointsWebgl({
       );
     }
   }
+  // The sprite cap the pane drew with (rendering/point-sprite.js), checked
+  // here as every other field is: a pass without it would ask the driver for
+  // a NaN cap.
+  if (!Number.isFinite(renderState.pointSizeMax) || renderState.pointSizeMax <= 0) {
+    throw new RangeError(
+      'Figure-export renderState.pointSizeMax must be a finite positive number.'
+    );
+  }
   pickShaderSources(renderState.shaderQuality, dimension);
   for (const [name, value] of [
     ['outputWidthPx', outputWidthPx],
@@ -874,11 +877,15 @@ export function rasterizePointsWebgl({
     throw new RangeError('Figure-export alphaThreshold must be between 0 and 1.');
   }
 
+  // The source the raster shows: the whole viewport `{0, 0, 1, 1}` or the
+  // framing crop. Always a rectangle; there is no letterboxed default.
+  const viewRect = assertNormalizedRect01(viewRect01, 'Figure-export raster viewRect01');
+
   const packed = packBuffers({
     positions,
     dimension,
     colors,
-    // The cells' colours: the alpha byte is their layer.
+    // The cells' colors: the alpha byte is their layer.
     colorAlpha: 'layer',
     transparency,
     lodMembership,
@@ -937,33 +944,20 @@ export function rasterizePointsWebgl({
     const srcViewportW = renderState.viewportWidth;
     const srcViewportH = renderState.viewportHeight;
 
-    // Export pixels per viewer pixel, and the projection that draws them.
-    let s;
-    let mvpMatrix = renderState.mvpMatrix;
-    let projectionMatrix = renderState.projectionMatrix;
-    if (viewRect === null) {
-      // Letterbox the on-screen viewport into the export canvas (preserves projection/aspect).
-      s = Math.min(outW / srcViewportW, outH / srcViewportH);
-      const vpW = Math.max(1, Math.round(srcViewportW * s));
-      const vpH = Math.max(1, Math.round(srcViewportH * s));
-      const vpX = Math.floor((outW - vpW) / 2);
-      const vpY = Math.floor((outH - vpH) / 2);
-      gl.viewport(vpX, vpY, vpW, vpH);
-    } else {
-      // The sub-rectangle fills the canvas: the projection is zoomed onto it
-      // in clip space, so every point is placed and drawn at this raster's
-      // own resolution.
-      s = Math.min(
-        outW / (viewRect.width * srcViewportW),
-        outH / (viewRect.height * srcViewportH)
-      );
-      const zoom = viewRectClipTransform(viewRect);
-      mvpMatrix = multiplyMat4(zoom, renderState.mvpMatrix);
-      projectionMatrix = multiplyMat4(zoom, renderState.projectionMatrix);
-      gl.viewport(0, 0, outW, outH);
-    }
+    // The source (the view, or the framing crop) fills the canvas: the
+    // projection is mapped onto it in clip space, so every point is placed
+    // and drawn at this raster's own resolution. `s` is export pixels per
+    // viewer pixel.
+    const s = Math.min(
+      outW / (viewRect.width * srcViewportW),
+      outH / (viewRect.height * srcViewportH)
+    );
+    const zoom = viewRectClipTransform(viewRect);
+    const mvpMatrix = multiplyMat4(zoom, renderState.mvpMatrix);
+    const projectionMatrix = multiplyMat4(zoom, renderState.projectionMatrix);
+    gl.viewport(0, 0, outW, outH);
 
-    // Positions and colours as separate segmented stores.
+    // Positions and colors as separate segmented stores.
     // A cell its embedding does not place (NaN positions) goes up as the
     // stand-in the vertex shader rejects (`unplaced-positions.js`).
     const pointPass = uploadPointPass(gl, positionsForGpu(packed.positions, packed.dimension), packed.dimension, packed.colors, packed.count, 'Figure-export point');
@@ -981,10 +975,10 @@ export function rasterizePointsWebgl({
     const pointSize = pointSizePx;
     // IMPORTANT: The point scale is derived from the SOURCE viewport height.
     //
-    // We letterbox the source viewport into a differently-sized export canvas by
-    // changing gl.viewport(). To produce a *scaled copy* of what the user sees
-    // (WYSIWYG), we scale u_pointSize at the callsite and keep the projection
-    // factor consistent with the interactive viewer's original one.
+    // A viewer pixel is `s` export pixels everywhere in this raster. To
+    // produce a *scaled copy* of what the user sees (WYSIWYG), the caller
+    // scales u_pointSize by the raster's zoom and the projection factor stays
+    // the interactive viewer's own.
     const shaderFrame = {
       modelView: new Float32Array(16),
       halfDir: new Float32Array(3),
@@ -1005,15 +999,17 @@ export function rasterizePointsWebgl({
     // The point pass's size uniform: its layers set it again (`drawPointPass`).
     const pointSizeUniform = u('u_pointSize');
     setF1(pointSizeUniform, pointSize);
-    // The shader caps a sprite at 128 pixels of whatever it is drawing into.
-    // This raster is `s` times the screen, so a point that the viewer clamps at
-    // 128 must clamp at 128 * s here, or it would occupy a smaller fraction of
-    // the exported image than of the view it reproduces. Reachable in an
-    // ordinary 3D close-up: with attenuation the size grows as 1/eyeDepth.
+    // The shader caps a sprite at the viewer's cap (rendering/point-sprite.js)
+    // of whatever it is drawing into. This raster is `s` times the screen, so
+    // a point the viewer clamps at the cap must clamp at `s` times it here, or
+    // it would occupy a smaller fraction of the exported image than of the
+    // view it reproduces. Reachable in an ordinary 3D close-up: with
+    // attenuation the size grows as 1/eyeDepth.
     //
     // The driver's own maximum bounds it, because asking for a larger sprite
     // than ALIASED_POINT_SIZE_RANGE allows is undefined rather than clamped.
-    setF1(u('u_pointSizeMax'), exportPointSizeMax(gl, s));
+    const pointSizeMax = exportPointSizeMax(gl, renderState.pointSizeMax, s);
+    setF1(u('u_pointSizeMax'), pointSizeMax);
     setF1(u('u_sizeAttenuation'), sizeAttenuation);
     setF1(u('u_pointScale'), pointScale);
 
@@ -1067,7 +1063,7 @@ export function rasterizePointsWebgl({
       setV3(u('u_lightDir'), lightDir);
       setV3(u('u_halfDir'), shaderFrame.halfDir);
       setF1(u('u_invCenterShade'), shaderFrame.invCenterShade);
-      // Only an opaque (sculpted) point mixes toward the fog colour, which a
+      // Only an opaque (sculpted) point mixes toward the fog color, which a
       // figure sets to its paper.
       setV3(u('u_fogColor'), renderState.fogColor);
     }
@@ -1138,7 +1134,7 @@ export function rasterizePointsWebgl({
         const overlayPass = uploadPointPass(gl, overlayPacked.positions, 3, overlayPacked.colors, overlayPacked.count, 'Figure-export overlay');
         passes.push(overlayPass);
         setF1(u('u_pointSize'), overlayPoints.pointSizePx);
-        setF1(u('u_pointSizeMax'), exportPointSizeMax(gl, s));
+        setF1(u('u_pointSizeMax'), pointSizeMax);
         drawPointPass(overlayPass, overlayPacked.count);
       }
     }
@@ -1178,13 +1174,16 @@ export function rasterizePointsWebgl({
       setHMat4(hu('u_projectionMatrix'), projectionMatrix);
 
       setHF1(hu('u_pointSize'), pointSize);
-      setHF1(hu('u_pointSizeMax'), exportPointSizeMax(gl, s));
+      setHF1(hu('u_pointSizeMax'), pointSizeMax);
       setHF1(hu('u_sizeAttenuation'), sizeAttenuation);
       setHF1(hu('u_pointScale'), pointScale);
 
       const style = HIGHLIGHT_STYLES_BY_QUALITY[quality];
+      // The ring within this GPU's largest point (asking for more is undefined).
+      setHF1(hu('u_gpuPointSizeMax'), gpuPointSizeMax(gl) ?? pointSizeMax * style.scale);
       setHF1(hu('u_highlightScale'), style.scale);
-      setHV3(hu('u_highlightColor'), DEFAULT_HIGHLIGHT_COLOR);
+      setHV3(hu('u_highlightColor'), HIGHLIGHT_COLOR);
+      setHV3(hu('u_highlightRingColor'), HIGHLIGHT_RING_COLOR);
       setHF1(hu('u_ringWidth'), style.ringWidth);
       setHF1(hu('u_haloStrength'), style.haloStrength);
       setHF1(hu('u_haloShape'), style.haloShape);

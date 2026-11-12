@@ -29,15 +29,13 @@ import { el, hasAtLeastUnicodeCodePoints } from './dom.js';
 import { createDomId } from '../../components/dom-id.js';
 import { createInfoTip } from '../../components/controls.js';
 import { runExactCleanup } from './cleanup.js';
-import {
-  COMMUNITY_MODAL_ESCAPE_OWNER,
-  removeOwningCommunityModal,
-} from './modal-shell.js';
+import { removeOwningCommunityModal } from './modal-shell.js';
 import {
   assertExactAnnotationUserKey,
   assertExactGitHubLogin,
 } from './identity-assertions.js';
 import { isCancellation } from '../../../../utils/abort.js';
+import { debounce } from '../../../../utils/debounce.js';
 
 /** Quiet period after the last keystroke before an ORCID lookup starts. */
 export const ORCID_SEARCH_DEBOUNCE_MS = 250;
@@ -259,11 +257,14 @@ export function createIdentityProfileModal({
             orcidSuggestPopupEl = suggestionBox;
             orcidSuggestAnchorEl = orcidInput;
             let profileModalClosed = false;
-            let searchTimer = null;
+            // The ORCID search runs once typing pauses; the suggestions hide a
+            // moment after focus leaves (a pointerdown on one cancels it); the
+            // popup is placed again once its layout settled.
+            const searchSoon = debounce(search => void search(), ORCID_SEARCH_DEBOUNCE_MS);
+            const hideSoon = debounce(() => hideSuggestions(), ORCID_SUGGESTION_HIDE_DELAY_MS);
+            const positionSoon = debounce(() => positionSuggest(), 60);
             let activeSearch = null;
-            let hideTimer = null;
             let positionFrame = null;
-            let positionTimer = null;
             const orcidSearchCache = new Map();
             const orcidComboboxInputs = [nameInput, orcidInput];
             let suggestionItems = [];
@@ -330,13 +331,7 @@ export function createIdentityProfileModal({
               publishSuggestionState();
             };
 
-            const cancelPendingSearchTimer = () => {
-              if (searchTimer === null) return false;
-              const timer = searchTimer;
-              clearTimeout(timer);
-              if (searchTimer === timer) searchTimer = null;
-              return true;
-            };
+            const cancelPendingSearchTimer = () => searchSoon.cancel();
 
             const abortActiveSearch = () => {
               if (activeSearch === null) return false;
@@ -444,17 +439,11 @@ export function createIdentityProfileModal({
               if (positionFrame !== null) {
                 cancelAnimationFrame(positionFrame);
               }
-              if (positionTimer !== null) {
-                clearTimeout(positionTimer);
-              }
               positionFrame = requestAnimationFrame(() => {
                 positionFrame = null;
                 positionSuggest();
               });
-              positionTimer = setTimeout(() => {
-                positionTimer = null;
-                positionSuggest();
-              }, 60);
+              positionSoon();
             };
 
             async function searchOrcid(query, { signal } = {}) {
@@ -498,7 +487,7 @@ export function createIdentityProfileModal({
                 if (
                   q === lastQuery &&
                   (
-                    searchTimer !== null ||
+                    searchSoon.pending ||
                     activeSearch !== null ||
                     suggestionsOpen
                   )
@@ -518,8 +507,7 @@ export function createIdentityProfileModal({
                 return;
               }
 
-              searchTimer = setTimeout(async () => {
-                searchTimer = null;
+              searchSoon(async () => {
                 if (
                   profileModalClosed ||
                   document.activeElement !== suggestionOwner
@@ -569,7 +557,7 @@ export function createIdentityProfileModal({
                     activeSearch = null;
                   }
                 }
-                }, ORCID_SEARCH_DEBOUNCE_MS);
+              });
               };
 
           const onAnyInput = (event) => {
@@ -631,15 +619,10 @@ export function createIdentityProfileModal({
             // a busy event loop.
             cancelPendingSearchTimer();
             abortActiveSearch();
-            if (hideTimer) clearTimeout(hideTimer);
-            hideTimer = setTimeout(() => {
-              hideTimer = null;
-              hideSuggestions();
-            }, ORCID_SUGGESTION_HIDE_DELAY_MS);
+            hideSoon();
           };
           const cancelHide = () => {
-            if (hideTimer) clearTimeout(hideTimer);
-            hideTimer = null;
+            hideSoon.cancel();
           };
           const focusCombobox = (event) => {
             cancelHide();
@@ -663,7 +646,7 @@ export function createIdentityProfileModal({
           const dismissComboboxSuggestions = () => {
             const ownsTransientUi =
               suggestionsOpen ||
-              searchTimer !== null ||
+              searchSoon.pending ||
               activeSearch !== null;
             if (!ownsTransientUi) return false;
             cancelPendingSearchTimer();
@@ -671,10 +654,17 @@ export function createIdentityProfileModal({
             hideSuggestions();
             return true;
           };
-          nameInput[COMMUNITY_MODAL_ESCAPE_OWNER] =
-            dismissComboboxSuggestions;
-          orcidInput[COMMUNITY_MODAL_ESCAPE_OWNER] =
-            dismissComboboxSuggestions;
+          // Escape with suggestions shown (or a search on its way) closes
+          // them, not the dialog: the key is taken (`preventDefault`), and
+          // an app dialog stays open on a taken Escape.
+          const handleComboboxEscape = (event) => {
+            if (event.key !== 'Escape') return;
+            if (!dismissComboboxSuggestions()) return;
+            event.preventDefault();
+            event.stopPropagation();
+          };
+          nameInput.addEventListener('keydown', handleComboboxEscape);
+          orcidInput.addEventListener('keydown', handleComboboxEscape);
             const scroller = content.closest('.community-annotation-modal-body');
             const handleScrollerScroll = () => {
               if (suggestionsOpen) positionSuggest();
@@ -691,26 +681,8 @@ export function createIdentityProfileModal({
             content.__cellucidCleanup = () => {
               profileModalClosed = true;
               runExactCleanup('Community annotation profile teardown', [
-                [
-                  'ORCID debounce timer',
-                  searchTimer === null
-                    ? null
-                    : () => {
-                      const timer = searchTimer;
-                      clearTimeout(timer);
-                      if (searchTimer === timer) searchTimer = null;
-                    }
-                ],
-                [
-                  'ORCID suggestion hide timer',
-                  hideTimer === null
-                    ? null
-                    : () => {
-                      const timer = hideTimer;
-                      clearTimeout(timer);
-                      if (hideTimer === timer) hideTimer = null;
-                    }
-                ],
+                ['ORCID debounce timer', searchSoon.pending ? () => searchSoon.cancel() : null],
+                ['ORCID suggestion hide timer', hideSoon.pending ? () => hideSoon.cancel() : null],
                 [
                   'ORCID suggestion position frame',
                   positionFrame === null
@@ -721,16 +693,7 @@ export function createIdentityProfileModal({
                       if (positionFrame === frame) positionFrame = null;
                     }
                 ],
-                [
-                  'ORCID suggestion position timer',
-                  positionTimer === null
-                    ? null
-                    : () => {
-                      const timer = positionTimer;
-                      clearTimeout(timer);
-                      if (positionTimer === timer) positionTimer = null;
-                    }
-                ],
+                ['ORCID suggestion position timer', positionSoon.pending ? () => positionSoon.cancel() : null],
                 [
                   'ORCID request',
                   activeSearch === null
@@ -754,13 +717,6 @@ export function createIdentityProfileModal({
                     'resize',
                     handleWindowResize
                   )
-                ],
-                [
-                  'ORCID combobox Escape owners',
-                  () => {
-                    nameInput[COMMUNITY_MODAL_ESCAPE_OWNER] = null;
-                    orcidInput[COMMUNITY_MODAL_ESCAPE_OWNER] = null;
-                  }
                 ],
                 ['ORCID suggestion cache', () => orcidSearchCache.clear()]
               ]);

@@ -31,3 +31,17 @@ export function panelLetter(index) {
   } while (remaining >= 0);
   return letters;
 }
+
+/**
+ * A panel's title in a multi-panel figure: its letter and its view's name
+ * (`view.rename`), else its label ("B. Day 7"). The grid composition
+ * (`layout.js`) measures it and both renderers draw it, so a column is as
+ * wide as its titles and no title is cut off.
+ *
+ * @param {{ id?: string, name?: string|null, label?: string }|null|undefined} view
+ * @param {number} index
+ * @returns {string}
+ */
+export function panelTitle(view, index) {
+  return `${panelLetter(index)}. ${String(view?.name ?? (view?.label || String(view?.id || 'live')))}`;
+}

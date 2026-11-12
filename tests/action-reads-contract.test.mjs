@@ -1,14 +1,14 @@
 /**
  * Declared inputs (History v2 §3.4, §6 test 2): every action of the
- * catalogue says what its result is computed from beyond its parameters and
+ * catalog says what its result is computed from beyond its parameters and
  * the domains it touches (`reads`, its result inputs) and where its
  * parameters' names resolve (`context`, its name context), so a step's
  * staleness (result inputs only, for every action) and a deleted step's
- * dependent re-apply (both) follow from the catalogue alone.
+ * dependent re-apply (both) follow from the catalog alone.
  *
  * Here: the declarations themselves (required, distinct, known, never a
  * touched domain, empty for an action that records no step), refused by
- * `defineAction` when they are wrong, written in the catalogue document; and
+ * `defineAction` when they are wrong, written in the catalog document; and
  * the inputs every parameter naming something implies (a field by its name
  * reads the fields' overlays, a gene the data mapping's gene names, a view
  * by its name the views, a highlight page the highlights, cells by original
@@ -103,13 +103,14 @@ test('an action that names a field, a gene, a view, a page or cells reads where 
 });
 
 test('the view in focus: an action on it reads the views unless it changes them', () => {
-  // Colours, filters, hidden cells and the colouring belong to a view; an
+  // Colors, filters, hidden cells and the coloring belong to a view; an
   // action without a view parameter acts on the view in focus.
   const perView = ['active-field', 'filters', 'colors', 'visibility'];
   for (const definition of definitions) {
     if (isSteplessEffect(definition.effect) || definition.touches.includes('views')) continue;
     if (!definition.touches.some(domain => perView.includes(domain))) continue;
-    if (definition.type.startsWith('field.') || definition.type === 'mapping.set') continue;
+    // The data mapping and the expression values act on every view alike.
+    if (definition.type.startsWith('field.') || definition.type === 'mapping.set' || definition.type === 'expression.transform.set') continue;
     assert.ok(definition.reads.includes('views') || definition.context.includes('views'), `${definition.type} acts on the view in focus, so it reads views or resolves in them`);
   }
 });

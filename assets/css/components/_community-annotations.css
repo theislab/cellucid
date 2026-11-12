@@ -100,6 +100,13 @@
   margin-top: 0;
 }
 
+/* A quiet action alone in a column (`.btn-quiet`: View full evidence under
+   the evidence line, View all comments under the comments) keeps its width. */
+.community-annotation-suggestion-meta > .community-annotation-evidence-more,
+.community-annotation-comments-inline > .community-annotation-view-all {
+  align-self: flex-start;
+}
+
 .community-annotation-suggestion-evidence {
   font-size: var(--type-hint);
   color: var(--color-text-secondary);
@@ -323,29 +330,8 @@
   white-space: nowrap;
 }
 
-/* Modal */
-.community-annotation-modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: var(--color-surface-overlay);
-  z-index: var(--z-modal);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: var(--space-5);
-}
-
-.community-annotation-secondary-overlay {
-  position: fixed;
-  inset: 0;
-  background: var(--color-surface-overlay);
-  z-index: calc(var(--z-modal) + 2);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: var(--space-5);
-}
-
+/* Dialogs: a dialog layer (components/_modals.css, `.community-annotation-dialog`)
+   holding this card; a details dialog opens over the voting one. */
 .community-annotation-modal {
   --community-annotation-nav-btn-width: 76px;
   width: min(520px, 96vw);
@@ -1095,18 +1081,14 @@ button.community-annotation-suggest-item:focus-visible {
   min-width: 0;
 }
 
+/* Edit and Delete beside a comment's meta line: quiet buttons, at full
+   strength (a faded quiet action fell below AA contrast). */
 .community-annotation-inline-action-links {
   display: inline-flex;
   align-items: baseline;
   gap: var(--space-1);
   margin-left: var(--space-1);
   white-space: nowrap;
-  opacity: var(--opacity-75);
-  transition: opacity var(--duration-fast) var(--easing-standard);
-}
-
-.community-annotation-inline-action-links:hover {
-  opacity: 1;
 }
 
 .community-annotation-comment {
@@ -1152,37 +1134,6 @@ button.community-annotation-suggest-item:focus-visible {
   display: flex;
   gap: var(--control-row-gap);
   margin-top: var(--control-row-gap);
-}
-
-.community-annotation-comment-action-btn {
-  padding: 0;
-  font-size: var(--type-button);
-  color: var(--color-text-tertiary);
-  background: none;
-  border: none;
-  cursor: pointer;
-  text-decoration: underline;
-  transition: var(--transition-colors);
-}
-
-.community-annotation-comment-action-btn:hover {
-  color: var(--color-text-secondary);
-}
-
-.community-annotation-merged-comment-btn {
-  padding: 0;
-  font-size: var(--type-button);
-  color: var(--color-text-tertiary);
-  background: none;
-  border: none;
-  cursor: pointer;
-  opacity: var(--opacity-75);
-  transition: var(--transition-colors);
-}
-
-.community-annotation-merged-comment-btn:hover {
-  color: var(--color-text-secondary);
-  opacity: 1;
 }
 
 .community-annotation-comment-form {

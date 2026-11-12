@@ -1,5 +1,5 @@
 /**
- * The summary of one neighbour graph read from an AnnData file (its
+ * The summary of one neighbor graph read from an AnnData file (its
  * `obsp` matrix), as the AnnData adapter publishes it: `{n_cells, n_edges,
  * max_neighbors}`, with both counts null until the edges are first read
  * (counting them reads the whole graph), and the edges

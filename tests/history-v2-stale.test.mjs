@@ -29,14 +29,17 @@ async function page() {
     defineAction({ type: 'field.rename', title: 'r', summary: 'x', group: 'T', params: NUMBER, touches: ['field-overlays'], reads: [], effect: 'state', describe: p => `rename ${p.v}`, code: () => 'r()' }),
     // As highlight.range: the cells the filters leave are its result input.
     defineAction({ type: 'highlight.visible', title: 'h', summary: 'x', group: 'T', params: NONE, touches: ['highlights'], reads: ['filters'], effect: 'state', describe: () => 'highlight the visible cells', code: () => 'h()' }),
-    // As color.category: the field it names resolves in the field overlays, its colour does not follow them.
-    defineAction({ type: 'color.set', title: 'c', summary: 'x', group: 'T', params: NUMBER, touches: ['colors'], reads: [], context: ['field-overlays'], effect: 'view', describe: p => `colour ${p.v}`, code: () => 'c()' }),
+    // As color.category: the field it names resolves in the field overlays, its color does not follow them.
+    defineAction({ type: 'color.set', title: 'c', summary: 'x', group: 'T', params: NUMBER, touches: ['colors'], reads: [], context: ['field-overlays'], effect: 'view', describe: p => `color ${p.v}`, code: () => 'c()' }),
+    // As camera-path.keyframe.add: it reads its input and holds its value (captures it).
+    defineAction({ type: 'snapshot.save', title: 's', summary: 'x', group: 'T', params: NONE, touches: ['colors'], reads: ['filters'], captures: ['filters'], effect: 'view', describe: () => 'save the filters', code: () => 's()' }),
   ];
   const dispatcher = createActionDispatcher({ catalog: createActionCatalog([...defs, ...historyActions]) });
   dispatcher.provide('filter.set', ({ v }) => { state.filters = v; });
   dispatcher.provide('field.rename', ({ v }) => { state.names = v; });
   dispatcher.provide('highlight.visible', () => { state.h = Array.from({ length: 10 - state.filters }, (_, i) => i); });
   dispatcher.provide('color.set', ({ v }) => { state.colors = v; });
+  dispatcher.provide('snapshot.save', () => { state.colors = 100 + state.filters; });
   let n = 0;
   const history = createHistory({
     dispatcher, domains, dataset: { id: 'd', name: 'D', cellOrder: null },
@@ -62,8 +65,23 @@ test('a cell set made from the filters is stale once they change, naming the ste
 
 test('a step whose name resolves in a domain is not stale when it changes, and records nothing of it', async () => {
   const { history, step, stale } = await page();
-  const coloured = await step('color.set', { v: 3 });
-  assert.deepEqual(history.active.steps.get(coloured.id).reads, {}, 'the name context is not recorded');
+  const colored = await step('color.set', { v: 3 });
+  assert.deepEqual(history.active.steps.get(colored.id).reads, {}, 'the name context is not recorded');
   await step('field.rename', { v: 1 });
   assert.deepEqual(await stale(), []);
 });
+
+test('a step that captures its input (a camera path keyframe) is never stale when that input changes, and still records it', async () => {
+  // Owner, 2026-11-10 (F57): building a path (save, move the camera, save) marked keyframes stale.
+  const { history, step, stale } = await page();
+  await step('filter.set', { v: 2 });
+  const saved = await step('snapshot.save');
+  assert.ok(Object.hasOwn(history.active.steps.get(saved.id).reads, 'filters'), 'replay still knows what it read');
+  await step('filter.set', { v: 5 });
+  assert.deepEqual(await stale(), []);
+});
+
+test('an action captures only inputs it reads', () => {
+  assert.throws(() => defineAction({ type: 'bad.capture', title: 'b', summary: 'x', group: 'T', params: NONE, touches: ['colors'], reads: [], captures: ['filters'], effect: 'view', describe: () => 'b', code: () => 'b()' }), /captures must list distinct inputs it reads/);
+});
+

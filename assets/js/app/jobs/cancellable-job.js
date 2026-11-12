@@ -6,9 +6,9 @@
  * owns how every job starts, reports, stops and ends:
  *
  * - **Cancel.** A job owns one `AbortController`; its `signal` goes to every
- *   read and compute task of the job, so cancelling stops them where they
+ *   read and compute task of the job, so canceling stops them where they
  *   are (reads in the reader worker, tasks in the analysis workers).
- *   Cancelling rejects with a `user` cancellation (`utils/abort.js`), and is never
+ *   Canceling rejects with a `user` cancellation (`utils/abort.js`), and is never
  *   a failure: it is not logged as one, not shown as one, and leaves nothing
  *   half-applied (the feature applies a result only once its job is done).
  * - **Shared work.** `awaitWithSignal` (`utils/abort.js`) lets one caller
@@ -36,6 +36,8 @@ import { describeReadProgress, getReadActivityLog } from '../../data/read-activi
 import { formatBytes, formatDuration, formatRemaining, formatCount } from '../../utils/format-units.js';
 import { trackCellWork } from '../../data/open-cells-work.js';
 import { cancel, isCancellation } from '../../utils/abort.js';
+import { failureDetails, sayFailure } from '../../utils/errors.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
 /**
  * Read kinds a job owns (`ReadActivity.kind`): an analysis's gene reads, the
@@ -57,8 +59,9 @@ const runningJobs = new Set();
 
 /**
  * Whether a read activity belongs to a job, which shows it itself: a read of
- * a job's kind, one a running job owns, or one a job adopted by joining the
- * load it reads for (`data/read-activity-log.js`, `adopt`).
+ * a job's kind, one a running job owns, or one adopted by an owner that
+ * shows it: a job joining the load it reads for, a gene's own loading
+ * notification (`data/read-activity-log.js`, `adopt`).
  */
 export function isJobRead(activity) {
   return JOB_READ_KINDS.has(activity?.kind) || runningJobs.has(activity?.owner) || (activity?.adoptedBy?.length ?? 0) > 0;
@@ -169,7 +172,7 @@ export class CancellableJob {
     this._successNotice = successNotice;
     this._notifications = notifications;
     this._notificationId = null;
-    this._listeners = new Set();
+    this._listeners = createListenerSet(`the job "${this.title}"`);
     this._updateTimer = null;
     /** @type {Map<number, Object>} The job's reads, latest report of each */
     this._reads = new Map();
@@ -302,7 +305,7 @@ export class CancellableJob {
   cancel() {
     if (!this.running) return false;
     this._end('cancelled');
-    cancel(this._controller, 'user', `${this.title} was cancelled.`);
+    cancel(this._controller, 'user', `${this.title} was canceled.`);
     if (this._notificationId !== null) {
       this._closeNotification(id => this._notifications.dismiss(id));
     }
@@ -341,14 +344,16 @@ export class CancellableJob {
       this.cancel();
       return;
     }
-    const why = error instanceof Error ? error.message : String(error);
+    // A broken invariant is said as one, its own words under Details (`utils/errors.js`).
+    const why = sayFailure(error);
     this.message = why;
     this._end('failed');
     const said = text ?? `${this.title} failed: ${why}`;
+    const details = failureDetails(error);
     if (this._notificationId !== null) {
-      this._closeNotification(id => this._notifications.fail(id, said));
+      this._closeNotification(id => this._notifications.fail(id, said, details));
     } else if (this._failureNotice) {
-      this._notifications.error(said, { category: this.category });
+      this._notifications.error(said, { category: this.category, ...details });
     }
   }
 
@@ -366,8 +371,7 @@ export class CancellableJob {
    * @returns {() => void} Unsubscribe
    */
   subscribe(listener) {
-    this._listeners.add(listener);
-    return () => this._listeners.delete(listener);
+    return this._listeners.add(listener);
   }
 
   /** @private */
@@ -407,13 +411,7 @@ export class CancellableJob {
         this._notificationId = null;
       }
     }
-    for (const listener of this._listeners) {
-      try {
-        listener(this);
-      } catch (error) {
-        console.error(`[cellucid:jobs] A listener of "${this.title}" failed:`, error);
-      }
-    }
+    this._listeners.notify(this);
   }
 
   /** @private */

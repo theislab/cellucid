@@ -48,7 +48,7 @@ export function python(script, input) {
 
 /** Python's reading and comparison of each copy with its source. */
 const COMPARE = String.raw`
-import json, sys, math, zipfile
+import json, sys, math, re, unicodedata, zipfile
 import numpy as np, pandas as pd, scipy.sparse as sp
 import anndata, mudata, zarr
 from cellucid._anndata_files import ANNDATA_KINDS, MUDATA_KINDS, classify_anndata_path, read_cellucid_identity
@@ -80,6 +80,30 @@ def dense(x):
     if sp.issparse(x): return x.toarray()
     return np.asarray(x)
 
+FORBIDDEN = re.compile(r'[/\\<>:"|?*\x00-\x1f]')
+RESERVED = {".", "..", ".zarray", ".zattrs", ".zgroup", ".zmetadata", "zarr.json"}
+DEVICES = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+def portable_names(names, taken=()):
+    # The copy's portable element names (names.js portableElementName): what a name a store
+    # cannot hold (a column 'a/b' an .h5ad nests) is written as.
+    seen = {unicodedata.normalize("NFC", name).lower() for name in taken}
+    out = []
+    for name in names:
+        base = re.sub(r"[ .]+$", lambda m: "_" * len(m.group(0)), FORBIDDEN.sub("_", str(name)))
+        if base == "" or base in RESERVED or base.split(".", 1)[0].upper() in DEVICES:
+            base = "_" + base
+        def fitted(suffix):
+            text = base
+            while len((text + suffix).encode("utf-8")) > 255: text = text[:-1]
+            return re.sub(r"[ .]+$", lambda m: "_" * len(m.group(0)), text) + suffix
+        candidate, n = fitted(""), 2
+        while unicodedata.normalize("NFC", candidate).lower() in seen:
+            candidate, n = fitted(f"_{n}"), n + 1
+        seen.add(unicodedata.normalize("NFC", candidate).lower())
+        out.append(candidate)
+    return out
+
 def same(a, b, where):
     if isinstance(a, (anndata.AnnData,)):
         compare_anndata(a, b, where); return
@@ -92,6 +116,7 @@ def same(a, b, where):
             # A file of anndata before 0.8 whose column-order lists only some of its columns
             # (SeuratDisk): anndata reads the listed ones, the reader presents every one, the copy keeps them all.
             b = b[[column for column in b.columns if column in a.columns]]
+        a = a.set_axis(portable_names(list(a.columns), taken=["_index"]), axis=1)
         assert list(a.columns) == list(b.columns), f"{where}: columns {list(a.columns)} != {list(b.columns)}"
         assert list(map(str, a.index)) == list(map(str, b.index)), f"{where}: index"
         for column in a.columns: same_series(a[column], b[column], f"{where}[{column}]")

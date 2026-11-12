@@ -97,7 +97,7 @@ test('analytics is absent on localhost and loaded exactly once on production', (
   assert.deepEqual(calls.map(call => call[0]), ['consent', 'js', 'set', 'config']);
   // What the page lets Google collect is fixed before the tag loads, so a
   // change in the property cannot widen it: no advertising storage, no
-  // advertising use of user data (user-provided data), no personalisation,
+  // advertising use of user data (user-provided data), no personalization,
   // no Google signals.
   assert.deepEqual(calls[0], ['consent', 'default', {
     ad_storage: 'denied',

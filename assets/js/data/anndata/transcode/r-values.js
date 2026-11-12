@@ -11,6 +11,9 @@ import { NA_INTEGER, hostValues } from '../../../formats/rds/index.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { allocateTypedArray } from '../../sparse-column-index.js';
 
+/** bit64's NA: the smallest 64-bit integer. */
+const NA_INTEGER64 = -(2n ** 63n);
+
 /** An S4 slot holding `NULL` is stored as this symbol. */
 const NULL_SLOT = '\u0001NULL\u0001';
 
@@ -215,7 +218,8 @@ function codesOf(count, length) {
  * - character → categorical of its distinct values, sorted (NA kept);
  * - logical → booleans, nullable when it has NA;
  * - integer → int32, nullable when it has NA;
- * - double (dates and times included) → float64; `integer64` → float64;
+ * - double (dates and times included) → float64; `integer64` → int64,
+ *   nullable when it has NA (identifiers past 2^53 then read as text);
  * - an `Rle` (S4Vectors run-length column) → its expansion, as above.
  *
  * @param {Object} node
@@ -281,11 +285,22 @@ export async function columnOf(node, rows, context) {
     }
     case 'double': {
       if (hasClass(node, 'integer64')) {
+        // bit64's integers, each in a double's 8 bytes: kept as the 64-bit
+        // integers they are (NA_integer64, the smallest one, missing), so
+        // identifiers past 2^53 are read exactly, as text
+        // (`values.js` `readExactIntegers`).
         const values = await vectorValues(node, context);
         const words = new BigInt64Array(values.buffer, values.byteOffset, rows);
-        const out = allocateTypedArray(Float64Array, rows, 'An integer64 column');
-        for (let i = 0; i < rows; i++) out[i] = words[i] === -(2n ** 63n) ? NaN : Number(words[i]);
-        return { kind: 'numbers', values: out, note: 'integer64 read as float64' };
+        const out = allocateTypedArray(BigInt64Array, rows, 'An integer64 column');
+        out.set(words);
+        let mask = null;
+        for (let i = 0; i < rows; i++) {
+          if (out[i] !== NA_INTEGER64) continue;
+          mask ??= allocateTypedArray(Uint8Array, rows, 'An integer64 column mask');
+          mask[i] = 1;
+          out[i] = 0n;
+        }
+        return mask === null ? { kind: 'numbers', values: out } : { kind: 'nullable-integer', values: out, mask };
       }
       if (node.region) return { kind: 'numbers', region: node.region, dtype: '>f8' };
       return { kind: 'numbers', values: await vectorValues(node, context) };

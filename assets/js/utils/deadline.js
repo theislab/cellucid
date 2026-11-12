@@ -1,7 +1,7 @@
 /**
  * A deadline whose timer is released as soon as the work it bounds settles.
  *
- * `AbortSignal.timeout()` cannot be cancelled, so its timer outlives the work
+ * `AbortSignal.timeout()` cannot be canceled, so its timer outlives the work
  * it bounds, and some runtimes do not keep a process alive for it. This owns an
  * ordinary timer, aborts its signal with a `TimeoutError` when it fires, and
  * clears the timer on `release()`. `extend()` starts the full interval again,

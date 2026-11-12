@@ -25,6 +25,14 @@
  *   check     `(value, record, context) => string|null`: a further rule,
  *             returning the reason a value is refused
  *   defaultText  how the docs table states a default that depends on data
+ *   pages     select: `true` when its choices are the highlight pages (a
+ *             page's id in the record; the actions name it by its name)
+ *   means     what an agent's action parameter says beyond the label
+ *             (`actions/definitions/analysis.js` `optionParamSchema`): the
+ *             values a choice made from the data takes, or what a choice
+ *             does, where neither the label nor the values say it. Every
+ *             word is sent with every call of an agent: only where it earns
+ *             that
  *
  * `context` is what the data offers (fields, groups, matrices, genes); a
  * schema validates a record's shape without it and its choices with it.
@@ -34,6 +42,9 @@
 
 import { isObjectRecord } from '../../../utils/exact-record.js';
 
+
+/** A cell scope's values (Cells, Within) as an agent's action names them (`means`). */
+export const CELL_SCOPE_MEANS = 'all, visible (the cells the view shows) or page:<page name> (a highlight page\'s cells)';
 
 export const OPTION_KINDS = Object.freeze([
   'select', 'segmented', 'number', 'boolean', 'text', 'flags', 'groups', 'gene-sets', 'variable'
@@ -101,8 +112,12 @@ function validateEntry(entry, groupIds, keys) {
           throw new TypeError(`Option "${key}" choices are { value: string, label }`);
         }
         requireText(choice.label, `Option "${key}" choice label`);
+        requireAliases(choice, key);
       }
     }
+  }
+  if (entry.pages !== undefined && (entry.pages !== true || entry.kind !== 'select')) {
+    throw new TypeError(`Option "${key}" pages is true on a select, or left out`);
   }
   for (const name of ['when', 'check']) {
     if (entry[name] !== undefined && typeof entry[name] !== 'function') {
@@ -116,6 +131,42 @@ function validateEntry(entry, groupIds, keys) {
       }
     }
   }
+}
+
+/**
+ * A choice's other names (`aliases`: the same choice as something else names
+ * it, as the mapped expression matrix is also `X`): distinct strings, never
+ * its own value.
+ */
+function requireAliases(choice, key) {
+  if (choice.aliases === undefined) return;
+  if (!Array.isArray(choice.aliases) || choice.aliases.some(alias => typeof alias !== 'string' || alias.length === 0 || alias === choice.value) ||
+    new Set(choice.aliases).size !== choice.aliases.length) {
+    throw new TypeError(`Option "${key}" choice "${choice.value}" aliases are distinct names other than its value`);
+  }
+}
+
+/** The choice `value` names (its value or one of its aliases), or undefined. */
+function choiceNamed(choices, value) {
+  return choices.find(choice => choice.value === value) ?? choices.find(choice => choice.aliases?.includes(value));
+}
+
+/**
+ * A list of groups in the order its picker shows them (`context.groupsFor`,
+ * the field's categories), ids the data does not list after them as given: a
+ * set of groups has one form, so the picker reading it back (every time the
+ * form refreshes) changes nothing. An agent's `["Epicardial fibroblast", …]`
+ * in its own order was rewritten by the next refresh into the field's order,
+ * and the history recorded "Changed outside the history" (live-7 L25-2).
+ */
+function groupsInOrder(entry, value, record, context) {
+  if (value?.mode !== 'subset' || typeof context?.groupsFor !== 'function') return value;
+  const groups = context.groupsFor(entry, record) ?? [];
+  if (groups.length === 0) return value;
+  const chosen = new Set(value.ids);
+  const listed = groups.map(group => String(group.id)).filter(id => chosen.has(id));
+  const known = new Set(listed);
+  return { mode: 'subset', ids: [...listed, ...value.ids.filter(id => !known.has(id))] };
 }
 
 /** An entry's choices; null when they depend on data and no context is given. */
@@ -133,7 +184,7 @@ function refuseValue(entry, value, record, context) {
     case 'segmented': {
       if (typeof value !== 'string') return `${label} must be one of its choices`;
       const choices = choicesOf(entry, context, record);
-      if (choices !== null && !choices.some(choice => choice.value === value)) {
+      if (choices !== null && choiceNamed(choices, value) === undefined) {
         return `${label} has no choice "${value}"`;
       }
       break;
@@ -320,7 +371,16 @@ export function defineOptions(spec) {
       const { valid, errors } = schema.validate(record, context);
       if (!valid) throw new TypeError(errors.join('; '));
       const copy = {};
-      for (const entry of entries) copy[entry.key] = cloneValue(record[entry.key]);
+      for (const entry of entries) {
+        let value = record[entry.key];
+        // A choice given by another name is kept by its own value.
+        if ((entry.kind === 'select' || entry.kind === 'segmented') && context !== undefined) {
+          const choices = choicesOf(entry, context, record);
+          if (choices !== null) value = choiceNamed(choices, value)?.value ?? value;
+        }
+        if (entry.kind === 'groups') value = groupsInOrder(entry, value, record, context);
+        copy[entry.key] = cloneValue(value);
+      }
       return copy;
     },
 
@@ -359,6 +419,37 @@ export function defineOptions(spec) {
     },
   };
   return Object.freeze(schema);
+}
+
+/**
+ * Some of a schema's options as a form of their own (all essentials), as
+ * the expanded view shows an analysis's display options: each entry's rules
+ * (`when`, `choices`, `check`) read the whole record, `outer()`, with the
+ * form's values over it, since a display option may apply only for another
+ * option's value (composition's "Bars per" needs samples and a condition).
+ *
+ * @param {Object} schema - A schema from `defineOptions`
+ * @param {{id: string, keys: string[], outer: () => Object}} subset
+ */
+export function subsetOptions(schema, { id, keys, outer }) {
+  if (typeof outer !== 'function') throw new TypeError('An options subset reads the whole record from outer()');
+  const whole = record => ({ ...outer(), ...record });
+  return defineOptions({
+    id,
+    groups: [],
+    options: keys.map(key => {
+      const entry = schema.entry(key);
+      return {
+        ...entry,
+        group: ESSENTIALS,
+        ...(entry.when === undefined ? {} : { when: (record, context) => entry.when(whole(record), context) }),
+        ...(typeof entry.choices === 'function'
+          ? { choices: (context, record) => entry.choices(context, whole(record)) }
+          : {}),
+        ...(entry.check === undefined ? {} : { check: (value, record, context) => entry.check(value, whole(record), context) })
+      };
+    })
+  });
 }
 
 /** A value as text, as the docs and the "n changed" summary state it. */

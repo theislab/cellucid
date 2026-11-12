@@ -6,6 +6,7 @@ import { HighPerfRenderer } from '../assets/js/rendering/high-perf-renderer.js';
 import { RankLevels } from '../assets/js/rendering/high-perf/lod-levels.js';
 import { requireLodMembership } from '../assets/js/rendering/high-perf/renderer-contracts.js';
 import {
+  getPresentedGridColumns,
   getPresentedPane,
   resolvePresentedLayout,
   runSynchronousBorrowedViewDataCallback,
@@ -184,11 +185,12 @@ test('presented layout mirrors exact odd-sized framebuffer grid arithmetic', () 
         { length: viewCount },
         (_, index) => `view_${index}`,
       );
+      // The arrangement is the column rule's for the presented area
+      // (`getPresentedGridColumns`, held in viewport-center-contract); the
+      // subject here is the framebuffer arithmetic of whatever it chose.
       const expectedCols = viewCount === 1
         ? 1
-        : viewCount <= 3
-          ? viewCount
-          : Math.ceil(Math.sqrt(viewCount));
+        : getPresentedGridColumns(viewCount, cssWidth * (1 - leftOcclusionRatio), cssHeight);
       const expectedRows = Math.ceil(viewCount / expectedCols);
       const layout = resolvePresentedLayout({
         canvasHeight,
@@ -708,14 +710,11 @@ test('presented-state observers stay semantic and allocation-bounded at frame ca
   );
   assert.match(
     subscriptionSource,
-    /presentedViewStateListeners\.add\(exactListener\)/,
+    /const unsubscribe = presentedViewStateListeners\.add\(exactListener\)/,
   );
   assert.match(subscriptionSource, /let subscribed = true;/);
   assert.match(subscriptionSource, /if \(!subscribed\) return;/);
-  assert.match(
-    subscriptionSource,
-    /presentedViewStateListeners\.delete\(exactListener\)/,
-  );
+  assert.match(subscriptionSource, /subscribed = false;\s*unsubscribe\(\);/);
 
   const controlsSource = extractSourceRange(
     source,

@@ -5,17 +5,15 @@
  *   categoricalFields  [{key, name, categoryCount}] (categoryCount null
  *                      until the field is read)
  *   colorField         the key of the categorical field the cells are
- *                      coloured by, or null
+ *                      colored by, or null
  *   pages              [{id, name}] the highlight pages
  *   groupsFor(entry, record)  the cell types of the chosen field
  *
  * @module analysis/options/composition-options
  */
 
-import { defineOptions } from './option-schema.js';
-
-/** Field names that read as the sample (replicate) of a cell. */
-export const SAMPLE_FIELD_PATTERN = /sample|donor|patient|individual|library|batch/i;
+import { CELL_SCOPE_MEANS, defineOptions } from './option-schema.js';
+import { identityField, sampleField, sampleFieldRank } from '../../utils/field-roles.js';
 
 function fieldChoices(context) {
   return (context?.categoricalFields ?? []).map(field => ({ value: field.key, label: field.name }));
@@ -29,14 +27,12 @@ function noneOrFieldExcept(...taken) {
   ];
 }
 
-/** Field names that read as a cell type or cluster annotation. */
-export const CELL_TYPE_FIELD_PATTERN = /cell.?type|annotation|cluster|leiden|louvain|subtype|label|lvl\d/i;
-
 /**
- * The field of cell types: the coloring field when it is categorical; else
- * the first categorical field named like a cell type or cluster; else the
- * first that is not named like a sample; with two or more categories where
- * there is one.
+ * The field of cell types: the coloring field when it is categorical and not
+ * named like a sample; else the best-ranked identity name (cell type,
+ * annotation, lineage, cluster: `utils/field-roles.js`); else the first not
+ * named like a sample, an id or a quality flag; with two or more categories
+ * where there is one.
  */
 export function defaultCellTypeField(context) {
   const fields = context?.categoricalFields ?? [];
@@ -44,29 +40,21 @@ export function defaultCellTypeField(context) {
   // The coloring field, unless it reads as samples (a view colored by donor).
   if (
     context.colorField &&
-    !SAMPLE_FIELD_PATTERN.test(context.colorField) &&
+    sampleFieldRank(context.colorField) === null &&
     fields.some(field => field.key === context.colorField)
   ) {
     return context.colorField;
   }
-  // A field whose categories are not read yet may well have several.
-  const several = fields.filter(field => field.categoryCount === null || field.categoryCount >= 2);
-  return (
-    several.find(field => CELL_TYPE_FIELD_PATTERN.test(field.key))
-    ?? several.find(field => !SAMPLE_FIELD_PATTERN.test(field.key))
-    ?? several[0]
-    ?? fields[0]
-  ).key;
+  return identityField(fields);
 }
 
 /**
- * The first field named like a sample, donor, patient, individual, library
- * or batch that is not the cell types' field; else none.
+ * The best-ranked field named like a donor, patient, sample, library or
+ * batch (`utils/field-roles.js` `SAMPLE_FIELD_TIERS`) that is not the cell
+ * types' field; else none.
  */
 export function defaultSampleField(context) {
-  const cellTypes = defaultCellTypeField(context);
-  return (context?.categoricalFields ?? [])
-    .find(field => field.key !== cellTypes && SAMPLE_FIELD_PATTERN.test(field.key))?.key ?? '';
+  return sampleField(context?.categoricalFields ?? [], defaultCellTypeField(context));
 }
 
 function cellChoices(context) {
@@ -92,7 +80,7 @@ export const compositionOptions = defineOptions({
       tip: 'composition-cell-types',
       group: 'essentials',
       default: defaultCellTypeField,
-      defaultText: 'The coloring field when it is not named like a sample, else the first categorical field named like a cell type or cluster, else the first not named like a sample',
+      defaultText: 'The coloring field when it is not named like a sample, else the best field named like a cell type, annotation, lineage or cluster, else the first not named like a sample',
       choices: fieldChoices,
       check: value => (value === '' ? 'Choose the field that holds the cell types' : null)
     },
@@ -102,8 +90,9 @@ export const compositionOptions = defineOptions({
       label: 'Samples',
       tip: 'composition-samples',
       group: 'essentials',
+      means: 'a sample or donor field: the replicate the tests run across (empty: none)',
       default: defaultSampleField,
-      defaultText: 'The first other field named like sample, donor, patient, individual, library or batch; else None',
+      defaultText: 'The other field named most like a donor, patient, sample, library or batch, in that order; else None',
       choices: noneOrFieldExcept('cellTypes')
     },
     {
@@ -112,6 +101,7 @@ export const compositionOptions = defineOptions({
       label: 'Condition',
       tip: 'composition-condition',
       group: 'essentials',
+      means: 'a categorical field whose groups are compared (bin a continuous one such as age into a field first; empty: no test)',
       default: '',
       defaultText: 'None',
       choices: noneOrFieldExcept('cellTypes', 'samples')
@@ -122,6 +112,7 @@ export const compositionOptions = defineOptions({
       label: 'Cells',
       tip: 'composition-cells',
       group: 'cells',
+      means: CELL_SCOPE_MEANS,
       default: 'all',
       defaultText: 'All cells',
       choices: cellChoices
@@ -140,12 +131,25 @@ export const compositionOptions = defineOptions({
       label: 'Test',
       tip: 'composition-test',
       group: 'test',
+      means: 'logit: Welch\'s t or ANOVA of logit proportions across samples (propeller without moderation); rank: Wilcoxon or Kruskal–Wallis; clr: centered log-ratios',
       default: 'logit',
       choices: [
         { value: 'logit', label: 'Logit proportions (propeller)' },
         { value: 'rank', label: 'Ranks of proportions' },
-        { value: 'clr', label: 'Centred log-ratio' }
+        { value: 'clr', label: 'Centered log-ratio' }
       ],
+      when: record => record.samples !== '' && record.condition !== ''
+    },
+    {
+      // The same donors in both conditions (two organs of one fetus): each
+      // donor's difference (`stats/composition-tests.js`).
+      key: 'paired',
+      kind: 'boolean',
+      label: 'Pair samples across conditions',
+      tip: 'composition-paired',
+      group: 'test',
+      means: 'true (two conditions, at least 3 samples in both): a sample with cells in both is a pair, others left out; each cell type tested over the pairs holding its cells, not tested in fewer than 3 (test: too few pairs); logit and clr: paired t-test (scipy ttest_rel), rank: Wilcoxon signed-rank. The result\'s about says how many samples are in both',
+      default: false,
       when: record => record.samples !== '' && record.condition !== ''
     },
     {

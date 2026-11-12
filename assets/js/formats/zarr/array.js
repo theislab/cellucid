@@ -22,7 +22,7 @@
  *
  * A sharded (Zarr v3) array reads each shard's index once (cached; the
  * indexes a read needs all at once), then fetches only the inner chunks it
- * needs, every shard's in the same task once the indexes are in, neighbours
+ * needs, every shard's in the same task once the indexes are in, neighbors
  * in one request.
  *
  * @module formats/zarr/array
@@ -338,7 +338,7 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
   async function assemble(selection, options) {
     if (context.closed) throw new ZarrFormatError(`${what}: the store has been closed.`);
     if (meta.unsupported) throw meta.unsupported;
-    // A read cancelled before it starts fetches nothing.
+    // A read canceled before it starts fetches nothing.
     if (options.signal?.aborted) throw abortReason(options.signal);
     // An absent chunk reads as the fill value, so a host that hides this
     // array's files must be caught before any value is returned.
@@ -375,7 +375,7 @@ export function createArrayNode({ path, name, attrs, meta, store, context, serve
     const target = output === null ? null : wordsOf(output, raw ? type.itemSize : undefined);
     // Each chunk is waited for with this read's own signal (`SharedWork`):
     // a chunk another read also waits for never fails this read when that
-    // read is cancelled.
+    // read is canceled.
     const work = pending.map((promise, k) => promise.then(({ decoded, shared, offset = 0 }) => {
       const item = list[k];
       if (decoded === null) {

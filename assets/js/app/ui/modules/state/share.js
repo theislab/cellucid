@@ -3,7 +3,7 @@
  * methods paragraph (the history's reads `history.pseudocode` and
  * `history.methods`, which an agent and a notebook read too), or open a
  * printable report of the branch shown up to the step shown (made by
- * `app/history/exports/report.js` from the tracker, the catalogue, the
+ * `app/history/exports/report.js` from the tracker, the catalog, the
  * dataset's facts and the version: its own methods text and pseudocode) in a
  * window of its own where the person reads, prints or saves it as PDF.
  *
@@ -27,11 +27,12 @@ import { reportHistoryFailure } from './shared.js';
 import { ActionRefused } from '../../../actions/dispatcher.js';
 import { reportDocument, reportPictureDefaults } from '../../../history/exports/report.js';
 import { pathTo } from './history-source.js';
-import { getNotificationCenter } from '../../../notification-center.js';
 import { historySettings, setHistorySetting } from '../../../history/history-settings.js';
 import { wireAppDialog } from '../../components/app-dialog.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
 import { quoteName } from '../../../actions/targets/names.js';
+import { throwIfAborted } from '../../../../utils/abort.js';
+import { copyText } from '../../../utils/clipboard.js';
 
 /** The release version the page names (`<meta name="cellucid-version">`). */
 export function pageVersion(ownerDocument) {
@@ -44,7 +45,7 @@ export function pageVersion(ownerDocument) {
  * @param {() => object|null} options.history
  * @param {() => import('./history-source.js').TrackerView|null} options.view - the tracker shown
  * @param {(type: string, params: object) => Promise<{text: string}>} options.read - a history read
- * @param {(stepId: string) => Promise<unknown>} options.jump - `history.jump`
+ * @param {(stepId: string, how?: {signal?: AbortSignal|null}) => Promise<unknown>} options.jump - `history.jump`
  * @param {() => object} options.datasetFacts - `dataset-facts.js`
  * @param {(() => Promise<{png: string}>)|null} options.pictures - Draw the selected view as a PNG
  *   (base64, the read `view.picture`), or null when this page cannot
@@ -76,12 +77,11 @@ export function createHistorySharing({
   }
 
   async function copy(text, what, count) {
-    try {
-      await navigator.clipboard.writeText(text);
-      getNotificationCenter().success(count === null ? `Copied ${what}.` : `Copied ${what} of ${formatCountOf(count, 'step')}.`, { category: 'session' });
-    } catch (error) {
-      reportHistoryFailure(`Copying ${what}`, error);
-    }
+    await copyText(text, {
+      what,
+      success: count === null ? `Copied ${what}.` : `Copied ${what} of ${formatCountOf(count, 'step')}.`,
+      category: 'session',
+    });
   }
 
   function writeReport(win, html) {
@@ -91,14 +91,21 @@ export function createHistorySharing({
     win.focus();
   }
 
-  /** Draw the views after each chosen step; back to the step shown after. */
-  async function picturesOf(tracker, chosen) {
+  /**
+   * Draw the views after each chosen step; back to the step shown after.
+   * `signal` (an agent's `history.report`): stopped, no further step is
+   * shown, the jump under way ends, and the step shown before comes back
+   * before the report ends as a cancellation (F147).
+   */
+  async function picturesOf(tracker, chosen, signal = null) {
     const out = new Map();
     if (pictures === null || chosen.length === 0) return out;
     const returnTo = tracker.headId;
     try {
       for (const step of chosen) {
-        await jump(step.id);
+        throwIfAborted(signal);
+        await jump(step.id, { signal });
+        throwIfAborted(signal);
         const { png } = await pictures();
         out.set(step.id, { src: `data:image/png;base64,${png}`, alt: `The view after “${step.label}”` });
       }
@@ -111,12 +118,12 @@ export function createHistorySharing({
   /**
    * The report of the branch shown up to the step shown, with a picture of
    * the views after each step of `chosenIds`: the document the window shows
-   * and an agent's `history.report` writes or reads.
+   * and an agent's `history.report` writes or reads (`signal`: its Stop).
    */
-  async function makeReport(chosenIds) {
+  async function makeReport(chosenIds, signal = null) {
     const { tracker, branch, to, steps } = shown();
     const chosen = steps.filter(step => chosenIds.has(step.id));
-    const shot = await picturesOf(tracker, chosen);
+    const shot = await picturesOf(tracker, chosen, signal);
     // The report's own methods text, pseudocode and entries (`report.js`), of the tracker record.
     const html = reportDocument({
       tracker: tracker.tracker, branch, to, catalog: history()?.catalog, generatedAt: Date.now(),
@@ -256,15 +263,16 @@ export function createHistorySharing({
      * The report as `history.report` makes it: its HTML and what it covers.
      * Pictures need the page's drawing of a view; a text is never given any.
      *
-     * @param {{pictures: 'none'|'default'|string[]}} options
+     * @param {{pictures: 'none'|'default'|string[], signal?: AbortSignal|null}} options - `signal`:
+     *   what stops it (the action's Stop): the steps shown for pictures stop and the step shown comes back
      */
-    async report({ pictures: choice }) {
+    async report({ pictures: choice, signal = null }) {
       if (choice !== 'none' && pictures === null) {
         throw new ActionRefused('This page cannot draw the views as pictures, so the report can have none: ask for pictures "none".', {
           code: 'unavailable', type: 'history.report',
         });
       }
-      return makeReport(pictureChoice(choice));
+      return makeReport(pictureChoice(choice), signal);
     },
     destroy() {
       controller.abort();

@@ -24,7 +24,7 @@
  * @module data/open-cells-work
  */
 
-import { awaitWithSignal } from '../utils/abort.js';
+import { awaitWithSignal, throwIfAborted } from '../utils/abort.js';
 
 const running = new Set();
 let change = null;
@@ -54,10 +54,10 @@ export function trackCellWork(promise) {
  */
 export async function cellWorkSettled(signal = null) {
   while (running.size > 0) {
-    if (signal?.aborted) throw signal.reason;
+    throwIfAborted(signal);
     await awaitWithSignal(Promise.allSettled([...running]), signal);
   }
-  if (signal?.aborted) throw signal.reason;
+  throwIfAborted(signal);
 }
 
 /** Whether any work on the open cells is under way. */
@@ -77,10 +77,10 @@ export function cellWorkRunning() {
  */
 export async function useOpenCells(task, signal = null) {
   for (let steady = cellsSteady(); steady !== null; steady = cellsSteady()) {
-    if (signal?.aborted) throw signal.reason;
+    throwIfAborted(signal);
     await steady;
   }
-  if (signal?.aborted) throw signal.reason;
+  throwIfAborted(signal);
   return trackCellWork(Promise.resolve().then(task));
 }
 

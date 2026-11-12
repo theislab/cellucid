@@ -15,9 +15,10 @@
  * @module ui/modules/state/search
  */
 
-import { openMenu } from './menu.js';
+import { openMenu } from '../../components/menu.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
 import { searchWords, stepMatches } from '../../../history/search.js';
+import { debounce } from '../../../../utils/debounce.js';
 
 /** The Filter menu's choices: each a key of the query and its value. */
 export const SEARCH_FILTERS = Object.freeze([
@@ -151,7 +152,11 @@ export function createSearch({ box, toggle, input, filterButton, onChange, onClo
   const query = { ...EMPTY_QUERY };
   /** The labels of the part and the day chosen, as the menu named them. */
   const named = { domain: null, day: null };
-  let timer = null;
+  // The text filters once typing pauses.
+  const filterByText = debounce(() => {
+    query.text = input.value;
+    onChange({ ...query });
+  }, 120);
 
   function filtersOn() {
     const on = SEARCH_FILTERS.filter(choice => !('separator' in choice) && query[choice.key] === choice.value).map(choice => choice.label);
@@ -180,7 +185,6 @@ export function createSearch({ box, toggle, input, filterButton, onChange, onClo
     const now = choices();
     const list = key === 'domain' ? now.domains.map(each => ({ value: each.id, label: each.label, count: each.count }))
       : now.days.map(each => ({ value: each.day, label: each.label, count: each.count }));
-    filterButton.setAttribute('aria-expanded', 'true');
     openMenu({
       anchor: filterButton,
       label: key === 'domain' ? 'Steps that changed' : 'Steps taken on',
@@ -193,7 +197,6 @@ export function createSearch({ box, toggle, input, filterButton, onChange, onClo
           run: () => choose(key, each.value, each.label),
         })),
     });
-    filterButton.setAttribute('aria-expanded', 'false');
   }
 
   function setOpen(open) {
@@ -216,13 +219,7 @@ export function createSearch({ box, toggle, input, filterButton, onChange, onClo
     setOpen(box.hidden);
     if (box.hidden) onClose();
   }, { signal });
-  input.addEventListener('input', () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => {
-      query.text = input.value;
-      onChange({ ...query });
-    }, 120);
-  }, { signal });
+  input.addEventListener('input', () => filterByText(), { signal });
   box.addEventListener('keydown', event => {
     if (event.key === 'Escape') {
       event.preventDefault();
@@ -234,7 +231,6 @@ export function createSearch({ box, toggle, input, filterButton, onChange, onClo
     }
   }, { signal });
   filterButton.addEventListener('click', () => {
-    filterButton.setAttribute('aria-expanded', 'true');
     openMenu({
       anchor: filterButton,
       label: 'Filter the steps',
@@ -254,7 +250,6 @@ export function createSearch({ box, toggle, input, filterButton, onChange, onClo
         { label: 'Day…', hint: named.day ?? '', run: () => openChoices('day') },
       ],
     });
-    filterButton.setAttribute('aria-expanded', 'false');
   }, { signal });
 
   return {
@@ -269,7 +264,7 @@ export function createSearch({ box, toggle, input, filterButton, onChange, onClo
     },
     get query() { return { ...query }; },
     destroy() {
-      clearTimeout(timer);
+      filterByText.cancel();
       controller.abort();
     },
   };

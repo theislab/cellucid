@@ -60,6 +60,7 @@ function createDiscovery(gene = 'GENE') {
   const dataLayer = {
     state: { pointCount: values.length },
     getAvailableVariables: () => [{ key: gene }],
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
     async readGeneColumn(requested, options) {
       assert.equal(requested, gene);
       assert.equal(options.priority, 'bulk');
@@ -165,7 +166,7 @@ test('an aborted run publishes nothing and rejects with its reason', async () =>
     controller.abort(reason);
     await assert.rejects(run, error => error === reason);
   });
-  // The workers' groups (one entry a cell) do not outlive the cancelled run,
+  // The workers' groups (one entry a cell) do not outlive the canceled run,
   // and the pool stops replaying them to replaced workers.
   assert.deepEqual(
     broadcasts.map(({ type, execution }) => [type, execution.retainAs ?? execution.releases]),
@@ -286,6 +287,7 @@ test('over a gene route a marker task names its delivery and runs on the worker 
       return { bytes: genes.map(() => 32) };
     },
     async readGeneColumn() { throw new Error('a delivered gene is never read here'); },
+    runValues: async () => ({ transform: { normalize: false, log1p: false }, sizes: null, key: 'raw', record: null }),
   };
   const engine = new MarkerDiscoveryEngine({ dataLayer });
   const { options } = createDiscovery();

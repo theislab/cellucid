@@ -1,16 +1,20 @@
 /**
  * The Cellucid relay, played by a spec: `page.routeWebSocket` on the
- * deployed relay's `/tab`, so nothing leaves the machine. It welcomes every
- * tab, answers claims with `client`, keeps the connections an approval
+ * deployed relay's `/tab` and `page.route` on its claim endpoint
+ * (`/oauth/claim`, a credentialed request), so nothing leaves the machine.
+ * It welcomes every tab, answers claims with `client`, keeps the connections an approval
  * makes, records what the tab sent, and asks the tab to run tools as Claude
  * or ChatGPT does through it (`callTool`). For the Connect panel's specs and
  * the agents' acceptance matrix (a connector alone, with the chat bar, and
  * either failing).
  */
 import { expect } from './test.mjs';
+import { RELAY_PROTOCOL_VERSION } from '../../../assets/js/app/agent/bridge/relay-protocol.js';
 
 /** The deployed relay's tab socket (`DEFAULT_RELAY_ORIGIN` in `app/agent/bridge/relay-client.js`). */
 export const RELAY_TAB = 'wss://mcp.cellucid.com/tab';
+/** The deployed relay's claim endpoint (`relay/oauth.js` `handleClaim`). */
+export const RELAY_CLAIM = 'https://mcp.cellucid.com/oauth/claim';
 /** Where this browser keeps its pairing (`app/agent/bridge/tab-secret.js`). */
 export const SECRET_KEY = 'cellucid:agent-relay:tab-secret';
 export const CLAUDE = Object.freeze({
@@ -30,6 +34,36 @@ export async function pairTab(page, secret = 'B'.repeat(43)) {
  */
 export async function playRelay(page, { client = CLAUDE, refuseFirst = 0 } = {}) {
   const relay = { sent: [], sockets: [], connections: [], client, refused: refuseFirst, opened: 0 };
+  // A claim is a credentialed request (`relay-client.js` `claimAtRelay`): recorded
+  // as `{type: 'claim', code, secret, origin}`, answered for the page's origin alone.
+  await page.route(RELAY_CLAIM, async route => {
+    const request = route.request();
+    const origin = request.headers().origin ?? null;
+    const cors = {
+      'Access-Control-Allow-Origin': origin ?? 'null',
+      'Access-Control-Allow-Credentials': 'true',
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      Vary: 'Origin',
+    };
+    if (request.method() === 'OPTIONS') {
+      await route.fulfill({ status: 204, headers: cors });
+      return;
+    }
+    const { code, secret } = request.postDataJSON();
+    relay.sent.push({ type: 'claim', code, secret, origin });
+    // A refusal is an answer, as a socket reply is (`relay/oauth.js` `handleClaim`): a 200.
+    const answer = body => route.fulfill({ status: 200, headers: cors, contentType: 'application/json', body: JSON.stringify(body) });
+    if (code === 'ZZZZZZZZ') {
+      await answer({ ok: false, error: { code: 'unknown', message: 'This connect code is unknown or has expired. Start connecting again from Claude or ChatGPT.' } });
+      return;
+    }
+    if (code === 'YYYYYYYY') {
+      await answer({ ok: false, error: { code: 'other-browser', message: 'This connect code was started in another browser, so it cannot connect this one. Approve in the browser that shows the code, or start connecting again from Claude or ChatGPT in this browser.' } });
+      return;
+    }
+    await answer({ ok: true, value: { client: relay.client, expiresAt: Date.now() + 600_000 } });
+  });
   await page.routeWebSocket(RELAY_TAB, ws => {
     relay.opened += 1;
     if (relay.refused > 0) {
@@ -47,13 +81,6 @@ export async function playRelay(page, { client = CLAUDE, refuseFirst = 0 } = {})
       const message = JSON.parse(String(text));
       relay.sent.push(message);
       switch (message.type) {
-        case 'claim':
-          if (message.code === 'ZZZZZZZZ') {
-            ws.send(JSON.stringify({ type: 'reply', ref: message.ref, ok: false, error: { code: 'unknown', message: 'This connect code is unknown or has expired. Start connecting again from Claude or ChatGPT.' } }));
-            return;
-          }
-          reply(message.ref, { client: relay.client, expiresAt: Date.now() + 600_000 });
-          return;
         case 'decide':
           if (message.allow) {
             relay.connections.push({
@@ -80,7 +107,7 @@ export async function playRelay(page, { client = CLAUDE, refuseFirst = 0 } = {})
         default:
       }
     });
-    ws.send(JSON.stringify({ type: 'welcome', protocol: 1 }));
+    ws.send(JSON.stringify({ type: 'welcome', protocol: RELAY_PROTOCOL_VERSION }));
   });
   return relay;
 }
@@ -97,10 +124,13 @@ let calls = 0;
  * Ask the tab, as the relay does, to run one tool for an agent's connection
  * (`grant`); resolves the tab's answer. `startTool` sends it without waiting.
  */
-export function startTool(relay, tool, args, { agent = 'Claude', grant = 'g1', client = agent, host = 'claude.ai' } = {}) {
+export function startTool(relay, tool, args, {
+  agent = 'Claude', grant = 'g1', client = agent, host = 'claude.ai', known = host === 'claude.ai' || host === 'chatgpt.com',
+} = {}) {
   calls += 1;
   const id = `call-${calls}-${tool}`;
-  relay.sockets.at(-1).send(JSON.stringify({ type: 'call', id, tool, args, agent, grant, client, host }));
+  // `known`: the relay vouches for the app's name (Claude's and ChatGPT's hosts), as `relay/pairing.js` says it.
+  relay.sockets.at(-1).send(JSON.stringify({ type: 'call', id, tool, args, agent, grant, client, host, known }));
   return { id, result: () => received(relay, 'result', message => message.id === id) };
 }
 

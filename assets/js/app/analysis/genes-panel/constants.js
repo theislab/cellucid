@@ -48,7 +48,7 @@ export const ERROR_MESSAGES = {
     'At least 2 groups with cells are needed to compare. Found: {n}.',
 
   NO_GENES_AVAILABLE:
-    'This dataset publishes no gene expression fields, so no gene panel can be built. Load a dataset that includes gene expression.',
+    'This dataset publishes no gene expression fields, so no gene panel can be built. Open a dataset that includes gene expression.',
 
   NO_GENES_TO_TEST:
     'The gene filters leave no gene to test. Clear Exclude genes or Only genes in.'

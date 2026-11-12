@@ -58,6 +58,8 @@ function renderState() {
     },
     bgColor: Float32Array.from([1, 1, 1]),
     cameraDistance: 3,
+    // The sprite cap (rendering/point-sprite.js).
+    pointSizeMax: 160,
     cameraPosition: [0, 0, 3],
     far: 100,
     fogColor: Float32Array.from([1, 1, 1]),
@@ -91,6 +93,7 @@ function payload({
     dpi: null,
     format: 'svg',
     height: 100,
+    gridColumns: 1,
     meta: {
       views: [{
         fieldKey: null,
@@ -98,6 +101,8 @@ function payload({
         filters: [],
         id: 'live',
         label: 'Live',
+        name: null,
+        vectorField: null,
       }],
     },
     options: {
@@ -129,6 +134,7 @@ function payload({
     },
     selection: {
       highlightArray: null,
+      pageName: null,
       totalCount: 0,
       visibleCount: 0,
     },
@@ -138,6 +144,7 @@ function payload({
       data: {
         centroidColors: null,
         centroidFlags: { labels: false, points: false },
+        vectorField: null,
         centroidLabelTexts: [],
         centroidPositions: null,
         colors,
@@ -147,6 +154,7 @@ function payload({
       },
       id: 'live',
       label: 'Live',
+      name: null,
       renderState: renderState(),
       scientificState: {
         datasetGeneration: 7,
@@ -191,6 +199,7 @@ test('figure-export payload owns every asynchronous renderer input', () => {
   const wrongHighlightOwner = payload();
   wrongHighlightOwner.selection = {
     highlightArray: new Uint8Array(2),
+    pageName: 'Page 1',
     totalCount: 1,
     visibleCount: 1,
   };
@@ -345,6 +354,9 @@ test('reentrant abort in one grid snapshot fences every later borrowed owner', a
     getFilterSummaryForView() {
       return [];
     },
+    getActivePage() {
+      return null;
+    },
     getHighlightedCellCount() {
       return 0;
     },
@@ -376,6 +388,9 @@ test('reentrant abort in one grid snapshot fences every later borrowed owner', a
     },
     getLiveViewLabel() {
       return 'Live';
+    },
+    getViewName() {
+      return null;
     },
     getPointCount() {
       return 1;
@@ -422,8 +437,8 @@ test('reentrant abort in one grid snapshot fences every later borrowed owner', a
 test('figure-export failures publish one exact visible terminal outcome', () => {
   const calls = [];
   const notifications = {
-    failCalculation(id, message) {
-      calls.push(['fail', id, message]);
+    failCalculation(id, message, options) {
+      calls.push(['fail', id, message, options]);
     },
     error(message, options) {
       calls.push(['error', message, options]);
@@ -461,13 +476,9 @@ test('figure-export failures publish one exact visible terminal outcome', () => 
     console.error = originalConsoleError;
   }
 
+  // The export's own card says it, once; no second card repeats it.
   assert.deepEqual(calls, [
-    ['fail', 'figure-owner', 'snapshot rejected'],
-    [
-      'error',
-      'Export failed: snapshot rejected',
-      { category: 'render', duration: 6000 },
-    ],
+    ['fail', 'figure-owner', 'Export failed: snapshot rejected', {}],
   ]);
   assert.equal(consoleCalls.length, 1);
   assert.equal(consoleCalls[0][0], '[FigureExport] Export failed:');

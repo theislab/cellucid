@@ -412,9 +412,13 @@ async function readCellTables(tables, cells, model, readerOf, { signal, activity
     const { rename } = tablePrefix(path);
     const joined = joinTable(table, cells.length);
     if (joined.matched === 0) continue;
+    // A name an earlier table gave a column keeps that table's; one this
+    // table repeats is kept, under its portable name (`anndata-model.js`).
+    const earlier = new Set(model.obs.columns.map(existing => existing.name));
     for (const column of joined.columns) {
       const name = rename[column.name] ?? column.name;
-      if (!model.obs.columns.some(existing => existing.name === name)) model.obs.columns.push({ name, column: column.column });
+      if (earlier.has(name)) model.notes.push(`${path} column '${name}' was not read: an earlier table has a column of that name.`);
+      else model.obs.columns.push({ name, column: column.column });
     }
     const projection = projectionName(path);
     for (const embedding of joined.obsm) {
@@ -701,7 +705,7 @@ async function buildMap(space, { set, tables, readerOf, folderName, matrixBytes,
  * - a share the store holds is answered at once;
  * - a pass under way for as many rows or more serves every caller waiting,
  *   and stops only once none waits any more (one caller stopping, a gene
- *   read cancelled, leaves it to the others);
+ *   read canceled, leaves it to the others);
  * - more rows asked for while a smaller pass runs stop it: the larger pass
  *   serves its callers too (its rows begin with theirs), after one reading
  *   from now instead of the rest of one and a whole other;

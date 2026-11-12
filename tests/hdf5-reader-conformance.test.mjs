@@ -73,7 +73,7 @@ function generator(seedText) {
   };
 }
 
-/* ---------- normalising values for comparison ---------- */
+/* ---------- normalizing values for comparison ---------- */
 
 function decodeExpected(value) {
   if (value === 'NaN') return NaN;
@@ -102,7 +102,7 @@ function flatten(value) {
   return [value];
 }
 
-/** h5wasm's JSON attribute value, normalised like ours (64-bit integers are Numbers there). */
+/** h5wasm's JSON attribute value, normalized like ours (64-bit integers are Numbers there). */
 function attributeComparable(value) {
   if (typeof value === 'bigint') return Number(value);
   if (Array.isArray(value)) return value.map(attributeComparable);

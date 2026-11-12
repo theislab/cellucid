@@ -108,6 +108,8 @@ export function installSettingsActions({ sidebar, actions }) {
       { setting: key, value: setting.value },
       {},
       { label: setting.label, shown: setting.shown ?? null, value: setting.value },
+      // A control's event, never fired by a restore (`isApplyingControls` above): the person's act.
+      { person: true },
     ).catch(error => console.error(`[Settings] The change of "${key}" could not be recorded:`, error));
   }
   for (const type of OBSERVED_EVENTS) ownerDocument.addEventListener(type, observe);

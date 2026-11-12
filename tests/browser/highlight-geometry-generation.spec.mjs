@@ -8,7 +8,7 @@ import { dismissWelcome } from './helpers/welcome.mjs';
  * What each engine calls a request the page cancelled: Chromium
  * `net::ERR_ABORTED`, WebKit `cancelled` on macOS (hosted macOS WebKit reported
  * five of the reader's module requests so) and `Load request cancelled` on Linux
- * (`app/utils/sha256.js`, nightly run 41382954122).
+ * (`utils/sha256.js`, nightly run 41382954122).
  */
 const CANCELLED_BY_THE_PAGE = new Set(['net::ERR_ABORTED', 'cancelled', 'Load request cancelled']);
 
@@ -257,7 +257,7 @@ test('highlight upload follows exact same-reference geometry generations', async
     console.error = (...args) => {
       if (
         args[0] ===
-          '[Viewer] LOD change observer failed.'
+          '[cellucid] A listener of the level of detail failed:'
       ) {
         lodObserverDiagnostics.push(
           args[1]?.message ?? String(args[1]),

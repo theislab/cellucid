@@ -13,11 +13,15 @@
  *        embedding: {key, columns}   // the obsm array and columns the view shows
  *                 | {layout} | null, // a layout with no obsm name; null: no dataset
  *        followsDefault: boolean,    // it moves with its dimension's default
- *        centroids: {points, labels} // centroid points and labels shown
+ *        centroids: {points, labels},// centroid points and labels shown
+ *        name?: string               // the name it was given (`view.rename`); only a named view has the key
  *      }, …]}
  *
  * A kept view is named by its position, never by the viewer's id
- * (`view-list.js`). What each view is coloured by, filters, colours, hidden
+ * (`view-list.js`). A view's `name` is its label beside that number
+ * (`app/actions/targets/views.js`); an unnamed view's entry has no `name`,
+ * so a value of unnamed views is the same value it was before views had
+ * names (every saved session and published starting view). What each view is colored by, filters, colors, hidden
  * cells and camera are the per-view domains', restored after this one.
  *
  * Restore removes the kept views past the value's count (from the end) and
@@ -37,8 +41,8 @@
 
 import { publishSnapshotView, retireSnapshotView } from '../../view-snapshot-publication.js';
 import { layoutEmbeddingRef } from '../../../data/dataset-mapping.js';
-import { LIVE_VIEW_ID, viewIdsOf } from './view-list.js';
-import { viewNameInValue } from '../../actions/targets/views.js';
+import { LIVE_VIEW_ID, viewIdsOf, viewReadPart } from './view-list.js';
+import { viewLabelsInValue, viewNameInValue } from '../../actions/targets/views.js';
 import { formatCountOf } from '../../../utils/format-units.js';
 import { sameValue } from './same-value.js';
 
@@ -100,16 +104,20 @@ export function createViewsDomain({ state, viewer, refreshUi }) {
       camerasLinked: viewer.getCamerasLocked() === true,
       views: ids.map(id => {
         const flags = viewer.getCentroidFlags(id);
+        const name = viewer.getViewName(id);
         return {
           embedding: embeddingOf(state, id),
           followsDefault: state.viewContexts.has(id) ? state.viewFollowsDefault(id) : true,
           centroids: { points: flags?.points === true, labels: flags?.labels === true },
+          ...(name === null ? {} : { name }),
         };
       }),
     };
   }
 
-  async function restore(value) {
+  // `signal`: the history move's (its Stop): a view's embedding stops waiting for its
+  // coordinates, and the history puts back what was shown (F147).
+  async function restore(value, { signal = null } = {}) {
     if (value === null || typeof value !== 'object' || !Array.isArray(value.views) || value.views.length === 0) {
       throw new TypeError('The views to restore must list the live view and each kept view.');
     }
@@ -118,8 +126,9 @@ export function createViewsDomain({ state, viewer, refreshUi }) {
     }
     if (!['single', 'grid'].includes(value.layout) || typeof value.liveHidden !== 'boolean' || typeof value.camerasLinked !== 'boolean'
       || value.views.some(view => view === null || typeof view !== 'object' || typeof view.followsDefault !== 'boolean'
-        || typeof view.centroids?.points !== 'boolean' || typeof view.centroids?.labels !== 'boolean')) {
-      throw new TypeError('The views to restore must give the layout, the focus, the camera link and each view\'s embedding and centroids.');
+        || typeof view.centroids?.points !== 'boolean' || typeof view.centroids?.labels !== 'boolean'
+        || (Object.hasOwn(view, 'name') && (typeof view.name !== 'string' || !/^\S(?:.*\S)?$/u.test(view.name))))) {
+      throw new TypeError('The views to restore must give the layout, the focus, the camera link and each view\'s embedding and centroids (and a name, when it has one, as one line of text).');
     }
     const before = capture();
     if (JSON.stringify(before) === JSON.stringify(value)) return;
@@ -139,11 +148,13 @@ export function createViewsDomain({ state, viewer, refreshUi }) {
       const id = ids[i];
       if (wanted.embedding !== null
         && (JSON.stringify(embeddingOf(state, id)) !== JSON.stringify(wanted.embedding) || state.viewFollowsDefault(id) !== wanted.followsDefault)) {
-        await state.setViewRepresentation(id, layoutKeyOf(state, wanted.embedding), { followsDefault: wanted.followsDefault });
+        await state.setViewRepresentation(id, layoutKeyOf(state, wanted.embedding), { followsDefault: wanted.followsDefault, signal });
       }
       const flags = viewer.getCentroidFlags(id);
       if (flags.points !== wanted.centroids.points) viewer.setShowCentroidPoints(wanted.centroids.points, id);
       if (flags.labels !== wanted.centroids.labels) viewer.setShowCentroidLabels(wanted.centroids.labels, id);
+      const name = wanted.name ?? null;
+      if (viewer.getViewName(id) !== name) viewer.setViewName(id, name);
     }
     if (viewer.getCamerasLocked() !== value.camerasLinked) viewer.setCamerasLocked(value.camerasLinked);
     const focusId = ids[value.focus];
@@ -164,12 +175,13 @@ export function createViewsDomain({ state, viewer, refreshUi }) {
   /** Lines for what differs from `a` to `b`, views named as the list numbers them at `b`. */
   function describeViews(a, b) {
     const lines = [];
+    const labels = viewLabelsInValue(b);
     if (a.views.length !== b.views.length) {
       const kept = b.views.length - 1;
       lines.push(kept === 0 ? 'No kept views' : `${formatCountOf(kept, 'kept view')} (was ${a.views.length - 1})`);
     }
     if (a.layout !== b.layout) lines.push(b.layout === 'grid' ? 'Every view shown side by side' : 'One view at a time');
-    if (a.focus !== b.focus) lines.push(`${viewNameInValue(b.focus, b.liveHidden)} focused`);
+    if (a.focus !== b.focus) lines.push(`${viewNameInValue(b.focus, b.liveHidden, labels)} focused`);
     if (a.liveHidden !== b.liveHidden) lines.push(b.liveHidden ? 'The live view removed (the kept views numbered from View 1)' : 'The live view shown again as View 1');
     if (a.camerasLinked !== b.camerasLinked) lines.push(b.camerasLinked ? 'Cameras linked' : 'Cameras unlinked');
     const shared = Math.min(a.views.length, b.views.length);
@@ -178,18 +190,25 @@ export function createViewsDomain({ state, viewer, refreshUi }) {
       const y = b.views[v];
       if (JSON.stringify(x.embedding) !== JSON.stringify(y.embedding) && y.embedding !== null) {
         const name = y.embedding.key === undefined ? y.embedding.layout : `${y.embedding.key} ${y.embedding.columns.length}D`;
-        lines.push(`${viewNameInValue(v, b.liveHidden)} shows ${name}`);
+        lines.push(`${viewNameInValue(v, b.liveHidden, labels)} shows ${name}`);
       }
-      if (x.centroids.points !== y.centroids.points) lines.push(`${viewNameInValue(v, b.liveHidden)}: centroids ${y.centroids.points ? 'shown' : 'hidden'}`);
-      if (x.centroids.labels !== y.centroids.labels) lines.push(`${viewNameInValue(v, b.liveHidden)}: centroid labels ${y.centroids.labels ? 'shown' : 'hidden'}`);
+      if (x.centroids.points !== y.centroids.points) lines.push(`${viewNameInValue(v, b.liveHidden, labels)}: centroids ${y.centroids.points ? 'shown' : 'hidden'}`);
+      if (x.centroids.labels !== y.centroids.labels) lines.push(`${viewNameInValue(v, b.liveHidden, labels)}: centroid labels ${y.centroids.labels ? 'shown' : 'hidden'}`);
       if (x.followsDefault !== y.followsDefault && y.embedding !== null) {
-        lines.push(`${viewNameInValue(v, b.liveHidden)} ${y.followsDefault ? 'follows its dimension\'s default embedding' : 'keeps its own embedding'}`);
+        lines.push(`${viewNameInValue(v, b.liveHidden, labels)} ${y.followsDefault ? 'follows its dimension\'s default embedding' : 'keeps its own embedding'}`);
+      }
+      if ((x.name ?? null) !== (y.name ?? null)) {
+        lines.push(y.name === undefined
+          ? `${viewNameInValue(v, b.liveHidden)} no longer named "${x.name}"`
+          : `${viewNameInValue(v, b.liveHidden)} named "${y.name}"`);
       }
     }
     return lines;
   }
 
   return {
+    // A step read the view it acted in: staleness compares that view's part alone (F156).
+    readPart: viewReadPart,
     capture,
     restore,
     describe: describeViews,

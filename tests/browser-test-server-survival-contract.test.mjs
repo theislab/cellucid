@@ -191,6 +191,26 @@ test('every asset of the inventory is served whole, an empty one too', async t =
   assert.deepEqual(server.stderr.filter(line => /request failed/.test(line)), []);
 });
 
+test('the CORS port serves every file of a dataset as its bytes; the application port types only the site', async t => {
+  // Found 2026-11-10: `npm run serve`'s CORS port, documented for datasets opened by link, answered a
+  // .loom, an .rds, an .h5mu and a MatrixMarket folder's files with 415 (no web type of their own).
+  const server = await startServer();
+  t.after(() => {
+    server.child.kill('SIGKILL');
+  });
+  const classes = 'tests/fixtures/subsample-analysis/classes';
+  for (const file of ['cells.loom', 'seurat.rds', 'mudata.h5mu', 'outs/filtered_feature_bc_matrix.h5', 'mtx/matrix.mtx', 'mtx/barcodes.tsv']) {
+    const response = await fetch(`http://${HOST}:${server.samplePort}/${classes}/${file}`, { cache: 'no-store' });
+    assert.equal(response.status, 200, file);
+    assert.equal(response.headers.get('content-type'), 'application/octet-stream', file);
+    assert.equal(response.headers.get('access-control-allow-origin'), '*', file);
+    await response.arrayBuffer();
+  }
+  const site = await fetch(`http://${HOST}:${server.port}/${classes}/cells.loom`, { cache: 'no-store' });
+  assert.equal(site.status, 415, 'the site port types only what the site serves');
+  await site.arrayBuffer();
+});
+
 test('the server still refuses to start on an address it cannot take', async t => {
   const server = await startServer();
   t.after(() => {

@@ -8,7 +8,7 @@
  * its kind and what it was computed on, no payload), and an analysis
  * restored with one shows its settings and no result. Once a session file or
  * a saved state is shown, each analysis at the head whose result was left
- * out is run again through the catalogue's `analysis.run`: an ordinary step
+ * out is run again through the catalog's `analysis.run`: an ordinary step
  * (by "Session"), so undo takes it back and the history says it. A jump
  * later never runs one again: only opening does. A run that is refused (its
  * analysis is not shown, so it cannot draw) or fails is said, and its record

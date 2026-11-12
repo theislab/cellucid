@@ -9,7 +9,7 @@
  * compressed bits never exceed its block size by more than a few percent, so
  * the input is buffered a little past one block size and each block decoded
  * at once; memory is a few blocks. Every block's CRC is checked; the
- * randomised blocks of bzip2 0.9.0 and earlier, which no current writer
+ * randomized blocks of bzip2 0.9.0 and earlier, which no current writer
  * makes, are refused.
  * Concatenated streams (parallel compressors) are read one after another.
  *
@@ -138,7 +138,7 @@ function decodeTables(lengths, alphaSize) {
 function decodeBlock(bits, blockSize, tt) {
   const storedCrc = bits.read32();
   if (bits.bit()) {
-    throw new RdsUnsupportedError('randomised bzip2 block', 'This bzip2 file uses randomised blocks, which no current bzip2 writes. Compress it again with bzip2 or gzip.');
+    throw new RdsUnsupportedError('randomized bzip2 block', 'This bzip2 file uses randomized blocks, which no current bzip2 writes. Compress it again with bzip2 or gzip.');
   }
   const origPtr = bits.read(24);
   const used = bits.read(16);

@@ -345,8 +345,9 @@ test('committed Pull ignores observer failure and a reentrant final abort', () =
   const controller = new AbortController();
   const listenerFailure = new Error('Synthetic session observer failure');
   const reported = [];
-  const previousReportError = globalThis.reportError;
-  globalThis.reportError = (error) => reported.push(error);
+  const previousConsoleError = console.error;
+  // One policy for every listener (`utils/listener-set.js`): reported once on the console.
+  console.error = (message, error) => reported.push(error);
   let laterListenerState = null;
   session.on('changed', () => {
     controller.abort(new Error('Abort from committed-state observer'));
@@ -368,8 +369,7 @@ test('committed Pull ignores observer failure and a reentrant final abort', () =
     assert.deepEqual(laterListenerState, session.getStateSnapshot());
     assert.equal(controller.signal.aborted, true);
   } finally {
-    if (previousReportError === undefined) delete globalThis.reportError;
-    else globalThis.reportError = previousReportError;
+    console.error = previousConsoleError;
     clearPendingSave(session);
   }
 });

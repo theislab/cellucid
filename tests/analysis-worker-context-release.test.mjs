@@ -3,8 +3,8 @@
  * run ends. A UCell signature run keeps each worker's ranks of its range of
  * cells (about 18 bytes a cell per set gene: 1.8 GB at 2M cells and 50
  * genes); the context was released only by UCELL_FINISH, so a run that was
- * cancelled, superseded or failed before it left that memory in every worker
- * until the next UCell run. And a context broadcast that is cancelled while
+ * canceled, superseded or failed before it left that memory in every worker
+ * until the next UCell run. And a context broadcast that is canceled while
  * in flight leaves the context in the workers that already took it, so its
  * clear is owed from the moment the broadcast is sent (DE, pseudobulk DE, the
  * dot plot: the broadcast sits inside the try whose finally clears it).

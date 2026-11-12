@@ -3,7 +3,7 @@
  * is doing.
  *
  * The card opens with `transform: scale(0.96)` easing to `scale(1)`. Opening
- * anchored it at its centred position by reading `getBoundingClientRect()` in
+ * anchored it at its centered position by reading `getBoundingClientRect()` in
  * a 200 ms timer, and placed the panel-resizer corner from rectangles read in
  * a 250 ms timer. A client rectangle is the transformed box, so whenever the
  * transition had not finished by then — a slow frame, a busy machine — the
@@ -123,7 +123,7 @@ test('an expanded analysis view settles centred with its resizer corner on the c
   // The transition has finished, so client rectangles are layout boxes now.
   expect(['none', 'matrix(1, 0, 0, 1, 0, 0)']).toContain(geometry.transform);
   // Layout offsets are whole pixels, so the anchor is within half a pixel of
-  // the centred position; a rectangle read mid-transition was several off.
+  // the centered position; a rectangle read mid-transition was several off.
   expect(Math.abs(geometry.left - geometry.centredLeft)).toBeLessThanOrEqual(0.5);
   expect(Math.abs(geometry.top - geometry.centredTop)).toBeLessThanOrEqual(0.5);
   expect(Math.abs(geometry.corner.x - geometry.crossing.x)).toBeLessThanOrEqual(1);

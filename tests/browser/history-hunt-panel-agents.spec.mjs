@@ -8,7 +8,7 @@
 import { expect, test } from './helpers/test.mjs';
 import { takeSteps, waitForHistory } from './helpers/state-history.mjs';
 import {
-  CELL_TYPE, COLOR_BY_CELL_TYPE, installScriptedModel, openAgentDataset, openChat, queueReplies, say,
+  CELL_TYPE, COLOR_BY_SCORE, SCORE, installScriptedModel, openAgentDataset, openChat, queueReplies, say,
 } from './helpers/agent-chat.mjs';
 import { observeOutsideChanges, observeProductErrors } from './helpers/history-hunt.mjs';
 
@@ -31,7 +31,8 @@ function facts(page) {
 test('undo then redo pressed back to back lands on the step it started from', async ({ page }) => {
   const errors = observeProductErrors(page);
   await openAgentDataset(page);
-  const ids = await takeSteps(page, [['color.by', { field: CELL_TYPE }], hide(['gamma'])]);
+  // The dataset opens colored by cell_type (its first coloring): score is the step.
+  const ids = await takeSteps(page, [['color.by', { field: SCORE }], hide(['gamma'])]);
   const before = await facts(page);
   await page.evaluate(() => document.activeElement?.blur?.());
   await page.keyboard.press('ControlOrMeta+z');
@@ -53,8 +54,8 @@ test.describe('agents', () => {
     await waitForHistory(page);
     await openChat(page);
     const opening = await facts(page);
-    await queueReplies(page, [{ calls: [COLOR_BY_CELL_TYPE, { name: 'setting_set', args: { setting: 'point-size', value: 30 } }] }, { text: 'Done.' }]);
-    await say(page, 'Colour by cell type and make the points bigger');
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE, { name: 'setting_set', args: { setting: 'point-size', value: 30 } }] }, { text: 'Done.' }]);
+    await say(page, 'Color by score and make the points bigger');
     const turn = await page.locator('#agent-chat-log .agent-msg-user').last().getAttribute('data-turn');
     // The person acts after the turn.
     await takeSteps(page, [hide(['gamma'])]);

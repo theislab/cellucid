@@ -11,6 +11,7 @@
  */
 
 import { isPlainRecord, requireExactKeys } from '../../../utils/exact-record.js';
+import { createListenerSet } from '../../../utils/listener-set.js';
 
 
 const WINDOW_KEYS = ['height', 'width'];
@@ -38,8 +39,7 @@ class AnalysisViewSizes {
     this._window = new Map();
     /** @type {Map<string, {width: number, height: number, optionsWidth: number, footerHeight: number, statsWidth: number}>} */
     this._expandedView = new Map();
-    /** @type {Set<(modeId: string, size: object) => void>} */
-    this._listeners = new Set();
+    this._listeners = createListenerSet('an expanded view resized');
   }
 
   /** @param {string} modeId */
@@ -85,9 +85,7 @@ class AnalysisViewSizes {
    */
   personResizedExpandedView(modeId, size) {
     this.rememberExpandedViewSize(modeId, size);
-    for (const listener of [...this._listeners]) {
-      try { listener(modeId, { ...size }); } catch (error) { console.error('[analysis] a size listener failed', error); }
-    }
+    this._listeners.notify(modeId, { ...size });
   }
 
   /**
@@ -96,9 +94,7 @@ class AnalysisViewSizes {
    * @returns {() => void}
    */
   onPersonResize(listener) {
-    if (typeof listener !== 'function') throw new TypeError('An expanded-view size listener must be a function');
-    this._listeners.add(listener);
-    return () => this._listeners.delete(listener);
+    return this._listeners.add(listener);
   }
 
   /** The session record: `{window: {[modeId]: size}, expandedView: {[modeId]: size}}`. */

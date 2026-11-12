@@ -12,7 +12,7 @@
  * - Early culling of clipped points
  *
  * TRANSPARENCY HANDLING:
- * - The caller names what the colours' alpha byte is (`colorAlpha`,
+ * - The caller names what the colors' alpha byte is (`colorAlpha`,
  *   `requireColorAlphaMeaning`): the cells' layer (visibility is then the
  *   Uint8 transparency, 0 or 1, every cell shown without one) or a marker's
  *   own opacity (0..255; a transparency, when given, takes precedence)
@@ -25,16 +25,23 @@
  * - Memory efficient (only allocates for visible points)
  * - Configurable bin count for quality/performance tradeoff
  *
- * LETTERBOXING:
- * The viewer's viewport is letterboxed into the plot rectangle to maintain
- * aspect ratio without distortion. This matches the viewer's on-screen appearance.
+ * PLACEMENT:
+ * The plot rectangle has the view's aspect (or the framing crop's), and the
+ * view fills it exactly (`createPlotPlacement`, `projectIntoSource` in
+ * `plot-fit.js`): the same placement every figure layer uses.
+ *
+ * SIZE:
+ * Each point's radius is the sprite the viewer draws it as, at its own depth
+ * (`createViewportPointDiameter` in `point-size.js`: size attenuation makes a
+ * near point larger than a far one), times the plot's scale.
  *
  * @module ui/modules/figure-export/utils/point-projector
  */
 
 import { requirePositionArray } from '../../../../../rendering/position-layout.js';
 import { BENEATH_ALPHA_BYTE, UNREAD_ALPHA_BYTE, requireColorAlphaMeaning } from '../../../../../rendering/alpha-visibility.js';
-import { assertCropRect01, cropRect01ToPx } from './crop.js';
+import { createPlotPlacement, projectIntoSource } from './plot-fit.js';
+import { createViewportPointDiameter } from './point-size.js';
 import {
   assertDrawOrder,
   assertLodMembership,
@@ -46,9 +53,13 @@ import {
 /**
  * @typedef {object} RenderStateLike
  * @property {Float32Array} mvpMatrix
+ * @property {Float32Array} viewMatrix
+ * @property {Float32Array} modelMatrix
+ * @property {Float32Array} lightDir
+ * @property {number} fov
+ * @property {number} sizeAttenuation
  * @property {number} viewportWidth
  * @property {number} viewportHeight
- * @property {number} pointSize
  */
 
 /**
@@ -67,13 +78,15 @@ import {
  * @param {1|2|3} options.dimension - components per position (axes the
  *   embedding does not have are zero)
  * @param {Uint8Array|null} options.colors - length = n*4 (RGBA)
- * @param {'layer'|'opacity'} options.colorAlpha - What the colours' alpha
+ * @param {'layer'|'opacity'} options.colorAlpha - What the colors' alpha
  *   byte is (`requireColorAlphaMeaning`): the cells' layer, drawn beneath
  *   first, or a marker's opacity.
  * @param {Uint8Array|null} [options.transparency] - optional length = n (0 or 1)
  * @param {RenderStateLike} options.renderState
  * @param {PlotRect} options.plotRect
- * @param {number} [options.radiusPx]
+ * @param {number} options.pointDiameterViewportPx - the points' `u_pointSize`
+ *   (the pane's point size times its level's multiplier); each point's
+ *   radius is the sprite the viewer draws at its depth, in plot units
  * @param {import('../../../../../rendering/high-perf/renderer-contracts.js').LodMembership|null} [options.lodMembership]
  * @param {Uint32Array|null} [options.drawOrder] - The pane's full-detail draw
  *   order (`drawnSequence`); null draws in source order.
@@ -81,9 +94,10 @@ import {
  * @param {boolean} [options.sortByDepth] - if true, draw back-to-front using binned depth ordering
  * @param {number} [options.depthBins]
  * @param {import('./lod-membership.js').FigurePointLayers|null} [options.pointLayers] -
- *   While some cells are not read: they come first in their own colour at
- *   `radiusPx` (before every depth-sorted cell, as the pane draws them
- *   without depth writes), the cells read at `radiusPx * readScale`.
+ *   While some cells are not read: they come first in their own color at
+ *   `pointDiameterViewportPx` (before every depth-sorted cell, as the pane
+ *   draws them without depth writes), the cells read at
+ *   `pointDiameterViewportPx * readScale`.
  * @param {(x: number, y: number, r: number, g: number, b: number, a: number, radius: number, index: number) => void} options.onPoint
  * @returns {{ drawn: number, skipped: number }}
  */
@@ -95,7 +109,7 @@ export function forEachProjectedPoint({
   transparency = null,
   renderState,
   plotRect,
-  radiusPx = 1.5,
+  pointDiameterViewportPx,
   lodMembership = null,
   drawOrder = null,
   crop = null,
@@ -104,13 +118,16 @@ export function forEachProjectedPoint({
   pointLayers = null,
   onPoint
 }) {
-  const alphaIsOpacity = requireColorAlphaMeaning(colorAlpha, 'Figure-export projected colours') === 'opacity';
+  const alphaIsOpacity = requireColorAlphaMeaning(colorAlpha, 'Figure-export projected colors') === 'opacity';
   const layers = alphaIsOpacity ? null : requireFigurePointLayers(pointLayers, 'Figure-export projected point layers');
   const unreadRgb = layers === null ? null : layers.unreadColor.map(channel => Math.round(channel * 255));
   const zeroRgb = layers === null ? null : layers.zeroColor.map(channel => Math.round(channel * 255));
-  const readRadiusPx = radiusPx * (layers === null ? 1 : layers.readScale);
+  if (!(typeof pointDiameterViewportPx === 'number' && Number.isFinite(pointDiameterViewportPx) && pointDiameterViewportPx > 0)) {
+    throw new RangeError('Figure-export point diameter must be a finite positive number.');
+  }
+  const readDiameter = pointDiameterViewportPx * (layers === null ? 1 : layers.readScale);
   const isUnread = i => layers !== null && colors[i * 4 + 3] === UNREAD_ALPHA_BYTE;
-  // The grey of the cells with no value is drawn in the figure's own (`zeroCellColor`).
+  // The gray of the cells with no value is drawn in the figure's own (`zeroCellColor`).
   const isZero = i => zeroRgb !== null && colors[i * 4 + 3] === BENEATH_ALPHA_BYTE;
   if (!positions || !colors || !renderState?.mvpMatrix) {
     return { drawn: 0, skipped: 0 };
@@ -135,33 +152,25 @@ export function forEachProjectedPoint({
   const admittedIndices = drawnSequence(lodMembership, drawOrder, alphaIsOpacity ? null : colors, layers?.readEveryLevel === true);
   const candidateCount = admittedIndices?.length ?? n;
   const mvp = renderState.mvpMatrix;
-  const viewportW = Math.max(1, renderState.viewportWidth || 1);
-  const viewportH = Math.max(1, renderState.viewportHeight || 1);
-
-  const crop01 = assertCropRect01(crop);
-  const cropPx = cropRect01ToPx(crop01, viewportW, viewportH);
-  const hasCrop = Boolean(
-    cropPx &&
-    (cropPx.width < viewportW - 0.5 || cropPx.height < viewportH - 0.5 || cropPx.x > 0.5 || cropPx.y > 0.5)
-  );
-
-  // Fit the chosen source viewport (full viewport OR crop rect) into plotRect
-  // without distortion (letterbox/pillarbox).
-  const srcX0 = hasCrop && cropPx ? cropPx.x : 0;
-  const srcY0 = hasCrop && cropPx ? cropPx.y : 0;
-  const srcW = hasCrop && cropPx ? cropPx.width : viewportW;
-  const srcH = hasCrop && cropPx ? cropPx.height : viewportH;
-
-  const scale = Math.min(plotRect.width / srcW, plotRect.height / srcH);
-  const offsetX = plotRect.x + (plotRect.width - srcW * scale) / 2;
-  const offsetY = plotRect.y + (plotRect.height - srcH * scale) / 2;
+  const { source, viewportToPlot } = createPlotPlacement({ renderState, plotRect, crop });
+  const origin = viewportToPlot(source.x, source.y);
+  const plotX0 = origin.x;
+  const plotY0 = origin.y;
+  const scaleX = plotRect.width / source.width;
+  const scaleY = plotRect.height / source.height;
+  // A projected point: source-local x, y (viewport pixels) and NDC depth.
+  const local = new Float64Array(3);
+  // The radius (plot units) of a point drawn with `u_pointSize` = `pointSize`.
+  const diameterAt = createViewportPointDiameter(renderState);
+  const radiusAt = (x, y, z, pointSize) => diameterAt(x, y, z, pointSize) * scaleX * 0.5;
 
   let drawn = 0;
   let skipped = n - candidateCount;
 
   // A point at index `i` projected into the plot, or false where it is not
-  // drawn: x, y in `projected`.
+  // drawn: x, y in `projected`, and its model position in `at`.
   const projected = [0, 0];
+  const at = [0, 0, 0];
   const project = i => {
     const rawAlpha = opacityOf(i);
     let alpha = Number.isFinite(rawAlpha) ? rawAlpha : 1.0;
@@ -172,22 +181,17 @@ export function forEachProjectedPoint({
     const x = positions[ix];
     const y = dimension > 1 ? positions[ix + 1] : 0;
     const z = dimension > 2 ? positions[ix + 2] : 0;
-    const clipW = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-    if (!Number.isFinite(clipW) || clipW <= 0) return 0;
-    const ndcX = (mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12]) / clipW;
-    const ndcY = (mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13]) / clipW;
-    const ndcZ = (mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14]) / clipW;
-    if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1 || ndcZ < -1 || ndcZ > 1) return 0;
-    const viewportX = (ndcX * 0.5 + 0.5) * viewportW;
-    const viewportY = (-ndcY * 0.5 + 0.5) * viewportH;
-    if (hasCrop && (viewportX < srcX0 || viewportX > srcX0 + srcW || viewportY < srcY0 || viewportY > srcY0 + srcH)) return 0;
-    projected[0] = offsetX + (viewportX - srcX0) * scale;
-    projected[1] = offsetY + (viewportY - srcY0) * scale;
+    if (!projectIntoSource(mvp, source, x, y, z, local)) return 0;
+    projected[0] = plotX0 + local[0] * scaleX;
+    projected[1] = plotY0 + local[1] * scaleY;
+    at[0] = x;
+    at[1] = y;
+    at[2] = z;
     return alpha;
   };
 
   // The binned sort is O(n) in time and memory, so a requested depth sort is
-  // honoured at every point count.
+  // honored at every point count.
   if (sortByDepth) {
     // Cells not read lead the sequence (`drawnSequence`) and lie under every
     // cell read whatever their depth: drawn first, in sequence order.
@@ -198,7 +202,7 @@ export function forEachProjectedPoint({
         if (!isUnread(i)) break;
         const alpha = project(i);
         if (alpha === 0) continue;
-        onPoint(projected[0], projected[1], unreadRgb[0], unreadRgb[1], unreadRgb[2], alpha, radiusPx, i);
+        onPoint(projected[0], projected[1], unreadRgb[0], unreadRgb[1], unreadRgb[2], alpha, radiusAt(at[0], at[1], at[2], pointDiameterViewportPx), i);
         unreadDrawn++;
       }
     }
@@ -229,22 +233,8 @@ export function forEachProjectedPoint({
       const y = dimension > 1 ? positions[ix + 1] : 0;
       const z = dimension > 2 ? positions[ix + 2] : 0;
 
-      const clipX = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
-      const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
-      const clipZ = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
-      const clipW = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-      if (!Number.isFinite(clipW) || clipW <= 0) continue;
-
-      const ndcX = clipX / clipW;
-      const ndcY = clipY / clipW;
-      const ndcZ = clipZ / clipW;
-      if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1 || ndcZ < -1 || ndcZ > 1) continue;
-
-      const viewportX = (ndcX * 0.5 + 0.5) * viewportW;
-      const viewportY = (-ndcY * 0.5 + 0.5) * viewportH;
-      if (hasCrop) {
-        if (viewportX < srcX0 || viewportX > srcX0 + srcW || viewportY < srcY0 || viewportY > srcY0 + srcH) continue;
-      }
+      if (!projectIntoSource(mvp, source, x, y, z, local)) continue;
+      const ndcZ = local[2];
       let bin = (((ndcZ + 1) * 0.5) * bins) | 0;
       if (bin < 0) bin = 0;
       else if (bin >= bins) bin = bins - 1;
@@ -267,6 +257,7 @@ export function forEachProjectedPoint({
     const outY = new Float32Array(total);
     const outRGBA = new Uint8Array(total * 4);
     const outA = new Float32Array(total);
+    const outRadius = new Float32Array(total);
     const outIndex = new Uint32Array(total);
 
     // Pass 2: fill packed arrays in bin order.
@@ -290,40 +281,16 @@ export function forEachProjectedPoint({
       const y = dimension > 1 ? positions[ix + 1] : 0;
       const z = dimension > 2 ? positions[ix + 2] : 0;
 
-      const clipX = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
-      const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
-      const clipZ = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
-      const clipW = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-      if (!Number.isFinite(clipW) || clipW <= 0) continue;
-
-      const ndcX = clipX / clipW;
-      const ndcY = clipY / clipW;
-      const ndcZ = clipZ / clipW;
-      if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1 || ndcZ < -1 || ndcZ > 1) continue;
-
-      const viewportX = (ndcX * 0.5 + 0.5) * viewportW;
-      const viewportY = (-ndcY * 0.5 + 0.5) * viewportH;
-      if (
-        hasCrop &&
-        (
-          viewportX < srcX0 ||
-          viewportX > srcX0 + srcW ||
-          viewportY < srcY0 ||
-          viewportY > srcY0 + srcH
-        )
-      ) {
-        continue;
-      }
+      if (!projectIntoSource(mvp, source, x, y, z, local)) continue;
+      const ndcZ = local[2];
 
       let bin = (((ndcZ + 1) * 0.5) * bins) | 0;
       if (bin < 0) bin = 0;
       else if (bin >= bins) bin = bins - 1;
       const slot = offsets[bin] + counts[bin]++;
 
-      const localX = viewportX - srcX0;
-      const localY = viewportY - srcY0;
-      outX[slot] = offsetX + localX * scale;
-      outY[slot] = offsetY + localY * scale;
+      outX[slot] = plotX0 + local[0] * scaleX;
+      outY[slot] = plotY0 + local[1] * scaleY;
 
       const cj = i * 4;
       const oj = slot * 4;
@@ -333,6 +300,7 @@ export function forEachProjectedPoint({
       outRGBA[oj + 2] = zero ? zeroRgb[2] : colors[cj + 2];
       outRGBA[oj + 3] = colors[cj + 3];
       outA[slot] = alpha;
+      outRadius[slot] = radiusAt(x, y, z, readDiameter);
       outIndex[slot] = i;
     }
 
@@ -344,7 +312,7 @@ export function forEachProjectedPoint({
         const a = outA[s];
         if (a < POINT_VISIBILITY_THRESHOLD) continue;
         const oj = s * 4;
-        onPoint(outX[s], outY[s], outRGBA[oj], outRGBA[oj + 1], outRGBA[oj + 2], a, readRadiusPx, outIndex[s]);
+        onPoint(outX[s], outY[s], outRGBA[oj], outRGBA[oj + 1], outRGBA[oj + 2], a, outRadius[s], outIndex[s]);
         drawn++;
       }
     }
@@ -376,42 +344,17 @@ export function forEachProjectedPoint({
     const y = dimension > 1 ? positions[ix + 1] : 0;
     const z = dimension > 2 ? positions[ix + 2] : 0;
 
-    // Column-major mat4 × vec4 (x,y,z,1).
-    const clipX = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
-    const clipY = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
-    const clipW = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
-
-    if (!Number.isFinite(clipW) || clipW <= 0) {
+    if (!projectIntoSource(mvp, source, x, y, z, local)) {
       skipped++;
       continue;
     }
-
-    const clipZ = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
-    const ndcX = clipX / clipW;
-    const ndcY = clipY / clipW;
-    const ndcZ = clipZ / clipW;
-
-    // Outside clip-space; skip for export speed and smaller files.
-    if (ndcX < -1 || ndcX > 1 || ndcY < -1 || ndcY > 1 || ndcZ < -1 || ndcZ > 1) {
-      skipped++;
-      continue;
-    }
-
-    const viewportX = (ndcX * 0.5 + 0.5) * viewportW;
-    const viewportY = (-ndcY * 0.5 + 0.5) * viewportH;
-
-    if (hasCrop && (viewportX < srcX0 || viewportX > srcX0 + srcW || viewportY < srcY0 || viewportY > srcY0 + srcH)) {
-      skipped++;
-      continue;
-    }
-
-    const px = offsetX + (viewportX - srcX0) * scale;
-    const py = offsetY + (viewportY - srcY0) * scale;
+    const px = plotX0 + local[0] * scaleX;
+    const py = plotY0 + local[1] * scaleY;
 
     const j = i * 4;
-    if (isUnread(i)) onPoint(px, py, unreadRgb[0], unreadRgb[1], unreadRgb[2], alpha, radiusPx, i);
-    else if (isZero(i)) onPoint(px, py, zeroRgb[0], zeroRgb[1], zeroRgb[2], alpha, readRadiusPx, i);
-    else onPoint(px, py, colors[j], colors[j + 1], colors[j + 2], alpha, layers === null ? radiusPx : readRadiusPx, i);
+    if (isUnread(i)) onPoint(px, py, unreadRgb[0], unreadRgb[1], unreadRgb[2], alpha, radiusAt(x, y, z, pointDiameterViewportPx), i);
+    else if (isZero(i)) onPoint(px, py, zeroRgb[0], zeroRgb[1], zeroRgb[2], alpha, radiusAt(x, y, z, readDiameter), i);
+    else onPoint(px, py, colors[j], colors[j + 1], colors[j + 2], alpha, radiusAt(x, y, z, readDiameter), i);
     drawn++;
   }
 

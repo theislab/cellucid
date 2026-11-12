@@ -16,7 +16,7 @@
  *   GET and DELETE answer 405.
  *
  * Methods: `initialize`, `ping`, `server/discover`, `tools/list` (the
- * connected tab's catalogue, else the bundled one, plus `cellucid_status`),
+ * connected tab's catalog, else the bundled one, plus `cellucid_status`),
  * `tools/call` (run by the tab the person approved this connection from,
  * as the connection's agent), `resources/list`, `resources/read` and
  * `resources/templates/list` (the view card, an MCP App: `view-app.js`),
@@ -26,7 +26,7 @@
  */
 
 import { RELAY_BUNDLE } from './generated/bundle.js';
-import { RelayHttpError, emptyResponse, isJson, jsonResponse, readBody } from './http.js';
+import { RelayHttpError, emptyResponse, isJson, jsonResponse, readBody, withBaseHeaders } from './http.js';
 import { askPairing } from './oauth.js';
 import { randomBase64Url, textOf } from './encoding.js';
 import { viewAppContents, viewAppListing } from './view-app.js';
@@ -229,8 +229,12 @@ async function callTool(env, auth, request, rpcId, params) {
         + 'and they have not answered within the time a tool call has. The question stays open in Cellucid: '
         + 'ask the person to answer it there. Once they have, read the history (history_get) to see whether it ran; do not call this again before that.', true);
     case 'tab-closed':
-      return toolResult('The Cellucid tab closed or lost its connection before it answered. Read the history when it is back before repeating a change.', true);
-    case 'cancelled': return toolResult('The call was cancelled.', true);
+      return toolResult('The Cellucid tab closed, was reloaded or lost its connection before it answered, so whether this call was done is not known. '
+        + 'A reloaded tab connects again by itself within seconds: read the history (history_get) before repeating a change.', true);
+    case 'cancelled': return toolResult('The call was canceled.', true);
+    case 'removed':
+      return toolResult('This connection was removed in Cellucid while this call ran, and Cellucid stopped the call. '
+        + 'The person must connect this app again before it can work there; once connected, read the history (history_get) before repeating a change.', true);
     case 'unavailable': return toolResult(UNAVAILABLE, true);
     case 'oversize':
       return toolResult(`The answer was ${answer.chars} characters, more than a chat accepts (${RELAY_BUNDLE.protocol.resultTextChars}). Ask for fewer rows or a narrower read.`, true);
@@ -241,12 +245,13 @@ async function callTool(env, auth, request, rpcId, params) {
   }
 }
 
-function sse(events) {
+/** Events as one Server-Sent Events answer, with the relay's headers and the endpoint's CORS, as every other answer. */
+function sse(events, cors) {
   const body = events.map(event => `event: message\ndata: ${JSON.stringify(event)}\n\n`).join('');
-  return new Response(body, {
-    status: 200,
-    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' },
-  });
+  const headers = withBaseHeaders(cors);
+  headers.set('Content-Type', 'text/event-stream');
+  headers.set('X-Accel-Buffering', 'no');
+  return new Response(body, { status: 200, headers });
 }
 
 /**
@@ -348,7 +353,7 @@ export async function handleMcpPost(request, env, auth, cors) {
         return sse([
           { jsonrpc: '2.0', method: 'notifications/subscriptions/acknowledged', params: { _meta: { 'io.modelcontextprotocol/subscriptionId': id }, notifications: {} } },
           { jsonrpc: '2.0', id, result: { resultType: 'complete', _meta: { 'io.modelcontextprotocol/subscriptionId': id } } },
-        ]);
+        ], cors);
       default:
         throw new RpcFailure(era === 'modern' ? 404 : 200, ERRORS.methodNotFound, `Method not found: ${message.method}`);
     }

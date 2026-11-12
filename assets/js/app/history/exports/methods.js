@@ -32,13 +32,14 @@
  */
 
 import {
-  actorsOf, branchPath, groupRuns, inSentence, METHOD_DOMAINS, originOf, originPhrase, runHeadings, squashPhrase,
+  actorsOf, branchPath, groupRuns, METHOD_DOMAINS, originOf, originPhrase, runHeadings, squashPhrase,
 } from './step-text.js';
 import { domainName } from '../../actions/domains.js';
-import { countNoun, formatCount, formatCountOf } from '../../../utils/format-units.js';
+import { countNoun, formatCount, formatCountOf, formatShare } from '../../../utils/format-units.js';
+import { lowerFirst, upperFirst } from '../../../utils/text-case.js';
 
 const SUBSAMPLE_METHODS = Object.freeze({
-  blocks: 'in blocks of neighbouring cells',
+  blocks: 'in blocks of neighboring cells',
   uniform: 'uniformly at random',
   stratified: 'stratified by a field',
   spatial: 'spatially',
@@ -73,8 +74,7 @@ function datasetSentence(dataset) {
   const open = dataset?.openCells ?? null;
   let how = 'was opened in full';
   if (open !== null && Number.isFinite(open.open) && Number.isFinite(open.of) && open.open < open.of) {
-    const percent = (100 * open.open) / open.of;
-    const share = percent >= 1 ? `${Math.round(percent)}%` : `${Number(percent.toPrecision(2))}%`;
+    const share = formatShare(open.open, open.of);
     const method = SUBSAMPLE_METHODS[open.method] ?? null;
     const seed = Number.isSafeInteger(open.seed) ? ` with seed ${open.seed}` : '';
     how = `was opened on ${formatCount(open.open)} of its ${formatCountOf(open.of, 'cell')} (${share})`
@@ -96,9 +96,9 @@ function stepItem(step) {
     return `${lowerDomains(step.touches.filter(id => METHOD_DOMAINS.has(id)))} changed outside the recorded steps`;
   }
   if (step.kind === 'squashed') {
-    return `${inSentence(squashPhrase(step.squashed))}${step.touches.length > 0 ? ` (${lowerDomains(step.touches)})` : ''}`;
+    return `${lowerFirst(squashPhrase(step.squashed))}${step.touches.length > 0 ? ` (${lowerDomains(step.touches)})` : ''}`;
   }
-  return inSentence(trimEnd(step.label));
+  return lowerFirst(trimEnd(step.label));
 }
 
 /** "Step 2 was taken by …, and steps 4–6 by …", or null when the person took them all. */
@@ -116,7 +116,7 @@ function originSentence(numbered) {
   const clauses = [...byOrigin].map(([phrase, numbers], index) => {
     const noun = countNoun(numbers.length, 'step');
     if (index > 0) return `${noun} ${numberRanges(numbers)} by ${phrase}`;
-    return `${noun[0].toUpperCase()}${noun.slice(1)} ${numberRanges(numbers)} ${numbers.length === 1 ? 'was' : 'were'} taken by ${phrase}`;
+    return `${upperFirst(noun)} ${numberRanges(numbers)} ${numbers.length === 1 ? 'was' : 'were'} taken by ${phrase}`;
   });
   if (clauses.length === 0) return null;
   if (clauses.length === 1) return `${clauses[0]}.`;

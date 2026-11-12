@@ -12,7 +12,7 @@ import { computeStats } from '../../shared/number-utils.js';
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
 import { sharedCellsReason } from '../../shared/page-overlap.js';
-import { formatCount, formatSignificant } from '../../../../utils/format-units.js';
+import { formatCount, formatCountOf, formatPercent, formatSignificant } from '../../../../utils/format-units.js';
 
 // =============================================================================
 // LARGE PAGES: STATISTICS ON THE ANALYSIS WORKERS
@@ -157,9 +157,9 @@ export function renderSummaryStats(container, pageData, variableName) {
       for (let pageIndex = 0; pageIndex < pageData.length; pageIndex++) {
         const pd = pageData[pageIndex];
         const count = pageCounts[pageIndex].get(cat) ?? 0;
-        const pct = pd.cellCount > 0 ? ((count / pd.cellCount) * 100).toFixed(1) : '0';
+        const pct = pd.cellCount > 0 ? (count / pd.cellCount) * 100 : 0;
         const td = document.createElement('td');
-        td.textContent = `${count} (${pct}%)`;
+        td.textContent = `${formatCount(count)} (${formatPercent(pct, 1)})`;
         row.appendChild(td);
       }
       tbody.appendChild(row);
@@ -169,7 +169,7 @@ export function renderSummaryStats(container, pageData, variableName) {
       const moreCell = document.createElement('td');
       moreCell.colSpan = pageData.length + 1;
       moreCell.className = 'analysis-stats-more';
-      moreCell.textContent = `... and ${allCategories.size - 10} more categories`;
+      moreCell.textContent = `…and ${formatCountOf(allCategories.size - 10, 'more category', 'more categories')}`;
       moreRow.appendChild(moreCell);
       tbody.appendChild(moreRow);
     }

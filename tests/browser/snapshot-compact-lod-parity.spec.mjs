@@ -2,7 +2,7 @@
  * A kept view draws a reduced level exactly as the live view draws it.
  *
  * Both draw the level's prefix of the geometry's stored draw order (the
- * snapshot from its own colour store, gathered into the same order), so a
+ * snapshot from its own color store, gathered into the same order), so a
  * snapshot of the live view, at the same reduced level and camera, must
  * produce the live view's pixels byte for byte -- with and without frustum
  * culling, and with translucent points, whose blend order would expose any

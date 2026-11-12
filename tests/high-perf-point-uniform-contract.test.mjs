@@ -37,7 +37,7 @@ test('every point pass publishes its uniforms through one shared helper', () => 
   });
   const names = [
     'u_mvpMatrix', 'u_modelViewMatrix', 'u_projectionMatrix',
-    'u_pointSize', 'u_sizeAttenuation', 'u_pointScale',
+    'u_pointSize', 'u_sizeAttenuation', 'u_pointScale', 'u_pointSizeMax',
     'u_lightingStrength', 'u_fogNear', 'u_fogScale',
     'u_fogColor', 'u_lightDir', 'u_halfDir', 'u_invCenterShade',
   ];
@@ -50,7 +50,7 @@ test('every point pass publishes its uniforms through one shared helper', () => 
   const fov = 1.2;
   renderer._applyPointUniforms(
     gl, uniforms, [16], view, model, [17], 7, 0.5, 600, fov,
-    0.8, 0.3, [0.1, 0.2, 0.3], [0, 0, 1],
+    0.8, 0.3, [0.1, 0.2, 0.3], [0, 0, 1], 160,
   );
   const pointScale = (600 / (2 * Math.tan(fov / 2))) * 0.01;
   assert.deepEqual(published, [
@@ -60,6 +60,8 @@ test('every point pass publishes its uniforms through one shared helper', () => 
     ['u_pointSize', 7],
     ['u_sizeAttenuation', 0.5],
     ['u_pointScale', pointScale],
+    // The sprite cap (rendering/point-sprite.js).
+    ['u_pointSizeMax', 160],
     // The shared fog model's two uniforms (fog-shaders.js).
     ['u_fogNear', 2],
     ['u_fogScale', fogScale(0.3, 2, 9)],

@@ -4,8 +4,9 @@
  * - Page data keeps a continuous field's typed-array element type, so a page's
  *   values are the field's own numbers at the field's width (4 bytes a cell for
  *   Float32 instead of a JavaScript number array's 8).
- * - The page-data cache is bounded by the bytes of the values it holds, not
- *   only by its entry count.
+ * - The page-data cache is bounded by the bytes of the values it holds and
+ *   by nothing else: no entry count, no age (F123: a count cap evicted small
+ *   results while memory was free).
  * - A density curve is computed once per page-values array and bandwidth, and
  *   the narrow/wide bandwidths no longer run (and discard) the auto kernel sum
  *   first; the curves are bit-identical to that double computation.
@@ -165,19 +166,26 @@ test('the page-data cache is bounded by the bytes of the values it holds', async
 
 test('LRUCache byte budget accounting', () => {
   assert.throws(() => new LRUCache({ maxBytes: 10 }), /sizeOf/);
+  assert.throws(() => new LRUCache({}), /maxBytes/, 'a cache without a byte budget would be unbounded');
+  assert.throws(() => new LRUCache({ maxBytes: 0, sizeOf: () => 0 }), /maxBytes/);
+  for (const made of ['maxSize', 'maxAge']) {
+    assert.throws(
+      () => new LRUCache({ maxBytes: 10, sizeOf: () => 0, [made]: 5 }),
+      /maxSize|maxAge|option/,
+      `${made} is not an option: the byte budget is the one bound`
+    );
+  }
   assert.throws(() => new LRUCache({ maxBytes: -1, sizeOf: () => 0 }), /maxBytes/);
-  const evicted = [];
   const cache = new LRUCache({
-    maxSize: 10,
     maxBytes: 100,
     sizeOf: value => value.length,
-    onEvict: key => evicted.push(key),
   });
   cache.set('a', 'x'.repeat(40)).set('b', 'x'.repeat(40));
   assert.equal(cache.getStats().bytes, 80);
   cache.get('a');
   cache.set('c', 'x'.repeat(30));
-  assert.deepEqual(evicted, ['b'], 'the least recently used entry goes first');
+  assert.deepEqual([...cache.keys()], ['a', 'c'], 'the least recently used entry goes first');
+  assert.equal(cache.getStats().evictions, 1);
   assert.equal(cache.getStats().bytes, 70);
   cache.set('a', 'x'.repeat(10));
   assert.equal(cache.getStats().bytes, 40, 'replacing an entry replaces its bytes');
@@ -192,6 +200,30 @@ test('LRUCache byte budget accounting', () => {
     () => new LRUCache({ maxBytes: 5, sizeOf: () => NaN }).set('k', 1),
     /sizeOf/
   );
+});
+
+test('the page-data cache keeps any number of small results while its bytes fit (no entry cap)', async t => {
+  const genes = Array.from({ length: 300 }, (_, g) => ({
+    key: `G${g}`,
+    kind: 'continuous',
+    loaded: true,
+    values: Float32Array.from({ length: POINT_COUNT }, (_, i) => g + i),
+  }));
+  const layer = makeLayer({ pages: [page('a', EVEN)], varFields: genes, options: { cacheMaxBytes: 1024 * 1024 } });
+  t.after(() => layer.destroy());
+  const first = await layer.getDataForPages({ type: 'gene_expression', variableKey: 'G0', pageIds: ['a'] });
+  for (let g = 1; g < genes.length; g++) {
+    await layer.getDataForPages({ type: 'gene_expression', variableKey: `G${g}`, pageIds: ['a'] });
+  }
+  const stats = layer._dataCache.getStats();
+  assert.equal(stats.size, genes.length, 'every result is kept while the budget holds them');
+  assert.equal(stats.evictions, 0);
+  assert.equal(
+    await layer.getDataForPages({ type: 'gene_expression', variableKey: 'G0', pageIds: ['a'] }),
+    first,
+    'the first result is still served from the cache'
+  );
+  assert.equal('maxSize' in stats, false, 'the cache reports no entry cap');
 });
 
 /**

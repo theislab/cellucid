@@ -31,6 +31,7 @@
 // Import shared operation handlers and kernels
 // These are ES modules that work in both main thread and worker context
 import { executeOperation } from './operation-handlers.js';
+import { transformedTask } from './task-values.js';
 import { LOG2_FOLD_CHANGE_PSEUDOCOUNT } from './math-utils.js';
 import {
   P_CONVENTIONS,
@@ -374,10 +375,14 @@ function resultBuffers(result) {
  * its result.
  *
  * @param {string} type
- * @param {Object} payload
+ * @param {Object} task - Its payload
  * @returns {Object}
  */
-function runTask(type, payload) {
+function runTask(type, task) {
+  // A task naming its run's values (delivered genes come as stored) has
+  // its genes put in them here, before any kernel sees them
+  // (`task-values.js`).
+  const payload = transformedTask(task);
   switch (type) {
     case 'GENE_ROUTE_OPEN':
       return openGeneRoute(payload);

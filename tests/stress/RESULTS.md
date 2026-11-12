@@ -90,7 +90,7 @@ suite limits a history's size.
 
 **The Node suite** (`history-stress.mjs`, `npm run stress:history`) drives the real modules:
 
-- the catalogue (`ACTION_DEFINITIONS`: real schemas, labels and pseudocode), the
+- the catalog (`ACTION_DEFINITIONS`: real schemas, labels and pseudocode), the
   dispatcher, `createHistory`, the value pool and the tree;
 - `writeHistoryFile` and `openHistoryFile`, `history.load`;
 - `createAutosave` over `createHistoryStore`, `openSavedState`;
@@ -136,9 +136,9 @@ The IndexedDB stand-in (`memory-database.mjs`):
 | Kind | Weight | Kind | Weight | Kind | Weight |
 | --- | --- | --- | --- | --- | --- |
 | camera | 250 | brush 1k cells | 50 | setting (slider, switch) | 150 |
-| colour by field | 70 | brush 100k cells | 5 | panel moved | 50 |
-| colour by gene | 40 | brush 500k (half, scattered) | 0.5 | section opened | 50 |
-| colour map | 20 | brush ~1M (all but 1000) | 0.5 | analysis panel switched | 10 |
+| color by field | 70 | brush 100k cells | 5 | panel moved | 50 |
+| color by gene | 40 | brush 500k (half, scattered) | 0.5 | section opened | 50 |
+| color map | 20 | brush ~1M (all but 1000) | 0.5 | analysis panel switched | 10 |
 | category filter | 70 | highlight group toggled | 20 | differential expression | 1 |
 | range filter | 40 | cells hidden (10k) | 5 | marker genes | 0.5 |
 | label edit (category rename) | 50 | all cells shown | 3 | correlation | 1 |
@@ -330,7 +330,7 @@ noisy. At 10k, figures that depend on which large values were made (analysis res
 fields) still differ by up to 55%: the session file size and the accounting. From 50k up the
 two seeds agree within about 16%.
 
-**`history.summary`** is in the catalogue but has no provider in v1, so nothing can read a
+**`history.summary`** is in the catalog but has no provider in v1, so nothing can read a
 constant-size summary today.
 
 ## 5. Recording by step kind
@@ -340,7 +340,7 @@ The recorder's p50 / p95 in ms, in the mixed history:
 | Kind | 10k, seed 1 | 10k, seed 2 | 100k, seed 1 | 100k, seed 2 |
 | --- | --- | --- | --- | --- |
 | camera | 0.05 / 0.07 | 0.05 / 0.08 | 0.05 / 0.08 | 0.05 / 0.09 |
-| colour by field or gene | 0.17 / 0.23 | 0.17 / 0.21 | 0.17 / 0.24 | 0.17 / 0.53 |
+| color by field or gene | 0.17 / 0.23 | 0.17 / 0.21 | 0.17 / 0.24 | 0.17 / 0.53 |
 | category / range filter | 0.09 / 0.12, 0.14 / 0.19 | 0.09 / 0.14, 0.14 / 0.33 | 0.09 / 0.13, 0.14 / 0.20 | 0.09 / 0.16, 0.14 / 0.40 |
 | brush 1k / 100k cells | 0.22 / 0.76, 0.46 / 1.13 | 0.21 / 0.82, 0.43 / 1.10 | 0.23 / 1.32, 0.45 / 1.54 | 0.25 / 1.30, 0.47 / 1.54 |
 | brush 500k / ~1M cells | 1.36 / 1.75, 2.35 / 2.37 | 1.36 / 1.62, 2.29 / 2.34 | 1.39 / 3.28, 2.37 / 2.74 | 1.41 / 2.91, 2.38 / 2.67 |
@@ -363,7 +363,7 @@ What these show:
   - Label edits and user fields grow with the history because `field-overlays` holds every
     user field made so far. One label edit touches five domains (`category.rename`).
   - Brushes cost their cells' bytes: SHA-256 of a 4 MB array is 2.3 ms.
-- **A step kind does not slow down as the history grows.** The camera, colour, filter,
+- **A step kind does not slow down as the history grows.** The camera, color, filter,
   setting and layout kinds are flat from 10k to 100k.
 
 ## 6. Bytes per step kind (each kind alone, 1M cells, 20k genes)
@@ -371,8 +371,8 @@ What these show:
 | Kind | Session file B/step | of which: step record | values | arrays | Autosave (IndexedDB) B/step | Recorder p50 ms | Autosave write p50 ms |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | camera | 225 | 125 | 100 | 0 | 999 | 0.06 | 0.36 |
-| colour by field | 27 | 25 | 2 | 0 | 501 | 0.10 | 0.29 |
-| colour by gene | 116 | 72 | 44 | 0 | 580 | 0.11 | 0.30 |
+| color by field | 27 | 25 | 2 | 0 | 501 | 0.10 | 0.29 |
+| color by gene | 116 | 72 | 44 | 0 | 580 | 0.11 | 0.30 |
 | category filter | 138 | 79 | 57 | 0 | 1,422 | 0.07 | 0.38 |
 | range filter | 182 | 108 | 74 | 0 | 1,404 | 0.12 | 0.37 |
 | brush 1k cells | 2,413 | 121 | 239 | 1,746 | 18,228 | 0.33 | 0.90 |
@@ -661,6 +661,14 @@ CELLUCID_HISTORY_STRESS=1 CELLUCID_HISTORY_STRESS_OUT=<file.json> \
 
 - `npm test` runs `tests/history-stress-harness.test.mjs`: the whole suite at a few hundred
   steps, in seconds. It asserts what the suite returns, never a timing.
+- **Each kind alone, since 2026-11-11 (bug hunt F165):** every step is a notebook cell of its own
+  (origin `host`, a turn each). Before, each step had a person's origin with a `turn` that a
+  person's step does not record, so a kind that coalesces merged every change into the warm-up
+  step: the camera row of §15 ("225 → 0", "one gesture's steps coalesce into one") measured
+  merges, not steps, and the other coalescing kinds (range filter, setting, panel) merged whenever
+  the recipe drew the same key twice. The run now counts only appended steps (`steps`; `merged`
+  must be 0) and reports the turn record each cell adds (`turnRecordBytesPerStep`, about 270 B at
+  5k cells, included in `fileBytesPerStep`; a person's step has none). §6 and §15 predate it.
 - H1-H3 re-point the suite at History v2 and compare against this file.
 
 ## 14. History v2 core (H1), measured 2026-11-04
@@ -746,7 +754,7 @@ Each kind alone (§6 before → after, B per step; the autosave column is what I
 | Kind | Session file | Autosave | Autosave write p50 ms |
 | --- | --- | --- | --- |
 | camera (one gesture's steps coalesce into one) | 225 → 0 | 999 → 282 | 0.36 → 0.11 |
-| colour by field / gene | 27 / 116 → 32 / 124 | 501 / 580 → 960 / 1,057 | 0.29 / 0.30 → 0.09 / 0.10 |
+| color by field / gene | 27 / 116 → 32 / 124 | 501 / 580 → 960 / 1,057 | 0.29 / 0.30 → 0.09 / 0.10 |
 | category / range filter | 138 / 182 → 226 / 220 | 1,422 / 1,404 → 2,033 / 1,946 | 0.38 / 0.37 → 0.14 / 0.14 |
 | brush 1k / 100k cells | 2,413 / 65,908 → 2,512 / 66,009 | 18,228 / 407,975 → 16,656 / 108,475 | 0.90 / 0.63 → 0.53 / 1.68 |
 | brush 500k scattered / ~1M cells | 125,687 / 2,661 → 125,745 / 2,774 | **2,003,696 / 3,999,997 → 129,551 / 7,429** | 0.79 / 1.73 → 6.65 / 8.12 |

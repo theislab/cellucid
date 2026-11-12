@@ -8,7 +8,7 @@
  * pass over its non-zero entries (`GROUP_SUMMARY_COMPUTE_GENES`,
  * `compute/group-expression-summary.js`). How the sums are shown — the
  * scaling, the mean of expressing cells, dot or matrix, the axes, the group
- * order, the colours — is applied to the sums on this thread without reading
+ * order, the colors — is applied to the sums on this thread without reading
  * again.
  *
  * @module analysis-types/dotplot-ui
@@ -19,6 +19,8 @@ import { dotplotOptions, DOTPLOT_DISPLAY_OPTIONS } from '../../options/dotplot-o
 import { createGeneIndex, geneIdentities, notebookGeneSets, resolveGenes } from '../../shared/gene-sets.js';
 import { getComputeManager } from '../../compute/compute-manager.js';
 import { OperationType } from '../../compute/operations.js';
+import { toCSVCell } from '../../compute/csv-export.js';
+import { categoryDisplayName } from '../../../actions/targets/names.js';
 import { groupSummaryValues, scaleByGene } from '../../compute/group-expression-summary.js';
 import {
   agglomerate,
@@ -28,15 +30,17 @@ import {
 import { createRunTunerFor, runGeneStream, taskGenes } from '../../shared/gene-stream-runner.js';
 import { GeneRoute } from '../../data/gene-route.js';
 import { createResultEnvelope, readResultEnvelope, requireDatasetGenes } from '../../shared/analysis-result-session.js';
-import { downloadCSV } from '../../shared/analysis-utils.js';
 import { formatCount, formatCountOf } from '../../../../utils/format-units.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
 import { PlotRegistry } from '../../shared/plot-registry-utils.js';
 import { createFieldGroups } from './field-groups.js';
 import { missingCategoryCode } from '../../../../data/categorical-storage-contract.js';
-import { dotplotMinimumWidth } from '../../plots/types/dotplot.js';
+import { dotplotMinimumHeight, dotplotMinimumWidth } from '../../plots/types/dotplot.js';
 import { maskReadFor } from '../../shared/gene-sample-cells.js';
-import { failureText } from '../../../../utils/errors.js';
+import { failureDetails, sayFailure } from '../../../../utils/errors.js';
+import { buttonClassName } from '../../../ui/components/controls.js';
+import { runScale, taskTransform, withCellScale } from '../../compute/task-values.js';
+import { describeValues, geneValueLabel, isValuesRecord } from '../../../../data/expression-transform.js';
 
 let groupSummaryRun = 0;
 
@@ -115,7 +119,7 @@ export function dotplotGroupOrder(order, sizes, means, geneCount) {
 }
 
 /**
- * The plot data from a summary and the display options: colour values,
+ * The plot data from a summary and the display options: color values,
  * fractions and means in the plot's group order.
  *
  * @param {Object} summary - `result.summary`
@@ -162,11 +166,13 @@ export function dotplotPlotData(summary, display, cellSizePx) {
     color: reorder(color),
     fraction: reorder(values.fraction),
     mean: reorder(source),
-    colorLabel: {
+    // What the colors are, with the units of the values the run read
+    // ("Mean expression · log1p(norm.)", `summary.values`).
+    colorLabel: geneValueLabel({
       none: display.meanOnlyExpressing ? 'Mean in expressing cells' : 'Mean expression',
       var: 'Mean, scaled per gene',
       z: 'Mean, z per gene'
-    }[display.scale],
+    }[display.scale], summary.values),
     colorMap: display.colorMap,
     maxDotSize: display.maxDotSize,
     cellSizePx,
@@ -196,7 +202,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
     this._fieldGroups = createFieldGroups({
       dataLayer: this.dataLayer,
       onReady: () => this._refreshOptionsContext(),
-      onError: error => this._notifications.error(`Dot plot groups: ${failureText(error)}`, { category: 'analysis' })
+      onError: error => this._notifications.error(`Dot plot groups: ${sayFailure(error)}`, { ...failureDetails(error), category: 'analysis' })
     });
   }
 
@@ -241,13 +247,9 @@ export class DotplotUI extends FormBasedAnalysisUI {
       // Null until the field is read: its categories are not known yet.
       categoryCount: Array.isArray(info.categories) ? info.categories.length : (info.categoryCount ?? null)
     }));
-    const state = this.dataLayer.state;
-    const active = state?.activeFieldSource === 'obs' && state.activeFieldIndex >= 0
-      ? state.obsData?.fields?.[state.activeFieldIndex]
-      : null;
     return {
       categoricalFields,
-      colorField: active?.kind === 'category' ? active.key : null,
+      colorField: this.dataLayer.getColoringCategoricalField(),
       pages: this.dataLayer.getPages().map(page => ({ id: page.id, name: page.name })),
       groupsFor: (_entry, record) => this._fieldGroups.groups(record.groupBy),
       getGenes: () => this._geneNames(),
@@ -291,10 +293,14 @@ export class DotplotUI extends FormBasedAnalysisUI {
       : null;
   }
 
-  /** The preview's height: every row legible; the frame scrolls itself beyond. */
-  _previewHeight(summary, swap) {
-    const rows = swap ? summary.genes.length : summary.groups.length;
-    return Math.max(220, Math.min(rows * 22 + 140, 640));
+  /**
+   * The preview's height: 22 px a row up to 640 px, and never so short that
+   * one name runs down onto the next (`dotplotMinimumHeight`).
+   */
+  _previewHeight(data) {
+    const rows = data.swap ? data.genes.length : data.groups.length;
+    const width = this._resultContainer?.clientWidth || 300;
+    return Math.max(220, Math.min(rows * 22 + 140, 640), dotplotMinimumHeight(data, width));
   }
 
   /** The room one row gets in the preview: its height over the rows. */
@@ -366,7 +372,8 @@ export class DotplotUI extends FormBasedAnalysisUI {
     categories.forEach((name, code) => {
       if (shown !== null && !shown.has(name)) return;
       groupOfCode[code] = groups.length;
-      groups.push(name);
+      // Named as shown (`(empty)`, `(blank)` for a category with no name).
+      groups.push(categoryDisplayName(field.categories[code]));
     });
     const cellCount = field.codes.length;
     // A first pass (`shared/progressive-cells.js`): the scope's cells in the sample.
@@ -383,6 +390,14 @@ export class DotplotUI extends FormBasedAnalysisUI {
     for (const group of cellGroup) if (group >= 0) sizes[group] += 1;
     // Groups with no cell in scope are left out of the plot.
     if (sizes.every(size => size === 0)) throw new Error('No cells of the chosen groups are in the chosen cells');
+
+    // The run's values (Data mapping › Expression values): each cell's
+    // library size before the genes are read when they are normalized.
+    const holdsCounts = this.dataLayer.matrixHoldsCounts(options.matrix);
+    const values = await this.dataLayer.runValues(options.matrix, {
+      readTo: (await this.dataLayer.geneCellsOf(options.matrix))?.cells ?? null, signal, owner: job.id
+    });
+    if (!this._isCurrentAnalysisRequest(requestId)) return null;
 
     const computeManager = getComputeManager();
     const contextId = `group-summary-${++groupSummaryRun}`;
@@ -405,12 +420,13 @@ export class DotplotUI extends FormBasedAnalysisUI {
         ? await GeneRoute.open({ dataLayer: this.dataLayer, pool: computeManager.workerPool(), signal })
         : null;
       let done = 0;
-      await runGeneStream({
+      await withCellScale(computeManager, { scale: runScale(values), backend, signal }, scaleId => runGeneStream({
         dataLayer: this.dataLayer,
         genes: uniqueGenes,
         tuner,
         route,
         matrix: options.matrix,
+        values,
         owner: job.id,
         // A few genes the user is waiting to see, not one of a long run's.
         priority: 'normal',
@@ -418,7 +434,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
         isCurrent: () => this._isCurrentAnalysisRequest(requestId),
         dispatch: (task, onTiming) => computeManager.execute(
           OperationType.GROUP_SUMMARY_COMPUTE_GENES,
-          { contextId, ...taskGenes(task), cutoff: options.cutoff, bins: VIOLIN_BINS },
+          { contextId, ...taskGenes(task, taskTransform(values, scaleId)), cutoff: options.cutoff, bins: VIOLIN_BINS },
           { ...(task.worker === null ? { backend } : { backend, worker: task.worker }), transfer: true, signal, onTiming }
         ),
         onResult: (task, summary) => {
@@ -426,7 +442,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
           done += task.genes.length;
           job.items(done, uniqueGenes.length, 'genes');
         }
-      });
+      }));
     } finally {
       if (route !== null) {
         void route.close().catch(error => console.warn('[DotPlot] Closing the gene route failed:', error));
@@ -477,6 +493,8 @@ export class DotplotUI extends FormBasedAnalysisUI {
       groupBy: options.groupBy,
       matrix: options.matrix,
       matrixLabel: this.dataLayer.resolveExpressionMatrix(options.matrix).label,
+      counts: holdsCounts,
+      values: values.record,
       bins: VIOLIN_BINS,
       range,
       histogram,
@@ -513,7 +531,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
   }
 
   async _showResult(result, requestId) {
-    const height = this._previewHeight(result.summary, result.data.swap);
+    const height = this._previewHeight(result.data);
     const rendered = await this._renderPreviewPlot({
       result,
       requestId,
@@ -561,9 +579,16 @@ export class DotplotUI extends FormBasedAnalysisUI {
     return rendered;
   }
 
-  /** The expanded view draws at its own size: dots scale to its cells. */
+  /**
+   * The expanded view draws at its own size: dots scale to its cells. A
+   * window too small to name every gene and group draws the plot as large as
+   * they need, and its plot section scrolls.
+   */
   async _renderModalPlot(container, context = {}) {
     const result = context.result ?? this._lastResult;
+    const minHeight = dotplotMinimumHeight(result.data, container.clientWidth || 800);
+    container.style.minHeight = `${minHeight}px`;
+    container.style.minWidth = `${dotplotMinimumWidth(result.data, Math.max(minHeight, container.clientHeight))}px`;
     const { genes, groups } = result.summary;
     const across = result.data.swap ? groups.length : genes.length;
     const down = result.data.swap ? genes.length : groups.length;
@@ -585,6 +610,7 @@ export class DotplotUI extends FormBasedAnalysisUI {
       ['Groups', formatCount(summary.groups.length)],
       ['Genes', formatCount(summary.genes.length)],
       ['Expression matrix', summary.matrixLabel],
+      ['Values', describeValues(summary.values, { counts: summary.counts })],
       ['Cells', formatCount(summary.sizes.reduce((total, size) => total + size, 0))],
       ['Expressed above', String(summary.cutoff)]
     ];
@@ -620,23 +646,31 @@ export class DotplotUI extends FormBasedAnalysisUI {
     }
     const mean = row => (Number.isFinite(row.mean) ? row.mean : -Infinity);
     const chosen = [...byGroup.values()].flatMap(group => [...group].sort((a, b) => mean(b) - mean(a)).slice(0, top));
+    const summary = result.summary;
     return {
       columns,
       rows: chosen.map(row => columns.map(column => (typeof row[column] === 'number' && !Number.isFinite(row[column]) ? null : row[column]))),
-      total: rows.length
+      total: rows.length,
+      // What a mean is of: an agent read raw-count means as expression levels.
+      about: {
+        group_by: summary.groupBy,
+        expression_matrix: summary.matrixLabel,
+        values: describeValues(summary.values, { counts: summary.counts }),
+        rows: 'each group\'s genes by mean, highest first'
+      }
     };
   }
 
-  _exportModalCSV() {
+  tableFile() {
     const result = this._lastResult;
-    if (!result) return;
+    if (!result) return null;
     const csv = this._longTable(result);
-    const cell = value => {
-      const text = typeof value === 'number' ? (Number.isFinite(value) ? String(value) : 'NA') : String(value);
-      return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-    };
-    const lines = [csv.columns.join(','), ...csv.rows.map(row => csv.columns.map(column => cell(row[column])).join(','))];
-    downloadCSV(lines.join('\n'), 'dot_plot', this._notifications);
+    // One CSV cell rule (`toCSVCell`): a missing value is an empty cell, as in every CSV the app writes.
+    const cell = toCSVCell;
+    // The means' column names the values the run read ("mean · log1p(norm.)").
+    const header = csv.columns.map(column => cell(column === 'mean' ? geneValueLabel(column, result.summary.values) : column));
+    const lines = [header.join(','), ...csv.rows.map(row => csv.columns.map(column => cell(row[column])).join(','))];
+    return { name: 'dot_plot', csv: lines.join('\n') };
   }
 
   /** "Score as signature": the plotted genes, one signature per gene set. */
@@ -650,11 +684,11 @@ export class DotplotUI extends FormBasedAnalysisUI {
     });
   }
 
-  _renderPreviewExpandAction() {
-    const expand = super._renderPreviewExpandAction();
+  _renderPreviewExpandAction(result) {
+    const expand = super._renderPreviewExpandAction(result);
     const score = document.createElement('button');
     score.type = 'button';
-    score.className = 'analysis-link-btn';
+    score.className = buttonClassName('quiet');
     score.textContent = 'Score as signature';
     score.addEventListener('click', () => this._trackInteractiveTask(this.scoreAsSignature(), 'Score as signature'));
     expand.parentElement.appendChild(score);
@@ -684,7 +718,8 @@ export class DotplotUI extends FormBasedAnalysisUI {
       !(summary.measured instanceof Uint32Array) || summary.measured.length !== summary.expressing.length ||
       !(summary.histogram instanceof Uint32Array) ||
       !Array.isArray(summary.genes) ||
-      typeof summary.matrix !== 'string' || typeof summary.matrixLabel !== 'string'
+      typeof summary.matrix !== 'string' || typeof summary.matrixLabel !== 'string' ||
+      typeof summary.counts !== 'boolean' || !isValuesRecord(summary.values)
     ) {
       throw new TypeError('A dot plot result must hold its per-group sums and expression matrix');
     }

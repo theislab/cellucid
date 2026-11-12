@@ -223,8 +223,12 @@ export const PlotRegistry = {
       return false;
     }
 
+    // The registered plot keeps every member its definition declares (its
+    // flags, such as `fitTickLabels`, and the helpers its methods reach
+    // through `this`, such as the volcano's `getSummary`), with the
+    // normalized fields over them.
     const plugin = {
-      id: plotType.id,
+      ...plotType,
       name: (
         Object.hasOwn(plotType, 'name') &&
         plotType.name
@@ -233,26 +237,12 @@ export const PlotRegistry = {
         Object.hasOwn(plotType, 'description') &&
         plotType.description
       ) ? plotType.description : '',
-      supportedTypes: plotType.supportedTypes,
       supportedLayouts: (
         Object.hasOwn(plotType, 'supportedLayouts') &&
         plotType.supportedLayouts
       ) ? plotType.supportedLayouts : ['side-by-side', 'grouped'],
       defaultOptions,
-      optionSchema,
-      // Core render/update/export functions
-      render: plotType.render,
-      update: Object.hasOwn(plotType, 'update') ? plotType.update : undefined,
-      exportCSV: Object.hasOwn(plotType, 'exportCSV')
-        ? plotType.exportCSV
-        : undefined,
-      // Plot building methods used by PlotFactory.render() via `this`
-      buildTraces: Object.hasOwn(plotType, 'buildTraces')
-        ? plotType.buildTraces
-        : undefined,
-      buildLayout: Object.hasOwn(plotType, 'buildLayout')
-        ? plotType.buildLayout
-        : undefined
+      optionSchema
     };
 
     return getPlotRegistry().register(plugin);

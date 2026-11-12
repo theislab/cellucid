@@ -22,6 +22,32 @@ export const HIGHLIGHT_MODE_COPY = {
   lasso: 'Alt+draw around cells to select them.'
 };
 
+/** How a gesture combines with the selection, by the keys held (no Select mode). */
+export const COMBINE_KEYS_COPY = Object.freeze({
+  range: 'Alt to intersect, Shift+Alt to add, Ctrl+Alt to subtract',
+  categorical: 'Alt to replace, Shift+Alt to add, Ctrl+Alt to subtract',
+});
+
+/** How a gesture combines while Select mode is on: the choice under the tools, not keys. */
+export const COMBINE_SELECT_MODE_COPY =
+  'Select mode: Intersect, Add or Subtract under the tools combines each gesture';
+
+/**
+ * The step line's help on combining, as HTML: both sentences, the one that
+ * holds shown. Which holds follows the Select mode switch at once, without a
+ * new gesture (`components/_highlight.css`: the section with its switch on
+ * hides the keys, else the Select mode line). R9F-13: the step line said the
+ * Alt keys while Select mode chose the combine.
+ *
+ * @param {{categorical?: boolean}} [options] - an annotation step on a
+ *   categorical field replaces with plain Alt
+ * @returns {string}
+ */
+export function combineHelpHtml({ categorical = false } = {}) {
+  const keys = categorical ? COMBINE_KEYS_COPY.categorical : COMBINE_KEYS_COPY.range;
+  return `<span class="combine-help-keys">${keys}</span><span class="combine-help-select">${COMBINE_SELECT_MODE_COPY}</span>`;
+}
+
 /**
  * Replaces the annotation tool's line in the Selection (i) while no presented
  * pane is colored by a field.

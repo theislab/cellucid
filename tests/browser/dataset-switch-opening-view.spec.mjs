@@ -1,17 +1,17 @@
 /**
  * A file opened after another dataset opens on its own terms: its embedding,
  * the camera framing its cells, the point size its cell count wants, and the
- * colours its file stores. Nothing the previous dataset (or its published
+ * colors its file stores. Nothing the previous dataset (or its published
  * preset) left behind carries over.
  *
  * The owner opened a 28,317-cell segmentation export after Suo (562k cells,
  * 3D, whose preset puts the camera inside the cloud and the point size at
- * 0.64) and saw a canvas of giant grey spheres: the new 2D file was framed by
+ * 0.64) and saw a canvas of giant gray spheres: the new 2D file was framed by
  * Suo's camera. Here the 96-cell 3D catalog dataset stands in for Suo, given
  * the same kind of pose and point size, and `data-mapping-crowded.h5ad` (the
  * same shape as that export: three 2-column UMAPs, a 3-column t-SNE and
  * spatial array, a 4-column integer `coordinates`, wide PCA and latent
- * matrices, no `X_umap`, no `uns['cellucid']`, and Scanpy's colours for
+ * matrices, no `X_umap`, no `uns['cellucid']`, and Scanpy's colors for
  * `cell_type`) is opened over it.
  *
  * Fixture: `scripts/generate-data-mapping-fixtures.py`.
@@ -146,7 +146,7 @@ test('a file opened after a 3D dataset with a close-up preset opens on its own e
   expect(after.camera).toEqual(fresh.camera);
   expect(after.pointSize).toBe(fresh.pointSize);
 
-  // Scanpy's colours: `cell_type` opens in the palette its file stores. The
+  // Scanpy's colors: `cell_type` opens in the palette its file stores. The
   // fresh page opened with its panels folded, so the field's panel is opened
   // first, as a person would (a forced choice skipped every check that the
   // control could be used).
@@ -156,7 +156,7 @@ test('a file opened after a 3D dataset with a close-up preset opens on its own e
     const state = window._cellucidState;
     const field = state.getActiveField();
     if (field?.key !== 'cell_type') return null;
-    // Each category's colour as the state gives it (`getColorForCategory`).
+    // Each category's color as the state gives it (`getColorForCategory`).
     return field.categories.map((_, index) => `#${state.getColorForCategory(field, index)
       .map(channel => Math.round(channel * 255).toString(16).padStart(2, '0'))
       .join('')}`);

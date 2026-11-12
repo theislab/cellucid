@@ -169,7 +169,7 @@ test('Quick Insights composition excludes missing cells from the counts and the 
   assert.equal(summary.total, 3);
   assert.deepEqual(
     summary.topCategories.map(({ name, count, percent }) => [name, count, percent]),
-    [['T', 2, '66.7'], ['B', 1, '33.3']],
+    [['T', 2, (2 / 3) * 100], ['B', 1, (1 / 3) * 100]],
   );
 
   assert.equal(

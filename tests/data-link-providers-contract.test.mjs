@@ -21,8 +21,9 @@ import dropbox from '../assets/js/data/sources/providers/dropbox.js';
 import github from '../assets/js/data/sources/providers/github.js';
 import { downloadRemoteFile } from '../assets/js/data/sources/remote-file.js';
 import { fileFormatOfName, titleOfName } from '../assets/js/data/input-formats.js';
-import { fetchCatalogFile, fetchWhenNotBusy } from '../assets/js/data/data-source.js';
-import { RETRY_AT_LEAST, RETRY_FOR_MS } from '../assets/js/formats/io/byte-source.js';
+import { DataSourceErrorCode, fetchCatalogFile, fetchJson, fetchWhenNotBusy } from '../assets/js/data/data-source.js';
+import { realmHosts } from '../assets/js/formats/io/hosts.js';
+import { isUnanswered, RETRY_AT_LEAST, RETRY_FOR_MS } from '../assets/js/formats/io/byte-source.js';
 import { ResponseClock } from '../assets/js/formats/io/link.js';
 import { virtualTime } from './helpers/virtual-time.mjs';
 
@@ -143,13 +144,79 @@ test('pasted text and ?data= values resolve to one canonical locator', () => {
     assert.equal(registry.resolve(input).locator, locator, input);
     assert.equal(registry.resolve(locator).locator, locator, `${locator} round trip`);
   }
-  assert.throws(() => registry.resolve('not a link'), /does not recognise/);
+  assert.throws(() => registry.resolve('not a link'), /does not recognize/);
   // Ambiguous short forms belong to a provider only after its scheme: a bare
   // number is not a Zenodo record, `user/repo` stays GitHub's shorthand.
-  assert.throws(() => registry.resolve('123'), /does not recognise/);
+  assert.throws(() => registry.resolve('123'), /does not recognize/);
   assert.equal(registry.resolve('lab/atlas').locator, 'gh:lab/atlas');
   assert.throws(() => registry.resolve('   '), /Paste a link/);
   assert.throws(() => registry.resolve('geo:not-an-accession'), /not a valid NCBI GEO reference/);
+});
+
+test('the forms a link is pasted in are the link they mean, or refused with why (R9S-1)', () => {
+  const registry = getProviderRegistry();
+  const cases = [
+    // A web address without its scheme, as an address bar shows it: https.
+    ['example.org/data/atlas.h5ad', 'https://example.org/data/atlas.h5ad'],
+    ['www.example.org/atlas.h5ad', 'https://www.example.org/atlas.h5ad'],
+    ['zenodo.org/records/123', 'zenodo:123'],
+    // This computer's own server: http, as `cellucid serve` serves.
+    ['127.0.0.1:8765/atlas.h5ad', 'http://127.0.0.1:8765/atlas.h5ad'],
+    ['lab-server:8080/atlas.h5ad', 'http://lab-server:8080/atlas.h5ad'],
+    // A provider's own form is never read as a host and port.
+    ['zenodo:123/a.h5ad', 'zenodo:123/a.h5ad'],
+    // Between quotes, angle brackets or backticks (Markdown, an e-mail).
+    ['"https://example.org/atlas.h5ad"', 'https://example.org/atlas.h5ad'],
+    ['<https://example.org/atlas.h5ad>', 'https://example.org/atlas.h5ad'],
+    ['`hf:lab/atlas`', 'hf:lab/atlas'],
+    // A repository's own page, its clone addresses, with or without https.
+    ['https://github.com/owner/repo', 'gh:owner/repo'],
+    ['https://github.com/owner/repo/', 'gh:owner/repo'],
+    ['https://github.com/owner/repo.git', 'gh:owner/repo'],
+    ['git@github.com:owner/repo.git', 'gh:owner/repo'],
+    ['github.com/owner/repo', 'gh:owner/repo'],
+    // A file page's own query (?raw=true, ?plain=1) names the same file.
+    ['https://github.com/owner/repo/blob/main/a.h5ad?raw=true', 'gh:owner/repo@main/a.h5ad'],
+    ['https://github.com/owner/repo/blob/main/a.h5ad?plain=1', 'gh:owner/repo@main/a.h5ad'],
+    // What is inside a store folder is the store, on every host.
+    ['https://github.com/owner/repo/blob/main/d/atlas.zarr/.zmetadata', 'gh:owner/repo@main/d/atlas.zarr'],
+    ['https://example.org/d/atlas.zarr/obs/.zattrs', 'https://example.org/d/atlas.zarr/'],
+    ['https://example.org/d/atlas.zarr/zarr.json', 'https://example.org/d/atlas.zarr/'],
+    ['https://huggingface.co/datasets/lab/atlas/blob/main/atlas.zarr/.zmetadata', 'hf:lab/atlas/atlas.zarr'],
+    // Hugging Face's short address, and Zenodo's preview page of a file.
+    ['https://hf.co/datasets/lab/atlas', 'hf:lab/atlas'],
+    ['https://zenodo.org/records/123/preview/a.h5ad', 'zenodo:123/a.h5ad'],
+  ];
+  for (const [input, locator] of cases) {
+    assert.equal(registry.resolve(input).locator, locator, input);
+    assert.equal(registry.resolve(locator).locator, locator, `${locator} round trip`);
+  }
+  // A signed address names its one object: kept as it is.
+  assert.equal(
+    registry.resolve('https://b.example/atlas.zarr/.zmetadata?X-Amz-Signature=s').locator,
+    'https://b.example/atlas.zarr/.zmetadata?X-Amz-Signature=s'
+  );
+  // An account never holds a dot or an @: no host, address or clone URL is
+  // read as GitHub's shorthand (it was: `gh:example.org/atlas.h5ad`).
+  for (const text of ['gh:example.org/atlas.h5ad', 'gh:me@host/repo', 'gh:-owner/repo', 'gh:owner/re po']) {
+    assert.throws(() => registry.resolve(text), /not a valid GitHub reference/, text);
+  }
+  // A DOI is no address without its scheme.
+  assert.equal(registry.resolve('10.5281/zenodo.123').locator, 'zenodo:123');
+  // A file on this computer, and a protocol no page can read, are refused
+  // with what to do, never "does not recognize".
+  for (const text of ['/Users/me/atlas.h5ad', '~/atlas.h5ad', 'C:\\data\\atlas.h5ad', 'file:///Users/me/atlas.h5ad']) {
+    assert.throws(() => registry.resolve(text), /is a file on a computer, not a web address: open it with Open… › File…/, text);
+  }
+  assert.throws(
+    () => registry.resolve('ftp://ftp.example.org/pub/atlas.h5ad'),
+    /^DataSourceError: A web page cannot read ftp:\/\/ addresses, so "ftp:\/\/ftp\.example\.org\/pub\/atlas\.h5ad" cannot be opened\. Paste the https:\/\/ address/
+  );
+  // GEO's FTP address is its HTTPS one.
+  assert.equal(
+    registry.resolve('ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE351nnn/GSE351300/suppl/a.h5ad').locator,
+    'geo:GSE351300/a.h5ad'
+  );
 });
 
 test('file names and formats are read from the URL, Zenodo-style /content included', () => {
@@ -320,6 +387,24 @@ test('GEO lists a series and opens its one .h5ad, or names the choices', async t
   assert.equal(compressed.file.title, 'GSE351300 GSE351300_x');
   listing = '<a href="GSE351300_RAW.tar">x</a>';
   await assert.rejects(geo.open('GSE351300'), /no supplementary file Cellucid opens \(it has: GSE351300_RAW\.tar\)/);
+});
+
+test('GEO asks whether NCBI fails through the one transport: a README that never answers ends, the refusal is said (RCD-2)', async t => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).endsWith('/suppl/')) return new Response('<a href="GSE351300_RAW.tar">x</a>', { status: 200 });
+    if (String(url).endsWith('/geo/README.txt')) {
+      // Silent, as a host that stopped answering: only the request's end ends it.
+      return new Promise((_resolve, reject) => init.signal?.addEventListener('abort', () => reject(init.signal.reason), { once: true }));
+    }
+    return new Response(null, { status: 404 });
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const started = performance.now();
+  await assert.rejects(geo.open('GSE351300'), /no supplementary file Cellucid opens \(it has: GSE351300_RAW\.tar\)/);
+  assert.ok(performance.now() - started < 15_000, 'ended as stalled within the link\'s patience');
 });
 
 test('Zenodo opens the one openable file of a record, with the listing\'s size and no probe', async t => {
@@ -639,12 +724,40 @@ test('a busy host is asked again, then answered as it is: catalog files included
   assert.equal(stillBusy.length, RETRY_AT_LEAST + 1);
   assert.ok(time.now() < RETRY_FOR_MS, `asked again for ${time.now()} ms`);
 
-  // A wait is cancelled with the request.
+  // A wait is canceled with the request.
   installFetch(t, () => ({ status: 429, headers: { 'Retry-After': '60' } }));
   const controller = new AbortController();
   const pending = fetchWhenNotBusy('https://raw.githubusercontent.com/o/r/HEAD/a', { signal: controller.signal });
   controller.abort(new DOMException('stop', 'AbortError'));
   await assert.rejects(pending, error => error.name === 'AbortError');
+});
+
+test('a person\'s "Try again" of a catalog file is one request through the one transport: its host\'s book hears it, and no answer is said as one (RCD-2)', async t => {
+  installFetch(t, () => ({ status: 200, json: { schema: 2 } }));
+  const answers = 'https://try-again-answers.example.org/catalog/datasets.json';
+  assert.equal(realmHosts.answeredBefore(answers), false);
+  await fetchCatalogFile(answers, undefined, { askOnce: true });
+  assert.equal(realmHosts.answeredBefore(answers), true, 'counted in the book of hosts (pacing, Retry-After, who answered before)');
+
+  // No answer: the transport's failure naming its host (for the sentence that
+  // says who is at fault), never the browser's bare TypeError, which reads as
+  // a problem inside Cellucid (`isInternalFailure`).
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new TypeError('Failed to fetch');
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+  const silent = 'https://try-again-silent.example.org/catalog/datasets.json';
+  await assert.rejects(
+    fetchCatalogFile(silent, undefined, { askOnce: true }),
+    error => isUnanswered(error) && error.details.host === 'try-again-silent.example.org'
+  );
+  await assert.rejects(
+    fetchJson(silent, 'link', { askOnce: true }),
+    error => error.code === DataSourceErrorCode.NETWORK_ERROR && isUnanswered(error.details.cause)
+  );
 });
 
 test('Dropbox reads a file link from its content host and refuses a folder link', async t => {
@@ -893,4 +1006,27 @@ test('s3:// and gs:// addresses are read at their HTTPS address; a Census copy\'
   const byId = await cellxgene.open(ID);
   assert.deepEqual(byCopy.file.resource.identity, byId.file.resource.identity, 'the same bytes, one identity');
   assert.equal(byCopy.file.id, byId.file.id, 'one dataset: sessions and annotations carry over');
+});
+
+test('a Zenodo record refused (403) is Zenodo refusing this network for now, not a record number to check (R9S-10)', async t => {
+  // Every record's description is public: a 403 for it is Zenodo's block of
+  // a network ("unusual traffic"). It said "could not be read (HTTP 403).
+  // Check the record number on zenodo.org".
+  installFetch(t, url => (url === 'https://zenodo.org/api/records/7' ? { status: 403, text: 'blocked' } : null));
+  await assert.rejects(zenodo.open('7'), error => {
+    assert.equal(error.details.hostFault.kind, 'refusing');
+    assert.equal(error.message, 'Zenodo (zenodo.org) is refusing requests from this network for now (HTTP 403, forbidden) for ' +
+      'record 7, which it gives everyone: a problem on Zenodo\'s side (an outage, or a block after many requests from one ' +
+      'network), not with the link or with Cellucid. Try again later.');
+    return true;
+  });
+});
+
+test('the CELLxGENE Census release list refused (403) is its host refusing this network for now (R9S-10)', async t => {
+  installFetch(t, url => (url.endsWith('/cell-census/release.json') ? { status: 403, text: 'AccessDenied' } : null));
+  await assert.rejects(cellxgene.open(ID), error => {
+    assert.equal(error.details.hostFault.kind, 'refusing');
+    assert.match(error.message, /^CELLxGENE \(cellxgene-census-public-us-west-2\.s3\.us-west-2\.amazonaws\.com\) is refusing requests from this network for now \(HTTP 403, forbidden\) for the Census release list/);
+    return true;
+  });
 });

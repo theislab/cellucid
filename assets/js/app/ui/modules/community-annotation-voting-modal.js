@@ -11,9 +11,9 @@ import { getNotificationCenter } from '../../notification-center.js';
 import { getCommunityAnnotationSession } from '../../community-annotations/session.js';
 import { getCommunityAnnotationAccessStore, isAnnotationRepoConnected } from '../../community-annotations/access-store.js';
 import { showConfirmDialog } from '../components/confirm-dialog.js';
-import { formatPercent } from '../components/display-format.js';
-import { formatCountOf, countNoun } from '../../../utils/format-units.js';
-import { claimModalDocumentLayer } from '../components/modal-background-owner.js';
+import { formatCountOf, countNoun, formatPercent } from '../../../utils/format-units.js';
+import { formatAgo } from './state/model.js';
+import { wireAppDialog } from '../components/app-dialog.js';
 import * as capApi from '../../community-annotations/cap-api.js';
 import { ANNOTATION_CONNECTION_CHANGED_EVENT } from '../../community-annotations/connection-events.js';
 import {
@@ -25,10 +25,21 @@ import {
   claimCommunityAnnotationModal
 } from './community-annotation-modal-owner.js';
 import { el } from './community-annotation/dom.js';
+import { runExactCleanup } from './community-annotation/cleanup.js';
 import { toCleanString } from '../../../utils/clean-string.js';
 import { createDomId } from '../components/dom-id.js';
-import { createInfoTip } from '../components/controls.js';
+import { buttonClassName, createInfoTip } from '../components/controls.js';
 import { cancel, cancelled, onAbort } from '../../../utils/abort.js';
+import { failureDetails, failureSentence, sayFailure } from '../../../utils/errors.js';
+
+/**
+ * A text box's length while it holds text, nothing while it is empty: no
+ * comment or label has a length limit, so "0 characters" under every card
+ * said nothing (bug hunt R9A-7).
+ */
+function charCountText(length) {
+  return length === 0 ? '' : formatCountOf(length, 'character');
+}
 
 function requireVotingContext(value, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -124,63 +135,6 @@ export function createCommunityAnnotationVotingContextLease(context) {
       if (!controller.signal.aborted) controller.abort();
     }
   });
-}
-
-function runExactCleanup(context, entries) {
-  const errors = [];
-  for (const [label, operation] of entries) {
-    if (operation === null || operation === undefined) continue;
-    if (typeof operation !== 'function') {
-      errors.push(new TypeError(`${label} cleanup must be a function`));
-      continue;
-    }
-    try {
-      operation();
-    } catch (error) {
-      errors.push(error);
-    }
-  }
-  if (errors.length === 1) throw errors[0];
-  if (errors.length > 1) {
-    throw new AggregateError(
-      errors,
-      `${context} failed in ${errors.length} cleanup operations`
-    );
-  }
-}
-
-function releaseExactModalDocumentLayer(release, label) {
-  if (typeof release !== 'function') {
-    throw new TypeError(`${label} release owner must be a function`);
-  }
-  try {
-    if (release() !== true) {
-      throw new Error(`${label} lost its exact document-layer owner`);
-    }
-    return true;
-  } catch (primaryError) {
-    try {
-      if (release() !== true) {
-        throw new Error(`${label} document-layer retry lost ownership`);
-      }
-      return true;
-    } catch (retryError) {
-      throw new AggregateError(
-        [primaryError, retryError],
-        `${label} document-layer release failed twice`
-      );
-    }
-  }
-}
-
-function describeErrorMessage(err) {
-  if (!(err instanceof Error)) {
-    throw new TypeError('Community annotation operations must reject with an Error instance');
-  }
-  if (typeof err.message !== 'string' || err.message.length === 0 || err.message !== err.message.trim()) {
-    throw new TypeError('Community annotation errors require a non-empty trimmed message');
-  }
-  return err.message;
 }
 
 function formatCommentAuthorHandle(session, username) {
@@ -511,16 +465,8 @@ function formatRelativeTime(isoString) {
   if (!Number.isFinite(timestamp)) {
     throw new RangeError('Comment timestamp must be a valid date');
   }
-  const diffMs = Date.now() - timestamp;
-  const diffMins = Math.floor(diffMs / 60000);
-  const diffHrs = Math.floor(diffMins / 60);
-  const diffDays = Math.floor(diffHrs / 24);
-
-  if (diffMins < 1) return 'just now';
-  if (diffMins < 60) return `${diffMins}m ago`;
-  if (diffHrs < 24) return `${diffHrs}h ago`;
-  if (diffDays < 30) return `${diffDays}d ago`;
-  return date.toLocaleDateString();
+  // How long ago, in the words every list of the app uses (`state/model.js` `formatAgo`).
+  return formatAgo(timestamp, Date.now()).long;
 }
 
 function listFocusableElements(root) {
@@ -967,80 +913,6 @@ function focusEnabledPaginationControl(preferred, alternate) {
   );
 }
 
-/**
- * Inline editors mark their cancellable region with `data-esc-cancel="true"`
- * and handle Escape themselves; every voting shell's trap leaves Escape from
- * inside such a region to the editor instead of closing the dialog.
- */
-const ESC_CANCEL_SELECTOR = '[data-esc-cancel="true"]';
-
-function trapModalFocus({ overlay, modal, close } = {}) {
-  const o = overlay;
-  const m = modal;
-  if (
-    !o ||
-    typeof o.addEventListener !== 'function' ||
-    typeof o.removeEventListener !== 'function'
-  ) {
-    throw new TypeError('Modal overlay must expose exact event listener methods');
-  }
-  if (!m || typeof m.contains !== 'function') {
-    throw new TypeError('Modal focus container must expose contains()');
-  }
-  if (typeof close !== 'function') {
-    throw new TypeError('Modal focus trap requires a close callback');
-  }
-
-  const onKeyDown = (e) => {
-    if (!e || typeof e.preventDefault !== 'function' || typeof e.stopPropagation !== 'function') {
-      throw new TypeError('Modal focus trap requires exact keyboard event methods');
-    }
-    if (e.key === 'Escape') {
-      const target = e.target;
-      if (target && typeof target.closest === 'function' && target.closest(ESC_CANCEL_SELECTOR)) return;
-      e.preventDefault();
-      e.stopPropagation();
-      close();
-      return;
-    }
-
-    if (e.key !== 'Tab') return;
-
-    const focusables = listFocusableElements(m);
-    if (!focusables.length) {
-      e.preventDefault();
-      return;
-    }
-
-    const first = focusables[0];
-    const last = focusables[focusables.length - 1];
-    const active = document.activeElement;
-    const containsActive = active && m.contains(active);
-
-    if (e.shiftKey) {
-      if (!containsActive || active === first) {
-        if (typeof last.focus !== 'function') {
-          throw new TypeError('Modal focus target must expose focus()');
-        }
-        e.preventDefault();
-        last.focus();
-      }
-      return;
-    }
-
-    if (!containsActive || active === last) {
-      if (typeof first.focus !== 'function') {
-        throw new TypeError('Modal focus target must expose focus()');
-      }
-      e.preventDefault();
-      first.focus();
-    }
-  };
-
-  o.addEventListener('keydown', onKeyDown, true);
-  return () => o.removeEventListener('keydown', onKeyDown, true);
-}
-
 // =============================================================================
 // CAP Integration UI Components
 // =============================================================================
@@ -1141,7 +1013,7 @@ function renderCapSearchResults({
             returnFocusTo.focus();
           }
         } catch (error) {
-          getNotificationCenter().error(describeErrorMessage(error), {
+          getNotificationCenter().error(failureSentence(error), { ...failureDetails(error),
             category: 'annotation'
           });
         }
@@ -1237,8 +1109,8 @@ function renderComment({
 
   if (isOwn && canInteract) {
     const actions = el('div', { className: 'community-annotation-comment-actions' });
-    const editBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Edit' });
-    const deleteBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Delete' });
+    const editBtn = el('button', { type: 'button', className: buttonClassName('quiet'), text: 'Edit' });
+    const deleteBtn = el('button', { type: 'button', className: buttonClassName('quiet'), text: 'Delete' });
     const editFocusKey = `${commentFocusPrefix}:edit`;
     ownModalFocusKey(editBtn, editFocusKey);
     ownModalFocusKey(deleteBtn, `${commentFocusPrefix}:delete`);
@@ -1255,15 +1127,15 @@ function renderComment({
       });
       input.value = text;
 
-      const charCounter = el('div', { className: 'community-annotation-char-counter', text: `${formatCountOf(input.value.length, 'character')}` });
+      const charCounter = el('div', { className: 'community-annotation-char-counter', text: charCountText(input.value.length) });
       input.addEventListener('input', () => {
-        charCounter.textContent = `${formatCountOf(input.value.length, 'character')}`;
+        charCounter.textContent = charCountText(input.value.length);
         inlineEdits.set(editFocusKey, 'text', input.value);
       });
 
       const formActions = el('div', { className: 'community-annotation-comment-form-actions' });
-      const saveBtn = el('button', { type: 'button', className: 'btn', text: 'Save' });
-      const cancelBtn = el('button', { type: 'button', className: 'btn', text: 'Cancel' });
+      const saveBtn = el('button', { type: 'button', className: buttonClassName('quiet-primary'), text: 'Save' });
+      const cancelBtn = el('button', { type: 'button', className: buttonClassName('quiet'), text: 'Cancel' });
       ownModalFocusKey(saveBtn, `${commentFocusPrefix}:save`, {
         restoreKey: editFocusKey
       });
@@ -1348,21 +1220,26 @@ function renderComment({
 let activeVotingModal = null;
 
 /**
- * The voting modal's own shell.
+ * Focus goes back to `prevFocus` when it can still take it, else to what the
+ * resolver names at close time.
  *
- * This is deliberately separate from `community-annotation/modal-shell.js`
- * rather than duplicated by accident. That module carries the full rationale;
- * the short form is that the two shells have different close orderings
- * (`onClose` retires this shell's render lifecycle *before* the focus trap and
- * the overlay removal), different nested-Escape protocols (the `data-esc-cancel`
- * marker here, `COMMUNITY_MODAL_ESCAPE_OWNER` there), and only this one owns the
- * primary/secondary voting modal cascade.
- *
- * The accessibility contract they *do* share — `role="dialog"`, `aria-modal`,
- * a generated `aria-labelledby`, focus into the dialog on open, focus restored
- * on close, Escape, and Tab wrapping both directions — is pinned by
- * `tests/community-annotation-modal-shell-parity-contract.test.mjs`. Changing
- * any of it here without the same change there fails that test.
+ * @param {Element|null} prevFocus
+ * @param {(() => HTMLElement|null)|null} resolver
+ * @returns {() => HTMLElement|null}
+ */
+function returnFocusTarget(prevFocus, resolver) {
+  return () => (isAvailableModalFocusTarget(prevFocus) ? prevFocus : resolver?.() ?? null);
+}
+
+/**
+ * The voting dialog's shell: an app dialog (`components/app-dialog.js`) drawn
+ * as a full-screen layer holding the community annotation card, like the
+ * cluster dialogs (`community-annotation/modal-shell.js`). Its own: closing
+ * first closes the details dialog over it, and its render lifecycle
+ * (`onClose`) retires before the dialog leaves the page, because its content
+ * holds abortable field loads that must not observe a detached tree.
+ * `tests/community-annotation-modal-shell-parity-contract.test.mjs` pins it on
+ * the one dialog implementation.
  */
 function showModal({
   title,
@@ -1396,14 +1273,14 @@ function showModal({
     );
   }
 
-  const overlay = el('div', { className: 'community-annotation-modal-overlay', role: 'dialog', 'aria-modal': 'true' });
-  const modal = el('div', { className: 'community-annotation-modal', role: 'document' });
+  const dialog = el('dialog', { className: 'dialog-layer community-annotation-dialog' });
+  const modal = el('div', { className: 'community-annotation-modal' });
 
   const header = el('div', { className: 'community-annotation-modal-header' });
   const titleEl = el('div', { className: 'community-annotation-modal-title', text: title || 'Community voting' });
   const titleId = createDomId('community-annotation-voting-title');
   titleEl.id = titleId;
-  overlay.setAttribute('aria-labelledby', titleId);
+  dialog.setAttribute('aria-labelledby', titleId);
   header.appendChild(titleEl);
   const closeBtn = el('button', { type: 'button', className: 'btn community-annotation-modal-close', text: 'Close' });
   header.appendChild(closeBtn);
@@ -1411,119 +1288,69 @@ function showModal({
   const content = el('div', { className: 'community-annotation-modal-body' });
   modal.appendChild(header);
   modal.appendChild(content);
-  overlay.appendChild(modal);
+  dialog.appendChild(modal);
 
   const prevFocus = returnFocusTo ?? document.activeElement;
-  let closed = false;
-  let closing = false;
-  let cleanupTrap = null;
   let releaseOwner = null;
-  let releaseDocumentLayer = null;
-  const releaseDocumentOwnership = () => {
-    if (releaseDocumentLayer === null) return;
-    const exactRelease = releaseDocumentLayer;
-    releaseExactModalDocumentLayer(
-      exactRelease,
-      'Community annotation voting modal'
-    );
-    if (releaseDocumentLayer === exactRelease) {
-      releaseDocumentLayer = null;
+  let modalReference = null;
+  const closeSecondary = () => {
+    if (activeSecondaryModal === null) return;
+    if (typeof activeSecondaryModal.close !== 'function') {
+      throw new TypeError('Active secondary modal must expose close()');
     }
+    activeSecondaryModal.close();
   };
-  const close = () => {
-    if (closed || closing) return;
-    closing = true;
-    try {
+  const owner = wireAppDialog(dialog, {
+    onClose: () => {
       runExactCleanup('Community annotation voting modal teardown', [
-        [
-          'secondary modal',
-          activeSecondaryModal === null
-            ? null
-            : () => {
-                if (typeof activeSecondaryModal.close !== 'function') {
-                  throw new TypeError(
-                    'Active secondary modal must expose close()'
-                  );
-                }
-                activeSecondaryModal.close();
-              }
-        ],
+        ['secondary modal', closeSecondary],
         ['owned modal lifecycle', onClose],
-        ['focus trap', cleanupTrap],
-        ['modal overlay', () => overlay.remove()],
-        ['modal document layer', releaseDocumentOwnership],
-        [
-          'previous focus target',
-          prevFocus === null && returnFocusResolver === null
-            ? null
-            : () => {
-                const previousFocusAvailable =
-                  prevFocus instanceof HTMLElement
-                  && prevFocus.isConnected
-                  && !(
-                    prevFocus instanceof HTMLButtonElement
-                    && prevFocus.disabled
-                  );
-                const target = previousFocusAvailable
-                  ? prevFocus
-                  : returnFocusResolver?.() ?? null;
-                if (target === null) return;
-                if (
-                  !(target instanceof HTMLElement)
-                  || !target.isConnected
-                  || typeof target.focus !== 'function'
-                ) {
-                  throw new TypeError(
-                    'Previous community annotation voting focus target must expose focus()'
-                  );
-                }
-                target.focus();
-              }
-        ]
+        ['modal dialog', () => dialog.remove()],
+        ['shared modal owner', releaseOwner === null ? null : () => {
+          const release = releaseOwner;
+          releaseOwner = null;
+          if (release() !== true) {
+            throw new Error(
+              'Community annotation voting modal lost its exact shared owner'
+            );
+          }
+        }],
+        ['active voting modal', () => {
+          if (activeVotingModal === modalReference) activeVotingModal = null;
+        }]
       ]);
-      if (
-        typeof releaseOwner !== 'function' ||
-        releaseOwner() !== true
-      ) {
-        throw new Error(
-          'Community annotation voting modal lost its exact shared owner'
-        );
-      }
-      releaseOwner = null;
-      closed = true;
-      if (activeVotingModal?.close === close) {
-        activeVotingModal = null;
-      }
-    } finally {
-      closing = false;
     }
+  });
+  // The details dialog over this one closes first, so focus comes back
+  // into this dialog before it hands focus back to its own opener. Closing
+  // again, or after Escape closed it, only settles what is left.
+  const close = () => {
+    closeSecondary();
+    owner.close();
   };
   closeBtn.addEventListener('click', close);
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close();
-  });
 
   let contentBuilt = false;
-  let ownerClaimed = false;
   try {
     buildContent(content);
     contentBuilt = true;
     releaseOwner = claimCommunityAnnotationModal(close);
-    ownerClaimed = true;
-    releaseDocumentLayer = claimModalDocumentLayer(overlay);
-    document.body.appendChild(overlay);
-    cleanupTrap = trapModalFocus({ overlay, modal, close });
-    const modalReference = { close, overlay, modal, content };
+    document.body.appendChild(dialog);
+    owner.open(returnFocusTarget(prevFocus, returnFocusResolver), { focus: closeBtn });
+    modalReference = { close, overlay: dialog, modal, content };
     activeVotingModal = modalReference;
-    closeBtn.focus();
     return modalReference;
   } catch (error) {
     const errors = [error];
     try {
-      if (ownerClaimed) {
+      if (dialog.open) {
         close();
-      } else if (contentBuilt || onClose !== null) {
-        onClose?.();
+      } else {
+        runExactCleanup('Unopened community annotation voting modal rollback', [
+          ['owned modal lifecycle', contentBuilt || onClose !== null ? onClose : null],
+          ['modal dialog', () => dialog.remove()],
+          ['shared modal owner', releaseOwner === null ? null : () => releaseOwner()]
+        ]);
       }
     } catch (cleanupError) {
       errors.push(cleanupError);
@@ -1684,7 +1511,7 @@ function renderMergeRow({
       editBtn = null;
 
       if (isOwn) {
-        editBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Edit' });
+        editBtn = el('button', { type: 'button', className: buttonClassName('quiet'), text: 'Edit' });
         ownModalFocusKey(editBtn, editFocusKey);
         editBtn.addEventListener('click', () => {
           inlineEdits.open(editFocusKey, {
@@ -1694,7 +1521,7 @@ function renderMergeRow({
           });
           enterNoteEdit(currentNote).focus();
         });
-        const deleteBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Delete' });
+        const deleteBtn = el('button', { type: 'button', className: buttonClassName('quiet'), text: 'Delete' });
         ownModalFocusKey(deleteBtn, `${noteFocusPrefix}:delete`);
         deleteBtn.hidden = !currentNote;
         deleteBtn.addEventListener('click', () => {
@@ -1736,7 +1563,6 @@ function renderMergeRow({
         rows: '1',
         'aria-label': 'Merge note',
         placeholder: 'Merge note (optional)…',
-        'data-esc-cancel': 'true',
         title: 'Enter to save • Esc to cancel'
       });
       ownModalFocusKey(input, `${noteFocusPrefix}:edit-input`, {
@@ -1746,7 +1572,7 @@ function renderMergeRow({
 
       const charCounter = el('div', {
         className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
-        text: `${formatCountOf(input.value.length, 'character')}`
+        text: charCountText(input.value.length)
       });
 
       const resize = () => {
@@ -1773,7 +1599,7 @@ function renderMergeRow({
       };
 
       input.addEventListener('input', () => {
-        charCounter.textContent = `${formatCountOf(input.value.length, 'character')}`;
+        charCounter.textContent = charCountText(input.value.length);
         inlineEdits.set(editFocusKey, 'note', input.value);
         resize();
       });
@@ -1801,7 +1627,7 @@ function renderMergeRow({
       return input;
     };
 
-    const detachBtn = el('button', { type: 'button', className: 'btn', text: 'Detach' });
+    const detachBtn = el('button', { type: 'button', className: buttonClassName('quiet'), text: 'Detach' });
     detachBtn.addEventListener('click', () => {
       showOwnedConfirmDialog(lifecycle, {
         title: 'Detach merge?',
@@ -1911,14 +1737,14 @@ function showSecondaryModal({
   }
   activeSecondaryModal = null;
 
-  const overlay = el('div', { className: 'community-annotation-secondary-overlay', role: 'dialog', 'aria-modal': 'true' });
-  const modal = el('div', { className: 'community-annotation-modal community-annotation-secondary-modal', role: 'document' });
+  const dialog = el('dialog', { className: 'dialog-layer community-annotation-dialog community-annotation-details-dialog' });
+  const modal = el('div', { className: 'community-annotation-modal community-annotation-secondary-modal' });
 
   const header = el('div', { className: 'community-annotation-modal-header' });
   const titleEl = el('div', { className: 'community-annotation-modal-title', text: title || 'Details' });
   const titleId = createDomId('community-annotation-secondary-title');
   titleEl.id = titleId;
-  overlay.setAttribute('aria-labelledby', titleId);
+  dialog.setAttribute('aria-labelledby', titleId);
   header.appendChild(titleEl);
   const closeBtn = el('button', { type: 'button', className: 'btn community-annotation-modal-close', text: 'Close' });
   header.appendChild(closeBtn);
@@ -1927,12 +1753,10 @@ function showSecondaryModal({
 
   modal.appendChild(header);
   modal.appendChild(content);
-  overlay.appendChild(modal);
+  dialog.appendChild(modal);
 
   let unsubscribe = null;
-  let ownerObserver = null;
   let closed = false;
-  const ownerOverlay = activeVotingModal?.overlay ?? null;
   const lifecycleController = new AbortController();
   let renderController = null;
   let renderGeneration = 0;
@@ -1941,26 +1765,13 @@ function showSecondaryModal({
     isCurrent: () => (
       !closed &&
       !lifecycleController.signal.aborted &&
-      overlay.isConnected
+      dialog.isConnected
     )
   };
   const prevFocus = returnFocusTo ?? document.activeElement;
   /** @type {Map<string, string>} */
   const drafts = new Map();
   const inlineEdits = new InlineEditState();
-  let cleanupTrap = null;
-  let releaseDocumentLayer = null;
-  const releaseDocumentOwnership = () => {
-    if (releaseDocumentLayer === null) return;
-    const exactRelease = releaseDocumentLayer;
-    releaseExactModalDocumentLayer(
-      exactRelease,
-      'Community annotation secondary modal'
-    );
-    if (releaseDocumentLayer === exactRelease) {
-      releaseDocumentLayer = null;
-    }
-  };
 
   const render = () => {
     renderGeneration += 1;
@@ -1983,7 +1794,7 @@ function showSecondaryModal({
         !ownedController.signal.aborted &&
         generation === renderGeneration &&
         renderController === ownedController &&
-        overlay.isConnected
+        dialog.isConnected
       )
     };
     const focusSnapshot = captureModalRerenderFocus(content);
@@ -2000,90 +1811,53 @@ function showSecondaryModal({
     }
   };
 
-  const close = () => {
-    if (closed) return;
-    runExactCleanup('Community annotation secondary modal teardown', [
-      [
-        'secondary modal lifecycle',
-        () => {
-          if (!lifecycleController.signal.aborted) {
-            lifecycleController.abort();
-          }
-          if (
-            renderController !== null &&
-            !renderController.signal.aborted
-          ) {
-            renderController.abort();
-          }
-        }
-      ],
-      ['session subscription', unsubscribe],
-      [
-        'owner observer',
-        ownerObserver === null
-          ? null
-          : () => {
-              if (typeof ownerObserver.disconnect !== 'function') {
-                throw new TypeError('Secondary modal observer must expose disconnect()');
-              }
-              ownerObserver.disconnect();
+  const owner = wireAppDialog(dialog, {
+    onClose: () => {
+      closed = true;
+      runExactCleanup('Community annotation secondary modal teardown', [
+        [
+          'secondary modal lifecycle',
+          () => {
+            if (!lifecycleController.signal.aborted) {
+              lifecycleController.abort();
             }
-      ],
-      ['focus trap', cleanupTrap],
-      ['secondary modal overlay', () => overlay.remove()],
-      ['modal document layer', releaseDocumentOwnership],
-      [
-        'previous focus target',
-        prevFocus === null &&
-        returnFocusResolver === null &&
-        activeVotingModal === null
-          ? null
-          : () => {
-              let target = isAvailableModalFocusTarget(prevFocus)
-                ? prevFocus
-                : null;
-              if (target === null && returnFocusResolver !== null) {
-                const resolved = returnFocusResolver();
-                if (
-                  resolved !== null &&
-                  !(resolved instanceof HTMLElement)
-                ) {
-                  throw new TypeError(
-                    'Secondary modal return focus resolver must return an element or exact null'
-                  );
-                }
-                if (isAvailableModalFocusTarget(resolved)) {
-                  target = resolved;
-                }
-              }
-              target ??= resolvePrimaryModalCloseButton();
-              if (target === null) return;
-              if (!isAvailableModalFocusTarget(target)) {
-                throw new TypeError(
-                  'Secondary modal focus target must be connected and enabled'
-                );
-              }
-              target.focus();
+            if (
+              renderController !== null &&
+              !renderController.signal.aborted
+            ) {
+              renderController.abort();
             }
-      ]
-    ]);
-    closed = true;
-    if (activeSecondaryModal !== null && activeSecondaryModal.close === close) {
-      activeSecondaryModal = null;
+          }
+        ],
+        ['session subscription', unsubscribe],
+        ['secondary modal dialog', () => dialog.remove()],
+        ['active secondary modal', () => {
+          if (activeSecondaryModal !== null && activeSecondaryModal.close === close) {
+            activeSecondaryModal = null;
+          }
+        }]
+      ]);
     }
+  });
+  const close = () => owner.close();
+  closeBtn.addEventListener('click', close);
+
+  // Focus goes back to the opener, else to what the resolver names, else to
+  // the voting dialog's Close under it.
+  const returnFocus = () => {
+    const target = returnFocusTarget(prevFocus, returnFocusResolver)();
+    if (target !== null && !(target instanceof HTMLElement)) {
+      throw new TypeError(
+        'Secondary modal return focus resolver must return an element or exact null'
+      );
+    }
+    return isAvailableModalFocusTarget(target) ? target : resolvePrimaryModalCloseButton();
   };
 
-  closeBtn.addEventListener('click', close);
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close();
-  });
-
   try {
-    cleanupTrap = trapModalFocus({ overlay, modal, close });
-    releaseDocumentLayer = claimModalDocumentLayer(overlay);
-    document.body.appendChild(overlay);
-    activeSecondaryModal = { close, overlay, lifecycle: modalLifecycle };
-    closeBtn.focus();
+    document.body.appendChild(dialog);
+    owner.open(returnFocus, { focus: closeBtn });
+    activeSecondaryModal = { close, overlay: dialog, lifecycle: modalLifecycle };
 
     if (session && typeof session.on === 'function') {
       unsubscribe = session.on('changed', () => render());
@@ -2092,19 +1866,11 @@ function showSecondaryModal({
       }
     }
 
-    if (ownerOverlay) {
-      // The owner's overlay is a child of <body>, so its removal is a
-      // childList change of <body> itself; nothing below <body> is watched.
-      ownerObserver = new MutationObserver(() => {
-        if (!document.body.contains(ownerOverlay)) close();
-      });
-      ownerObserver.observe(document.body, { childList: true });
-    }
-
     render();
   } catch (primaryError) {
     try {
-      close();
+      if (dialog.open) close();
+      else dialog.remove();
     } catch (cleanupError) {
       throw new AggregateError(
         [primaryError, cleanupError],
@@ -2114,7 +1880,7 @@ function showSecondaryModal({
     throw primaryError;
   }
 
-  return { close, overlay, modal, content };
+  return { close, overlay: dialog, modal, content };
 }
 
 function openSuggestionCommentsModal({
@@ -2474,7 +2240,7 @@ function renderSuggestionCard({
   if (evidence && evidenceShort !== evidence) {
     const moreBtn = el('button', {
       type: 'button',
-      className: 'community-annotation-merged-comment-btn',
+      className: buttonClassName('quiet', 'community-annotation-evidence-more'),
       text: 'View full evidence',
       'data-secondary-action': 'evidence',
       'data-suggestion-id': toCleanString(suggestion?.id)
@@ -2570,7 +2336,7 @@ function renderSuggestionCard({
     const editBoxId = createDomId('community-annotation-edit');
     const editBtn = el('button', {
       type: 'button',
-      className: 'btn',
+      className: buttonClassName('quiet'),
       text: 'Edit',
       'aria-expanded': 'false',
       'aria-controls': editBoxId
@@ -2629,8 +2395,8 @@ function renderSuggestionCard({
     };
 
     const editActions = el('div', { className: 'community-annotation-suggestion-actions' });
-    const saveBtn = el('button', { type: 'button', className: 'btn', text: 'Save' });
-    const cancelBtn = el('button', { type: 'button', className: 'btn', text: 'Cancel' });
+    const saveBtn = el('button', { type: 'button', className: buttonClassName('quiet-primary'), text: 'Save' });
+    const cancelBtn = el('button', { type: 'button', className: buttonClassName('quiet'), text: 'Cancel' });
     ownModalFocusKey(saveBtn, `${suggestionFocusPrefix}:edit-save`, {
       restoreKey: editFocusKey
     });
@@ -2701,7 +2467,7 @@ function renderSuggestionCard({
         }
         save();
       } catch (err) {
-        getNotificationCenter().error(describeErrorMessage(err), { category: 'annotation' });
+        getNotificationCenter().error(failureSentence(err), { ...failureDetails(err), category: 'annotation' });
       }
     });
 
@@ -2745,7 +2511,7 @@ function renderSuggestionCard({
 
     actions.appendChild(editBtn);
 
-    const delBtn = el('button', { type: 'button', className: 'btn', text: 'Delete' });
+    const delBtn = el('button', { type: 'button', className: buttonClassName('quiet'), text: 'Delete' });
     ownModalFocusKey(delBtn, `${suggestionFocusPrefix}:delete`);
     delBtn.addEventListener('click', () => {
       showOwnedConfirmDialog(lifecycle, {
@@ -2784,7 +2550,7 @@ function renderSuggestionCard({
       const mergeBoxId = createDomId('community-annotation-merge-form');
       const mergeBtn = el('button', {
         type: 'button',
-        className: 'btn community-annotation-merge-button',
+        className: buttonClassName('quiet', 'community-annotation-merge-button'),
         text: 'Merge…',
         'aria-expanded': 'false',
         'aria-controls': mergeBoxId
@@ -2840,12 +2606,12 @@ function renderSuggestionCard({
       });
       const confirmMergeBtn = el('button', {
         type: 'button',
-        className: 'btn',
+        className: buttonClassName('quiet-primary'),
         text: 'Merge suggestion'
       });
       const cancelMergeBtn = el('button', {
         type: 'button',
-        className: 'btn',
+        className: buttonClassName('quiet'),
         text: 'Cancel'
       });
       ownModalFocusKey(
@@ -2914,7 +2680,7 @@ function renderSuggestionCard({
                 { category: 'annotation', duration: 2400 }
               );
             } catch (error) {
-              getNotificationCenter().error(describeErrorMessage(error), {
+              getNotificationCenter().error(failureSentence(error), { ...failureDetails(error),
                 category: 'annotation'
               });
             }
@@ -2946,7 +2712,7 @@ function renderSuggestionCard({
     }));
     const mergedBtn = el('button', {
       type: 'button',
-      className: 'community-annotation-merged-comment-btn',
+      className: buttonClassName('quiet'),
       text: `View merged (${mergedFrom.length})`,
       title: 'View original votes and comments for merged suggestions',
       'data-secondary-action': 'merged',
@@ -2991,7 +2757,7 @@ function renderSuggestionCard({
     );
     const charCounter = el('div', {
       className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
-      text: `${formatCountOf(input.value.length, 'character')}`
+      text: charCountText(input.value.length)
     });
     const resizeInput = () => {
       const cs = getComputedStyle(input);
@@ -3000,7 +2766,7 @@ function renderSuggestionCard({
       autoSizeTextarea(input, { minHeightPx: minHeight, maxHeightPx: maxHeight });
     };
     input.addEventListener('input', () => {
-      charCounter.textContent = `${formatCountOf(input.value.length, 'character')}`;
+      charCounter.textContent = charCountText(input.value.length);
       resizeInput();
     });
     input.addEventListener('keydown', (e) => {
@@ -3012,7 +2778,7 @@ function renderSuggestionCard({
       const id = session.addComment?.(fieldKey, catIdx, suggestion.id, text);
       if (id) {
         input.value = '';
-        charCounter.textContent = formatCountOf(0, 'character');
+        charCounter.textContent = charCountText(0);
         resizeInput();
         getNotificationCenter().success('Comment added', { category: 'annotation', duration: 1200 });
       } else {
@@ -3069,8 +2835,8 @@ function renderSuggestionCard({
       let currentText = toCleanString(c?.text || '');
       let isEditing = false;
 
-      const editBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Edit' });
-      const deleteBtn = el('button', { type: 'button', className: 'community-annotation-comment-action-btn', text: 'Delete' });
+      const editBtn = el('button', { type: 'button', className: buttonClassName('quiet'), text: 'Edit' });
+      const deleteBtn = el('button', { type: 'button', className: buttonClassName('quiet'), text: 'Delete' });
       const editFocusKey = previewEditKey(c);
       ownModalFocusKey(editBtn, editFocusKey);
       ownModalFocusKey(
@@ -3100,8 +2866,7 @@ function renderSuggestionCard({
           'aria-label': 'Edit comment',
           placeholder: 'Edit comment…',
           rows: '1',
-          'data-esc-cancel': 'true',
-          title: 'Enter to save • Esc to cancel'
+            title: 'Enter to save • Esc to cancel'
         });
         ownModalFocusKey(input, `${commentPreviewFocusPrefix}:edit-input`, {
           restoreKey: editFocusKey
@@ -3109,7 +2874,7 @@ function renderSuggestionCard({
         input.value = text;
         const counter = el('div', {
           className: 'community-annotation-char-counter community-annotation-char-counter--overlay',
-          text: `${formatCountOf(input.value.length, 'character')}`
+          text: charCountText(input.value.length)
         });
 
         const resize = () => {
@@ -3139,7 +2904,7 @@ function renderSuggestionCard({
         };
 
         input.addEventListener('input', () => {
-          counter.textContent = `${formatCountOf(input.value.length, 'character')}`;
+          counter.textContent = charCountText(input.value.length);
           inlineEdits.set(editFocusKey, 'text', input.value);
           resize();
         });
@@ -3228,7 +2993,7 @@ function renderSuggestionCard({
     if (sorted.length > 5) {
       const viewAllBtn = el('button', {
         type: 'button',
-        className: 'community-annotation-merged-comment-btn',
+        className: buttonClassName('quiet', 'community-annotation-view-all'),
         text: `View all ${formatCountOf(sorted.length, 'comment')}`,
         'aria-label':
           `View all ${formatCountOf(sorted.length, 'comment')} for ` +
@@ -3322,7 +3087,7 @@ function renderSuggestionCard({
             if (!ok) throw new Error('Failed to merge suggestions');
             getNotificationCenter().success('Merged suggestions (local moderation)', { category: 'annotation', duration: 2400 });
           } catch (error) {
-            getNotificationCenter().error(describeErrorMessage(error), {
+            getNotificationCenter().error(failureSentence(error), { ...failureDetails(error),
               category: 'annotation'
             });
           }
@@ -3398,13 +3163,8 @@ function buildVotingDetail({
         : `Pending (${formatCountOf(consensus.voters, 'voter')})`;
   panel.appendChild(consensusLine);
 
-  const suggestions = session
-    .getSuggestions(fieldKey, catIdx)
-    .slice()
-    .sort(
-      (a, b) =>
-        ((b.upvotes?.length || 0) - (b.downvotes?.length || 0)) - ((a.upvotes?.length || 0) - (a.downvotes?.length || 0))
-    );
+  // Ranked as the consensus ranks them (the session's order): the leader first.
+  const suggestions = session.getSuggestions(fieldKey, catIdx);
   const suggestionPageSize = 25;
   const suggestionPageCount = Math.max(
     1,
@@ -3750,8 +3510,8 @@ function buildVotingDetail({
         return;
       }
       getNotificationCenter().error(
-        `${failureLabel}: ${describeErrorMessage(error)}`,
-        { category: 'annotation' }
+        `${failureLabel}: ${sayFailure(error)}`,
+        { category: 'annotation', ...failureDetails(error) }
       );
     } finally {
       stopRelay();
@@ -3811,7 +3571,7 @@ function buildVotingDetail({
     try {
       markers = parseMarkerGenesInput(markerGenesInput.value);
     } catch (error) {
-      getNotificationCenter().error(describeErrorMessage(error), {
+      getNotificationCenter().error(failureSentence(error), { ...failureDetails(error),
         category: 'annotation'
       });
       return;
@@ -3878,7 +3638,7 @@ function buildVotingDetail({
         evidenceInput.value = '';
         capStatus.textContent = '';
       } catch (err) {
-        getNotificationCenter().error(describeErrorMessage(err), { category: 'annotation' });
+        getNotificationCenter().error(failureSentence(err), { ...failureDetails(err), category: 'annotation' });
       }
     });
   }
@@ -3946,7 +3706,6 @@ export function openCommunityAnnotationVotingModal({
       content.appendChild(status);
 
       let cleaned = false;
-      let observer = null;
       let unsubscribeChanged = null;
       let unsubscribeContextChanged = null;
       let renderVersion = 0;
@@ -3966,17 +3725,10 @@ export function openCommunityAnnotationVotingModal({
           ['active voting detail', retireActiveDetail],
           ['field-load and DOM event lifecycle', contextLease.retire],
           ['session change subscription', unsubscribeChanged],
-          ['session context subscription', unsubscribeContextChanged],
-          [
-            'modal observer',
-            observer === null
-              ? null
-              : () => observer.disconnect()
-          ]
+          ['session context subscription', unsubscribeContextChanged]
         ]);
         unsubscribeChanged = null;
         unsubscribeContextChanged = null;
-        observer = null;
         retireActiveDetail = null;
       };
       retireModalLifecycle = cleanupModalLifecycle;
@@ -4103,7 +3855,7 @@ export function openCommunityAnnotationVotingModal({
           ) {
             return;
           }
-          replaceContentWithStatus(describeErrorMessage(err));
+          replaceContentWithStatus(failureSentence(err));
           return;
         }
 
@@ -4214,10 +3966,11 @@ export function openCommunityAnnotationVotingModal({
           ) {
             return;
           }
-          const message = describeErrorMessage(error);
+          const message = failureSentence(error);
           replaceContentWithStatus(message);
           getNotificationCenter().error(message, {
-            category: 'annotation'
+            category: 'annotation',
+            ...failureDetails(error),
           });
         });
       };
@@ -4240,16 +3993,9 @@ export function openCommunityAnnotationVotingModal({
         );
       }
 
+      // The lifecycle ends with the dialog: every close runs the shell's
+      // onClose (above) before the dialog leaves the page.
       requestFocusedRender();
-
-      // The content leaves the document only with its overlay, a child of
-      // <body>, so watching <body>'s own children is enough.
-      observer = new MutationObserver(() => {
-        if (!document.body.contains(content)) {
-          cleanupModalLifecycle();
-        }
-      });
-      observer.observe(document.body, { childList: true });
 
       if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
         throw new TypeError('Community voting requires window.addEventListener()');

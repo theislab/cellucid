@@ -17,6 +17,7 @@
 
 import { createButton } from '../ui/components/controls.js';
 import { formatDuration, formatCount } from '../../utils/format-units.js';
+import { debounce } from '../../utils/debounce.js';
 
 /** A running job is shown once it has run this long. */
 const SHOW_RUNNING_AFTER_MS = 250;
@@ -38,7 +39,7 @@ function describeJobState(job) {
       const done = job.itemsTotal > 0 && job.itemsDone > 0
         ? ` ${formatCount(job.itemsDone)} of ${formatCount(job.itemsTotal)}${job.itemsUnit ? ` ${job.itemsUnit}` : ''} were done.`
         : '';
-      return { title: `${job.title} cancelled`, detail: `Cancelled after ${after}.${done} Nothing was kept.`, tone: 'muted', action: 'run-again' };
+      return { title: `${job.title} canceled`, detail: `Canceled after ${after}.${done} Nothing was kept.`, tone: 'muted', action: 'run-again' };
     }
     case 'failed':
       return { title: `${job.title} failed`, detail: job.message, tone: 'danger', action: 'run-again' };
@@ -76,7 +77,8 @@ export function createJobStatusView({ onRunAgain, showAfterMs = SHOW_RUNNING_AFT
 
   let job = null;
   let unsubscribe = null;
-  let showTimer = null;
+  // A running job is shown once it ran `showAfterMs` (a quick one never flashes).
+  const showWhenLong = debounce(() => render(), showAfterMs);
   let action = null;
   const button = createButton({
     label: 'Cancel',
@@ -86,11 +88,13 @@ export function createJobStatusView({ onRunAgain, showAfterMs = SHOW_RUNNING_AFT
       else if (action === 'run-again') onRunAgain();
     },
   });
+  // Cancel turns into Run again: a double click is one press (`ui/core/press-guard.js`).
+  button.dataset.singlePress = '';
   root.append(title, plan, detail, progress, button);
 
   function render() {
     const described = job === null ? null : describeJobState(job);
-    if (described === null || (job.state === 'running' && showTimer !== null)) {
+    if (described === null || (job.state === 'running' && showWhenLong.pending)) {
       root.hidden = true;
       return;
     }
@@ -122,25 +126,18 @@ export function createJobStatusView({ onRunAgain, showAfterMs = SHOW_RUNNING_AFT
     show(nextJob) {
       unsubscribe?.();
       unsubscribe = null;
-      clearTimeout(showTimer);
-      showTimer = null;
+      showWhenLong.cancel();
       job = nextJob;
       if (job !== null) {
         unsubscribe = job.subscribe(render);
-        if (job.state === 'running') {
-          showTimer = setTimeout(() => {
-            showTimer = null;
-            render();
-          }, showAfterMs);
-        }
+        if (job.state === 'running') showWhenLong();
       }
       render();
     },
     destroy() {
       unsubscribe?.();
       unsubscribe = null;
-      clearTimeout(showTimer);
-      showTimer = null;
+      showWhenLong.cancel();
       job = null;
       root.remove();
     },

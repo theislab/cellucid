@@ -19,7 +19,9 @@
  *   picked one's. One that is gone, or changed since (its size or
  *   modification time, a folder's any file's), is not reopened under that
  *   dataset's name: the failure says to choose it again with Open…, and the
- *   handle is forgotten (`readKeptLocalFile`).
+ *   handle is forgotten (`readKeptLocalFile`); one the browser cannot read
+ *   now (leave withdrawn, in use, a cloud folder's file not downloaded) is
+ *   said so and kept for the next try.
  * - **Listed**: by My datasets, as the datasets they open
  *   (`my-datasets.js`, which forgets a dataset's handle with it); the Stored
  *   dialog counts them in My datasets' row and forgets them with the list
@@ -39,6 +41,10 @@ import { readFolderHandle } from '../../data/local-folder.js';
 import { indexedDbKeyValueStore } from '../../utils/indexed-db-store.js';
 import { whileWaitingOnPerson } from '../../utils/person-wait.js';
 import { isCancellation } from '../../utils/abort.js';
+import { webStorage } from '../../utils/web-storage.js';
+import { sha256Hex } from '../../utils/sha256.js';
+import { lowerFirst } from '../../utils/text-case.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
 const DB_NAME = 'cellucid-local-files';
 const STORE_NAME = 'handles';
@@ -75,7 +81,7 @@ function defaultStore() {
 }
 
 /** Whoever lists the handles hears when one is kept or forgotten (`onLocalFilesChange`). */
-const listeners = new Set();
+const listeners = createListenerSet('the files of this computer kept');
 
 /**
  * Hear when a handle is kept or forgotten in this page (My datasets, the
@@ -85,18 +91,11 @@ const listeners = new Set();
  * @returns {() => void}
  */
 export function onLocalFilesChange(listener) {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
+  return listeners.add(listener);
 }
 
 function announce() {
-  for (const listener of listeners) {
-    try {
-      listener();
-    } catch {
-      // A listener's failure is its own.
-    }
-  }
+  listeners.notify();
 }
 
 function pathOf(file) {
@@ -120,8 +119,7 @@ export async function heldBy(kind, files) {
   if (kind === 'file') return { size: list[0].size, lastModified: list[0].lastModified };
   // A path never holds U+0000, so each line reads back one way.
   const lines = list.map(file => `${pathOf(file)}\u0000${file.size}\u0000${file.lastModified}`).sort();
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(lines.join('\n'))));
-  return { files: lines.length, digest: Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('') };
+  return { files: lines.length, digest: await sha256Hex(new TextEncoder().encode(lines.join('\n'))) };
 }
 
 function sameHeld(a, b) {
@@ -203,6 +201,19 @@ export async function readPermissionOf(record) {
   }
 }
 
+/**
+ * Why reading a kept handle failed, by the File System Access error: gone
+ * (`NotFoundError`; `TypeMismatchError`, a file where a folder was or the
+ * reverse), refused (`NotAllowedError`, `SecurityError`: leave withdrawn),
+ * else unreadable for now (`NotReadableError`: in use, not downloaded).
+ */
+function reopenFailureOf(cause) {
+  const name = cause?.name;
+  if (name === 'NotFoundError' || name === 'TypeMismatchError') return 'gone';
+  if (name === 'NotAllowedError' || name === 'SecurityError') return 'refused';
+  return 'unreadable';
+}
+
 /** The failure of a reopen, saying why and what to do: choose it again. */
 function reopenFailure(reason, record, cause = null) {
   const choose = `Choose it with Open… › ${record.kind === 'folder' ? 'Folder…' : 'File…'}`;
@@ -210,6 +221,9 @@ function reopenFailure(reason, record, cause = null) {
     refused: [`Reading "${record.name}" was not allowed. ${choose} to open it.`, DataSourceErrorCode.PERMISSION_DENIED],
     gone: [`"${record.name}" is no longer where it was opened from (moved, renamed or deleted). ${choose} where it is now.`, DataSourceErrorCode.FILE_NOT_FOUND],
     changed: [`"${record.name}" changed since it was opened here. ${choose} to open it as it is now.`, DataSourceErrorCode.VALIDATION_ERROR],
+    unreadable: [`"${record.name}" could not be read just now: it may be in use by another program, or not on this computer ` +
+      `yet (a file in a cloud folder before it downloads). Try again in a moment, or ${lowerFirst(choose)} to open it.`,
+    DataSourceErrorCode.PERMISSION_DENIED],
   }[reason];
   const error = explainedFailure(said[0], said[1], 'local-user', { reopen: reason });
   if (cause !== null) error.cause = cause;
@@ -246,8 +260,12 @@ export async function readKeptLocalFile(datasetId, record, { signal = null, stor
       : await readFolderHandle(record.handle, { signal });
   } catch (cause) {
     if (signal?.aborted || isCancellation(cause)) throw cause;
-    await forgetLocalFiles([datasetId], store);
-    throw reopenFailure('gone', record, cause);
+    // Only a file or folder no longer there is forgotten; leave withdrawn,
+    // or one that cannot be read now (in use, a cloud folder's file not
+    // downloaded), keeps its handle for the next try.
+    const reason = reopenFailureOf(cause);
+    if (reason === 'gone') await forgetLocalFiles([datasetId], store);
+    throw reopenFailure(reason, record, cause);
   }
   if (!sameHeld(await heldBy(record.kind, files), record.held)) {
     await forgetLocalFiles([datasetId], store);
@@ -308,11 +326,7 @@ export async function forgetLocalFiles(keys, store = defaultStore()) {
 }
 
 function tabStorage() {
-  try {
-    return globalThis.sessionStorage ?? null;
-  } catch {
-    return null;
-  }
+  return webStorage('sessionStorage');
 }
 
 /**

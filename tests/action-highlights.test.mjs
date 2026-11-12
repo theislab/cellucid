@@ -1,13 +1,14 @@
 /**
  * The highlight actions (`app/actions/definitions/highlights.js`) on a real
  * DataState opened on a subsample: pages and groups named by their names,
- * cells by original position, a page of the colour a highlight asks for (no
- * page is ever recoloured by a highlight), unique names, and a sentence for
+ * cells by original position, a page of the color a highlight asks for (no
+ * page is ever recolored by a highlight), unique names, and a sentence for
  * every name that does not resolve. Implementations:
  * `app/ui/modules/highlight/highlight-actions.js`.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 
 import { createDataState } from '../assets/js/app/state/core/data-state.js';
 import { createDimensionManager } from '../assets/js/data/dimension-manager.js';
@@ -104,18 +105,18 @@ test('definitions: every highlight action is in the catalogue with a sentence an
   assert.equal(
     highlightActions.find(d => d.type === 'highlight.page.recolor').coalesce({ page: 'P', color: '#000000' }),
     'P',
-    'a colour drag is one step per page'
+    'a color drag is one step per page'
   );
 });
 
-test('pages: made with unique names, shown, renamed, recoloured, deleted; refusals name the pages', async () => {
+test('pages: made with unique names, shown, renamed, recolored, deleted; refusals name the pages', async () => {
   const { state, act } = await scene();
   assert.deepEqual(pages(state), ['Page 1']);
   assert.deepEqual(await act('highlight.page.create', {}), { page: 'Page 2' });
   assert.equal(shown(state), 'Page 2');
   await act('highlight.page.create', { name: 'T cells', color: '#00aa00' });
   assert.deepEqual(state.getHighlightPages().map(p => [p.name, p.color]).at(-1), ['T cells', '#00aa00']);
-  await act('highlight.page.delete', { page: 'Page 2' });
+  await act('highlight.page.delete', { pages: ['Page 2'] });
   // "Page 3" is free again? No: three pages are counted from 3, and "Page 3" is free.
   assert.deepEqual(await act('highlight.page.create', {}), { page: 'Page 3' });
   assert.deepEqual(await act('highlight.page.create', {}), { page: 'Page 4' });
@@ -132,8 +133,14 @@ test('pages: made with unique names, shown, renamed, recoloured, deleted; refusa
   await act('highlight.page.recolor', { page: 'Monocytes', color: '#123456' });
   assert.equal(state.getHighlightPages()[2].color, '#123456');
 
-  for (const name of ['T cells', 'Monocytes', 'Page 4']) await act('highlight.page.delete', { page: name });
-  await assert.rejects(act('highlight.page.delete', { page: 'Page 1' }), /only highlight page and cannot be deleted; clear it instead/);
+  // Several pages in one call (L25-3): every name found first, so an unknown one deletes nothing; all of them are refused.
+  await assert.rejects(act('highlight.page.delete', { pages: ['T cells', 'B cells'] }), /There is no highlight page "B cells"/);
+  assert.deepEqual(pages(state), ['Page 1', 'T cells', 'Monocytes', 'Page 4']);
+  await assert.rejects(act('highlight.page.delete', { pages: ['Page 1', 'T cells', 'Monocytes', 'Page 4'] }),
+    /Deleting all 4 highlight pages would leave none; one page always stays, so leave one out \(and clear it instead\)\./);
+  assert.deepEqual(await act('highlight.page.delete', { pages: ['T cells', 'Monocytes', 'Page 4'] }), { pages: ['T cells', 'Monocytes', 'Page 4'], deleted: 3 });
+  assert.deepEqual(pages(state), ['Page 1']);
+  await assert.rejects(act('highlight.page.delete', { pages: ['Page 1'] }), /only highlight page and cannot be deleted; clear it instead/);
 });
 
 test('cells: original positions in, exactly the open ones highlighted, by identity; the step keeps the original positions', async () => {
@@ -160,52 +167,52 @@ test('cells: original positions in, exactly the open ones highlighted, by identi
   assert.equal(groupsOf(state, 'Page 1').length, 2, 'a refusal changes nothing');
 });
 
-test('a highlight colour picks a page of that colour and never recolours one', async () => {
+test('a highlight color picks a page of that color and never recolors one', async () => {
   const { state, act } = await scene();
   const firstColor = state.getActivePage().color;
   await act('highlight.cells', { cells: [0, 2], color: '#ff0000' });
   assert.deepEqual(state.getHighlightPages().map(p => [p.name, p.color]), [['Page 1', firstColor], ['Page 2', '#ff0000']]);
   assert.equal(shown(state), 'Page 2');
   await act('highlight.page.switch', { page: 'Page 1' });
-  // The same colour again: the page that has it, shown.
+  // The same color again: the page that has it, shown.
   await act('highlight.cells', { cells: [4], color: '#FF0000' });
   assert.equal(shown(state), 'Page 2');
   assert.equal(groupsOf(state, 'Page 2').length, 2);
-  // A named page: made with the colour, or refused when it has another.
+  // A named page: made with the color, or refused when it has another.
   await act('highlight.cells', { cells: [6], page: 'Notebook', color: '#0000ff' });
   assert.deepEqual(state.getHighlightPages().at(-1), { ...state.getHighlightPages().at(-1), name: 'Notebook', color: '#0000ff' });
   await assert.rejects(
     act('highlight.cells', { cells: [8], page: 'Notebook', color: '#00ff00' }),
-    /Highlight page "Notebook" is #0000ff, not #00ff00; name another page, or leave the colour out/
+    /Highlight page "Notebook" is #0000ff, not #00ff00; name another page, or leave the color out/
   );
   assert.deepEqual(state.getHighlightPages().map(p => p.color), [firstColor, '#ff0000', '#0000ff']);
 });
 
 test('category and range: cells of the selected view, named by field and label', async () => {
   const { state, act } = await scene();
-  const outcome = await act('highlight.category', { field: { source: 'obs', key: 'cluster' }, category: 'b' });
-  assert.deepEqual(outcome, { page: 'Page 1', group: 'cluster: b', cells: 5 });
+  const outcome = await act('highlight.category', { field: { source: 'obs', key: 'cluster' }, categories: ['b'] });
+  assert.deepEqual(outcome, { page: 'Page 1', groups: ['cluster: b'], categories: ['b'], cells: 5, updated: 0 });
   const [category] = groupsOf(state, 'Page 1');
   assert.deepEqual([...category.cellIndices], [1, 5, 9, 13, 17]);
   assert.equal(
-    await act('highlight.category', { field: { source: 'obs', key: 'cluster' }, category: 'b' }),
+    await act('highlight.category', { field: { source: 'obs', key: 'cluster' }, categories: ['b'] }),
     null,
     'asked again with the same cells shown, nothing changes'
   );
   await assert.rejects(
-    act('highlight.category', { field: { source: 'obs', key: 'cluster' }, category: 'z' }),
+    act('highlight.category', { field: { source: 'obs', key: 'cluster' }, categories: ['z'] }),
     /There is no category "z" in "cluster"; the categories are "a", "b", "c" and "d"\.$/
   );
   await assert.rejects(
-    act('highlight.category', { field: { source: 'obs', key: 'leiden' }, category: 'b' }),
+    act('highlight.category', { field: { source: 'obs', key: 'leiden' }, categories: ['b'] }),
     /There is no field "leiden"; the fields are "cluster" and "score"\./
   );
   await assert.rejects(
-    act('highlight.category', { field: { source: 'obs', key: 'score' }, category: 'b' }),
+    act('highlight.category', { field: { source: 'obs', key: 'score' }, categories: ['b'] }),
     /score is not categorical; highlight a range of its values instead/
   );
   await assert.rejects(
-    act('highlight.category', { field: { source: 'var', key: 'GENE1' }, category: 'b' }),
+    act('highlight.category', { field: { source: 'var', key: 'GENE1' }, categories: ['b'] }),
     /A gene has no categories/
   );
 
@@ -220,9 +227,68 @@ test('category and range: cells of the selected view, named by field and label',
   await assert.rejects(act('highlight.range', { field: { source: 'var', key: 'NOPE' }, min: 0, max: 1 }), /"NOPE" is not a gene in this dataset\. genes\.search finds a gene by part of its name\./);
 });
 
+test('several categories in one call: a group each, one outcome, all or none (F107)', async () => {
+  const { state, act, dispatched } = await scene();
+  const field = { source: 'obs', key: 'cluster' };
+  const outcome = await act('highlight.category', { field, categories: ['a', 'c', 'd'], page: 'Donors' });
+  assert.deepEqual(outcome, {
+    page: 'Donors', groups: ['cluster: a', 'cluster: c', 'cluster: d'], categories: ['a', 'c', 'd'], cells: 15, updated: 0,
+  });
+  assert.equal(dispatched.filter(entry => entry.type === 'highlight.category').length, 1, 'one action, so one step');
+  assert.deepEqual(groupsOf(state, 'Donors').map(group => [group.label, group.cellCount]), [['cluster: a', 5], ['cluster: c', 5], ['cluster: d', 5]]);
+  const definition = highlightActions.find(d => d.type === 'highlight.category');
+  assert.equal(
+    definition.describe({ field, categories: ['a', 'c', 'd'], page: 'Donors' }, outcome),
+    'Highlighted "a", "c" and "d" of cluster (15 cells) on page "Donors"'
+  );
+  assert.equal(
+    definition.describe({ field, categories: ['a', 'b', 'c', 'd'] }, { categories: ['a', 'b', 'c', 'd'], cells: 20, updated: 0 }),
+    'Highlighted 4 categories of cluster (20 cells)'
+  );
+  assert.equal(definition.code({ field, categories: ['a', 'c'], page: 'Donors' }), 'highlight_category("cluster", ["a", "c"], page="Donors")');
+
+  // Asked again with one more: only the new one changes (the others hold the same cells).
+  state.categoryTransparency[2] = 0;
+  const again = await act('highlight.category', { field, categories: ['a', 'b', 'c', 'd'], page: 'Donors' });
+  assert.deepEqual(again, { page: 'Donors', groups: ['cluster: b', 'cluster: c'], categories: ['b', 'c'], cells: 9, updated: 1 }, 'b added, c brought up to date (cell 2 hidden), a and d as they were');
+  assert.equal(
+    definition.describe({ field, categories: ['a', 'b', 'c', 'd'], page: 'Donors' }, again),
+    'Highlighted "b" and "c" of cluster (9 cells) on page "Donors", 1 of them brought up to date'
+  );
+  assert.equal(groupsOf(state, 'Donors').length, 4);
+  assert.equal(await act('highlight.category', { field, categories: ['d', 'a'], page: 'Donors' }), null, 'nothing new, no step');
+
+  // One category not visible, or not there: refused before anything changes.
+  for (let i = 3; i < N; i += 4) state.categoryTransparency[i] = 0;
+  await assert.rejects(
+    act('highlight.category', { field, categories: ['a', 'd'], page: 'Fresh' }),
+    /No cell of "cluster: d" is visible in the selected view; show the category first, or leave it out\./
+  );
+  await assert.rejects(act('highlight.category', { field, categories: ['a', 'z'], page: 'Fresh' }), /There is no category "z" in "cluster"/);
+  assert.deepEqual(pages(state), ['Page 1', 'Donors'], 'no page made, no group added');
+  await assert.rejects(act('highlight.category', { field, categories: [] }), /needs at least 1 item/);
+  await assert.rejects(act('highlight.category', { field, categories: ['a', 'a'] }), /categories must not repeat an item/);
+});
+
+test('a category is named by its label as the legend shows it: a boolean or numeric value as its text (L14-6)', async () => {
+  const { upgradeParams } = await import('../assets/js/app/actions/catalog.js');
+  const definition = getActionCatalog().get('highlight.category');
+  // A version 1 step of the legend's button held the raw value; version 2 holds its label.
+  assert.deepEqual(upgradeParams(definition, 1, { field: { source: 'obs', key: 'is_doublet' }, category: true, page: 'P' }),
+    { field: { source: 'obs', key: 'is_doublet' }, page: 'P', categories: ['true'] });
+  assert.deepEqual(upgradeParams(definition, 1, { field: { source: 'obs', key: 'leiden' }, category: 3 }),
+    { field: { source: 'obs', key: 'leiden' }, categories: ['3'] });
+  // A raw number or boolean is refused by the schema, in words an agent can act on.
+  const { actions } = await scene();
+  await assert.rejects(actions.dispatch('highlight.category', { field: { source: 'obs', key: 'cluster' }, categories: [true] }), /categories\[0\] must be string, not true/);
+  // The legend's button names the category by its shown label, as every other legend action does.
+  const legend = readFileSync(new URL('../assets/js/app/ui/modules/legend/categorical-legend.js', import.meta.url), 'utf8');
+  assert.match(legend, /'highlight\.category', \{[\s\S]{0,200}categories: \[formatCategoryLabel\(currentField\.categories\[catIdx\]\)\]/);
+});
+
 test('asked again (Run again of a stale step): a category or range group takes the cells the view shows now, in its place', async () => {
   const { state, act } = await scene();
-  await act('highlight.category', { field: { source: 'obs', key: 'cluster' }, category: 'b' });
+  await act('highlight.category', { field: { source: 'obs', key: 'cluster' }, categories: ['b'] });
   await act('highlight.range', { field: { source: 'obs', key: 'score' }, min: 2, max: 4 });
   const [category, range] = groupsOf(state, 'Page 1');
   // The selected view hides cells 5 and 6 (a filter, as the view shows them).
@@ -230,8 +296,8 @@ test('asked again (Run again of a stale step): a category or range group takes t
   state.categoryTransparency[6] = 0;
 
   assert.deepEqual(
-    await act('highlight.category', { field: { source: 'obs', key: 'cluster' }, category: 'b' }),
-    { page: 'Page 1', group: 'cluster: b', cells: 4, updated: true }
+    await act('highlight.category', { field: { source: 'obs', key: 'cluster' }, categories: ['b'] }),
+    { page: 'Page 1', groups: ['cluster: b'], categories: ['b'], cells: 4, updated: 1 }
   );
   assert.deepEqual(
     await act('highlight.range', { field: { source: 'obs', key: 'score' }, min: 2, max: 4 }),
@@ -244,15 +310,15 @@ test('asked again (Run again of a stale step): a category or range group takes t
   assert.deepEqual([...nextRange.cellIndices], [4, 7, 8]);
   assert.deepEqual([...category.cellIndices], [1, 5, 9, 13, 17], 'a value captured before keeps its cells');
   assert.equal(
-    highlightActions.find(d => d.type === 'highlight.category').describe({ field: { source: 'obs', key: 'cluster' }, category: 'b' }, { cells: 4, updated: true }),
+    highlightActions.find(d => d.type === 'highlight.category').describe({ field: { source: 'obs', key: 'cluster' }, categories: ['b'] }, { categories: ['b'], cells: 4, updated: 1 }),
     'Updated the cells of "b" of cluster (4 cells)'
   );
 
   // No cell of the group visible now: refused, the group keeps its cells.
   for (const i of [1, 9, 13, 17]) state.categoryTransparency[i] = 0;
   await assert.rejects(
-    act('highlight.category', { field: { source: 'obs', key: 'cluster' }, category: 'b' }),
-    /No cell of "cluster: b" is visible in the selected view; "cluster: b" on page "Page 1" keeps its 4 cells\./
+    act('highlight.category', { field: { source: 'obs', key: 'cluster' }, categories: ['b'] }),
+    /No cell of "cluster: b" is visible in the selected view; "cluster: b" on page "Page 1" keeps its 4 cells; show the category first, or leave it out\./
   );
   assert.deepEqual([...groupsOf(state, 'Page 1')[0].cellIndices], [1, 9, 13, 17]);
 });
@@ -309,7 +375,7 @@ test('every refusal is an ActionRefused sentence, never a TypeError from inside'
     ['highlight.page.switch', { page: 'X' }],
     ['highlight.page.rename', { page: 'X', name: 'Y' }],
     ['highlight.page.recolor', { page: 'X', color: '#000000' }],
-    ['highlight.page.delete', { page: 'X' }],
+    ['highlight.page.delete', { pages: ['X'] }],
     ['highlight.page.clear', { page: 'X' }],
     ['highlight.group.toggle', { group: 'X', enabled: true }],
     ['highlight.group.remove', { group: 'X' }],

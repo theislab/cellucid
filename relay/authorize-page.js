@@ -2,7 +2,9 @@
  * The page a person sees when Claude or ChatGPT asks to connect: who asks,
  * the connect code, "Open Cellucid to approve" (a link to the Cellucid page
  * with `#cellucid_connect=<code>`), and a live wait that sends the browser on
- * as soon as the person allowed or denied in Cellucid. Its script and style
+ * as soon as the person allowed or denied in Cellucid. The response sets the
+ * browser's approver cookie (`approval.js` `APPROVER_COOKIE`, in `oauth.js`):
+ * only a Cellucid page of this browser can claim the code. Its script and style
  * are served by the relay itself (`script-src 'self'`), and it can be framed
  * by nobody.
  */
@@ -63,20 +65,28 @@ ${body}
  * @param {{code: string, display: string, request: string, appOrigin: string, client: object, expiresInMinutes: number}} page
  */
 export function approvalPage({ code, display, request, appOrigin, client, expiresInMinutes }) {
-  const who = client.host === null ? escapeHtml(client.agent) : `${escapeHtml(client.agent)} <span class="host">(${escapeHtml(client.host)})</span>`;
+  // Claude and ChatGPT with the host that vouches for them; any other app by its host (or as an
+  // app on this computer), with the name it gives itself only in quotes, as what it calls itself.
+  const selfNamed = client.name !== null && client.name !== client.agent
+    ? `, which calls itself <q>${escapeHtml(client.name)}</q>,` : '';
+  const who = client.known
+    ? `${escapeHtml(client.agent)} <span class="host">(${escapeHtml(client.host)})</span>`
+    : `${escapeHtml(client.agent)}${selfNamed}`;
   const local = client.loopback
     ? `<p class="note">The app asking runs on this computer: the answer goes to <strong>${escapeHtml(client.redirectHost)}</strong>.</p>`
     : `<p class="note">The answer goes to <strong>${escapeHtml(client.redirectHost)}</strong>.</p>`;
   const unknown = client.known ? '' : '<p class="warn">Approve only if you started connecting Cellucid from this app yourself, just now.</p>';
+  // An app on this computer that no host vouches for is named as such, mid-sentence in lower case.
+  const named = !client.known && client.host === null ? `${client.agent.charAt(0).toLowerCase()}${client.agent.slice(1)}` : client.agent;
   const link = `${appOrigin}/#cellucid_connect=${encodeURIComponent(display)}`;
   return pageResponse(shell('Connect to Cellucid', `<main data-code="${escapeHtml(code)}" data-request="${escapeHtml(request)}">
-<h1>Connect ${escapeHtml(client.agent)} to Cellucid</h1>
+<h1>Connect ${escapeHtml(named)} to Cellucid</h1>
 <p>${who} asks to work in the Cellucid tab you approve it from: read the open dataset and act in it. Every step it takes is kept in that tab's history and can be undone there.</p>
 ${local}
 ${unknown}
 <p class="code" aria-label="Connect code">${escapeHtml(display)}</p>
 <p><a class="primary" href="${escapeHtml(link)}" target="_blank" rel="noopener">Open Cellucid to approve</a></p>
-<p class="small">On another device, open Cellucid there, choose Connect, and type the code.</p>
+<p class="small">Approve in this browser: the link opens Cellucid here, or type the code under Connect in a Cellucid tab of this browser. Another browser or device cannot take it.</p>
 <p id="status" role="status" aria-live="polite">Waiting for your answer in Cellucid…</p>
 <p><button id="cancel" type="button">Cancel</button></p>
 <p class="small">The code expires in ${escapeHtml(expiresInMinutes)} minutes.</p>
@@ -84,12 +94,23 @@ ${unknown}
 <script src="/oauth/assets/authorize.js" defer></script>`), 200);
 }
 
-/** A page that says why the request cannot go on (nothing is sent back to the app). */
-export function failurePage(message, status) {
+/**
+ * A page that says why the request cannot go on. With `answer` (the error
+ * redirect to an app the relay cannot vouch for, and that app's host) the
+ * person may take the error back to the app by a link; nothing is sent
+ * there by itself.
+ * @param {string} message
+ * @param {number} status
+ * @param {{href: string, host: string}|null} [answer]
+ */
+export function failurePage(message, status, answer = null) {
+  const next = answer === null
+    ? '<p class="small">Close this window and try connecting again from the app that asked.</p>'
+    : `<p><a href="${escapeHtml(answer.href)}" rel="noreferrer">Return to ${escapeHtml(answer.host)}</a></p>`;
   return pageResponse(shell('Cellucid cannot connect', `<main>
 <h1>Cellucid cannot connect</h1>
 <p>${escapeHtml(message)}</p>
-<p class="small">Close this window and try connecting again from the app that asked.</p>
+${next}
 </main>`), status);
 }
 

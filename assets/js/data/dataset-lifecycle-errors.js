@@ -11,15 +11,15 @@ import { isCancellation } from '../utils/abort.js';
 /**
  * Combine an operation's failure with a failure in its cleanup or reporting.
  *
- * A cancelled operation (a newer selection superseded it) is returned
- * unchanged: its caller discards the result by recognising the cancellation,
- * which an aggregate would hide, turning a cancelled open into a reported
+ * A canceled operation (a newer selection superseded it) is returned
+ * unchanged: its caller discards the result by recognizing the cancellation,
+ * which an aggregate would hide, turning a canceled open into a reported
  * failure. The secondary failure is logged instead.
  *
  * @param {Error} primaryFailure
  * @param {unknown} secondaryFailure
  * @param {string} message
- * @returns {Error} The cancelled primary failure, or an AggregateError
+ * @returns {Error} The canceled primary failure, or an AggregateError
  */
 export function combineDatasetLifecycleFailures(
   primaryFailure,

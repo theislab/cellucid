@@ -8,19 +8,35 @@
  * Each name is a folder of a Zarr store, an entry name of a `.zarr.zip`
  * someone may unpack, and a group member of an `.h5ad`: no `/ \ < > : " | ?
  * *` or control character, not `.` or `..` or a Zarr metadata name, no
- * trailing space or dot, no Windows device name, and names side by side in
- * one group differ by more than letter case (and Unicode form: `é` written
- * as one code point or as `e` and an accent are one name to a file system
- * that normalises, and to a ZIP reader that does).
+ * trailing space or dot, no Windows device name, at most 255 bytes in UTF-8
+ * (the longest file name Linux, macOS and Windows all take), and names side
+ * by side in one group differ by more than letter case (and Unicode form:
+ * `é` written as one code point or as `e` and an accent are one name to a
+ * file system that normalizes, and to a ZIP reader that does).
+ *
+ * A writer that copies names it did not choose (a copy of an open dataset,
+ * a store converted from another format, an export) writes each under
+ * `portableElementName` and says which it renamed; names a person or a
+ * program chooses are refused with `requireElementKey`'s sentence instead.
  *
  * @module data/anndata/write/names
  */
+
+import { formatCountOf } from '../../../utils/format-units.js';
 
 /** What cannot appear in a file name on every platform, with the path separators and control characters. */
 const FORBIDDEN = /[/\\<>:"|?*\u0000-\u001f]/;
 /** The names of a Zarr store's metadata documents (cellucid-python's `ZARR_METADATA_NAMES`). */
 export const ZARR_METADATA_NAMES = Object.freeze(['.zarray', '.zattrs', '.zgroup', '.zmetadata', 'zarr.json']);
 const DEVICE_NAMES = new Set(['CON', 'PRN', 'AUX', 'NUL', ...Array.from({ length: 9 }, (_, i) => `COM${i + 1}`), ...Array.from({ length: 9 }, (_, i) => `LPT${i + 1}`)]);
+/**
+ * The longest name, in UTF-8 bytes, that every platform takes as a file
+ * name: Linux file systems count 255 bytes, macOS 255 UTF-8 characters,
+ * Windows 255 UTF-16 units, and a name's UTF-8 bytes are never fewer than
+ * either of those.
+ */
+export const MAX_ELEMENT_NAME_BYTES = 255;
+const encoder = new TextEncoder();
 
 /**
  * `key` as one portable path component, or a `TypeError` saying why not.
@@ -36,8 +52,39 @@ export function requireElementKey(key, what) {
   else if (key === '.' || key === '..' || ZARR_METADATA_NAMES.includes(key)) problem = 'is reserved by the Zarr store layout';
   else if (key.endsWith(' ') || key.endsWith('.')) problem = 'ends with a space or a dot, which Windows removes from file names';
   else if (DEVICE_NAMES.has(key.split('.', 1)[0].toUpperCase())) problem = 'is a reserved device name on Windows';
+  else if (encoder.encode(key).length > MAX_ELEMENT_NAME_BYTES) problem = `is ${formatCountOf(encoder.encode(key).length, 'byte')} long in UTF-8, longer than the ${MAX_ELEMENT_NAME_BYTES} a file name may be`;
   if (problem !== null) throw new TypeError(`${what} '${key}' ${problem}. It becomes a path in the store, so rename it.`);
   return key;
+}
+
+/**
+ * `name` as an element name `requireElementKey` takes, distinct (by
+ * `folderKey`) from every name in `taken`, which it joins: the name itself
+ * when it already is one; otherwise each forbidden character as `_`, a
+ * trailing space or dot as `_`, a reserved name (`.`, `..`, a Zarr metadata
+ * name, a Windows device name) or no name at all after `_`, cut to
+ * `MAX_ELEMENT_NAME_BYTES` at a character boundary, and, when the result is
+ * taken, `_2`, `_3`, … after it. The caller says which names it changed.
+ *
+ * @param {string} name
+ * @param {Set<string>} taken - `folderKey`s of the names already in the group
+ * @returns {string}
+ */
+export function portableElementName(name, taken) {
+  let base = String(name).replace(new RegExp(FORBIDDEN.source, 'g'), '_').replace(/[ .]+$/, ends => '_'.repeat(ends.length));
+  if (base === '' || base === '.' || base === '..' || ZARR_METADATA_NAMES.includes(base) || DEVICE_NAMES.has(base.split('.', 1)[0].toUpperCase())) {
+    base = `_${base}`;
+  }
+  const fitted = (stem, suffix) => {
+    let text = stem;
+    while (encoder.encode(text + suffix).length > MAX_ELEMENT_NAME_BYTES) text = Array.from(text).slice(0, -1).join('');
+    // A cut may leave a trailing space or dot again.
+    return `${text.replace(/[ .]+$/, ends => '_'.repeat(ends.length))}${suffix}`;
+  };
+  let candidate = fitted(base, '');
+  for (let n = 2; taken.has(folderKey(candidate)); n++) candidate = fitted(base, `_${n}`);
+  taken.add(folderKey(candidate));
+  return candidate;
 }
 
 /** The form two names that are one folder share: Unicode composed (NFC), letter case folded. */

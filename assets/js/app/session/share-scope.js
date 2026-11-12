@@ -11,7 +11,9 @@
  * - `trackers` and `branches` (`[{tracker, branches}]`): what of the history
  *   goes. A branch brings the steps it starts from: a branch it forks from
  *   comes along up to its fork step (named in the file, not in `scope`);
- * - `notes` (notes and bookmarks), `chats` (conversations), `journal`
+ * - `notes` (notes and bookmarks), `chats` (conversations; one saved
+ *   during a turn ends where the save took it, said so:
+ *   `agent/chat/conversation.js` `transcriptForSave`), `journal`
  *   (Recently deleted, and with it the trackers that are in it);
  * - `times`: `exact`, `dates` (every time rounded down to its UTC day) or
  *   `none` (every time null; the file's own time is then 1970-01-01);
@@ -25,7 +27,7 @@
  * main and shown branches, notes; no conversation or Recently deleted) and
  * {@link STATE_DEFAULTS} (Current state only leaves out notes,
  * conversations, who acted and times: what remains is the state's own
- * values and the dataset reference); the last two are the catalogue's rule
+ * values and the dataset reference); the last two are the catalog's rule
  * for `history.share` (`shareScopeOf`).
  *
  * @module session/share-scope
@@ -36,11 +38,13 @@ import {
   createTracker, historyModelDocument, squashedLabel,
 } from '../history/model.js';
 import { DOMAIN_IDS } from '../actions/domains.js';
+import { setOwnDataProperty } from '../../utils/exact-record.js';
 import { shareScopeOf } from '../actions/definitions/history.js';
 import { hashValue } from '../history/value-pool.js';
 import { NO_PAGE_CHROME, writeHistoryFile } from './history-file.js';
 import { actionStamps, appStamp } from './app-stamp.js';
 import { leftOutResultOf } from '../analysis/shared/analysis-result-session.js';
+import { transcriptForSave } from '../agent/chat/conversation.js';
 
 /** Save: the whole history as a backup of one's own work. */
 export const SAVE_DEFAULTS = Object.freeze({
@@ -50,7 +54,7 @@ export const SAVE_DEFAULTS = Object.freeze({
 /**
  * Share: the tracker shown with its main and shown branches, and the notes;
  * what `history.share` writes when its parameters are left out
- * (`shareScopeOf`, the catalogue's one rule).
+ * (`shareScopeOf`, the catalog's one rule).
  */
 export const SHARE_DEFAULTS = Object.freeze({ ...shareScopeOf({}), trackers: 'active', branches: 'main-and-shown' });
 
@@ -172,7 +176,8 @@ export function analysisWithoutResults(value) {
   if (Array.isArray(value)) return value.map(analysisWithoutResults);
   const out = {};
   for (const [key, child] of Object.entries(value)) {
-    out[key] = key === 'result' && Object.hasOwn(value, 'settings') ? leftOutResultOf(child) : analysisWithoutResults(child);
+    // Keys can be the data's own (a category named `__proto__` too): own properties, never the prototype.
+    setOwnDataProperty(out, key, key === 'result' && Object.hasOwn(value, 'settings') ? leftOutResultOf(child) : analysisWithoutResults(child));
   }
   return out;
 }
@@ -375,6 +380,8 @@ export async function shareHistory({ snapshot, shown, choice, valueOf, catalog, 
     }
     if (!choice.notes) trackers = trackers.map(withoutNotes);
     if (!choice.chats) trackers = trackers.map(withoutConversations);
+    // A conversation saved during a turn ends where the save took it, said so (not "the page closed").
+    else trackers = trackers.map(tracker => ({ ...tracker, chats: tracker.chats.map(([conversation, transcript]) => [conversation, transcriptForSave(transcript)]) }));
     if (choice.content === 'steps') {
       const strip = step => (step.params === null || !catalog.has(step.type) ? step : { ...step, params: withoutCells(step.params, catalog.get(step.type).params) });
       trackers = trackers.map(tracker => ({

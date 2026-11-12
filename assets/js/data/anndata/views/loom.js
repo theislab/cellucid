@@ -27,14 +27,16 @@
  *
  * Which axis holds the cells is decided by the attribute lengths, never
  * assumed: a file whose column attributes have as many rows as the matrix
- * (loomR's orientation) is read without transposing. A file with no
- * embedding is refused with what to do (`noEmbeddingRefusal`).
+ * (loomR's orientation) is read without transposing. A file without a
+ * two-dimensional `/matrix` breaks the format (`AnnDataFormatError`, said
+ * in the Loom format's terms); one with no embedding is refused with what
+ * to do (`noEmbeddingRefusal`).
  *
  * @module data/anndata/views/loom
  */
 
 import { isArrayNode, isGroup, numericDtype, stringDtype } from '../../../formats/store.js';
-import { attributeValue, elementBytes } from '../elements.js';
+import { AnnDataFormatError, attributeValue, elementBytes } from '../elements.js';
 import { SLAB_BYTES, axisPositionWriter, readConvertedRange, readNumbers } from '../values.js';
 import { LayoutRefusal, noEmbeddingRefusal } from './refusal.js';
 import { isClusteringColumn } from '../transcode/tables.js';
@@ -69,11 +71,17 @@ const STACK_PATTERNS = Object.freeze([
   Object.freeze([/^(.*[A-Za-z])([123])$/, ['1', '2', '3']]),
 ]);
 
-/** Whether a store root is a Loom file. */
+/**
+ * Whether a store root is a Loom file: by the attribute groups only Loom
+ * writes (`col_attrs`, `row_attrs`), on a root declaring no AnnData
+ * encoding. Its matrix is not part of recognizing it: a Loom file without a
+ * readable `/matrix` is a Loom file breaking its format, refused as one
+ * (`loomView`), not read as some other format and refused for that one's
+ * parts.
+ */
 export function isLoomRoot(root) {
   if (!isGroup(root) || attributeValue(root, 'encoding-type') !== undefined) return false;
-  const matrix = root.get('matrix');
-  return isArrayNode(matrix) && matrix.shape.length === 2 && (root.has('col_attrs') || root.has('row_attrs'));
+  return isGroup(root.get('col_attrs')) || isGroup(root.get('row_attrs'));
 }
 
 /** Decode the XML character references loompy 2 writes into ASCII text. */
@@ -371,6 +379,14 @@ function arraysOf(group) {
  */
 export function loomView(root, { name }) {
   const matrix = root.get('matrix');
+  if (!isArrayNode(matrix) || matrix.shape.length !== 2) {
+    throw new AnnDataFormatError(
+      `a Loom file holds its genes × cells matrix at /matrix, a two-dimensional array; this one ${
+        matrix === null || matrix === undefined ? 'has none'
+          : isGroup(matrix) ? 'holds a group there'
+            : `holds a ${matrix.shape.length}-dimensional array there`}`
+    );
+  }
   const colAttrs = arraysOf(root.get('col_attrs'));
   const rowAttrs = arraysOf(root.get('row_attrs'));
   const [first, second] = matrix.shape;

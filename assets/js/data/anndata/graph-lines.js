@@ -1,5 +1,5 @@
 /**
- * A neighbour graph (`obsp`) read line by line: the one way every graph
+ * A neighbor graph (`obsp`) read line by line: the one way every graph
  * reaches its edges (`connectivity-edges.js` `connectivityEdgesFromLines`)
  * and, gathered, the reader's matrix (`AnnDataReader.getConnectivities`).
  *
@@ -38,7 +38,7 @@
 
 import { connectivityEdgeBytes, denseConnectivitySlab } from '../connectivity-edges.js';
 import { allocateTypedArray } from '../sparse-column-index.js';
-import { elementBytes, encodingType } from './elements.js';
+import { AnnDataFormatError, elementBytes, encodingType } from './elements.js';
 import { checkPointers, sparseContract } from './sparse.js';
 import { SLAB_BYTES, asNumbers, axisPositionWriter, readConvertedRange, readIntegers, readNumbers, readRowSlabs, readStored } from './values.js';
 import { CellRows, KeptPositions, gatheredArray, keptEntries, readKeptRowPointers } from './views/cell-subset.js';
@@ -390,9 +390,9 @@ async function openRowLines(group, order, { k, nStored, positionOf, plan, stream
     if (lo === 0 && hi === nStored) checkPointers(pointers, nnz, label);
     else {
       for (let i = 0; i < pointers.length; i++) {
-        if (!(pointers[i] >= (i === 0 ? 0 : pointers[i - 1]))) throw new Error(`${label} indptr must be monotonic`);
+        if (!(pointers[i] >= (i === 0 ? 0 : pointers[i - 1]))) throw new AnnDataFormatError(`${label} indptr must be monotonic`);
       }
-      if (pointers[pointers.length - 1] > nnz) throw new Error(`${group.path}: row pointers reach past its ${nnz} stored values`);
+      if (pointers[pointers.length - 1] > nnz) throw new AnnDataFormatError(`${group.path}: row pointers reach past its ${nnz} stored values`);
     }
     bound = 0;
     for (let i = 0; i < count; i++) bound += pointers[order.rows[i] - lo + 1] - pointers[order.rows[i] - lo];
@@ -444,7 +444,7 @@ async function openRowLines(group, order, { k, nStored, positionOf, plan, stream
     const stored = await readKeptRowPointers(pointerNode, sortedRows, { mergeGapBytes, readOptions, chunks });
     const { rowPointers } = keptEntries(stored, sortedRows);
     bound = rowPointers[count];
-    if (bound > indexNode.shape[0]) throw new Error(`${group.path}: row pointers reach past its ${indexNode.shape[0]} stored values`);
+    if (bound > indexNode.shape[0]) throw new AnnDataFormatError(`${group.path}: row pointers reach past its ${indexNode.shape[0]} stored values`);
     const chunkEntries = Array.isArray(dataNode.chunks) && dataNode.chunks.length > 0 && dataNode.partialChunks !== true ? dataNode.chunks[0] : null;
     read = async (first, last) => {
       const { rowPointers: local, entries } = keptEntries(stored, new CellRows(order.rows.subarray(first, last), nStored));
@@ -655,7 +655,7 @@ export async function placedGraphLines(graph, nObs, { readOptions = {} } = {}) {
     mergeGapBytes: () => 0, roundTripBytes: () => 0, readOptions, chunks: null, onShare: () => {},
   });
   // Every stored entry is a mapped row's: a row no cell is mapped to holds none.
-  if (lines.nnz !== group.get('indices').shape[0]) throw new RangeError(`${group.path} joins a row that no cell of the dataset is mapped to`);
+  if (lines.nnz !== group.get('indices').shape[0]) throw new AnnDataFormatError(`${group.path} joins a row that no cell of the dataset is mapped to`);
   return lines;
 }
 
@@ -696,7 +696,7 @@ export async function readPlacedGraphRows(graph, cells, { mergeGapBytes, readOpt
     for (let entry = read.pointers[at]; entry < read.pointers[at + 1]; entry++) {
       const column = Number(read.indices[entry]);
       const cell = column >= 0 && column < nRows ? cellOfRow[column] : -1;
-      if (cell < 0) throw new RangeError(`${group.path} joins a row that no cell of the dataset is mapped to`);
+      if (cell < 0) throw new AnnDataFormatError(`${group.path} joins a row that no cell of the dataset is mapped to`);
       indices[write] = cell;
       data[write++] = Number(read.data[entry]);
     }
@@ -855,7 +855,7 @@ export async function readGraphRows(graph, lines, nLines, { mergeGapBytes, readO
       total += slab.indices.length;
     }
     const pointers = allocateTypedArray(Float64Array, lines.length + 1, 'Connectivity row pointers');
-    const indices = allocateTypedArray(Int32Array, total, 'Connectivity row neighbours');
+    const indices = allocateTypedArray(Int32Array, total, 'Connectivity row neighbors');
     const data = allocateTypedArray(held[0]?.data.constructor ?? Float64Array, total, 'Connectivity row weights');
     for (const slab of held) {
       const at = pointers[slab.start];
@@ -872,7 +872,7 @@ export async function readGraphRows(graph, lines, nLines, { mergeGapBytes, readO
     let stored = 0;
     for (let i = 0; i < block.length; i++) if (block[i] !== 0) stored++;
     const pointers = allocateTypedArray(Float64Array, lines.length + 1, 'Connectivity row pointers');
-    const indices = allocateTypedArray(Int32Array, stored, 'Connectivity row neighbours');
+    const indices = allocateTypedArray(Int32Array, stored, 'Connectivity row neighbors');
     const data = allocateTypedArray(Float64Array, stored, 'Connectivity row weights');
     let at = 0;
     for (let line = 0; line < lines.length; line++) {
@@ -893,7 +893,7 @@ export async function readGraphRows(graph, lines, nLines, { mergeGapBytes, readO
   const { rowPointers, entries } = keptEntries(stored, rows);
   const total = rowPointers[lines.length];
   if (total > indexNode.shape[0]) {
-    throw new Error(`${graph.path}: row pointers reach past its ${indexNode.shape[0]} stored values`);
+    throw new AnnDataFormatError(`${graph.path}: row pointers reach past its ${indexNode.shape[0]} stored values`);
   }
   if (total === 0) return { pointers: rowPointers, indices: new Int32Array(0), data: new Float64Array(0) };
   const [indices, data] = await Promise.all([

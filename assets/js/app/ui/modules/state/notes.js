@@ -2,7 +2,7 @@
  * @fileoverview Notes on a step, a branch, a group, a turn or the tracker
  * (History v2 §3.13): each with its author and time ("edited" once edited),
  * its text in the Markdown subset (emphasis, inline code, http(s) links)
- * built from text nodes only, Edit and Remove, and "+ Note". Every change is
+ * built from text nodes only, Edit and Remove, and "Add note". Every change is
  * a history action (`history.note.add`, `.edit`, `.remove`), kept in the
  * tracker's journal, so it is undone from the toast or Recently deleted;
  * Ctrl+Z stays for the state.
@@ -15,6 +15,7 @@
 
 import { authorOf, formatStepTime } from './model.js';
 import { renderInlineMarkdown } from '../../../agent/chat/markdown.js';
+import { createButton } from '../../components/controls.js';
 
 /**
  * @param {object} options
@@ -33,10 +34,8 @@ export function notesBlock({ doc, notes, target, act, now, addLabel = 'Note' }) 
   list.className = 'history-note-list';
   list.hidden = notes.length === 0;
   for (const note of notes) list.append(noteItem(doc, note, { act, now }));
-  const add = doc.createElement('button');
-  add.type = 'button';
-  add.className = 'btn btn-compact history-note-add';
-  add.textContent = `+ ${addLabel}`;
+  // Notes live inside a row's details: their actions are quiet.
+  const add = createButton({ label: `Add ${addLabel.toLowerCase()}`, variant: 'quiet', className: 'history-note-add' });
   add.addEventListener('click', () => {
     add.hidden = true;
     root.append(editor(doc, {
@@ -62,16 +61,8 @@ function noteItem(doc, note, { act, now }) {
   const author = authorOf(note.by, null);
   const when = note.at === null ? '' : `, ${formatStepTime(note.at, now())}`;
   meta.textContent = `— ${author.name}${when}${note.editedAt !== null ? ', edited' : ''}${note.fromReply ? ', from the reply' : ''}`;
-  const edit = doc.createElement('button');
-  edit.type = 'button';
-  edit.className = 'btn btn-compact history-note-edit';
-  edit.textContent = 'Edit';
-  edit.setAttribute('aria-label', `Edit the note “${note.text}”`);
-  const remove = doc.createElement('button');
-  remove.type = 'button';
-  remove.className = 'btn btn-compact history-note-remove';
-  remove.textContent = 'Remove';
-  remove.setAttribute('aria-label', `Remove the note “${note.text}”`);
+  const edit = createButton({ label: 'Edit', variant: 'quiet', ariaLabel: `Edit the note “${note.text}”`, className: 'history-note-edit' });
+  const remove = createButton({ label: 'Remove', variant: 'quiet', ariaLabel: `Remove the note “${note.text}”`, className: 'history-note-remove' });
   edit.addEventListener('click', () => {
     item.replaceChildren(editor(doc, {
       value: note.text,
@@ -97,14 +88,8 @@ function editor(doc, { value, label, save, done }) {
   area.placeholder = 'Markdown: *emphasis*, `code`, [links](https://…)';
   const row = doc.createElement('div');
   row.className = 'app-dialog-actions';
-  const ok = doc.createElement('button');
-  ok.type = 'button';
-  ok.className = 'btn btn-compact btn-primary';
-  ok.textContent = 'Save';
-  const cancel = doc.createElement('button');
-  cancel.type = 'button';
-  cancel.className = 'btn btn-compact';
-  cancel.textContent = 'Cancel';
+  const ok = createButton({ label: 'Save', variant: 'quiet-primary' });
+  const cancel = createButton({ label: 'Cancel', variant: 'quiet' });
   row.append(cancel, ok);
   form.append(area, row);
   const close = () => {

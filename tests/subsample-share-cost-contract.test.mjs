@@ -95,10 +95,10 @@ test('blocks read about their share of the chunks; a uniform share reads nearly 
   const blocks = await readShare(METHODS.blocks(k));
   const uniform = await readShare(METHODS.uniform(k));
   const chunks = N / CHUNK;
-  assert.ok(blocks.chunks <= Math.ceil(chunks / 100) + 4, `blocks at 1 %: ${blocks.chunks} of ${chunks} chunks`);
+  assert.ok(blocks.chunks <= Math.ceil(chunks / 100) + 4, `blocks at 1%: ${blocks.chunks} of ${chunks} chunks`);
   // Each 500-cell chunk holds one of 200 uniform cells with probability 1 - 0.99^500.
   const expected = cellShareReadShare([{ rows: CHUNK, bytes: N * 8 }], 0.01, 'uniform');
-  assert.ok(Math.abs(uniform.chunks / chunks - expected) < 0.05, `uniform at 1 %: ${uniform.chunks} of ${chunks}, priced ${expected}`);
+  assert.ok(Math.abs(uniform.chunks / chunks - expected) < 0.05, `uniform at 1%: ${uniform.chunks} of ${chunks}, priced ${expected}`);
   assert.ok(Math.abs(cellShareReadShare([{ rows: CHUNK, bytes: N * 8 }], 0.01, 'blocks') - 0.01) < 1e-12);
   // Read byte by byte (no chunks): about the share, whatever the method.
   assert.equal(cellShareReadShare([{ rows: null, bytes: 100 }], 0.01, 'uniform'), 0.01);
@@ -106,12 +106,12 @@ test('blocks read about their share of the chunks; a uniform share reads nearly 
   const subset = { readLayout: [{ rows: CHUNK, bytes: N * 8 }], prioritySeed: null };
   const said = scatteredShareCost(subset, { method: 'uniform', seed: null, fraction: 0.01 });
   assert.ok(said !== null && said.read > 0.95 && said.cheap < 0.02 && said.alternative === 'blocks', JSON.stringify(said));
-  assert.match(said.text, /^Reads about 99 % of the file for 1\.0 % of its cells; blocks read about 1 %\.$/);
+  assert.match(said.text, /^Reads about 99% of the file for 1% of its cells; blocks read about 1%\.$/);
   assert.equal(scatteredShareCost(subset, { method: 'blocks', seed: null, fraction: 0.01 }), null);
   assert.equal(scatteredShareCost(subset, { method: 'uniform', seed: null, fraction: 1 }), null);
   // A priority-ordered file: uniform under its own seed is its first rows;
   // another seed, and blocks of original positions, lie throughout it
-  // (measured: 10 % blocks of a 10M-cell priority-ordered .h5ad read 380 MB
+  // (measured: 10% blocks of a 10M-cell priority-ordered .h5ad read 380 MB
   // of the 385 MB every cell reads); the file's own order is offered.
   const priority = { ...subset, prioritySeed: 3 };
   assert.equal(scatteredShareCost(priority, { method: 'uniform', seed: 3, fraction: 0.01 }), null);
@@ -119,13 +119,13 @@ test('blocks read about their share of the chunks; a uniform share reads nearly 
   assert.equal(scatteredShareCost(priority, { method: 'uniform', seed: 4, fraction: 0.01 })?.alternative, 'file');
   const blocksThere = scatteredShareCost(priority, { method: 'blocks', seed: null, fraction: 0.1 });
   assert.equal(blocksThere?.alternative, 'file');
-  assert.match(blocksThere.text, /this file's own order reads about 10 %\.$/);
+  assert.match(blocksThere.text, /this file's own order reads about 10%\.$/);
   assert.equal(scatteredShareCost({ readLayout: [] }, { method: 'uniform', seed: null, fraction: 0.01 }), null);
 });
 
 test('a share\'s rows are placed in source order by their runs, as a comparator sort places them, ties and partial reads included', () => {
   // A uniform share in priority order (single-row runs all over), with a few
-  // empty runs whose start equals a neighbour's (ties).
+  // empty runs whose start equals a neighbor's (ties).
   const kept = METHODS.uniform(N / 10);
   const runs = runsOfPositions(kept);
   const reference = (a, b) => {
@@ -289,7 +289,7 @@ test(`${layout}: a 0.7 share's first gene is one pass, every cell's: no per-row 
   const rows = names.length;
   // The work of the gene's plan and pass, counted: rows sorted by
   // comparison (the pass priced over the rows in open order sorted every
-  // row's run: 3 s of a 50 % share of 5M cells) and row pointers looked up
+  // row's run: 3 s of a 50% share of 5M cells) and row pointers looked up
   // one by one (the kept values counted a row at a time: 1.3 s there).
   const sort = Float64Array.prototype.sort;
   const indexOf = RowPointers.prototype.indexOf;
@@ -300,7 +300,7 @@ test(`${layout}: a 0.7 share's first gene is one pass, every cell's: no per-row 
   const before = counting.fetched.length;
   let column;
   try {
-    // Said before the gene: one pass, so no colours before the whole (its
+    // Said before the gene: one pass, so no colors before the whole (its
     // segments in open order promised the first after a slab's rows).
     const plan = await reader.geneReadPlan('X');
     assert.equal(plan.progressive, null, `no partial picture is promised (${JSON.stringify(plan.progressive)})`);

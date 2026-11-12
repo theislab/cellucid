@@ -25,7 +25,7 @@ export async function listVectorDataset(page) {
 
 /**
  * Watch the velocity overlay's next build, from before the action that
- * starts it. Its card ("Preparing velocity overlay...") is held back for its
+ * starts it. Its card ("Preparing velocity overlay…") is held back for its
  * first second (`NOTICE_AFTER_MS`, notification-center.js), and a build that
  * ends sooner ends without a card or a "Velocity overlay ready" success: the
  * particles appearing say it. Built is either way the card went: completed

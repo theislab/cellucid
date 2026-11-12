@@ -19,7 +19,7 @@
 
 import { HOST_LITTLE_ENDIAN } from '../../formats/io/byte-order.js';
 import { allocateTypedArray } from '../sparse-column-index.js';
-import { elementBytes } from './elements.js';
+import { AnnDataFormatError, elementBytes } from './elements.js';
 
 /** Decoded bytes per slab. A scheduling choice, not a limit on what is read. */
 export const SLAB_BYTES = 32 * 1024 * 1024;
@@ -213,7 +213,7 @@ export function writeInt32(values, output, offset, label) {
     for (let i = 0; i < length; i++) {
       const value = valueOfWords(words, i, signed);
       if (!(value >= -2147483648 && value <= 2147483647)) {
-        throw new Error(`${label} ${values[i]} is outside the Int32 range`);
+        throw new AnnDataFormatError(`${label} ${values[i]} is outside the Int32 range`);
       }
       output[offset + i] = value;
     }
@@ -223,14 +223,14 @@ export function writeInt32(values, output, offset, label) {
     const raw = values[i];
     if (typeof raw === 'bigint') {
       if (raw < -2147483648n || raw > 2147483647n) {
-        throw new Error(`${label} ${raw} is outside the Int32 range`);
+        throw new AnnDataFormatError(`${label} ${raw} is outside the Int32 range`);
       }
       output[offset + i] = Number(raw);
       continue;
     }
     const value = Number(raw);
     if (!Number.isSafeInteger(value) || value < -2147483648 || value > 2147483647) {
-      throw new Error(`${label} ${String(raw)} is outside the Int32 range`);
+      throw new AnnDataFormatError(`${label} ${String(raw)} is outside the Int32 range`);
     }
     output[offset + i] = value;
   }
@@ -285,7 +285,7 @@ export function writeExactNumbers(values, output, offset, label) {
     for (let i = 0; i < length; i++) {
       const value = valueOfWords(words, i, signed);
       if (!Number.isSafeInteger(value)) {
-        throw new RangeError(`${label} ${values[i]} is outside the safe integer range`);
+        throw new AnnDataFormatError(`${label} ${values[i]} is outside the safe integer range`);
       }
       output[offset + i] = value;
     }
@@ -294,7 +294,7 @@ export function writeExactNumbers(values, output, offset, label) {
   for (let i = 0; i < length; i++) {
     const raw = values[i];
     if (raw > 9007199254740991n || raw < -9007199254740991n) {
-      throw new RangeError(`${label} ${raw} is outside the safe integer range`);
+      throw new AnnDataFormatError(`${label} ${raw} is outside the safe integer range`);
     }
     output[offset + i] = Number(raw);
   }
@@ -431,6 +431,69 @@ export function asNumbers(values, label) {
   const signed = values instanceof BigInt64Array;
   for (let i = 0; i < values.length; i++) numbers[i] = valueOfWords(words, i, signed);
   return numbers;
+}
+
+/**
+ * Whether 64-bit integers (BigInts) hold a value no double holds exactly:
+ * one past the safe integers (beyond ±(2^53 − 1)). Such integers are
+ * identifiers (a database id, a barcode hashed to an integer), never
+ * measurements, so a column of them is read as their exact decimal text
+ * (`readExactIntegers`), as a categorical's labels are (`dataframe.js`
+ * `categoryLabels`). Positions `mask` marks (a nullable column's missing
+ * values) are not data and are passed over. Read through the values' 32-bit
+ * words, never a BigInt per value.
+ *
+ * @param {ArrayLike<number|bigint>} values
+ * @param {ArrayLike<number>|null} [mask]
+ * @returns {boolean}
+ */
+export function holdsUnsafeIntegers(values, mask = null) {
+  if (!is64BitIntegers(values)) return false;
+  const words = wordsOf(values);
+  const signed = values instanceof BigInt64Array;
+  for (let i = 0; i < values.length; i++) {
+    if (mask !== null && mask[i]) continue;
+    if (!Number.isSafeInteger(valueOfWords(words, i, signed))) return true;
+  }
+  return false;
+}
+
+/** Why a column of integers is read as text: one line, said with the column (`readExactIntegers`). */
+export const UNSAFE_INTEGERS_AS_TEXT = 'Read as text: it holds whole numbers past 2^53, which are identifiers, not measurements, and no number holds them exactly.';
+
+/**
+ * Rows `[start, end)` of a one-dimensional integer array of 64 bits, exactly:
+ * `{values}`, a Float64Array (NaN where `mask` marks a missing value), when
+ * every value is a safe integer; otherwise `{text}`, every value as its
+ * decimal text (null where missing), the column then being identifiers
+ * (`holdsUnsafeIntegers`). One read of the stored values; `mask` (1 =
+ * missing) is a nullable column's, already read for these rows.
+ *
+ * `as` is how a column already shown reads more rows: `'text'` (it was
+ * found to be identifiers: these rows too, whatever they hold) or
+ * `'numbers'` (it was found to be numbers: these rows as their nearest
+ * doubles); `'decide'` decides from these rows.
+ *
+ * @param {'decide'|'text'|'numbers'} [as]
+ * @returns {Promise<{values: Float64Array}|{text: Array<string|null>}>}
+ */
+export async function readExactIntegers(array, start, end, label, options = {}, mask = null, as = 'decide') {
+  const raw = await readStored(array, start, end, label, options);
+  if (as === 'text' || (as === 'decide' && holdsUnsafeIntegers(raw, mask))) {
+    const text = new Array(raw.length);
+    for (let i = 0; i < raw.length; i++) text[i] = mask !== null && mask[i] ? null : raw[i].toString();
+    return { text };
+  }
+  const values = allocateTypedArray(Float64Array, raw.length, label);
+  writeFloat64(raw, values, 0);
+  if (mask !== null) for (let i = 0; i < values.length; i++) if (mask[i]) values[i] = Number.NaN;
+  return { values };
+}
+
+/** Whether `array` stores integers of 64 bits (read exactly by `readExactIntegers`). */
+export function stores64BitIntegers(array) {
+  const kind = array?.dtype?.kind;
+  return (kind === 'int' || kind === 'uint') && array.dtype.bytes === 8;
 }
 
 /** Rows `[start, end)` exactly as stored (typed array, strings, 0/1 booleans). */

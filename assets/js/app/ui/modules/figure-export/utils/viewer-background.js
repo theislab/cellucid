@@ -1,7 +1,7 @@
 /**
  * @fileoverview Active viewer-background reader and reference-layer appearance.
  *
- * The viewer's `Background` control decides two things at once: the colour the
+ * The viewer's `Background` control decides two things at once: the color the
  * canvas is cleared to, and which reference layer is drawn behind the data —
  * the matplotlib-style grid box (`Grid`), the floor and dot surface
  * (`Studio`), or nothing (`White`, `Black`). `viewer.setBackground()`
@@ -52,10 +52,10 @@ export const REFERENCE_GRID_SIZE = 2.0;
  * exactly.
  *
  * `kind: 'studio'` records carry the studio palette the viewer draws with and
- * its surface (clear) colour. The viewer fades the backdrop in at the same
+ * its surface (clear) color. The viewer fades the backdrop in at the same
  * rate, with the same settled-frame guarantee.
  *
- * `kind: 'look'` records name a baked backdrop look and its surface colour;
+ * `kind: 'look'` records name a baked backdrop look and its surface color;
  * the look itself travels per pane in `renderState.backdrop.look` and is
  * redrawn by `components/backdrop-look-export.js`.
  *
@@ -176,7 +176,7 @@ export function readActiveReferenceGridAppearance(documentRef) {
 /**
  * Reject anything that is not one of the appearances published above.
  *
- * The renderers derive line colours and widths from these scalars, so a
+ * The renderers derive line colors and widths from these scalars, so a
  * hand-built lookalike would paint a layer the viewer never drew.
  *
  * @param {unknown} appearance

@@ -1,0 +1,80 @@
+{
+  "examples": [
+    {
+      "allocation": "proportional",
+      "count": 1,
+      "embedding": "x",
+      "field": "x",
+      "fraction": 1,
+      "method": null,
+      "mode": "all",
+      "seed": null
+    }
+  ],
+  "params": {
+    "additionalProperties": false,
+    "properties": {
+      "allocation": {
+        "default": "proportional",
+        "enum": [
+          "proportional",
+          "balanced"
+        ],
+        "type": "string"
+      },
+      "count": {
+        "minimum": 1,
+        "type": "integer"
+      },
+      "embedding": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "field": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "fraction": {
+        "exclusiveMinimum": 0,
+        "maximum": 1,
+        "type": "number"
+      },
+      "method": {
+        "default": null,
+        "enum": [
+          "uniform",
+          "blocks",
+          "stratified",
+          "spatial",
+          null
+        ],
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "mode": {
+        "enum": [
+          "all",
+          "subsample"
+        ],
+        "type": "string"
+      },
+      "seed": {
+        "default": null,
+        "maximum": 4294967295,
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "mode"
+    ],
+    "type": "object"
+  },
+  "type": "cells.open",
+  "version": 2
+}

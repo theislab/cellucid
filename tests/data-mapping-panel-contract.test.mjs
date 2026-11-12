@@ -74,10 +74,10 @@ function anndataMapping({ enabled, defaults }) {
  * live view and snapshot-1 show UMAP because it is the 2D default;
  * snapshot-2 shows t-SNE because the user chose it.
  */
-function makeMappingState({ failLoads = {}, failMoveFor = null } = {}) {
+function makeMappingState({ failLoads = {}, failMoveFor = null, obsm = { X_umap: 2, X_tsne: 2, X_pca: 6, velocity_umap: 2 } } = {}) {
   const described = describeAnnDataProbes(mappingProbes({
     nObs: N_OBS,
-    obsm: { X_umap: 2, X_tsne: 2, X_pca: 6, velocity_umap: 2 },
+    obsm,
     hasX: true,
   }));
   const candidates = assembleAnnDataCandidates(described, {
@@ -150,7 +150,7 @@ function makeMappingState({ failLoads = {}, failMoveFor = null } = {}) {
   state.publishDatasetMapping({ mapping: candidates.defaults, candidates, origin: 'default' });
   manager.setViewLayout('live', 'X_umap');
   manager.setViewLayout('snapshot-1', 'X_umap');
-  manager.setViewLayout('snapshot-2', manager.resolveRepresentation(TSNE));
+  manager.setViewLayout('snapshot-2', Object.hasOwn(obsm, 'X_tsne') ? manager.resolveRepresentation(TSNE) : 'X_umap');
   return { state, manager, loads, events, moves, candidates };
 }
 
@@ -279,7 +279,8 @@ test('an embedding that fails its load check changes nothing and stays unusable'
   );
   assert.equal(
     state.describeDataMappingRefusal(next),
-    'X_pca is enabled, but this dataset cannot plot (NaN at cell 2).'
+    // One sentence, as the other groups' (L21-7: "X_gone is enabled, but this dataset does not have." named nothing it lacked).
+    "This mapping enables obsm['X_pca'] columns [0, 1], which this dataset cannot plot (NaN at cell 2)."
   );
   const pcaChoice = state.getRepresentationChoices().find(choice => choice.ref.key === 'X_pca');
   assert.deepEqual([pcaChoice.usable, pcaChoice.reason], [false, 'NaN at cell 2']);
@@ -307,7 +308,7 @@ test('a mapping the panel cannot apply is refused with its reason', async () => 
   const base = state.getDataMapping();
   assert.equal(
     state.describeDataMappingRefusal({ ...base, knn: 'connectivities' }),
-    "This mapping uses obsp['connectivities'] as its neighbour graph, which this dataset does not have."
+    "This mapping uses obsp['connectivities'] as its neighbor graph, which this dataset does not have."
   );
   // Every other group is checked against the catalog the same way.
   assert.equal(state.describeDataMappingRefusal({ ...base, latent: 'X_pca' }), null);
@@ -320,14 +321,14 @@ test('a mapping the panel cannot apply is refused with its reason', async () => 
       enabled: [{ key: 'X_gone', columns: [0, 1] }, UMAP],
       defaults: { '2d': UMAP },
     })),
-    'X_gone is enabled, but this dataset does not have.'
+    "This mapping enables obsm['X_gone'] columns [0, 1], which this dataset does not have."
   );
   assert.match(
     state.describeDataMappingRefusal(anndataMapping({
       enabled: [{ key: 'X_tsne', columns: [0, 1, 2] }, UMAP],
       defaults: { '2d': UMAP },
     })),
-    /^X_tsne is enabled, but this dataset cannot plot \(obsm\['X_tsne'\]: .*\)\.$/
+    /^This mapping enables obsm\['X_tsne'\] columns \[0, 1, 2\], which this dataset cannot plot \(obsm\['X_tsne'\]: .*\)\.$/
   );
   assert.equal(
     state.describeEmbeddingRefusal({ key: 'X_gone', columns: [0, 1] }),
@@ -1049,7 +1050,7 @@ test('a grid export draws each view with the embedding it shows', async () => {
       fogDensity: 0, fogFar: 3.5, fogNear: 2.5, fov: Math.PI / 4,
       lightDir: Float32Array.from([0, 0, 1]), lightingStrength: 1,
       modelMatrix: new Float32Array(identity), mvpMatrix: new Float32Array(identity),
-      near: 0.01, pointSize: 4, projectionMatrix: new Float32Array(identity),
+      near: 0.01, pointSize: 4, pointSizeMax: 160, projectionMatrix: new Float32Array(identity),
       shaderQuality: 'full', sizeAttenuation: 1, viewMatrix: new Float32Array(identity),
       viewportHeight: 100, viewportWidth: 100,
     },
@@ -1065,6 +1066,7 @@ test('a grid export draws each view with the embedding it shows', async () => {
         return transforms[layoutKey];
       },
     },
+    getActivePage: () => null,
     getActiveViewId: () => 'live',
     getDatasetGeneration: () => 1,
     getFieldForView: () => null,
@@ -1084,6 +1086,7 @@ test('a grid export draws each view with the embedding it shows', async () => {
     getPointCount: () => 1,
     getPresentedViewState: () => presented,
     getSnapshotViews: () => [{ id: 'snapshot-1', label: 't-SNE' }],
+    getViewName: () => null,
     getViewLayout: () => ({ liveViewHidden: false, mode: 'grid' }),
     withBorrowedViewData(viewId, callback) {
       borrowed.push(viewId);
@@ -1152,4 +1155,26 @@ test('an Apply whose open cells grow meanwhile is still this dataset\'s: it says
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(panel.status().dataset.tone, 'success');
   assert.equal(panel.status().textContent, 'Applied.');
+});
+
+test('a dimension the mapping names no default for marks the embedding its key shows first, and an edit elsewhere writes none (R9M-5)', async t => {
+  // A mapping naming only the 2D default (a session saved so, an agent's
+  // mapping.set): two 3-column arrays are on with no 3D default named.
+  const panel = mountPanel(t, { obsm: { X_umap: 2, X_spatial: 3, X_phate: 3, X_pca: 6, velocity_umap: 2 } });
+  assert.deepEqual(panel.state.getDataMapping().embeddings.defaults, { '1d': null, '2d': UMAP, '3d': null });
+  const defaults = () => panel.rows().filter(row => row.isDefault === 'true').map(row => row.name);
+  // Key 3 shows the first enabled 3D embedding in the mapping's order: X_phate.
+  assert.equal(panel.state.getDimensionManager().getOpeningLayout(3), panel.state.getDimensionManager().resolveRepresentation({ key: 'X_phate', columns: [0, 1, 2] }));
+  assert.deepEqual(defaults(), ['PHATE', 'UMAP']);
+  // Turning PCA on and applying changes the embeddings only: no 3D default is written.
+  panel.row('PCA 1,2').querySelector('.data-mapping-enable').checked = true;
+  panel.row('PCA 1,2').querySelector('.data-mapping-enable').dispatch('change');
+  assert.deepEqual(defaults(), ['PHATE', 'UMAP']);
+  panel.apply.dispatch('click');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(panel.applied.at(-1).embeddings.defaults, { '1d': null, '2d': UMAP, '3d': null });
+  // Turning the shown 3D default off marks the next one, still unnamed.
+  panel.row('PHATE').querySelector('.data-mapping-enable').checked = false;
+  panel.row('PHATE').querySelector('.data-mapping-enable').dispatch('change');
+  assert.deepEqual(defaults(), ['Spatial', 'UMAP']);
 });

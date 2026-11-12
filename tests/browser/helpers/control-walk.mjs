@@ -32,7 +32,7 @@
  *   moved the history, which shows exactly the values it records.
  *
  * A control that changes nothing (an info button, a menu, a dialog, a
- * download, a file picker, an expander) is recognised by that effect, not
+ * download, a file picker, an expander) is recognized by that effect, not
  * by a list. Left out are links (they leave the page) and the few controls
  * that replace the dataset, sign in or delete what this browser keeps, each
  * listed below with why. A control a click cannot reach (something covers
@@ -45,8 +45,8 @@
  * scene, and siblings from what opened them.
  *
  * Scenes: the fixture dataset (categories, a continuous field, genes, two
- * embeddings) coloured by a category, with a highlight and a kept view; then
- * coloured by a continuous field; by a gene; with the kept view selected
+ * embeddings) colored by a category, with a highlight and a kept view; then
+ * colored by a continuous field; by a gene; with the kept view selected
  * showing the 3D embedding; with camera path keyframes. A control walked in
  * an earlier scene is not walked again. The walk is split into parts, a
  * test each (`PARTS`: a section of the sidebar each, then everything outside
@@ -57,7 +57,7 @@
  * browser job's shards set it `apart`: `playwright.config.mjs`,
  * `.github/workflows/test.yml`). One part is walked alone with
  * `--grep "<section id>"`. Another
- * test walks the Visualization section of a dataset with neighbour graphs
+ * test walks the Visualization section of a dataset with neighbor graphs
  * and vector fields (their controls show only there). A control is judged by
  * what it does, never by how long it takes: the walk is bounded by its
  * progress (`untilHung`, `keepPartAlive`). The report lists every control and
@@ -77,7 +77,7 @@ import { takeSteps, waitForHistory } from './state-history.mjs';
 import { chooseFiles } from './file-input.mjs';
 
 const FIXTURE_URL = `/?sampleCatalog=${ENCODED_SAMPLE_CATALOG_URL}&dataset=current-ui`;
-/** 300 cells with three neighbour graphs and vector fields (`fixtures/README.md`). */
+/** 300 cells with three neighbor graphs and vector fields (`fixtures/README.md`). */
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const GRAPH_AND_VECTORS = path.join(HERE, '..', 'fixtures', 'data-mapping-full.h5ad');
 const CELLS = 120;
@@ -249,7 +249,7 @@ async function installWalker(page) {
       '[role="menuitemcheckbox"]', '[role="menuitemradio"]', '[role="tab"]', '[role="switch"]', '[role="checkbox"]',
       '[role="radio"]', '[role="slider"]', '[role="option"]', '[role="combobox"]', '[contenteditable="true"]',
     ].join(', ');
-    // Not controls of the app: the page's own frame (welcome, licence, the
+    // Not controls of the app: the page's own frame (welcome, license, the
     // text for search engines, the footer) and the notifications.
     const OUTSIDE = '#welcome-modal, #license-modal, main.sr-only, #copyright, #notification-center';
     const INPUT_ROLES = {
@@ -259,17 +259,8 @@ async function installWalker(page) {
 
     const clean = text => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 90);
     // An id minted on this page, or made from one (`<minted>-trigger`, `<scope>-method-<minted>`),
-    // names nothing on the next draw.
-    const stableId = element => {
-      if (!element.id) return null;
-      const parts = element.id.split('-');
-      for (let start = 0; start < parts.length; start++) {
-        for (let end = start + 1; end <= parts.length; end++) {
-          if (isGeneratedDomId(parts.slice(start, end).join('-'))) return null;
-        }
-      }
-      return element.id;
-    };
+    // names nothing on the next draw: it holds the minted separator (`dom-id.js`).
+    const stableId = element => (!element.id || isGeneratedDomId(element.id) ? null : element.id);
 
     function roleOf(element) {
       const explicit = element.getAttribute('role');
@@ -1283,7 +1274,7 @@ function declarePartTest(test, part) {
     await openFixture(page);
     await takeSteps(page, [
       ['color.by', { field: { source: 'obs', key: 'cell_type' } }],
-      ['highlight.category', { field: { source: 'obs', key: 'cell_type' }, category: 'gamma' }],
+      ['highlight.category', { field: { source: 'obs', key: 'cell_type' }, categories: ['gamma'] }],
       ['view.keep', {}],
     ]);
     await openEverySection(page);
@@ -1353,7 +1344,7 @@ function declarePartTest(test, part) {
 }
 
 /**
- * The controls the first fixture cannot show (a neighbour graph's edges, a
+ * The controls the first fixture cannot show (a neighbor graph's edges, a
  * vector field's overlay) on a dataset that has both: its Visualization
  * section is walked the same way. Smoke's controls need a volume renderer
  * this browser may not offer; they stay listed as not shown.

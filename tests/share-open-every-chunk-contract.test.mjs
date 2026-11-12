@@ -6,7 +6,7 @@
  *   (`cell-subset.js` `rowWaves`): the chunks its rows lie in, each once,
  *   in waves of a slab, each row one copy to its place, and no pass over
  *   pieces (its runs never ordered by source row, listed or walked through
- *   a permutation). A 50 % uniform share of a 10M-cell `.h5ad` took
+ *   a permutation). A 50% uniform share of a 10M-cell `.h5ad` took
  *   4.7-7.0 s for its first view against every cell's 0.9 s, the same
  *   bytes: the pass placed 5M single-row pieces of each column through
  *   three permuted arrays a row.
@@ -16,7 +16,7 @@
  *   radix order of their 32-bit words), rows past 2^32 included.
  * - **Pricing a share's first gene passes over rows in chunks already
  *   counted** (`subsample-plan.js` `rowChunks`): the gene sample's fit
- *   priced 5M single-row spans at each of its steps (2 s of a 50 % share's
+ *   priced 5M single-row spans at each of its steps (2 s of a 50% share's
  *   opening over a 20 ms link); the price is unchanged.
  */
 import assert from 'node:assert/strict';

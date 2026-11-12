@@ -191,8 +191,9 @@ test('Alt+click in an unfocused pane selects that pane\'s category among the cel
   await expect(page.locator('#highlight-mode-description'))
     .toContainText('Alt to replace');
 
-  // Confirming commits exactly those cells as an annotation group; the group
-  // names no field, so nothing in it can point at the focused view's.
+  // Confirming commits exactly those cells as an annotation group, named by
+  // the pane's category; the group names no field, so nothing in it can
+  // point at the focused view's.
   await page.locator('#annotation-confirm-btn').click();
   await expect(page.locator('#annotation-step-controls')).toHaveCount(0);
   const group = await page.evaluate(
@@ -208,7 +209,7 @@ test('Alt+click in an unfocused pane selects that pane\'s category among the cel
   );
   expect(group).toEqual({
     type: 'annotation',
-    label: 'Annotation (40 cells)',
+    label: expected.category,
     cells: expected.cells,
     fieldKey: null,
   });

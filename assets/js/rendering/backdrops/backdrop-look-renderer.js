@@ -6,7 +6,7 @@
  *   in parallel (KHR_parallel_shader_compile where available), then one band
  *   of one cube face (or of the tile) is rendered offscreen per slice, so no
  *   slice hands the GPU more than a few milliseconds of work. Nothing is drawn
- *   until the bake has landed; the pane shows the look's surface colour
+ *   until the bake has landed; the pane shows the look's surface color
  *   meanwhile, then the look fades in over `BACKDROP_LOOK_FADE_SECONDS` (at
  *   once under reduced motion).
  * - Only the family on screen keeps its bake: choosing another family, or a
@@ -14,7 +14,7 @@
  *   twins of a family share their bake, so switching between them is instant.
  * - Per pane, derived data bakes (Atelier's contact shadow, the data tints)
  *   re-run in idle slices only when the pane's positions, visibility or
- *   colours change; never on a camera move. New tints apply at once: a
+ *   colors change; never on a camera move. New tints apply at once: a
  *   crossfade would redraw every pane for its duration.
  *
  * COST WHILE STILL
@@ -38,6 +38,7 @@
 
 import { glStateOf } from '../gl-state-shadow.js';
 import { BACKDROP_LOOK_PROGRAMS } from './backdrop-look-shaders.js';
+import { onReducedMotionChange } from '../../utils/reduced-motion.js';
 import { deleteProgramReleasingUse, deleteTextureTracked, fenceHasPassed } from '../gl-utils.js';
 import {
   ATELIER_KEY_LIGHT,
@@ -132,7 +133,7 @@ function halfFromFloat(value) {
 
 /**
  * Separable box blur of one channel, in place, `passes` times. Yields every
- * `BLUR_LINES_PER_UNIT` rows or columns, so even its first, unoptimised run
+ * `BLUR_LINES_PER_UNIT` rows or columns, so even its first, unoptimized run
  * never holds a slice for long.
  */
 const BLUR_LINES_PER_UNIT = 64;
@@ -480,7 +481,7 @@ export function createBackdropLookRenderer(gl, { invalidate, requestFrame, prefe
   }
 
   /**
-   * Estimate the GPU time of a band from its fence: the fence signalled
+   * Estimate the GPU time of a band from its fence: the fence signaled
    * between the previous poll and this one, so the midpoint of that interval
    * (from the issue for the first poll). A band that signals at its first
    * poll on fast hardware is thereby counted as half the poll's wait, not as
@@ -922,7 +923,7 @@ export function createBackdropLookRenderer(gl, { invalidate, requestFrame, prefe
     if (job.cancelled) return;
     yield* boxBlur(ao, size, aoRadius, 3, scratch);
     if (job.cancelled) return;
-    // Normalise each channel to a high percentile of its own density, so the
+    // Normalize each channel to a high percentile of its own density, so the
     // shadow's darkness does not depend on the cell count.
     // The 97th percentile of a field's positive values, from a histogram:
     // linear time, no sort.
@@ -1045,7 +1046,7 @@ export function createBackdropLookRenderer(gl, { invalidate, requestFrame, prefe
         geometry.stageZ.toFixed(5),
       ].join('|');
       // The draw path only compares this key. A change queues an idle check
-      // that hashes the visibility: a filter moves the shadow, a recolour
+      // that hashes the visibility: a filter moves the shadow, a recolor
       // (which bumps the same generation) does not.
       const checkKey = `${base}|${generation}`;
       if (checkKey !== pane.checkedKey) {
@@ -1107,9 +1108,6 @@ export function createBackdropLookRenderer(gl, { invalidate, requestFrame, prefe
   if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
   // A change of the system's reduced-motion setting takes effect at once:
   // ambient motion stops (or may resume) without waiting for another event.
-  const reducedMotionQuery = typeof matchMedia === 'function'
-    ? matchMedia('(prefers-reduced-motion: reduce)')
-    : null;
   const onReducedMotion = () => {
     syncAmbient();
     if (prefersReducedMotion() && opacity < 1 && isLookReady()) {
@@ -1118,7 +1116,7 @@ export function createBackdropLookRenderer(gl, { invalidate, requestFrame, prefe
       invalidate();
     }
   };
-  reducedMotionQuery?.addEventListener?.('change', onReducedMotion);
+  const stopReducedMotionWatch = onReducedMotionChange(onReducedMotion);
 
   // -------------------------------------------------------------------------
   // Public surface
@@ -1378,7 +1376,7 @@ export function createBackdropLookRenderer(gl, { invalidate, requestFrame, prefe
     if (ambientTimer !== null) clearTimeout(ambientTimer);
     ambientTimer = null;
     if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
-    reducedMotionQuery?.removeEventListener?.('change', onReducedMotion);
+    stopReducedMotionWatch();
     for (const waiter of readyWaiters) waiter.reject(new Error('Backdrop look renderer disposed.'));
     readyWaiters.clear();
     if (!deleteObjects) return;

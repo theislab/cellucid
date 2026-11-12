@@ -55,7 +55,7 @@ async function page({ copy = async (changes, { sink }) => { await sink.write(new
       const columns = Object.fromEntries(names.map(name => [name, {
         kind: 'categorical', categories: [...expected.dataset.obs[name].categories], codes: Int8Array.from(expected.dataset.obs[name].codes), ordered: false,
       }]));
-      return { nObs: expected.dataset.n_obs, obsColumns: ['cell_type', 'leiden'], modalityColumns: [], varColumns: [], columns, cellucid: null };
+      return { nObs: expected.dataset.n_obs, obsColumns: ['cell_type', 'leiden'], modalityColumns: [], varColumns: [], columns, unsKeys: [], colors: {}, cellucid: null };
     },
     async writeAnnDataCopy(changes, options) {
       calls.push(['writeAnnDataCopy', changes.obs.map(change => change.name)]);

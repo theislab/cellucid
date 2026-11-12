@@ -161,7 +161,7 @@ function numcodecsDecoder(id, configuration, what) {
   return decoder === null ? null : { ...decoder, codec: { id, configuration: plainConfiguration(id, configuration) } };
 }
 
-/** The part of a codec's configuration its decoder reads (the rest may not be serialisable). */
+/** The part of a codec's configuration its decoder reads (the rest may not be serializable). */
 function plainConfiguration(id, configuration) {
   return id === 'shuffle' ? { elementsize: configuration?.elementsize ?? 4 } : {};
 }
@@ -360,7 +360,7 @@ export function decodesOffThread(pipeline) {
   return pipeline.decoders.some(decoder => decoder.allocates);
 }
 
-/** The codec descriptions of a pipeline's decoders, in decode order (serialisable). */
+/** The codec descriptions of a pipeline's decoders, in decode order (serializable). */
 export function codecsOf(pipeline) {
   return pipeline.decoders.map(decoder => decoder.codec);
 }

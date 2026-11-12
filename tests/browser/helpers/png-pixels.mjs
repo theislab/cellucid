@@ -22,7 +22,7 @@ export function decodePng(bytes) {
       height = data.readUInt32BE(4);
       if (data[8] !== 8) throw new Error(`PNG bit depth ${data[8]} is not 8.`);
       channels = { 2: 3, 6: 4 }[data[9]];
-      if (channels === undefined) throw new Error(`PNG colour type ${data[9]} is not RGB(A).`);
+      if (channels === undefined) throw new Error(`PNG color type ${data[9]} is not RGB(A).`);
       if (data[12] !== 0) throw new Error('Interlaced PNGs are not read here.');
     } else if (type === 'IDAT') {
       idat.push(data);

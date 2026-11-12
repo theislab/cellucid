@@ -290,6 +290,30 @@ test('stale and failed staged commits preserve the exact prior selection', async
     assert.equal(alpha.deactivations.length, 0);
   });
 
+  await t.test('the shown dataset growing in place does not supersede a newer stage (R9V-2)', async () => {
+    // Suo grows in the background while a link opens: each growth step adopts
+    // the resized metadata, which once made the link fail "superseded before
+    // publication" and left Suo on screen.
+    const manager = new DataSourceManager();
+    manager.registerSource('alpha', source('alpha'));
+    manager.registerSource('link', source('link'));
+    await selectDataset(manager, 'alpha', 'growing');
+    const revision = manager.getCurrentSelectionRevision();
+    const stage = await manager.stageDatasetSelection('link', 'asked');
+    manager.adoptResizedMetadata({ ...metadata('growing'), stats: { ...metadata('growing').stats, n_cells: 2 } });
+    assert.equal(manager.getCurrentSelectionRevision(), revision + 1, 'caches keyed to the cells still see the growth');
+    const publication = manager.commitDatasetSelection(stage);
+    manager.publishDatasetSelection(publication);
+    assert.equal(manager.getCurrentSourceType(), 'link');
+    assert.equal(manager.getCurrentDatasetId(), 'asked');
+    // A None staged while it grows commits too.
+    await selectDataset(manager, 'alpha', 'growing');
+    const clear = manager.stageDatasetClear();
+    manager.adoptResizedMetadata(metadata('growing'));
+    assert.notEqual(manager.commitDatasetClear(clear), null);
+    assert.equal(manager.getCurrentDatasetId(), null);
+  });
+
   await t.test('cleanup failure retains the fully published candidate', async () => {
     const deactivationFailure = new Error('cannot retire prior source');
     const manager = new DataSourceManager();

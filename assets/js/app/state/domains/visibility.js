@@ -18,7 +18,7 @@
  */
 
 import { openCellList, originalCellList } from './cell-positions.js';
-import { differingViews, inEachView, requireViewsFit, viewIdsOf, viewOwner } from './view-list.js';
+import { differingViews, inEachView, requireViewsFit, viewIdsOf, viewOwner, viewReadPart } from './view-list.js';
 import { viewNameInValue } from '../../actions/targets/views.js';
 import { cellVisibilityMaskWrites, isAllShownCellVisibilityMask } from '../managers/per-cell-array-ownership.js';
 import { formatCountOf } from '../../../utils/format-units.js';
@@ -59,6 +59,8 @@ function sameCells(a, b) {
  */
 export function createVisibilityDomain({ state, viewer, refreshUi }) {
   return {
+    // A step read the view it acted in: staleness compares that view's part alone (F156).
+    readPart: viewReadPart,
     capture() {
       return { views: viewIdsOf(viewer).map(id => captureViewHidden(viewOwner(state, id), state.cellIdentity)) };
     },
@@ -76,15 +78,15 @@ export function createVisibilityDomain({ state, viewer, refreshUi }) {
       });
       if (indices.length > 0) refreshUi();
     },
-    /** `context.liveHidden`: the live view is hidden at the later value (`views` domain), so the list numbers the kept views from 1. */
-    describe(a, b, { liveHidden = false } = {}) {
+    /** `context.liveHidden`: the live view is hidden at the later value (`views` domain), so the list numbers the kept views from 1; `context.viewLabels`: the views' names there (`viewLabelsInValue`). */
+    describe(a, b, { liveHidden = false, viewLabels = null } = {}) {
       const lines = [];
       const count = Math.max(a.views.length, b.views.length);
       for (let v = 0; v < count; v++) {
         const before = a.views[v] ?? NONE;
         const after = b.views[v] ?? NONE;
         if (sameCells(before, after)) continue;
-        const prefix = count > 1 ? `${viewNameInValue(v, liveHidden)}: ` : '';
+        const prefix = count > 1 ? `${viewNameInValue(v, liveHidden, viewLabels)}: ` : '';
         lines.push(after.length === 0
           ? `${prefix}every cell shown again`
           : `${prefix}${formatCountOf(after.length, 'cell')} hidden by hand (was ${before.length})`);

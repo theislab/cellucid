@@ -87,11 +87,6 @@ const ALLOWED = [
       '(2^29 to 2^30 units) bounds it far below one ArrayBuffer; and a view of one stream piece.',
   },
   {
-    file: 'data/sources/auth/pkce.js',
-    allocations: ['new Uint8Array(bytes)', 'new Uint8Array(digest)'],
-    reason: 'A PKCE verifier\'s random bytes and a SHA-256 digest: tens of bytes.',
-  },
-  {
     file: 'data/viewer-protocol.js',
     allocations: ['new Uint8Array(frame)'],
     reason: 'A view of a received binary frame (an ArrayBuffer): nothing is allocated.',
@@ -209,9 +204,9 @@ const ALLOWED = [
     file: 'formats/zarr/dtypes.js',
     allocations: [
       'new Uint8Array(type.itemSize)', 'new type.valueClass(count)', 'new Uint8Array(count * fieldSize)',
-      'new field.type.valueClass(count * perElement)', 'new Uint8Array(binary.length)',
+      'new field.type.valueClass(count * perElement)',
     ],
-    reason: 'One element (a fill value, base64 of one element), and a structured (record) dtype\'s fields: AnnData ' +
+    reason: 'One element (a fill value), and a structured (record) dtype\'s fields: AnnData ' +
       'writes records only in `uns` tables (rank_genes_groups: genes by groups), never per cell.',
   },
   {

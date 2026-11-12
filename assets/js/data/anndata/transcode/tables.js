@@ -6,7 +6,8 @@
  * read, and their embedding columns found by name.
  *
  * - **Columns**: a column whose every non-empty value is a number is
- *   numeric (empty, `NA` and `NaN` read as NaN); any other is text,
+ *   numeric (empty, `NA` and `NaN` read as NaN; a whole number past 2^53,
+ *   an identifier, is no number); any other is text,
  *   written as a categorical (empty and `NA` missing). A text table says
  *   nothing of its columns' types, so a column named for a clustering
  *   (`Cluster`, `seurat_clusters`, `leiden`, `louvain`, `kmeans_10`,
@@ -47,11 +48,17 @@ export function isClusteringColumn(name) {
   return CLUSTERING_COLUMN.test(name.trim().replace(/([a-z])([A-Z])/g, '$1 $2'));
 }
 
-/** A text table's value as a number: NaN where missing, null where it is no number. */
+/**
+ * A text table's value as a number: NaN where missing, null where it is no
+ * number. A whole number past 2^53 is no number either: no double holds it
+ * exactly, and such numbers are identifiers, so its column is text, its
+ * values kept as written (as an AnnData column of 64-bit integers is read,
+ * `values.js` `readExactIntegers`).
+ */
 function numberOfText(trimmed) {
   if (trimmed === '') return NaN;
   const number = Number(trimmed);
-  if (!Number.isNaN(number)) return number;
+  if (!Number.isNaN(number)) return /^[+-]?\d+$/.test(trimmed) && !Number.isSafeInteger(number) ? null : number;
   if (MISSING.has(trimmed)) return NaN;
   if (/^[+-]?inf(inity)?$/i.test(trimmed)) return trimmed.startsWith('-') ? -Infinity : Infinity;
   return null;

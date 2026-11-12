@@ -31,6 +31,7 @@ import { ReadActivity } from '../io/activity.js';
 import { roundTripBytesOf } from '../io/link.js';
 import { SharedWork } from '../../utils/abort.js';
 import { allocateTypedArray } from '../../data/sparse-column-index.js';
+import { onNextMacrotask } from '../../utils/yield-macrotask.js';
 
 /**
  * @typedef {Object} ChunkTable
@@ -592,12 +593,6 @@ async function btreeV1Table(file, layout, grid, gridCount, signal) {
   return table;
 }
 
-/**
- * Run `callback` on a later macrotask: after the current task and every
- * promise continuation of it, so every read asked for in one task (the
- * genes of one call, the arrays of one sparse gene) has joined the burst.
- */
-const scheduleMacrotask = typeof setImmediate === 'function' ? callback => setImmediate(callback) : callback => setTimeout(callback, 0);
 
 /**
  * The chunk index leaves the reads asked for in one task wait for, together:
@@ -614,7 +609,7 @@ function indexBurst(file, background, pending) {
     burst = { reads: new Set(), done: null };
     root.indexBursts.set(background, burst);
     const closing = burst;
-    closing.done = new Promise(resolve => scheduleMacrotask(() => {
+    closing.done = new Promise(resolve => onNextMacrotask(() => {
       if (root.indexBursts.get(background) === closing) root.indexBursts.delete(background);
       resolve(Promise.allSettled(closing.reads));
     }));

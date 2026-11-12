@@ -1,7 +1,7 @@
 /**
  * The history stress suite (`cellucid-private/plans/history-v2.md` §3.15.4,
  * workstream HS): it drives the real history (`app/history/history.js`,
- * `tree.js`, `value-pool.js`), the real dispatcher and catalogue, the real
+ * `tree.js`, `value-pool.js`), the real dispatcher and catalog, the real
  * session file (`app/session/history-file.js`) and the real autosave
  * (`app/history/autosave.js` over `autosave-store.js`) on the synthetic page
  * of `synthetic-page.mjs`, and measures where the time, the memory and the
@@ -10,7 +10,7 @@
  * Two runs:
  *
  * - `runMixedHistory`: one history built from a mix of every kind of step
- *   (camera, colour by field and gene, filters, highlight brushes of 1k,
+ *   (camera, color by field and gene, filters, highlight brushes of 1k,
  *   100k and ~1M cells, label edits, user fields, settings, layout, analysis
  *   results), with branches (undo, then act) and trackers, up to the largest
  *   size asked; at each checkpoint (1k, 10k, 50k, 100k steps) it measures
@@ -49,8 +49,8 @@ export const CONNECTOR_RESULT_CHARACTERS = 150_000;
  */
 export const MIX = Object.freeze([
   ['camera', 250, 'camera'],
-  ['colour-field', 70, 'colorField'],
-  ['colour-gene', 40, 'colorGene'],
+  ['color-field', 70, 'colorField'],
+  ['color-gene', 40, 'colorGene'],
   ['colormap', 20, 'colormap'],
   ['filter-category', 70, 'filterCategory'],
   ['filter-range', 40, 'filterRange'],
@@ -137,7 +137,7 @@ function timedPool(timing) {
   return Object.freeze(out);
 }
 
-/** The catalogue the dispatcher checks params with, its `check` timed. */
+/** The catalog the dispatcher checks params with, its `check` timed. */
 function timedCatalog(timing) {
   return catalog => Object.freeze({
     get: type => catalog.get(type),
@@ -646,7 +646,7 @@ export async function runMixedHistory({
     }]));
     const allRecorder = [...perKind.values()].flatMap(record => record.recorder);
     const allTotal = [...perKind.values()].flatMap(record => record.total);
-    // The window's records are summarised and dropped: each checkpoint reports the steps taken since the last.
+    // The window's records are summarized and dropped: each checkpoint reports the steps taken since the last.
     for (const record of perKind.values()) { record.total = []; record.recorder = []; record.hash = []; record.handler = []; record.coalesced = 0; }
     const checkStart = now();
     const readBack = savedStateLoad && mark <= savedStateLoadUpTo;
@@ -669,8 +669,8 @@ export async function runMixedHistory({
 /** The kinds `runStepKinds` measures alone, with the action that makes one step of each. */
 export const STEP_KINDS = Object.freeze([
   ['camera', 'camera'],
-  ['colour-field', 'colorField'],
-  ['colour-gene', 'colorGene'],
+  ['color-field', 'colorField'],
+  ['color-gene', 'colorGene'],
   ['filter-category', 'filterCategory'],
   ['filter-range', 'filterRange'],
   ['brush-1k', ['brush', 1_000]],
@@ -689,12 +689,27 @@ export const STEP_KINDS = Object.freeze([
   ['correlation', 'correlation'],
 ]);
 
+/** The JSON bytes of every tracker's turn records. */
+function turnRecordBytes(history) {
+  return history.trackers().reduce((sum, tree) => sum + JSON.stringify([...tree.turns.values()]).length, 0);
+}
+
+/** A dispatch's meta as a notebook cell of its own: a host turn named `turn`. */
+function cellMeta(turn) {
+  return { origin: 'host', host: 'python', turn };
+}
+
 /**
  * Each kind of step alone: a fresh history (with one result of each
  * analysis already shown, as a session that ran them has), `count` steps of
- * the kind, and what they add. Steps whose kind coalesces (a camera, a
- * slider, a range, a panel) are each given a turn of their own, so each is
- * one step.
+ * the kind, and what they add. Each step is a notebook cell of its own (a
+ * host turn: `by.turn` is part of what a merge must share), so a kind that
+ * coalesces (a camera, a slider, a range, a panel) still makes one step per
+ * change; a person's consecutive changes with one key are one step by design
+ * (`coalesce`), and their `turn` would not part them. Only steps the history
+ * appended are counted (`steps`); a change that merged into the head anyway
+ * is counted in `merged` (the per-step figures would otherwise divide a
+ * step's bytes among its merges).
  */
 export async function runStepKinds({ cells, genes = 20_000, seed = 7, counts = {}, defaultCount = 100, markerGroups = 12, correlationCells = 50_000, onProgress = () => {} }) {
   const out = {};
@@ -708,18 +723,25 @@ export async function runStepKinds({ cells, genes = 20_000, seed = 7, counts = {
     // One step first: the autosave writes the whole history (every root value) at its first write, which is no step's cost.
     for (let tries = 0; ; tries++) {
       const warm = resolveParams(page, recipe);
-      const { step } = await page.dispatcher.dispatch(warm[0], warm[1], { turn: `turn-warm-${tries}` });
+      const { step } = await page.dispatcher.dispatch(warm[0], warm[1], cellMeta(`turn-warm-${tries}`));
       if (step !== null) break;
     }
     await autosave.flush();
     const base = await measureSessionFile(stress, { load: false });
     const baseStore = database.usage();
+    const baseTurns = turnRecordBytes(history);
     const records = { total: [], recorder: [], hash: [], handler: [], autosave: [] };
     let made = 0;
+    let merged = 0;
     for (let i = 0; i < count; i++) {
       const action = resolveParams(page, recipe);
-      const timed = await dispatchTimed(stress, action[0], action[1], { turn: `turn-${i}` });
+      const before = stepCount(history);
+      const timed = await dispatchTimed(stress, action[0], action[1], cellMeta(`turn-${i}`));
       if (timed.step === null) continue;
+      if (stepCount(history) === before) {
+        merged++;
+        continue;
+      }
       made++;
       records.total.push(timed.total);
       records.recorder.push(timed.recorder);
@@ -738,7 +760,10 @@ export async function runStepKinds({ cells, genes = 20_000, seed = 7, counts = {
     const arrayBytes = Object.keys(after.breakdown).filter(key => key.startsWith('array-')).reduce((sum, key) => sum + chunkDelta(key), 0);
     out[kind] = {
       steps: made,
+      merged,
       fileBytesPerStep: per(after.bytes - base.bytes),
+      // Of which the turn record each cell adds to its tracker (a person's step has none).
+      turnRecordBytesPerStep: per(turnRecordBytes(history) - baseTurns),
       stepsChunkBytesPerStep: stepsBytes,
       valueBytesPerStep: valueBytes,
       arrayBytesPerStep: arrayBytes,

@@ -4,7 +4,7 @@
  * Context (`CorrelationAnalysisUI._getOptionsContext`):
  *   variableExists(type, key)   whether the dataset has the variable
  *   createVariableControl(entry, value, onChange)  the X / Y picker
- *   categoricalFields           [{key}] (Colour by)
+ *   categoricalFields           [{key}] (Color by)
  *
  * Display options (re-drawn without reading again): colorBy.
  *
@@ -37,7 +37,7 @@ export const CORRELATION_OPTIONS = defineOptions({
       ],
     },
     {
-      key: 'colorBy', kind: 'select', label: 'Colour by', tip: 'analysis-correlation', group: 'display',
+      key: 'colorBy', kind: 'select', label: 'Color by', tip: 'analysis-correlation', group: 'display',
       default: '',
       defaultText: 'Page',
       choices: context => [

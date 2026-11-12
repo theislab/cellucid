@@ -9,7 +9,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { formatCompactCount, formatDecimal, formatMultiplier, formatPercent, formatWithUnit } from '../assets/js/app/ui/components/display-format.js';
+import { formatDecimal, formatMultiplier, formatWithUnit } from '../assets/js/app/ui/components/display-format.js';
+import { formatCompactCount, formatPercent } from '../assets/js/utils/format-units.js';
 import { formatCells, formatCount, formatCountOf } from '../assets/js/utils/format-units.js';
 
 class FakeNode {
@@ -69,6 +70,7 @@ function runFrames() {
 }
 
 const {
+  buttonClassName,
   coalesceToFrame,
   createButton,
   createCheckbox,
@@ -186,6 +188,21 @@ test('switches, segments and disclosures carry their state in ARIA', () => {
 test('buttons come from one family and icon buttons say what they do', () => {
   assert.equal(createButton({ label: 'Reset' }).className, 'btn');
   assert.equal(createButton({ label: 'Run', variant: 'primary' }).className, 'btn btn-primary');
+  // Nested areas (a list item's details, a row): quiet, the main one accent text.
+  assert.equal(createButton({ label: 'Branch here', variant: 'quiet' }).className, 'btn btn-quiet');
+  assert.equal(createButton({ label: 'Show', variant: 'quiet-primary' }).className, 'btn btn-quiet btn-quiet-primary');
+  assert.throws(() => createButton({ label: 'Show', variant: 'loud' }), TypeError);
+  // The confirmation that destroys something, asked in a row or a dialog.
+  assert.equal(createButton({ label: 'Delete', variant: 'danger', className: 'btn-compact' }).className, 'btn btn-danger btn-compact');
+  // A row's action names its subject for a screen reader.
+  assert.equal(createButton({ label: 'Open', variant: 'quiet-primary', ariaLabel: 'Open Pancreas' }).getAttribute('aria-label'), 'Open Pancreas');
+  assert.throws(() => createButton({ label: 'Open', ariaLabel: '' }), TypeError);
+  // Template and element-helper markup take the same table.
+  assert.equal(buttonClassName('quiet'), 'btn btn-quiet');
+  assert.equal(buttonClassName('quiet-primary', 'community-annotation-merge-button'), 'btn btn-quiet btn-quiet-primary community-annotation-merge-button');
+  assert.throws(() => buttonClassName('loud'), TypeError);
+  // A row's menu of further actions is a drawn glyph, never a typed "⋯".
+  assert.match(createIconButton({ label: 'Branch “main”: actions', icon: ICONS.more }).innerHTML, /^<svg aria-hidden="true" focusable="false" /);
   const icon = createIconButton({ label: 'Rename category', icon: ICONS.rename });
   assert.equal(icon.className, 'icon-btn');
   assert.equal(icon.getAttribute('aria-label'), 'Rename category');

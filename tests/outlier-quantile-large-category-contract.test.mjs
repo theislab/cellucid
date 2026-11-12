@@ -1,7 +1,7 @@
 /**
  * Stored outlier quantiles are accepted for a category of any size (audit
  * NS-4). The rule writes a cell's quantile as `fround(fround(r) / fround(n))`
- * (`rankShare`); above 2^24 placed cells float32 no longer tells neighbouring
+ * (`rankShare`); above 2^24 placed cells float32 no longer tells neighboring
  * ranks apart, so a quantile names a range of ranks, and recovering one rank
  * from it (`round(q · n)`) refused quantiles the rule wrote correctly — from
  * about 17M cells in one category every opening read and ranked the whole
@@ -35,7 +35,7 @@ function ruleQuantiles(n, small) {
 test('a stored rank range above 2^24 cells is accepted, and a forged one refused', () => {
   const n = 2 ** 24 + 1;
   const { quantiles, codes } = ruleQuantiles(n, 50);
-  // Neighbouring ranks share a quantile up here.
+  // Neighboring ranks share a quantile up here.
   assert.equal(rankShare(n - 1, n), rankShare(n, n));
   assert.equal(storedQuantilesDefect(quantiles, codes, 2, 10), null);
 

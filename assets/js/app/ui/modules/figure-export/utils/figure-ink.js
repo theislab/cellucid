@@ -11,17 +11,17 @@
  * and axis numbers the reader cannot see.
  *
  * Ink is therefore derived from the figure's own background rather than
- * assumed. The two palettes are the same grey family the export already used
+ * assumed. The two palettes are the same gray family the export already used
  * (`#111`, `#6b7280`, `#e5e7eb`), mirrored across the luminance midpoint.
  *
  * A transparent figure keeps the light palette: it will be placed on a page
- * whose colour this file cannot know, and paper is the safe assumption — the
+ * whose color this file cannot know, and paper is the safe assumption — the
  * same assumption the centroid-label halo already makes.
  *
  * @module ui/modules/figure-export/utils/figure-ink
  */
 
-import { hexToRgb01 } from './color-utils.js';
+import { rgb01OfHex } from '../../../../../utils/hex-color.js';
 
 /** Rec. 709 luma weights, matching the viewer's own background test. */
 const LUMA_WEIGHTS = Object.freeze([0.2126, 0.7152, 0.0722]);
@@ -65,15 +65,15 @@ const DARK_INK = Object.freeze({
  *
  * @param {object} options
  * @param {string} options.background - the export background mode
- * @param {string} options.backgroundColor - exact #RRGGBB paper colour
+ * @param {string} options.backgroundColor - exact #RRGGBB paper color
  * @returns {FigureInk}
  */
 export function resolveFigureInk({ background, backgroundColor }) {
   if (background === 'transparent') return LIGHT_INK;
-  const rgb = hexToRgb01(backgroundColor);
+  const rgb = rgb01OfHex(backgroundColor);
   if (rgb === null) {
     throw new TypeError(
-      'Figure ink requires an exact #RRGGBB background colour.'
+      'Figure ink requires an exact #RRGGBB background color.'
     );
   }
   const luma =

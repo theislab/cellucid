@@ -4,7 +4,7 @@
  * is held and trimmed there, without stopping or failing work (round-2
  * audit CE-01, MB-1, MB-3, MB-7, MB-12).
  *
- * - The adapter's cached copies (obs payloads, coordinates, the neighbour
+ * - The adapter's cached copies (obs payloads, coordinates, the neighbor
  *   graph) share one `adapterCache` budget; a continuous column handed to
  *   its caller is not kept as well (one owner); a graph a view draws is
  *   working set, never a cached copy, and never evicted.
@@ -83,7 +83,7 @@ test('the adapter\'s cached copies share one budget, trim without invalidating, 
   const read = adapter._coalesceInFlight(adapter._geneExpressionInFlight, 'CD3E', 0, () => new Promise(resolve => { finish = resolve; }));
   await Promise.resolve();
   const released = adapter.releaseCachedCopies();
-  assert.deepEqual(released, ['cached copies of 2 fields', 'cached copies of 1 embedding', 'a cached copy of the neighbour graph']);
+  assert.deepEqual(released, ['cached copies of 2 fields', 'cached copies of 1 embedding', 'a cached copy of the neighbor graph']);
   assert.equal(adapter._obsFieldDataCache.size, 0);
   assert.equal(adapter._obsFieldDataCacheBytes, 0n);
   assert.deepEqual([...adapter._coordinateCacheLru.keys()], ['e2'], 'the pinned embedding stays');

@@ -4,7 +4,7 @@
  * bookmarks and a journal of its own edits; the recorder the dispatcher
  * tells of every action; every move (undo, redo, jump, switch); every edit
  * (journaled, undoable from Recently deleted); replays; and the history's
- * own catalogue actions (`definitions/history.js`), the one path the State
+ * own catalog actions (`definitions/history.js`), the one path the State
  * panel, agents, Python and R take.
  *
  * **Recording.** Before an action the touched domains' values are captured
@@ -42,7 +42,8 @@
  * steps below it that changed or read what it changed (§3.3.4), with Cancel.
  *
  * Subscribers hear `{kind, tracker, ...}`: `step` (`steps`: records
- * written), `moved` (`head`), `edited` (`op`, `journal`, `steps`, `removed`),
+ * written), `moved` (`head`), `edited` (`op`, `journal`, `steps`, `removed`;
+ * `journalRemoved`: entries an exact restore took out of Recently deleted),
  * `tracker`, `loaded`, `replayed` (`report`), `recording` (`on`), `chat`.
  *
  * @module app/history/history
@@ -51,18 +52,18 @@
 import { DOMAIN_IDS, REREADING_DOMAINS, domainName, withDerivedDomains } from '../actions/domains.js';
 import { ActionRefused } from '../actions/dispatcher.js';
 import { ParamsNotUpgradable, outsideActOf, upgradeParams } from '../actions/catalog.js';
-import { throwIfAborted } from '../../utils/abort.js';
+import { abortReason, isCancellation, onAbort, throwIfAborted } from '../../utils/abort.js';
 import { formatCountOf } from '../../utils/format-units.js';
 import {
   createBy, createStep, HISTORY_ID_PATTERNS, HISTORY_SENTENCES, idNumber, idOf, nameKey, OUTSIDE_CHANGE_TYPE,
-  sameBy, squashedLabel, suffixedName, validateHistory,
+  HistoryModelError, knownDomainsOnly, sameBy, squashedLabel, suffixedName, validateHistory, validateTracker,
 } from './model.js';
 import {
   branchOf, commonAncestor, insertStep, isOnPath, liveTracker, newTracker, orderedDomains, redoTarget,
   referencedHashes, stepHashes, stepOf, trackerRecord, valuesAt, valuesFrom,
 } from './tree.js';
-import { activeBranchAt, branchForNewStep, branchNamed, checkedName, placeStep, planBranchDelete, stepNamed } from './branches.js';
-import { beginEdit, commitEdit, rollbackEdit } from './journal.js';
+import { activeBranchAt, branchForNewStep, branchNamed, checkedName, placeStep, planBranchDelete, stepNamed, takeOut } from './branches.js';
+import { beginEdit, commitEdit, membershipStepIds, rollbackEdit } from './journal.js';
 import { bindingRefusal, byOfMeta, noteTurnOutside, noteTurnStep, turnUndoPlan } from './turns.js';
 import { readsOf, staleOnPath } from './provenance.js';
 import { searchSteps } from './search.js';
@@ -71,11 +72,11 @@ import { createDeleteRestore } from './delete-restore.js';
 import { createHistoryActions } from './actions.js';
 import { isReplayable, mapParams, namesCells, replayPlanOf, stepParamsIn } from './replay.js';
 import { quoteName } from '../actions/targets/names.js';
-
-function unknownDomainsMessage(ids) {
-  return `This history holds state this version of Cellucid does not have (${ids.map(id => `"${id}"`).join(', ')}). `
-    + 'Open it in the version of Cellucid it was saved with.';
-}
+import { viewLabelsInValue, viewNameInValue } from '../actions/targets/views.js';
+import { sameValue } from '../state/domains/same-value.js';
+import { HISTORY_WAITS_FOR_DATASET } from '../ui/no-dataset.js';
+import { onNextMacrotask } from '../../utils/yield-macrotask.js';
+import { createListenerSet } from '../../utils/listener-set.js';
 
 /** Keep only what a timeline needs of an outcome (counts, names), never arrays of cells. */
 function summarizeOutcome(outcome) {
@@ -95,14 +96,17 @@ const OUTSIDE_BY = Object.freeze({ origin: 'outside', agent: null, model: null, 
 /** A move's choice while paused with changes: keep them as one step first, or discard them. */
 export const PAUSED_CHOICES = Object.freeze(['keep', 'discard']);
 
-/** Run `fn` in a task of its own, after the one running now (a message to itself, never a timer). */
-function runInNextTask(fn) {
-  const channel = new MessageChannel();
-  channel.port1.onmessage = () => {
-    channel.port1.close();
-    fn();
-  };
-  channel.port2.postMessage(null);
+/**
+ * `value` with every string in `names` (a generated id) replaced by its name,
+ * as a value or as an object's key, at any depth; typed arrays as they are.
+ * @param {unknown} value
+ * @param {Map<string, string>} names
+ */
+export function renamedIds(value, names) {
+  if (typeof value === 'string') return names.get(value) ?? value;
+  if (Array.isArray(value)) return value.map(item => renamedIds(item, names));
+  if (value === null || typeof value !== 'object' || ArrayBuffer.isView(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [names.get(key) ?? key, renamedIds(item, names)]));
 }
 
 /**
@@ -126,7 +130,7 @@ function runInNextTask(fn) {
 export function createHistory({
   dispatcher, domains, dataset, newTrackerId, now = () => Date.now(), pool = createValuePool(),
   offDomains = () => [], recordNewTrackers = () => true, person = () => null, openSaved = null,
-  nextTask = runInNextTask,
+  nextTask = onNextMacrotask,
 }) {
   if (typeof newTrackerId !== 'function') throw new TypeError('The history needs newTrackerId()');
   const catalog = dispatcher.catalog;
@@ -153,6 +157,14 @@ export function createHistory({
   /** Whether an exclusive task runs now, and its end (an observed change waits for it). */
   let exclusiveBusy = false;
   let exclusiveDone = Promise.resolve();
+  /**
+   * What asks for heavy work the exclusive operation running finds (`heavy`
+   * of `exclusive`: the action's `ctx.heavy`, by its dispatch's signal), or
+   * null: the person acting, a replay, a session.
+   */
+  let exclusiveHeavy = null;
+  /** Each own action's dispatch signal → its `ctx.heavy` (`exclusive` finds it by the signal it is given). */
+  const heavyOfSignal = new WeakMap();
   let restoringDepth = 0;
   let observedTail = Promise.resolve();
   const pendingObserved = new Set();
@@ -176,7 +188,7 @@ export function createHistory({
    * shown, the head's values or the paused draft of the tracker in use name
    * them. Each goes from the pool once none of those does (`sweep`), or stays
    * once a record takes it (`claim`). §3.5: an action that changed nothing,
-   * a cancelled one and a paused change keep nothing.
+   * a canceled one and a paused change keep nothing.
    */
   const transient = new Set();
   /**
@@ -185,15 +197,13 @@ export function createHistory({
    * the pool, so a gesture of 200 changes keeps one value.
    */
   let gesture = { step: null, owned: new Set() };
-  const listeners = new Set();
+  const listeners = createListenerSet('the history');
   let destroyed = false;
   /** Stops keeping what turns do outside the state (set once the history listens). */
   let stopOutside = () => {};
 
   function notify(kind, detail = {}) {
-    for (const listener of [...listeners]) {
-      try { listener({ kind, ...detail }); } catch (error) { console.error('[history] listener failed', error); }
-    }
+    listeners.notify({ kind, ...detail });
   }
 
   function off() {
@@ -227,31 +237,54 @@ export function createHistory({
     for (const hash of hashes) transient.delete(hash);
   }
 
-  /** `${domain}\0${hash}` → the hash of the value's canonical form (its owner's `canonical`), computed once. */
+  /** `${domain}\0${hash}\0${overlays}` → the hash of the value's canonical form, computed once. */
   const canonicalHashes = new Map();
 
   /**
-   * The hash of a value's canonical form: its generated ids renamed and its
-   * times dropped by its domain's owner (`domains.js`), or the hash itself
-   * for a domain whose values have none. Verify and a delete's "did this
-   * input change" compare these; a restore puts back the value itself.
+   * The user fields' generated ids a `field-overlays` value holds, each with
+   * the name its canonical form gives it (`user_1`, … in order:
+   * `canonicalFieldOverlays`), or null when it holds none.
    */
-  async function canonicalOf(domain, hash) {
+  function userFieldNames(overlays) {
+    const value = overlays === undefined || overlays === null ? null : pool.get(overlays);
+    const ids = Array.isArray(value?.userFields) ? value.userFields.map(item => item.id) : [];
+    return ids.length === 0 ? null : new Map(ids.map((id, index) => [id, `user_${index + 1}`]));
+  }
+
+  /**
+   * The hash of a value's canonical form: its generated ids renamed and its
+   * times dropped by its domain's owner (`domains.js`), and every user
+   * field's generated id it names (a color, a filter, a view of a field
+   * made by a step) renamed as the `overlays` value beside it names it
+   * (the state's `field-overlays` hash), or the hash itself for a value with
+   * none. Verify and a delete's "did this input change" compare these; a
+   * restore puts back the value itself.
+   */
+  async function canonicalOf(domain, hash, overlays = undefined) {
     if (hash === undefined || !domains.has(domain)) return hash;
     const owner = domains.owner(domain);
-    if (typeof owner.canonical !== 'function') return hash;
-    const key = `${domain}\u0000${hash}`;
+    const names = domain === 'field-overlays' ? null : userFieldNames(overlays);
+    if (typeof owner.canonical !== 'function' && names === null) return hash;
+    const key = `${domain}\u0000${hash}\u0000${names === null ? '' : overlays}`;
     let out = canonicalHashes.get(key);
     if (out === undefined) {
-      out = await hashValue(owner.canonical(pool.get(hash)));
+      let value = pool.get(hash);
+      if (typeof owner.canonical === 'function') value = owner.canonical(value);
+      if (names !== null) value = renamedIds(value, names);
+      out = await hashValue(value);
       canonicalHashes.set(key, out);
     }
     return out;
   }
 
-  /** Whether two values of a domain are the same but for generated ids and times. */
-  async function sameCanonical(domain, a, b) {
-    return a === b || (await canonicalOf(domain, a)) === (await canonicalOf(domain, b));
+  /**
+   * Whether two values of a domain are the same but for generated ids and
+   * times; `overlaysA`, `overlaysB`: the `field-overlays` hash of the state
+   * each belongs to, so a user field made again under a new id (a replay, a
+   * step applied again) is the same field.
+   */
+  async function sameCanonical(domain, a, b, overlaysA = undefined, overlaysB = undefined) {
+    return a === b || (await canonicalOf(domain, a, overlaysA)) === (await canonicalOf(domain, b, overlaysB));
   }
 
   /** Every hash a step record names. */
@@ -279,35 +312,66 @@ export function createHistory({
    * Put back `target` (domain → hash), in domain order, for each domain whose
    * value differs from what is shown when its turn comes; what is shown is
    * captured again after each (after a domain whose restore reads the dataset
-   * again, every domain is).
+   * again, every domain is). Each owner is given the other values put back
+   * (`target(id)`: a domain restored before its dependants takes them into
+   * account, the data mapping the Expression values its matrix is shown in)
+   * and `heavy`, which asks for heavy work its restore finds (the cells'
+   * totals of normalized values: the running action's `ctx.heavy`, null
+   * otherwise, and for a rollback, which puts back what was shown).
+   *
+   * `failed`: a load's list of the parts it could not put back (F155). Given,
+   * a domain whose owner refuses its value (a value written by an earlier
+   * version of Cellucid, which this one cannot read; a failure while it was
+   * put back) keeps what is shown and is listed `{part: 'domain', domain,
+   * error}`, and the next domain is put back; a cancellation, or the dataset
+   * replaced, still ends it whole. Not given (a move), one failure ends it.
    */
-  async function putBack(target, signal) {
+  async function putBack(target, signal, { heavy = exclusiveHeavy, failed = null } = {}) {
+    const valueOf = id => (Object.hasOwn(target, id) ? pool.get(target[id]) : undefined);
     for (const id of orderedDomains(Object.keys(target))) {
       if (shown[id] === target[id]) continue;
       if (destroyed) throw new Error('The dataset was replaced; its history no longer applies');
       throwIfAborted(signal);
+      const was = shown[id];
       try {
-        await domains.owner(id).restore(pool.get(target[id]), { signal });
+        await domains.owner(id).restore(pool.get(target[id]), { signal, heavy, target: valueOf });
       } catch (error) {
-        if (!destroyed) {
-          try { shown = { ...shown, ...await capture([id]) }; } catch { /* the restore's own failure is reported */ }
+        const partial = failed !== null && !destroyed && !isCancellation(error) && signal?.aborted !== true;
+        if (partial && was !== undefined) {
+          // A part left as it was shown: its owner may have put back some of it before it refused
+          // (a control set, its renderer refusing), so what it showed is put back in turn (R9H-11).
+          try {
+            await domains.owner(id).restore(pool.get(was), { signal: null, heavy: null, target: id2 => (id2 === id ? pool.get(was) : valueOf(id2)) });
+          } catch { /* what it shows now is captured below; the restore's own failure is reported */ }
         }
-        throw error;
+        if (!destroyed) {
+          // What it (and, after one that reads the dataset again, every domain) shows now.
+          const again = partial && REREADING_DOMAINS.includes(id) ? DOMAIN_IDS : [id];
+          try { shown = { ...shown, ...await capture(again) }; } catch { /* the restore's own failure is reported */ }
+        }
+        if (!partial) throw error;
+        failed.push({ part: 'domain', domain: id, error });
+        continue;
       }
       // Captured again: the domain, the domains that follow it, or every domain after one that reads the dataset again.
       shown = { ...shown, ...await capture(REREADING_DOMAINS.includes(id) ? DOMAIN_IDS : withDerivedDomains([id])) };
     }
+    // Stopped while its last domain was put back: the caller puts back what was shown.
+    throwIfAborted(signal);
   }
 
-  /** Put back `target`; on a failure what was shown comes back. */
-  async function restoreTo(target, { signal = null } = {}) {
+  /**
+   * Put back `target`; on a failure what was shown comes back. `failed`: a
+   * load's parts not put back (`putBack`), each listed and the rest restored.
+   */
+  async function restoreTo(target, { signal = null, failed = null } = {}) {
     const from = { ...shown };
     restoringDepth++;
     try {
-      await putBack(target, signal);
+      await putBack(target, signal, { failed });
     } catch (error) {
       if (!destroyed) {
-        try { await putBack(from, null); } catch (rollbackError) { error.rollbackError = rollbackError; }
+        try { await putBack(from, null, { heavy: null }); } catch (rollbackError) { error.rollbackError = rollbackError; }
       }
       throw error;
     } finally {
@@ -328,9 +392,18 @@ export function createHistory({
    * (`requireExclusive`), never `exclusive` again (it would wait for itself).
    * A change observed while a task runs is recorded after it, against what is
    * shown then (`recordObservedNow`).
+   *
+   * `signal`: what stops it (the dispatch of the history's action: the
+   * person's Stop of an agent, the page closing). Stopped while it waits for
+   * its turn, it never runs (bug hunt LB-2), as an action stopped at the
+   * dispatcher's gate never does, and its caller hears so at once; a move
+   * passes it on to its restore (stopped there, what was shown comes back
+   * and the caller hears once it has).
    */
-  function exclusive(task) {
+  function exclusive(task, { signal = null, heavy = signal === null ? null : (heavyOfSignal.get(signal) ?? null) } = {}) {
+    let started = false;
     const run = exclusiveTail.then(async () => {
+      throwIfAborted(signal);
       // A gesture still settling (a camera drag recorded at its settle) is
       // ended now and recorded first, and a change waiting for the work it set
       // off is recorded first: a move never starts before the change it would
@@ -342,14 +415,18 @@ export function createHistory({
         await Promise.all([tail, ...pendingObserved]);
         if (tail === observedTail && pendingObserved.size === 0) break;
       }
+      throwIfAborted(signal);
+      started = true;
       exclusiveBusy = true;
       // Every value it holds stays readable while it runs (a rollback puts back what was shown).
       const unhold = pool.hold();
       let release;
       exclusiveDone = new Promise(resolve => { release = resolve; });
+      exclusiveHeavy = heavy;
       try {
         return await task();
       } finally {
+        exclusiveHeavy = null;
         exclusiveBusy = false;
         sweep();
         unhold();
@@ -357,7 +434,20 @@ export function createHistory({
       }
     });
     exclusiveTail = run.then(() => undefined, () => undefined);
-    return run;
+    if (signal === null) return run;
+    return new Promise((resolve, reject) => {
+      // Still waiting for its turn: ended now (when its turn comes it does nothing).
+      const stopWaiting = onAbort(signal, () => {
+        if (!started) reject(abortReason(signal));
+      });
+      run.then(value => {
+        stopWaiting();
+        resolve(value);
+      }, error => {
+        stopWaiting();
+        reject(error);
+      });
+    });
   }
 
   /** Inner operations (moves, edits) run only inside `exclusive`. */
@@ -543,7 +633,8 @@ export function createHistory({
    * The step an action makes from what it changed, or null: nothing changed
    * but domains switched off (they never make a step), or nothing at all. A
    * domain switched off is still captured: where it differs from the head it
-   * is kept in the step.
+   * is kept in the step. `unrecorded` hears why no step was recorded (the
+   * dispatch's `unrecorded`, what an agent is told: `agent/bridge/mcp-content.js` `UNRECORDED_NOTES`).
    */
   /** Whether `step` left the domains of `ids` it touches as they are shown now (it touches at least one). */
   function holdsShown(step, ids) {
@@ -551,12 +642,52 @@ export function createHistory({
     return held.length > 0 && held.every(id => step.after[id] === shown[id]);
   }
 
-  async function recordAction(tracker, { definition, params, meta, after, outcome, reads, startedAt, observed = false }) {
+  /**
+   * A step's label naming the views it changed, when several views are open
+   * and it changed some of them, not all (F157: with several views, "Colored
+   * by gene Sox9" in the history and the methods text could not say which
+   * panel it changed). The views are found from what changed: each touched
+   * per-view domain (an owner with `readPart`) compared view by view, and
+   * named as the Compare views list names them (`viewNameInValue`, with a
+   * view's label). A label that names a view already, a step that keeps or
+   * removes views (the count changes) and a domain of another shape are left
+   * as they are.
+   *
+   * @param {string} label - `describe`'s
+   * @param {string[]} touches
+   * @param {Record<string, string>} before - hashes before the step
+   * @param {Record<string, string>} after - hashes after it
+   */
+  function labelWithViews(label, touches, before, after) {
+    if (/\bView \d+\b|\blive view\b/.test(label)) return label;
+    const viewsHash = after.views ?? before.views;
+    const views = viewsHash !== undefined && pool.has(viewsHash) ? pool.get(viewsHash) : null;
+    const count = Array.isArray(views?.views) ? views.views.length : 0;
+    if (count < 2) return label;
+    const changed = new Set();
+    for (const id of touches) {
+      if (id === 'views' || !domains.has(id) || typeof domains.owner(id).readPart !== 'function') continue;
+      const a = before[id] !== undefined && pool.has(before[id]) ? pool.get(before[id]) : null;
+      const b = after[id] !== undefined && pool.has(after[id]) ? pool.get(after[id]) : null;
+      if (!Array.isArray(a?.views) || !Array.isArray(b?.views) || a.views.length !== b.views.length || b.views.length !== count) return label;
+      for (let i = 0; i < count; i++) if (!sameValue(a.views[i], b.views[i])) changed.add(i);
+    }
+    // The live view hidden has no row: a change only there names nothing a reader can find.
+    const shownViews = views.liveHidden === true ? count - 1 : count;
+    if (changed.size === 0 || changed.size >= shownViews) return label;
+    const labels = viewLabelsInValue(views);
+    const names = [...changed].sort((x, y) => x - y).map(index => viewNameInValue(index, views.liveHidden === true, labels));
+    const listed = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
+    return `${label} in ${listed}`;
+  }
+
+  async function recordAction(tracker, { definition, params, meta, after, outcome, reads, startedAt, observed = false, unrecorded = () => {} }) {
     const offIds = new Set(off());
     shown = { ...shown, ...after };
     const by = byOfMeta(meta, person());
     if (tracker.paused !== null) {
       notePaused(tracker, by);
+      unrecorded('paused');
       return null;
     }
     const changed = orderedDomains(Object.keys(after).filter(id => after[id] !== headValues[id]));
@@ -571,13 +702,14 @@ export function createHistory({
         const at = now();
         head.params = params;
         head.code = codeOf(definition, params);
-        head.label = definition.describe(params, outcome);
+        head.label = labelWithViews(definition.describe(params, outcome), head.touches, head.before, head.after);
         head.outcome = summarizeOutcome(outcome) ?? head.outcome;
         head.until = at;
         head.merged += 1;
         notify('step', { tracker: tracker.id, step: head.id, steps: [head.id], branch: head.branch });
         return head;
       }
+      unrecorded(changed.length === 0 ? 'unchanged' : 'off');
       return null;
     }
     let offNow = {};
@@ -592,7 +724,8 @@ export function createHistory({
     const at = now();
     const fields = {
       kind: 'action', type: definition.type, params, v: definition.version, code: codeOf(definition, params),
-      label: definition.describe(params, outcome), by, at, until: at, ms: Math.max(0, at - startedAt), touches,
+      label: labelWithViews(definition.describe(params, outcome), touches, headValues, values),
+      by, at, until: at, ms: Math.max(0, at - startedAt), touches,
       before: Object.fromEntries(touches.map(id => [id, headValues[id]])),
       after: Object.fromEntries(touches.map(id => [id, values[id]])),
       reads, outcome: summarizeOutcome(outcome), coalesceKey: coalesceKeyOf(definition, params),
@@ -603,7 +736,10 @@ export function createHistory({
     if (fields.coalesceKey !== null && coalesceStep === head.id && head.coalesceKey === fields.coalesceKey && head.children.length === 0
       && sameBy(head.by, by) && head.notes.length === 0 && head.bookmark === null && head.branch === branch.id
       && branch.tip === head.id && !branch.locked && pending === null && head.kind === 'action') {
-      return amendHead(tracker, head, fields);
+      const merged = amendHead(tracker, head, fields);
+      // Brought back where the step it merged into began: that step is taken out.
+      if (merged === null) unrecorded('retracted');
+      return merged;
     }
     return appendRecord(tracker, fields, meta);
   }
@@ -629,6 +765,10 @@ export function createHistory({
         delete head.after[id];
       }
     }
+    // What is shown now is the head's, whether the step stays or goes.
+    if (tracker === active) headValues = { ...headValues, ...fields.after };
+    // The gesture ended where it began (a slider dragged and brought back): no step.
+    if (head.touches.length === 0) return retractHead(tracker, head, owned, replaced);
     head.params = fields.params;
     head.code = fields.code;
     head.label = fields.label;
@@ -637,7 +777,6 @@ export function createHistory({
     head.ms = head.ms === null ? fields.ms : head.ms + fields.ms;
     head.outcome = fields.outcome ?? head.outcome;
     head.reads = fields.reads;
-    if (tracker === active) headValues = { ...headValues, ...fields.after };
     claim(hashesOfStep(head));
     if (owned !== null) {
       // The values of the gesture this merge replaced, which nothing else holds, go.
@@ -652,6 +791,31 @@ export function createHistory({
     if (turn) turn.endedAt = head.until;
     notify('step', { tracker: tracker.id, step: head.id, steps: [head.id], branch: head.branch });
     return head;
+  }
+
+  /**
+   * Take out a head step its gesture brought back to where it began: it
+   * changes nothing, and a step that changes nothing would be an Undo that
+   * does nothing visible. Taken out as it was put in (the head, its branch's
+   * tip, a branch it started), never journaled: no one deleted it. The values
+   * the gesture alone made go; the next change of the gesture is a step of
+   * its own. Returns null: no step was recorded.
+   */
+  function retractHead(tracker, head, owned, replaced) {
+    const parent = head.parent;
+    takeOut(tracker, beginEdit(tracker, { op: 'step.retract', by: head.by, at: head.until, label: head.label }), [head.id]);
+    if (tracker === active) coalesceStep = null;
+    if (owned !== null) {
+      const still = new Set([...Object.values(shown), ...Object.values(headValues)]);
+      for (const hash of [...replaced, ...owned]) {
+        if (!owned.has(hash) || still.has(hash)) continue;
+        owned.delete(hash);
+        pool.release(hash);
+      }
+      gesture = { step: null, owned: new Set() };
+    }
+    notify('edited', { tracker: tracker.id, op: 'step.retract', journal: null, label: head.label, steps: [parent], removed: [head.id] });
+    return null;
   }
 
   /** Write a re-applied action into the step it re-applies (a deleted step's dependants). */
@@ -686,6 +850,14 @@ export function createHistory({
     }
   }
 
+  /**
+   * The actions recorded now (from `before` to `after` or `failed`), each
+   * with the domains a person's own act changed meanwhile (`meanwhile`,
+   * `observed`'s `person`): a stopped action's rollback leaves those as the
+   * person made them (R9W-5).
+   */
+  const openTokens = new Set();
+
   const recorder = Object.freeze({
     /**
      * Before the dataset's first tracker starts (while its starting view is
@@ -710,8 +882,15 @@ export function createHistory({
       else shown = { ...shown, ...captured };
       const reads = readsOf(definition.reads, shown, (definition.reads ?? []).includes('history') ? branchTipRead(tracker, params) : null);
       // The values it captured stay readable until it is recorded or put back.
-      return { tracker, definition, params, meta, before: captured, reads, startedAt: now(), unhold: pool.hold() };
+      const token = { tracker, definition, params, meta, before: captured, reads, startedAt: now(), unhold: pool.hold(), meanwhile: new Set() };
+      openTokens.add(token);
+      return token;
     },
+    /**
+     * Record the step the action made (resolves to it), or none (null): then
+     * `token.unrecorded` says why (`'unchanged'`, `'off'`, `'paused'`,
+     * `'retracted'`, `'elsewhere'`; the dispatcher's `unrecorded`).
+     */
     async after(token, outcome) {
       try {
         if (destroyed) return null;
@@ -721,26 +900,34 @@ export function createHistory({
         }
         if (token.tracker !== active) {
           shown = { ...shown, ...after };
+          token.unrecorded = 'elsewhere';
           return null;
         }
-        return await recordAction(token.tracker, { ...token, after, outcome });
+        return await recordAction(token.tracker, { ...token, after, outcome, unrecorded: reason => { token.unrecorded = reason; } });
       } finally {
+        openTokens.delete(token);
         sweep();
         token.unhold();
       }
     },
-    /** A failed handler leaves nothing half done: what it changed is put back. */
+    /**
+     * A failed handler leaves nothing half done: what it changed is put back,
+     * but for a domain the person changed meanwhile by an act of their own
+     * (`token.meanwhile`): the newest act stands, and is its own step.
+     */
     async failed(token) {
       try {
         if (destroyed) return;
         shown = { ...shown, ...await capture(withDerivedDomains(token.definition.touches)) };
+        const back = Object.fromEntries(Object.entries(token.before).filter(([id]) => !token.meanwhile.has(id)));
         restoringDepth++;
         try {
-          await putBack(token.before, null);
+          await putBack(back, null);
         } finally {
           restoringDepth--;
         }
       } finally {
+        openTokens.delete(token);
         sweep();
         token.unhold();
       }
@@ -751,8 +938,9 @@ export function createHistory({
      * when given, is the work the change set off: the change is recorded once
      * it has settled, so its step holds all of it.
      */
-    observed({ definition, params, meta, outcome = null, after = null }) {
+    observed({ definition, params, meta, outcome = null, after = null, person = false }) {
       if (restoringDepth > 0 || active === null) return Promise.resolve(null);
+      if (person) for (const token of openTokens) for (const id of withDerivedDomains(definition.touches)) token.meanwhile.add(id);
       const tracker = active;
       if (after !== null) {
         const recorded = Promise.resolve(after).then(() => recordObservedNow(tracker, { definition, params, meta, outcome }));
@@ -852,6 +1040,9 @@ export function createHistory({
     const steps = [];
     const removed = [];
     for (const id of edit.kept.steps.keys()) (tracker.steps.has(id) ? steps : removed).push(id);
+    // A group made, extended or removed changes its steps' group without keeping them.
+    for (const id of membershipStepIds(tracker, entry)) if (!edit.kept.steps.has(id)) steps.push(id);
+
     notify('edited', { tracker: tracker.id, op: entry.op, journal: entry.id, label: entry.label, steps, removed });
   }
 
@@ -945,7 +1136,9 @@ export function createHistory({
 
   async function startTracker({ start = 'opened', name = null, meta = {} } = {}) {
     // The dataset's first tracker starts with the dataset's opening; any other is started by someone.
-    const by = active === null && trackers.size === 0 ? createBy({ origin: 'startup' }) : byOf(meta);
+    // Its opening is no step of a turn (nothing undoes it, and the new tracker holds no turn yet):
+    // an agent's or a notebook's turn that starts one is said by who, not by the turn.
+    const by = active === null && trackers.size === 0 ? createBy({ origin: 'startup' }) : { ...byOf(meta), turn: null };
     const checked = name === null ? null : checkedName('tracker', name);
     if (checked !== null && liveTrackers().some(tracker => nameKey(tracker.name) === nameKey(checked))) {
       throw refuse(HISTORY_SENTENCES.nameTaken({ kind: 'tracker', name: checked }), 'name-taken');
@@ -968,7 +1161,7 @@ export function createHistory({
   // -------------------------------------------------------------------------
   // Replays (a saved history, a branch without a step, a branch's steps here, verify)
 
-  /** A source step's parameters at this catalogue's version, or why they cannot be replayed here. */
+  /** A source step's parameters at this catalog's version, or why they cannot be replayed here. */
   function replayableParams(step, mapping) {
     if (!catalog.has(step.type)) return { reason: `"${step.type}" is not an action of this version of Cellucid; it was recorded with another version and cannot be replayed here.` };
     const definition = catalog.get(step.type);
@@ -1113,7 +1306,8 @@ export function createHistory({
       }
       try {
         const { step: result } = await dispatcher.dispatch(step.type, named.params, {
-          origin: 'replay', internal: true, signal, replayOf,
+          // Heavy work a step finds is the replay's (`exclusive`'s `heavy`): its agent asked, its load's line naming it.
+          origin: 'replay', internal: true, signal, replayOf, heavy: exclusiveHeavy,
         });
         say(step, result === null ? 'unchanged' : 'applied', result?.id ?? null);
       } catch (error) {
@@ -1193,43 +1387,66 @@ export function createHistory({
     return values;
   }
 
-  function checkDomains(record) {
-    const unknown = new Set();
-    for (const step of record.steps) {
-      for (const id of [...step.touches, ...Object.keys(step.before), ...Object.keys(step.after)]) {
-        if (!DOMAIN_IDS.includes(id)) unknown.add(id);
-      }
-    }
-    if (unknown.size > 0) throw new RangeError(unknownDomainsMessage([...unknown]));
-  }
-
   /**
    * Read a saved history: show its active tracker's head, read the rest, and
    * hand back its trackers live (`replace`: every tracker; `add`: beside the
-   * ones there). On any failure what was shown comes back.
+   * ones there), with what it could not restore (`unrestored`, F155).
+   *
+   * It is restored part by part: each domain of the head (`putBack`'s
+   * `failed`) and each tracker on its own. A domain whose value this
+   * version cannot put back keeps what is shown; a tracker whose records
+   * this version cannot read (`HistoryModelError`: written by another
+   * version of the history's model) is left out, `{part: 'tracker',
+   * tracker: {id, name}, active, error}`; when it is the one shown its head
+   * was put back already, and the caller keeps that as a new tracker
+   * (`activeId` null, `orphan` its record, for its name and conversations).
+   * A state domain this version does not have (a history another version
+   * wrote: `knownDomainsOnly`) is left out of every step, `{part:
+   * 'unknown-domain', domain}`, and the rest restored.
+   * A history whose structure is broken (a hash it does not hold, a
+   * conversation of a tracker it does not have), a cancellation or the
+   * dataset replaced is refused whole, and what was shown comes back.
    */
   async function readSaved(saved, { values = new Map(), rest = null, signal = null }) {
     for (const [hash, value] of values) pool.adopt(hash, value);
-    const records = saved.trackers.map(record => ({ ...record, steps: record.steps.map(step => ({ ...step })), journal: [...record.journal] }));
+    const unknownDomains = new Set();
+    const knownOnly = record => {
+      const { tracker, unknown } = knownDomainsOnly(record);
+      for (const id of unknown) unknownDomains.add(id);
+      return tracker;
+    };
+    const records = saved.trackers.map(record => knownOnly({ ...record, steps: record.steps.map(step => ({ ...step })), journal: [...record.journal] }));
     const activeRecord = records.find(record => record.id === saved.activeTracker);
     if (activeRecord === undefined) throw new RangeError('A saved history names an active tracker it does not hold');
-    for (const record of records) checkDomains(record);
     const previous = await capture(DOMAIN_IDS);
     shown = { ...previous };
-    // A domain a saved root does not hold (one this version added later) keeps the value shown now.
+    // A domain a saved root does not hold (a file from before the domain, or
+    // written by hand) is the value its owner says its absence means
+    // (`absent()`: the Expression values as stored), so one file restores one
+    // state whatever was shown; an owner that says none keeps the value shown.
+    const absentHashes = new Map();
+    for (const id of DOMAIN_IDS) {
+      const owner = domains.owner(id);
+      if (typeof owner.absent !== 'function') continue;
+      if (!records.some(record => record.steps.some(step => step.parent === null && !(id in step.after)))) continue;
+      const { hash, added } = await pool.putNew(owner.absent());
+      if (added) transient.add(hash);
+      absentHashes.set(id, hash);
+    }
     for (const record of records) {
       const root = record.steps.find(step => step.parent === null);
       if (root !== undefined) {
         root.after = { ...root.after };
-        for (const id of DOMAIN_IDS) if (!(id in root.after)) root.after[id] = previous[id];
+        for (const id of DOMAIN_IDS) if (!(id in root.after)) root.after[id] = absentHashes.get(id) ?? previous[id];
       }
     }
     const target = valuesAtRecord(activeRecord, activeRecord.headId);
     const draft = activeRecord.paused?.draft ?? null;
     const shownTarget = draft === null ? target : { ...target, ...draft };
     if (Object.values(shownTarget).some(hash => !pool.has(hash))) throw new RangeError('A saved history does not hold the values of the step it shows');
+    const unrestored = [];
     try {
-      await restoreTo(shownTarget, { signal });
+      await restoreTo(shownTarget, { signal, failed: unrestored });
       if (rest !== null) {
         const more = await rest();
         throwIfAborted(signal);
@@ -1242,7 +1459,7 @@ export function createHistory({
         for (const { tracker, journal } of more.journals ?? []) {
           const record = records.find(each => each.id === tracker);
           if (record === undefined) throw new RangeError(`A saved journal names a tracker the history does not hold ("${tracker}")`);
-          record.journal = journal;
+          record.journal = knownOnly({ ...record, journal }).journal;
         }
         for (const { tracker, step, params, outcome } of more.params ?? []) {
           const record = records.find(each => each.id === tracker);
@@ -1252,8 +1469,28 @@ export function createHistory({
           held.outcome = outcome;
         }
       }
-      validateHistory({ dataset: saved.dataset, activeTracker: saved.activeTracker, trackers: records });
-      const live = records.map(liveTracker);
+      // Each tracker is read on its own: one whose records this version cannot read is one part not restored.
+      const readable = records.filter(record => {
+        try {
+          validateTracker(record);
+          return true;
+        } catch (error) {
+          if (!(error instanceof HistoryModelError)) throw error;
+          unrestored.push({
+            part: 'tracker', tracker: { id: record.id, name: record.name }, active: record.id === saved.activeTracker, error,
+          });
+          return false;
+        }
+      });
+      const orphan = readable.includes(activeRecord) ? null : activeRecord;
+      if (orphan === null) {
+        validateHistory({ dataset: saved.dataset, activeTracker: saved.activeTracker, trackers: readable });
+      } else {
+        // The one shown is left out: the others are checked together, one not removed standing for the active one.
+        const standIn = readable.find(record => record.removed === null);
+        if (standIn !== undefined) validateHistory({ dataset: saved.dataset, activeTracker: standIn.id, trackers: readable });
+      }
+      const live = readable.map(liveTracker);
       for (const tracker of live) {
         const hashes = referencedHashes(tracker);
         for (const hash of Object.values(tracker.paused?.draft ?? {})) hashes.add(hash);
@@ -1261,11 +1498,62 @@ export function createHistory({
           if (!pool.has(hash)) throw new RangeError(`A saved history does not hold the value ${hash.slice(0, 12)} its steps refer to`);
         }
       }
-      return { live, activeId: saved.activeTracker, target };
+      // The state domains this version does not have are named first: their changes are left out of every step.
+      unrestored.unshift(...[...unknownDomains].sort().map(domain => ({ part: 'unknown-domain', domain })));
+      return { live, activeId: orphan === null ? saved.activeTracker : null, orphan, target, unrestored };
     } catch (error) {
       try { await restoreTo(previous); } catch (rollbackError) { if (error && typeof error === 'object') error.rollbackError ??= rollbackError; }
       throw error;
     }
+  }
+
+  /**
+   * Show what a load read (`readSaved`, inside its exclusive operation): its
+   * active tracker at its head, else, when the tracker shown could not be
+   * read (`orphan`), what it showed kept as a new tracker of that name with
+   * its conversations. A part of the head that could not be put back keeps
+   * what is shown, and the tracker records that as its own step from the
+   * saved head to what is shown, naming the parts (`unrestoredLabel`): the
+   * head and what is shown agree, and undoing it would try the saved value
+   * again. Returns the tracker shown.
+   */
+  function showLoaded({ activeId, orphan, target, unrestored }) {
+    pending = null;
+    coalesceStep = null;
+    if (activeId === null) {
+      const taken = liveTrackers().map(tracker => tracker.name);
+      let name = null;
+      try {
+        name = suffixedName(checkedName('tracker', orphan.name), 'restored', taken);
+      } catch {
+        // A name this version does not take: the new tracker is named as any new one.
+      }
+      const tracker = beginTracker({
+        name, start: { kind: 'shown', from: null, report: null, mapping: null }, rootValues: { ...shown }, by: createBy({ origin: 'session' }),
+      });
+      for (const pair of Array.isArray(orphan.chats) ? orphan.chats : []) {
+        if (Array.isArray(pair) && pair.length === 2 && typeof pair[0] === 'string' && pair[0] !== '') tracker.chats.set(pair[0], pair[1]);
+      }
+      return tracker;
+    }
+    const tracker = trackers.get(activeId);
+    use(tracker);
+    headValues = target;
+    const offIds = new Set(off());
+    const gaps = orderedDomains(unrestored.filter(part => part.part === 'domain').map(part => part.domain)
+      .filter(id => !offIds.has(id) && shown[id] !== undefined && headValues[id] !== shown[id]));
+    if (gaps.length === 0) return tracker;
+    if (tracker.paused !== null) {
+      notePaused(tracker);
+      return tracker;
+    }
+    appendRecord(tracker, {
+      kind: 'outside', type: OUTSIDE_CHANGE_TYPE, params: { domains: gaps }, by: { ...OUTSIDE_BY }, at: now(),
+      label: unrestoredLabel(gaps), touches: gaps,
+      before: Object.fromEntries(gaps.map(id => [id, headValues[id]])),
+      after: Object.fromEntries(gaps.map(id => [id, shown[id]])),
+    }, {});
+    return tracker;
   }
 
   /** Re-issue tracker ids taken here, and every reference to them in the file (H2 note b). */
@@ -1353,47 +1641,47 @@ export function createHistory({
     return { recording: tracker.paused === null, since: tracker.paused?.at ?? null, squashed, head: tracker.headId };
   }
 
-  async function undoNow(meta = {}) {
+  async function undoNow(meta = {}, { signal = null } = {}) {
     requireExclusive('Undo');
     const tracker = requireActive();
     settleBeforeMove(tracker, byOf(meta));
     const head = stepOf(tracker, tracker.headId);
     if (head.parent === null) {
-      if (Object.keys(pausedDraft(tracker) ?? {}).length > 0) await show(tracker, head.id);
+      if (Object.keys(pausedDraft(tracker) ?? {}).length > 0) await show(tracker, head.id, { signal });
       return false;
     }
-    await show(tracker, head.parent);
+    await show(tracker, head.parent, { signal });
     carryTurn(tracker, meta);
     return true;
   }
 
-  async function redoNow(meta = {}) {
+  async function redoNow(meta = {}, { signal = null } = {}) {
     requireExclusive('Redo');
     const tracker = requireActive();
     settleBeforeMove(tracker, byOf(meta));
     const target = redoTarget(tracker);
     if (target === null) return false;
-    await show(tracker, target);
+    await show(tracker, target, { signal });
     carryTurn(tracker, meta);
     return true;
   }
 
-  async function jumpNow(stepId, meta = {}) {
+  async function jumpNow(stepId, meta = {}, { signal = null } = {}) {
     requireExclusive('A jump');
     const tracker = requireActive();
     stepNamed(tracker, stepId);
     settleBeforeMove(tracker, byOf(meta));
-    await show(tracker, stepId);
+    await show(tracker, stepId, { signal });
     carryTurn(tracker, meta);
   }
 
-  async function useTrackerNow(ref, meta = {}) {
+  async function useTrackerNow(ref, meta = {}, { signal = null } = {}) {
     requireExclusive('Using a tracker');
     const tracker = trackerNamed(ref);
     if (tracker === active) return;
     if (active !== null) settleBeforeMove(active, byOf(meta));
     const target = valuesAt(tracker, tracker.headId);
-    await restoreTo(withoutOff({ ...target, ...(tracker.paused?.draft ?? {}) }));
+    await restoreTo(withoutOff({ ...target, ...(tracker.paused?.draft ?? {}) }), { signal });
     use(tracker);
     headValues = target;
     pending = null;
@@ -1408,7 +1696,7 @@ export function createHistory({
     if (plan.first === null) return { head: tracker.headId, removed: 0, other_branches: plan.otherBranches, journal: null, flagged: [] };
     if (!onlyOwn || plan.contiguous) {
       settleBeforeMove(tracker, byOf(meta));
-      await show(tracker, stepOf(tracker, plan.first).parent);
+      await show(tracker, stepOf(tracker, plan.first).parent, { signal });
       // Undoing a turn is no move away from it: it goes on from here.
       plan.turn.branch = tracker.activeBranch;
       turnSeen.set(plan.turn.id, personMoves);
@@ -1474,6 +1762,8 @@ export function createHistory({
     get usedOrder() { return usedOrder; },
     set usedOrder(value) { usedOrder = value; },
     get destroyed() { return destroyed; },
+    /** The running exclusive operation's `heavy` (its action's `ctx.heavy`, a load's), or null. */
+    get exclusiveHeavy() { return exclusiveHeavy; },
     get api() { return api; },
     get restoreEntry() { return deleteRestore.restoreEntry; },
     catalog, dataset, dispatcher, domains, now, openSaved, person, pool, trackers,
@@ -1484,13 +1774,13 @@ export function createHistory({
   };
   const deleteRestore = createDeleteRestore(h);
   const { dependantsOf, deleteStepNow, removeSteps } = deleteRestore;
-  const { handlers: ownActions, estimators, branchMoved, describeBranchDelete } = createHistoryActions(h);
+  const { handlers: ownActions, estimators, staleness, describeBranchDelete } = createHistoryActions(h);
 
   // -------------------------------------------------------------------------
   // The API
 
   function requireStarted(type) {
-    if (active === null) throw refuse('The history starts once the dataset is open.', 'unavailable', type);
+    if (active === null) throw refuse(HISTORY_WAITS_FOR_DATASET, 'unavailable', type);
     return active;
   }
 
@@ -1505,18 +1795,26 @@ export function createHistory({
     },
     /**
      * Put a saved state back without recording it: a dataset's starting view,
-     * before the dataset's first tracker starts.
+     * before the dataset's first tracker starts. `keepShown(values, shownOf)`,
+     * when given, returns the values to put back once what is shown is known
+     * (`shownOf(domainId)`): what the state leaves as it is. A state domain
+     * this version does not have (a starting view another version wrote) is
+     * left out and named, the rest put back (F164). Resolves `{leftOut}`:
+     * those domains' ids. `heavy`: what heavy work a restore finds goes to
+     * (the load's progress line).
      */
-    showValues(values) {
+    showValues(values, keepShown = null, { heavy = null } = {}) {
       return exclusive(async () => {
         if (active !== null) throw new Error('A state is put back without a step only before the first tracker starts');
-        const unknown = Object.keys(values).filter(id => !DOMAIN_IDS.includes(id));
-        if (unknown.length > 0) throw new RangeError(unknownDomainsMessage(unknown));
+        const leftOut = Object.keys(values).filter(id => !DOMAIN_IDS.includes(id)).sort();
+        const known = Object.fromEntries(Object.entries(values).filter(([id]) => DOMAIN_IDS.includes(id)));
+        shown = { ...shown, ...await capture(Object.keys(known)) };
+        const applied = keepShown === null ? known : keepShown(known, id => pool.get(shown[id]));
         const target = {};
-        for (const id of orderedDomains(Object.keys(values))) target[id] = await pool.put(values[id]);
-        shown = { ...shown, ...await capture(Object.keys(target)) };
+        for (const id of orderedDomains(Object.keys(applied))) target[id] = await pool.put(applied[id]);
         await restoreTo(target);
-      });
+        return { leftOut };
+      }, { heavy });
     },
     /**
      * Record what is shown: a change made outside an action becomes its own
@@ -1583,19 +1881,20 @@ export function createHistory({
     setRecording(on, options = {}) {
       return exclusive(() => setRecordingNow(on, options));
     },
-    undo(meta = {}) {
-      return exclusive(() => undoNow(meta));
+    /** `signal`, on every move: stopped while it waits, it never runs; while it restores, what was shown comes back. */
+    undo(meta = {}, { signal = null } = {}) {
+      return exclusive(() => undoNow(meta, { signal }), { signal });
     },
-    redo(meta = {}) {
-      return exclusive(() => redoNow(meta));
+    redo(meta = {}, { signal = null } = {}) {
+      return exclusive(() => redoNow(meta, { signal }), { signal });
     },
     /** Show the state after `stepId` (any step of the tracker in use, on any branch). */
-    jump(stepId, meta = {}) {
-      return exclusive(() => jumpNow(stepId, meta));
+    jump(stepId, meta = {}, { signal = null } = {}) {
+      return exclusive(() => jumpNow(stepId, meta, { signal }), { signal });
     },
     /** Show another tracker and record into it. */
-    useTracker(ref, meta = {}) {
-      return exclusive(() => useTrackerNow(ref, meta));
+    useTracker(ref, meta = {}, { signal = null } = {}) {
+      return exclusive(() => useTrackerNow(ref, meta, { signal }), { signal });
     },
     /**
      * Undo one turn on the branch shown (§3.3.10): back to before its first
@@ -1603,13 +1902,13 @@ export function createHistory({
      * with their dependants applied again (journaled).
      */
     undoTurn(turnId, options = {}) {
-      return exclusive(() => undoTurnNow(turnId, options));
+      return exclusive(() => undoTurnNow(turnId, options), { signal: options.signal ?? null });
     },
     /** What undoing a turn would do (the panel's two-choice dialog). */
     turnUndoPlan: turnId => turnUndoPlan(requireActive(), turnId),
     /** Delete a step (journaled; only its dependants applied again). */
     deleteStep(stepId, { signal = null, meta = {} } = {}) {
-      return exclusive(() => deleteStepNow(requireActive(), stepId, { signal, meta }));
+      return exclusive(() => deleteStepNow(requireActive(), stepId, { signal, meta }), { signal });
     },
     /** The steps a delete of `stepId` would apply again, and their recorded time (the dialog's estimate). */
     deletePlan(stepId) {
@@ -1622,13 +1921,17 @@ export function createHistory({
       const tracker = trackerRef === null ? requireActive() : trackerNamed(trackerRef);
       return describeBranchDelete(tracker, planBranchDelete(tracker, branchNamed(tracker, ref), { withSubBranches }));
     },
-    /** Replay recorded steps in a new tracker (`{steps, from, name, mapping}`, `replay.js` `replayPlanOf`). */
-    replay(plan, { signal = null, onStep = null, meta = {} } = {}) {
+    /**
+     * Replay recorded steps in a new tracker (`{steps, from, name, mapping}`, `replay.js` `replayPlanOf`).
+     * `heavy`: what heavy work its steps find goes to (a load's: named on its progress line); by
+     * default the running action's (`exclusive`).
+     */
+    replay(plan, { signal = null, onStep = null, meta = {}, heavy = undefined } = {}) {
       if (!Array.isArray(plan?.steps)) throw new TypeError('A replay names the steps it applies');
       if (plan.from === null || typeof plan.from !== 'object' || typeof plan.from.tracker?.id !== 'string') {
         throw new TypeError('A replay names the tracker its steps come from (a Link)');
       }
-      return exclusive(() => replayIntoNewTracker(plan, { signal, onStep, meta }));
+      return exclusive(() => replayIntoNewTracker(plan, { signal, onStep, meta }), heavy === undefined ? { signal } : { signal, heavy });
     },
     /** What differs between two steps, domain by domain; the steps may be of two trackers. */
     async diff(a, b) {
@@ -1641,7 +1944,8 @@ export function createHistory({
       const va = valuesAt(ta, sa);
       const vb = valuesAt(tb, sb);
       const out = [];
-      const context = { liveHidden: vb.views !== undefined && pool.get(vb.views)?.liveHidden === true };
+      const viewsAtB = vb.views === undefined ? null : pool.get(vb.views);
+      const context = { liveHidden: viewsAtB?.liveHidden === true, viewLabels: viewLabelsInValue(viewsAtB) };
       for (const id of DOMAIN_IDS) {
         if (va[id] === vb[id]) continue;
         const owner = domains.owner(id);
@@ -1710,7 +2014,7 @@ export function createHistory({
     /** One domain's value as it is shown now (a domain switched off, or while paused, may differ from the head's). */
     shownValue(domainId) {
       requireActive();
-      if (shown[domainId] === undefined) throw new RangeError(unknownDomainsMessage([domainId]));
+      if (shown[domainId] === undefined) throw new RangeError(`There is no state domain "${domainId}"`);
       return pool.get(shown[domainId]);
     },
     /** The last step of the branch named `ref` (name or id) of the tracker in use. */
@@ -1722,12 +2026,12 @@ export function createHistory({
     /** Stale steps on the path to the head (`provenance.js`). */
     stale(trackerRef = null) {
       const tracker = trackerRef === null ? requireActive() : trackerNamed(trackerRef);
-      return staleOnPath(tracker, tracker.headId, read => branchMoved(read));
+      return staleOnPath(tracker, tracker.headId, staleness);
     },
     /** The steps that match (`search.js`). */
     search(criteria, trackerRef = null) {
       const tracker = trackerRef === null ? requireActive() : trackerNamed(trackerRef);
-      const stale = new Set(staleOnPath(tracker, tracker.headId, read => branchMoved(read)).map(entry => entry.step.id));
+      const stale = new Set(staleOnPath(tracker, tracker.headId, staleness).map(entry => entry.step.id));
       return searchSteps(tracker, criteria, { catalog, isStale: id => stale.has(id) });
     },
     /** The pending "Branch here", or null. */
@@ -1746,7 +2050,7 @@ export function createHistory({
         }
       }
     },
-    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    subscribe: listener => listeners.add(listener),
     /** The history as the model's `History` record (every tracker, removed ones included); the pool holds the values. */
     snapshot() {
       if (active !== null && active.paused !== null) active.paused.draft = pausedDraft(active);
@@ -1777,20 +2081,20 @@ export function createHistory({
      */
     load(saved, options = {}) {
       return exclusive(async () => {
+        let unrestored;
         try {
-          const { live, activeId, target } = await readSaved(saved, options);
+          const read = await readSaved(saved, options);
+          unrestored = read.unrestored;
           trackers.clear();
-          for (const tracker of live) trackers.set(tracker.id, tracker);
+          for (const tracker of read.live) trackers.set(tracker.id, tracker);
           usedOrder = [];
-          use(trackers.get(activeId));
-          headValues = target;
-          pending = null;
-          coalesceStep = null;
+          showLoaded(read);
         } finally {
           prune();
         }
-        notify('loaded', {});
-      });
+        notify('loaded', { unrestored: unrestored.length });
+        return { unrestored };
+      }, { signal: options.signal ?? null, heavy: options.heavy ?? null });
     },
     /**
      * Load a session file's trackers beside the ones here (§3.3.7, Q2): each
@@ -1799,10 +2103,11 @@ export function createHistory({
      * it remapped) and "(shared)" when its name is; the file's active
      * tracker is shown.
      */
-    importTrackers(saved, { file, values = new Map(), rest = null, signal = null }) {
+    importTrackers(saved, { file, values = new Map(), rest = null, signal = null, heavy = null }) {
       if (typeof file !== 'string' || file.length === 0) throw new TypeError('An import names its file');
       return exclusive(async () => {
         let added;
+        let unrestored;
         const loads = new Map();
         try {
           const { records: remapped, rest: reissuedRest } = reissue(saved.trackers);
@@ -1822,26 +2127,24 @@ export function createHistory({
             return { ...record, name, start };
           });
           const restHere = rest === null ? null : async () => reissuedRest(await rest());
-          const { live, target } = await readSaved({ ...saved, activeTracker: named[activeIndex].id, trackers: named }, { values, rest: restHere, signal });
-          for (const tracker of live) trackers.set(tracker.id, tracker);
+          const read = await readSaved({ ...saved, activeTracker: named[activeIndex].id, trackers: named }, { values, rest: restHere, signal });
+          unrestored = read.unrestored;
+          for (const tracker of read.live) trackers.set(tracker.id, tracker);
           // Each tracker loaded beside the others is journaled: undoing the load removes it to Recently deleted.
-          for (const tracker of live) {
+          for (const tracker of read.live) {
             if (tracker.removed !== null) continue;
             const entry = commitEdit(beginEdit(tracker, { op: 'load', by: byOf({}), at: now(), label: `Loaded "${tracker.name}" from ${file}` }), { always: true });
             loads.set(tracker.id, entry.id);
           }
-          const shownTracker = trackers.get(named[activeIndex].id);
-          use(shownTracker);
-          headValues = target;
-          pending = null;
-          coalesceStep = null;
-          added = live.map(tracker => ({ id: tracker.id, name: tracker.name, journal: loads.get(tracker.id) ?? null }));
+          const shownTracker = showLoaded(read);
+          added = [...read.live, ...(read.live.includes(shownTracker) ? [] : [shownTracker])]
+            .map(tracker => ({ id: tracker.id, name: tracker.name, journal: loads.get(tracker.id) ?? null }));
         } finally {
           prune();
         }
-        notify('loaded', { added: added.map(each => each.id) });
-        return { trackers: added, tracker: { id: active.id, name: active.name }, head: active.headId };
-      });
+        notify('loaded', { added: added.map(each => each.id), unrestored: unrestored.length });
+        return { trackers: added, tracker: { id: active.id, name: active.name }, head: active.headId, unrestored };
+      }, { signal, heavy });
     },
     destroy() {
       destroyed = true;
@@ -1854,9 +2157,13 @@ export function createHistory({
     get destroyed() { return destroyed; },
   };
 
+  // Each own action's `ctx.heavy` is found by its signal when it runs exclusively (`exclusive`).
   const removers = Object.entries(ownActions)
     .filter(([type]) => catalog?.has?.(type) === true)
-    .map(([type, handler]) => dispatcher.provide(type, handler));
+    .map(([type, handler]) => dispatcher.provide(type, (params, ctx = {}) => {
+      if (ctx.signal != null && typeof ctx.heavy === 'function') heavyOfSignal.set(ctx.signal, ctx.heavy);
+      return handler(params, ctx);
+    }));
   for (const [type, estimate] of estimators) {
     if (catalog?.has?.(type) === true && typeof dispatcher.provideEstimate === 'function') removers.push(dispatcher.provideEstimate(type, estimate));
   }
@@ -1885,6 +2192,15 @@ export function createHistory({
   }) : () => {};
   stopOutside = unsubscribeOutside;
   return Object.freeze(api);
+}
+
+/**
+ * The label of the step a load records for the parts of a saved head it
+ * could not put back (F155): what is shown there is what was shown before.
+ * @param {string[]} ids - domain ids
+ */
+export function unrestoredLabel(ids) {
+  return `Not restored from the saved state: ${ids.map(domainName).join(', ')} (kept as shown)`;
 }
 
 /** A squashed step's label from why it was made, how many it replaced and the domains it changes. */

@@ -5,7 +5,7 @@
       "description": "One version of one action a session's steps use (one stamp per type and version present).",
       "properties": {
         "params": {
-          "description": "SHA-256 of the shape of that version's params schema (actionParamsShape, canonical JSON) when the writer's catalogue is at that version; null for an earlier version, whose upgraders take it forward.",
+          "description": "SHA-256 of the shape of that version's params schema (actionParamsShape, canonical JSON) when the writer's catalog is at that version; null for an earlier version, whose upgraders take it forward.",
           "pattern": "^[0-9a-f]{64}$",
           "type": [
             "string",
@@ -35,7 +35,7 @@
       "description": "What wrote a session file.",
       "properties": {
         "catalog": {
-          "description": "The SHA-256 of the action catalogue document it was written with.",
+          "description": "The SHA-256 of the action catalog document it was written with.",
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
@@ -125,6 +125,7 @@
           "enum": [
             "cells",
             "mapping",
+            "expression",
             "field-overlays",
             "gene-sets",
             "views",
@@ -158,6 +159,7 @@
             "categories-merged",
             "field-deleted",
             "gene-set",
+            "column-colors",
             "presentation"
           ]
         },
@@ -263,7 +265,7 @@
           "x-id": "branch"
         },
         "lane": {
-          "description": "Its colour slot (--history-lane-<lane>).",
+          "description": "Its color slot (--history-lane-<lane>).",
           "maximum": 7,
           "minimum": 0,
           "type": "integer"
@@ -637,6 +639,11 @@
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
+        "expression": {
+          "description": "The value hash of \"expression\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
         "field-overlays": {
           "description": "The value hash of \"field-overlays\".",
           "pattern": "^[0-9a-f]{64}$",
@@ -684,6 +691,25 @@
         }
       },
       "required": [],
+      "type": "object"
+    },
+    "ExpressionValues": {
+      "additionalProperties": false,
+      "description": "The expression values the genes were shown and analyzed in at a step (its `expression` value: the Data mapping's Expression values): the transform asked, which never changes the values an object stores.",
+      "properties": {
+        "log1p": {
+          "description": "Then ln(1 + x) (scanpy's log1p); both false: the values as stored.",
+          "type": "boolean"
+        },
+        "normalize": {
+          "description": "Each cell scaled to 10,000 total counts (scanpy's normalize_total(target_sum=1e4)).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "normalize",
+        "log1p"
+      ],
       "type": "object"
     },
     "Group": {
@@ -1071,12 +1097,12 @@
           "x-time": "ms-since-1970-utc"
         },
         "label": {
-          "description": "What it did, as its step would be labelled.",
+          "description": "What it did, as its step would be labeled.",
           "minLength": 1,
           "type": "string"
         },
         "type": {
-          "description": "The action (annotation.vote, figure.export, …).",
+          "description": "The action (annotation.publish, figure.export, …).",
           "minLength": 1,
           "type": "string"
         }
@@ -1214,6 +1240,17 @@
           },
           "type": "array"
         },
+        "expression": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExpressionValues"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The expression values of the step applied (what the person looked at the genes in), recorded, never applied: X keeps its values. Null when the session holds none (a session from before them: the values as stored)."
+        },
         "package": {
           "description": "What applied it.",
           "enum": [
@@ -1273,6 +1310,7 @@
         "columns",
         "renamed",
         "skipped",
+        "expression",
         "session"
       ],
       "type": "object"
@@ -1308,6 +1346,11 @@
         },
         "colors": {
           "description": "The value hash of \"colors\".",
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "expression": {
+          "description": "The value hash of \"expression\".",
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
@@ -1783,6 +1826,7 @@
             "categories-merged",
             "field-deleted",
             "gene-set",
+            "column-colors",
             "presentation"
           ]
         },
@@ -2091,6 +2135,7 @@
             "enum": [
               "cells",
               "mapping",
+              "expression",
               "field-overlays",
               "gene-sets",
               "views",
@@ -2125,7 +2170,7 @@
           "x-time": "ms-since-1970-utc"
         },
         "v": {
-          "description": "The version of the action's parameters it was recorded with (the catalogue's version); null but for an action.",
+          "description": "The version of the action's parameters it was recorded with (the catalog's version); null but for an action.",
           "minimum": 1,
           "type": [
             "integer",
@@ -2570,6 +2615,7 @@
   "x-domains": [
     "cells",
     "mapping",
+    "expression",
     "field-overlays",
     "gene-sets",
     "views",
@@ -2650,6 +2696,7 @@
   "x-readInputs": [
     "cells",
     "mapping",
+    "expression",
     "field-overlays",
     "gene-sets",
     "views",

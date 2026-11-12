@@ -37,7 +37,7 @@ import {
   createVariableSelector,
   createGeneExpressionSelector
 } from '../components/selectors.js';
-import { failureText } from '../../../../utils/errors.js';
+import { joinFailure, sayFailure } from '../../../../utils/errors.js';
 
 /**
  * Variable type constants
@@ -140,7 +140,7 @@ class VariableSelectorComponent {
       console.error('[VariableSelectorComponent] Failed to render:', err);
       this.container.replaceChildren(createStatusLine({
         tone: 'danger',
-        text: 'Failed to load variables. Please try refreshing.'
+        text: `${joinFailure(`The fields could not be listed`, sayFailure(err))}`
       }).root);
     }
   }
@@ -262,7 +262,7 @@ class VariableSelectorComponent {
         pending
           ? 'Reading the gene names…'
           : failure !== null
-            ? `The gene names could not be read: ${failureText(failure)}`
+            ? `${joinFailure(`The gene names could not be read`, sayFailure(failure))}`
             : 'No gene expression data available.'
       ));
       // A dataset just shown reads its genes after its first view: listed

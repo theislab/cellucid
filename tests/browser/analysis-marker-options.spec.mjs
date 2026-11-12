@@ -182,6 +182,17 @@ test('a subset against one reference group, then filters re-applied without test
   await panel.locator('.analysis-result-controls').getByRole('button', { name: 'List', exact: true }).click();
   await setOptions(page, { direction: 'up', minLog2FC: 100 });
   await expect(panel.locator('.marker-ranked-preview .empty-state')).toContainText('No genes pass the filters');
+  // The expanded view says it the same way, with the same way on (R9E-11:
+  // it said only "No genes pass the filters.").
+  await panel.getByRole('button', { name: /Expand/ }).click();
+  const modal = page.locator('.analysis-modal.open');
+  await expect(modal.locator('.empty-state')).toContainText(/^No genes pass the filters \(\d+ genes? tested in 2 groups\)\./);
+  await modal.getByRole('button', { name: 'Relax filters' }).click();
+  await expect.poll(async () => (await shown(page)).markers.A.length).toBeGreaterThan(0);
+  await page.keyboard.press('Escape');
+  await expect(modal).toHaveCount(0);
+  await setOptions(page, { direction: 'up', minLog2FC: 100 });
+  await expect(panel.locator('.marker-ranked-preview .empty-state')).toContainText('No genes pass the filters');
   await panel.getByRole('button', { name: 'Relax filters' }).click();
   await expect.poll(async () => (await shown(page)).markers.A.length).toBeGreaterThan(0);
   expect(errors).toEqual([]);

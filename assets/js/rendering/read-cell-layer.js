@@ -3,7 +3,7 @@
  * sample of the open cells (`data/anndata/subsample-plan.js`, `genes`) on a
  * map of all of them.
  *
- * A colour's alpha byte names its cell's layer (`alpha-visibility.js`):
+ * A color's alpha byte names its cell's layer (`alpha-visibility.js`):
  * cells not read (`UNREAD_ALPHA_BYTE`) lie at the bottom, the grey of the
  * cells read with no value (`BENEATH_ALPHA_BYTE`: a gene's zeros, a missing
  * value, a category's missing cells) above them, and the expressing cells on
@@ -16,9 +16,9 @@
  *   toward the middle: darker than a light background (on white the grey of
  *   211, as always), lighter than a dark one (a mid-dark grey: 56 on the
  *   dark grid, 38 on black). So it stands out from the background as much
- *   on every theme, and never more than the colours of a field's values:
+ *   on every theme, and never more than the colors of a field's values:
  *   on a dark background the light grey of 211 outshone the expressing
- *   cells. Its RGB bytes in a colours array are not drawn (`cellLayerColors`
+ *   cells. Its RGB bytes in a colors array are not drawn (`cellLayerColors`
  *   names what is).
  * - **The fade** (`unreadCellColor`). A cell not read is drawn flat in the
  *   view's background moved a small step of lightness toward the grey for
@@ -93,7 +93,7 @@ function srgbToLinear(channel) {
   return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
 }
 
-/** CIE L* of an sRGB colour (channels 0..1). */
+/** CIE L* of an sRGB color (channels 0..1). */
 function lightnessOf(rgb) {
   const y = 0.2126 * srgbToLinear(rgb[0]) + 0.7152 * srgbToLinear(rgb[1]) + 0.0722 * srgbToLinear(rgb[2]);
   return y > 216 / 24389 ? 116 * Math.cbrt(y) - 16 : (24389 / 27) * y;
@@ -120,7 +120,7 @@ function greyOfLightness(lightness) {
 }
 
 /**
- * The colour a cell with no value (a gene's 0, a missing value, a
+ * The color a cell with no value (a gene's 0, a missing value, a
  * category's missing cells) is drawn in over `background` (sRGB, channels
  * 0..1): a neutral grey `ZERO_LIGHTNESS_CONTRAST` of CIE lightness from the
  * background's, darker on a background lighter than the middle (L* 50),
@@ -131,7 +131,7 @@ function greyOfLightness(lightness) {
  * @returns {Float32Array}
  */
 export function zeroCellColor(background, target = new Float32Array(3)) {
-  requireRgb01(background, 'The background of the grey for 0');
+  requireRgb01(background, 'The background of the gray for 0');
   const from = lightnessOf(background);
   const grey = greyOfLightness(from >= 50 ? from - ZERO_LIGHTNESS_CONTRAST : from + ZERO_LIGHTNESS_CONTRAST);
   target[0] = grey;
@@ -141,7 +141,7 @@ export function zeroCellColor(background, target = new Float32Array(3)) {
 }
 
 /**
- * The colour a cell not read is drawn in over `background` (sRGB, channels
+ * The color a cell not read is drawn in over `background` (sRGB, channels
  * 0..1): the background mixed toward the grey for 0 (`zeroCellColor`) until
  * its lightness has moved `UNREAD_LIGHTNESS_STEP`, or half the way to that
  * grey's lightness where the two are closer than twice the step.
@@ -181,11 +181,11 @@ export function unreadCellColor(background, target = new Float32Array(3)) {
 }
 
 /**
- * The colours the lower layers are drawn in over `background` (sRGB,
+ * The colors the lower layers are drawn in over `background` (sRGB,
  * channels 0..1), as bytes: `zero`, the grey of the cells with no value
  * (`BENEATH_ALPHA_BYTE`), and `unread`, the fade of the cells not read
- * (`UNREAD_ALPHA_BYTE`). What every surface that draws a cell's colour
- * from a colours array substitutes for those layers' RGB bytes
+ * (`UNREAD_ALPHA_BYTE`). What every surface that draws a cell's color
+ * from a colors array substitutes for those layers' RGB bytes
  * (`drawnCellRgb`): the views (`HighPerfRenderer`, smoke), the figures and
  * the cell info card.
  *
@@ -199,7 +199,7 @@ export function cellLayerColors(background) {
 
 /**
  * The RGB bytes cell `index` of `colors` (RGBA8, its alpha byte the layer)
- * is drawn in: its own, or its layer's colour (`cellLayerColors`).
+ * is drawn in: its own, or its layer's color (`cellLayerColors`).
  *
  * @param {Uint8Array} colors
  * @param {number} index
@@ -216,9 +216,9 @@ export function drawnCellRgb(colors, index, layerColors) {
 
 /**
  * The cells a frame projects to size the read cells (`readCellSizeMultiplier`)
- * for one colours array: up to `PROBE_CELLS` of every cell and as many of the
+ * for one colors array: up to `PROBE_CELLS` of every cell and as many of the
  * cells read, each strided evenly over its cells, and how many are read.
- * Made again when the colours change; null when every cell is read.
+ * Made again when the colors change; null when every cell is read.
  *
  * @param {Uint8Array} colors - RGBA8, the alpha byte the cell's layer.
  * @param {number} unread - Cells not read (`colorLayersOf`).
@@ -294,12 +294,13 @@ function projectProbe(cell, frame, out) {
  * @param {number} frame.pointSize - u_pointSize of the read cells before this multiplier.
  * @param {number} frame.sizeAttenuation
  * @param {number} frame.fov
+ * @param {number} frame.pointSizeMax - u_pointSizeMax (rendering/point-sprite.js)
  * @param {number} [frame.readShare=1] - The share of the read cells this frame draws (a reduced level drawing them by rank).
  * @returns {number}
  */
 export function readCellSizeMultiplier(probes, frame) {
   if (probes === null) return 1;
-  const { width, height, pointSize, sizeAttenuation, fov } = frame;
+  const { width, height, pointSize, sizeAttenuation, fov, pointSizeMax } = frame;
   const readShare = frame.readShare ?? 1;
   const allCount = probes.all.length;
   if (scratch.x.length < allCount) {
@@ -322,7 +323,7 @@ export function readCellSizeMultiplier(probes, frame) {
     if (point[1] < minY) minY = point[1];
     if (point[1] > maxY) maxY = point[1];
   }
-  const sizeInput = { w: 1, pointSize, sizeAttenuation, fov, framebufferHeight: height, devicePixelRatio: 1 };
+  const sizeInput = { w: 1, pointSize, sizeAttenuation, fov, framebufferHeight: height, devicePixelRatio: 1, pointSizeMax };
   let readShown = 0;
   let diameterSum = 0;
   for (let k = 0; k < probes.read.length; k++) {

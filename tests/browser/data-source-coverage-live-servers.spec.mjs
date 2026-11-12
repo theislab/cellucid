@@ -36,7 +36,7 @@ import { expect, test } from './helpers/test.mjs';
 import { APP_ORIGIN as ORIGIN } from './helpers/origins.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
-import { formatCompactCount } from '../../assets/js/app/ui/components/display-format.js';
+import { formatCompactCount } from '../../assets/js/utils/format-units.js';
 import { formatCount } from '../../assets/js/utils/format-units.js';
 
 const LOCAL_CATALOG =
@@ -277,7 +277,7 @@ test('the Open from link control loads a published GitHub repository', async ({
 
   await expect(
     page.locator('#notification-center .notification')
-      .filter({ hasText: `Connected - ${publishedCount} datasets found` }),
+      .filter({ hasText: `Connected: ${publishedCount} datasets found` }),
   ).toHaveCount(1, { timeout: 60_000 });
   await expect(
     page.locator('#dataset-select option[value^="dataset:link:"]'),

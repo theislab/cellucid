@@ -2,7 +2,7 @@
  * Read activities: what one operation read, and how.
  *
  * Every public operation of a reader (opening a file, reading a field, the
- * genes of an analysis, an embedding, building a gene index, a neighbour
+ * genes of an analysis, an embedding, building a gene index, a neighbor
  * graph) runs under one `ReadActivity`. The byte reader and the format
  * readers count into it as they work — requests made and bytes fetched,
  * metadata served from the cache, chunks decoded and the bytes they decoded

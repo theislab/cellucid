@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parseSubsampleUrlParameters, subsampleLink, subsampleUrlEntries } from '../assets/js/app/subsample-url.js';
+import { linkedSubsampleSpec, parseSubsampleUrlParameters, subsampleLink, subsampleUrlEntries } from '../assets/js/app/subsample-url.js';
 import { readDataSourceUrlParameters } from '../assets/js/app/url-state.js';
 import { keptChunkShare } from '../assets/js/data/anndata/views/cell-subset.js';
 
@@ -52,6 +52,9 @@ test('malformed values and misplaced parameters are refused by name', () => {
     ['cells=', /must have a value/],
   ]) {
     assert.throws(() => parse(query), pattern, query);
+    // The reason alone: main.js says it after "The link's cell subsample was
+    // left out:", so it never repeats that prefix.
+    assert.throws(() => parse(query), error => !/^The link/.test(error.message), query);
   }
 });
 
@@ -77,4 +80,35 @@ test('the share of a cell-major matrix a subsample reads is the share of its chu
   assert.equal(keptChunkShare(pointers, Uint32Array.from([0, 1]), 6), 1 / 5);
   assert.equal(keptChunkShare(pointers, Uint32Array.from([0, 2, 4, 6, 8]), 6), 1);
   assert.equal(keptChunkShare(pointers, Uint32Array.from([1, 2]), 6), 2 / 5);
+});
+
+test('a link names the cells asked for, never a growing opening\'s step (F60)', () => {
+  const uniform = { method: 'uniform', k: 131072, seed: 0 };
+  const share = { method: 'uniform', k: 300000, seed: 7 };
+  // A dataset opened whole, growing from its first 131,072 cells: every cell.
+  const growingToAll = { nObs: 561947, kept: new Uint32Array(3), spec: uniform, autoFit: null, reproduced: null,
+    growth: { target: 561947, final: { mode: 'all', genes: null } } };
+  assert.equal(linkedSubsampleSpec(growingToAll), null);
+  // A share growing to itself: the share.
+  const growingToShare = { ...growingToAll, growth: { target: 300000, final: { mode: 'kept', spec: share, kept: new Uint32Array(3), autoFit: null, reproduced: null } } };
+  assert.deepEqual(linkedSubsampleSpec(growingToShare), share);
+  // Settled cells: the spec, unless fitted to the device or no longer reproduced.
+  assert.deepEqual(linkedSubsampleSpec({ kept: new Uint32Array(3), spec: share, autoFit: null, reproduced: null }), share);
+  assert.equal(linkedSubsampleSpec({ kept: new Uint32Array(3), spec: share, autoFit: { cells: 3 }, reproduced: null }), null);
+  assert.equal(linkedSubsampleSpec({ kept: new Uint32Array(3), spec: share, autoFit: null, reproduced: false }), null);
+  assert.equal(linkedSubsampleSpec({ kept: null, spec: null }), null);
+  assert.equal(linkedSubsampleSpec(null), null);
+});
+
+test('a chunked growth step is named by its share\'s size, the same for a link and the session (F64)', async () => {
+  const { openCellsValueOf } = await import('../assets/js/app/state/domains/cells.js');
+  const spec = { method: 'uniform', k: 4096, seed: 3 };
+  const chunkedStep = { nObs: 100000, kept: new Uint32Array(3), spec, autoFit: null, reproduced: null, chunks: { target: 30000 } };
+  assert.deepEqual(linkedSubsampleSpec(chunkedStep), { ...spec, k: 30000 });
+  assert.deepEqual(openCellsValueOf(chunkedStep), { method: 'uniform', k: 30000, seed: 3 });
+  // Growing to every cell (Suo opened whole): every cell, for both.
+  const growingToAll = { nObs: 561947, kept: new Uint32Array(3), spec: { method: 'uniform', k: 131072, seed: 0 }, autoFit: null, reproduced: null,
+    growth: { target: 561947, final: { mode: 'all', genes: null } } };
+  assert.equal(openCellsValueOf(growingToAll), null, 'an autosave of Suo while it grew reopened its first 131,072 cells');
+  assert.equal(linkedSubsampleSpec(growingToAll), null);
 });

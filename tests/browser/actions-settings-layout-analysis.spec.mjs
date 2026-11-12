@@ -166,7 +166,7 @@ test('every setting is listed, set through setting.set, and refused in words whe
     if (setting.kind === 'switch') other = !setting.value;
     else if (setting.kind === 'count') other = setting.value + 1;
     else if (setting.kind === 'number') other = setting.value === setting.max ? setting.min : setting.max;
-    else if (setting.kind === 'colour') other = setting.value === '#123456' ? '#654321' : '#123456';
+    else if (setting.kind === 'color') other = setting.value === '#123456' ? '#654321' : '#123456';
     else if (setting.kind === 'text') other = `${setting.value}x`;
     else other = setting.options.find(option => option.value !== setting.value)?.value;
     // Smoke rendering builds a volume: a choice of its own spec (renderer-smoke).
@@ -175,6 +175,8 @@ test('every setting is listed, set through setting.set, and refused in words whe
     if (applied.error !== undefined) {
       // Switched off by another setting, or kept by its owner until its data is there: said in words.
       expect(applied.error, setting.id).toMatch(/^".+" cannot be changed now: /);
+      // With the reason its owner gave (ui/core/control-availability.js), never a guess.
+      expect(applied.error, setting.id).not.toMatch(/it is not ready yet$|switched off by another setting/);
       refused.push(setting.id);
       continue;
     }
@@ -280,7 +282,7 @@ test('every setting changed through its control is recorded as its own step, and
         element.value = other.value;
       } else if (kind === 'number') {
         element.value = String(value === Number(element.max) ? element.min : element.max);
-      } else if (kind === 'colour') {
+      } else if (kind === 'color') {
         element.value = value === '#123456' ? '#654321' : '#123456';
       } else {
         element.value = `${value}x`;
@@ -390,17 +392,23 @@ test('each read returns the exact JSON of the fixture; a picture is a PNG of the
 
   const summary = await read(page, 'dataset.summary');
   expect(summary).toEqual({
-    name: 'B3 actions fixture', id: DATASET, source: summary.source, citation: null,
+    name: 'B3 actions fixture', id: DATASET, source: summary.source, description: null, citation: null,
     cells: { total: CELLS, open: CELLS, share: 1, subsample: null, digest: summary.cells.digest },
-    genes: { count: GENES.length, read_for: null },
+    genes: { count: GENES.length, modalities: null, modality: null, read_for: null, values: summary.genes.values },
     embeddings: summary.embeddings,
+    vector_fields: [],
     fields: { categorical: 1, continuous: 1, user_defined: 0 },
   });
-  expect(summary.embeddings.map(embedding => embedding.dimension)).toEqual([2]);
-  // A field's categories are known once it is read (a read of them reads it).
+  // The Expression values the genes are shown in: as stored by default.
+  expect(summary.genes.values).toMatchObject({ normalize: false, log1p: false });
+  // The embeddings shown (on), each by the obsm key and columns the actions take; the arrays the mapping could turn on are listed off.
+  expect(summary.embeddings.filter(embedding => embedding.enabled).map(embedding => embedding.dimension)).toEqual([2]);
+  expect(summary.embeddings.every(embedding => typeof embedding.key === 'string')).toBe(true);
+  // A field's categories are known once it is read: cell_type is read as the
+  // dataset opens colored by it (`first-coloring.js`).
   const byKey = list => [...list.fields].sort((a, b) => a.key.localeCompare(b.key));
   expect(byKey(await read(page, 'fields.list'))).toEqual([
-    { key: 'cell_type', kind: 'categorical', user_defined: false },
+    { key: 'cell_type', kind: 'categorical', categories: 3, user_defined: false },
     { key: 'score', kind: 'continuous', user_defined: false },
   ]);
   expect(await read(page, 'fields.list', { kind: 'continuous' })).toEqual({ fields: [{ key: 'score', kind: 'continuous', user_defined: false }] });
@@ -428,6 +436,8 @@ test('each read returns the exact JSON of the fixture; a picture is a PNG of the
       { field: { source: 'var', key: 'LYZ', kind: 'continuous' }, values: cells.map(cell => expressionOf(cell, GENES.indexOf('LYZ'))) },
     ],
     not_open: [],
+    // The genes' values as shown (Data mapping › Expression values: as stored by default).
+    gene_values: 'raw counts as stored, not normalized',
   });
   expect((await dispatch(page, 'cells.values', { cells: [60], fields: [{ source: 'obs', key: 'score' }] })).error)
     .toBe('Cell 60 is not a cell of this dataset: it has 60 cells, numbered from 0.');
@@ -465,9 +475,15 @@ test('each read returns the exact JSON of the fixture; a picture is a PNG of the
   expect(views.views[0].camera.navigationMode).toMatch(/^(orbit|planar|free)$/);
   expect(views.highlights).toEqual({ active_page: expect.any(String), pages: [{ name: expect.any(String), cells: 0, groups: [] }] });
 
-  // The size asked for is the plot's (as in a figure export); the picture says its own size exactly.
+  // The size asked for is the box the plot fits in (as in a figure export):
+  // the plot keeps the view's shape inside it; the picture says its own size
+  // and the plot's exactly.
   const picture = await read(page, 'view.picture', { width: 320, height: 200 });
-  expect(picture.plot).toEqual({ width: 320, height: 200 });
+  // One side fills the box, the other fits inside it.
+  expect(picture.plot.width).toBeLessThanOrEqual(320);
+  expect(picture.plot.height).toBeLessThanOrEqual(200);
+  expect(picture.plot.width === 320 || picture.plot.height === 200).toBe(true);
+  const aspect = picture.plot.width / picture.plot.height;
   expect(picture.view).toBe('View 1');
   expect(picture.notes).toEqual([]);
   const png = Buffer.from(picture.png, 'base64');
@@ -476,9 +492,16 @@ test('each read returns the exact JSON of the fixture; a picture is a PNG of the
   expect([decoded.width, decoded.height]).toEqual([picture.width, picture.height]);
   expect(picture.width).toBeGreaterThan(320);
   expect(picture.height).toBeGreaterThanOrEqual(200);
-  // A plot 80 pixels wider and 40 taller is a picture exactly that much larger.
+  // A plot that much larger is a picture that much larger (the legend beside
+  // it is the same).
   const larger = await read(page, 'view.picture', { width: 400, height: 240 });
-  expect([larger.width - picture.width, larger.height - picture.height]).toEqual([80, 40]);
+  expect(larger.plot.width / larger.plot.height).toBeCloseTo(aspect, 6);
+  expect(larger.width - picture.width).toBeCloseTo(larger.plot.width - picture.plot.width, 0);
+  expect(Math.abs(larger.height - picture.height - (larger.plot.height - picture.plot.height))).toBeLessThanOrEqual(1);
+  // A box of another shape around the same fitted plot draws the same picture.
+  const taller = await read(page, 'view.picture', { width: 320, height: 400 });
+  expect(picture.plot.width).toBe(320); // the view is wider than the 320 × 200 box
+  expect([taller.width, taller.height]).toEqual([picture.width, picture.height]);
   const largerDecoded = decodePng(Buffer.from(larger.png, 'base64'));
   expect([largerDecoded.width, largerDecoded.height]).toEqual([larger.width, larger.height]);
   // Without the legend, the picture is only the plot and its margins.
@@ -646,7 +669,7 @@ test('how an analysis is shown, and an analysis sent another\'s genes, are steps
   const before = await headStep(page);
   await panel.getByRole('button', { name: 'Score as signature', exact: true }).click();
   const sent = await headStep(page);
-  expect(sent).toMatchObject({ type: 'analysis.signature.set', params: { in: 'panel', show: true }, label: expect.stringMatching(/^Opened Gene signature with /) });
+  expect(sent).toMatchObject({ type: 'analysis.signature.set', params: { in: 'panel', show: true }, label: expect.stringMatching(/^Opened Gene signature: Gene sets set to /) });
   expect(sent.params.options.geneSets.length, 'the markers of each group, one set each').toBeGreaterThan(0);
   expect(await page.evaluate(() => window._comparisonModule.getOpenMode())).toBe('signature');
   await page.evaluate(() => window._cellucidHistories.current().undo());
@@ -660,7 +683,7 @@ test('an analysis\'s page choice, none included, survives a redraw and comes bac
   page.on('pageerror', error => errors.push(error.message));
   await openFixture(page);
   await waitForHistory(page);
-  expect((await dispatch(page, 'highlight.category', { field: { source: 'obs', key: 'cell_type' }, category: 'T cell', page: 'Page 1' })).error).toBeUndefined();
+  expect((await dispatch(page, 'highlight.category', { field: { source: 'obs', key: 'cell_type' }, categories: ['T cell'], page: 'Page 1' })).error).toBeUndefined();
   for (const [analysis, modeId] of [['detailed', 'detailed'], ['correlation', 'correlation'], ['signature', 'signature']]) {
     expect((await dispatch(page, 'analysis.open', { analysis })).error, analysis).toBeUndefined();
     // An explicit empty choice: a redraw shows no page, never the default.
@@ -693,7 +716,7 @@ test('apply then undo returns every state domain to its fingerprint, for these a
     ['layout.theme.set', { theme: 'dark' }],
     ['analysis.open', { analysis: 'composition' }],
     ['analysis.markers.set', { options: { groupBy: 'cell_type' } }],
-    ['figure-export.set', { width: 900, height: 700, include_axes: false }],
+    ['figure-export.set', { width: 120, include_axes: false }],
     ['figure-export.set', { auto_text_size: false }],
     ['figure-export.set', { title_follows_dataset: false, title: 'Figure 1' }],
     ['figure-export.set', { preview: { enabled: true, colorblind_mode: 'deuteranopia' } }],
@@ -833,10 +856,22 @@ test('a figure export option a person changes is one figure-export.set step, as 
   await expect(page.locator('#figure-export-axes')).toBeChecked({ checked: before.includeAxes });
 
   // An agent's: the same action by name; what does not go together is refused in its words, changing nothing.
-  const agent = await dispatch(page, 'figure-export.set', { width: 1000, legend_position: 'bottom' }, { origin: 'agent', agent: 'Claude' });
-  expect(agent.step).toMatchObject({ type: 'figure-export.set', origin: 'agent', label: 'Figure export: width 1000, legend position bottom' });
-  expect((await figureExport()).width).toBe(1000);
-  await expect(page.locator('#figure-export-width')).toHaveValue('1000');
+  // The width in millimetres (F271): a width alone that is no preset's makes the preset custom.
+  const agent = await dispatch(page, 'figure-export.set', { width: 150, legend_position: 'bottom' }, { origin: 'agent', agent: 'Claude' });
+  expect(agent.step).toMatchObject({ type: 'figure-export.set', origin: 'agent', label: 'Figure export: width 150, legend position bottom' });
+  expect((await figureExport()).width).toBe(150);
+  expect((await figureExport()).sizePreset).toBe('custom');
+  await expect(page.locator('#figure-export-width')).toHaveValue('150');
+  // Read back by the names the set takes (L14-4): every setting, the record's version aside.
+  const record = await figureExport();
+  const snake = value => (value === null || typeof value !== 'object' ? value
+    : Object.fromEntries(Object.entries(value).map(([key, item]) => [key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`), snake(item)])));
+  const { version: _recordVersion, ...settings } = record;
+  expect(await read(page, 'figure-export.get')).toEqual(snake(settings));
+  expect(await read(page, 'figure-export.get')).toMatchObject({ width: 150, size_preset: 'custom', legend_position: 'bottom' });
+  // A preset sets its width.
+  expect((await dispatch(page, 'figure-export.set', { size_preset: 'single-column' })).refused).toBeUndefined();
+  expect(await read(page, 'figure-export.get')).toMatchObject({ width: 89, size_preset: 'single-column' });
   const refused = await dispatch(page, 'figure-export.set', {
     frame: { lock_aspect: false, rect: { x: 0, y: 0, width: 0.5, height: 0.5 } },
     preview: { enabled: false, colorblind_mode: 'none' },

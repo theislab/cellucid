@@ -240,7 +240,7 @@ test('a published starting state reports its field and leaves the dimension rule
   await openCollapsedPanels(visitor);
   await expect(visitor.locator('#dataset-name')).toHaveText(DATASET_NAME);
 
-  // The restored field colours the plot, so the statistics line must name it.
+  // The restored field colors the plot, so the statistics line must name it.
   await expect(visitor.locator('#categorical-field'))
     .toHaveValue(/^[0-9]+$/);
   await expect(visitor.locator('#stats')).toContainText(

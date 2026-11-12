@@ -24,6 +24,8 @@ function makeParams(
   return {
     autoFog: false,
     cameraDistance: 3,
+    // The sprite cap (rendering/point-sprite.js).
+    pointSizeMax: 160,
     cameraPosition: Float32Array.of(0, 0, 3),
     dimensionLevel,
     fogColor: new Float32Array(3),

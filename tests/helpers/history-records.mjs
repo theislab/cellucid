@@ -117,7 +117,7 @@ export async function recordsHistory({ trackers: count = 1, now = (() => { let t
     async idle() {},
 
     /** Record a step changing `changes` (domain → value) on the active branch's tip. */
-    async step(changes, { type = 'color.by', params = { field: 'cell_type' }, by = user, label = 'Coloured by cell_type', tree = active } = {}) {
+    async step(changes, { type = 'color.by', params = { field: 'cell_type' }, by = user, label = 'Colored by cell_type', tree = active } = {}) {
       const shown = live.get(tree.id);
       const touches = DOMAIN_IDS.filter(domain => Object.hasOwn(changes, domain));
       const before = {};

@@ -75,11 +75,15 @@ export function isWorkerCompatibilityFailure(err) {
 /**
  * No answer this page may read came from the Worker: the transport's
  * `GITHUB_WORKER_UNREACHABLE` (its `answeredBefore` tells a Worker that
- * stopped answering from one never reached), a request the byte layer
- * reports unanswered, or `fetch`'s own rejection (a `TypeError`).
+ * stopped answering from one never reached), or a request the byte layer
+ * reports unanswered (`isUnanswered`: every request to the Worker goes
+ * through `fetchOnce`, which names `fetch`'s own rejection so). A bare
+ * `TypeError` is never one: it is the code's own broken contract
+ * (`utils/errors.js` `isInternalFailure`), and asking again cannot mend it
+ * (round 9: one read as "GitHub unreachable" and was retried).
  */
 export function isWorkerUnreachable(err) {
-  return err?.code === WORKER_UNREACHABLE || isUnanswered(err) || err instanceof TypeError;
+  return err?.code === WORKER_UNREACHABLE || isUnanswered(err);
 }
 
 /** The Worker's answer began and broke off before it was complete. */

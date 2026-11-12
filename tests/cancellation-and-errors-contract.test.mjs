@@ -62,7 +62,7 @@ test('a cancellation has a kind, is made once, and is told apart by name alone',
   const platform = new AbortController();
   platform.abort();
   assert.equal(cancellationKind(abortReason(platform.signal)), 'user');
-  // A deadline's TimeoutError is a failure: it is not relabelled.
+  // A deadline's TimeoutError is a failure: it is not relabeled.
   const timed = new AbortController();
   timed.abort(new DOMException('The operation timed out.', 'TimeoutError'));
   assert.equal(abortReason(timed.signal).name, 'TimeoutError');
@@ -333,4 +333,32 @@ test('a background discard that fails is logged with what was being done and sto
   await settleQuietly(Promise.reject(cancelled('closed', 'Closed.')), 'discarding a journal');
   assert.equal(warned.mock.callCount(), 1, 'a cancellation is no failure');
   await settleQuietly(undefined, 'nothing');
+});
+
+test('work nobody waits for ends quietly when cancelled and reports a failure; a cancellation nobody handles is no page error', async () => {
+  const { cancelled: cancelledError, settleInBackground, quietUnhandledCancellations } = await import('../assets/js/utils/abort.js');
+  const reported = [];
+  settleInBackground(Promise.reject(cancelledError('superseded', 'A newer choice took its place.')), error => reported.push(error));
+  const failure = new Error('could not read');
+  settleInBackground(Promise.reject(failure), error => reported.push(error));
+  settleInBackground(Promise.resolve(1), error => reported.push(error));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(reported, [failure]);
+  assert.throws(() => settleInBackground(null, () => {}), /a promise/);
+  assert.throws(() => settleInBackground(Promise.resolve(), null), /failures go/);
+
+  // The page's net: an unhandled cancellation is prevented (quiet), anything else left as it is.
+  const target = new EventTarget();
+  const remove = quietUnhandledCancellations(target);
+  const event = reason => {
+    const e = new Event('unhandledrejection', { cancelable: true });
+    e.reason = reason;
+    target.dispatchEvent(e);
+    return e.defaultPrevented;
+  };
+  assert.equal(event(cancelledError('superseded', 'Field interaction was superseded by a newer intent.')), true);
+  assert.equal(event(new DOMException('stopped', 'AbortError')), true);
+  assert.equal(event(new Error('a real failure')), false);
+  remove();
+  assert.equal(event(cancelledError('superseded', 'after removal')), false);
 });

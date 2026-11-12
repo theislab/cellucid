@@ -1,8 +1,9 @@
 /**
  * Categorical field operations (pure utilities).
  *
- * Centralizes category-index transforms used by destructive categorical edits
- * (merge categories, delete-to-unassigned) so state/UI code stays DRY.
+ * Centralizes category-index transforms used by categorical edits (merge
+ * categories, delete-to-unassigned, group categories into a new field) so
+ * state/UI code stays DRY.
  *
  * These helpers are intentionally state-free:
  * - Input: categories array + indices
@@ -17,6 +18,7 @@ import {
 } from '../../data/categorical-storage-contract.js';
 import { isCategoricalCodes } from '../../data/categorical-storage-contract.js';
 import { getCategoryColor } from '../../data/palettes.js';
+import { settleDistinctCategoryColors } from '../../data/distinct-colors.js';
 import { carriedCategoryState } from './category-state.js';
 
 function requireCategories(categories) {
@@ -45,7 +47,7 @@ function requireCategories(categories) {
 
 /**
  * Build an index mapping that merges a "deleted" category (and any existing
- * unassigned variants) into a single "unassigned" category.
+ * unassigned variants) into a single "Unassigned" category (by default).
  *
  * The output mapping is defined for indices `[0, categories.length)`.
  * Codes outside that range are expected to be handled by the caller.
@@ -215,10 +217,12 @@ export function applyCategoryIndexMapping(codes, mapping, newCategoryCount) {
 }
 
 /**
- * One view's colours and category visibility, carried into the categories of
+ * One view's colors and category visibility, carried into the categories of
  * a delete-to-unassigned edit: every kept category keeps its own; the
  * unassigned category keeps those of the unassigned category it already was,
- * or else takes the palette colour of its index and is shown.
+ * or else is shown in the palette color of its index when that can be told
+ * apart from the kept ones (`distinct-colors.js`), else in the next one that
+ * can.
  *
  * @param {ReturnType<typeof buildDeleteToUnassignedTransform>} transform
  * @param {{colors: Uint8Array, visible: Uint8Array}} state - by old index (`category-state.js`)
@@ -234,12 +238,14 @@ export function carryCategoryStateThroughDelete(transform, state) {
     if (oldIndex === unassignedOld || merged.has(oldIndex)) continue;
     from[transform.mapping[oldIndex]] = oldIndex;
   }
-  return carriedCategoryState(state, count, index => from[index], getCategoryColor);
+  const carried = carriedCategoryState(state, count, index => from[index], getCategoryColor);
+  settleDistinctCategoryColors(carried.colors, index => from[index] < 0);
+  return carried;
 }
 
 /**
- * One view's colours and category visibility, carried into the categories of
- * a merge: the merged category takes the colour of the one dragged onto the
+ * One view's colors and category visibility, carried into the categories of
+ * a merge: the merged category takes the color of the one dragged onto the
  * other and is shown while either was; every other category keeps its own.
  *
  * @param {ReturnType<typeof buildMergeCategoriesTransform>} transform
@@ -263,9 +269,10 @@ export function carryCategoryStateThroughMerge(transform, fromIndex, toIndex, st
 }
 
 /**
- * One view's colours and category visibility, carried into another category
- * list by category: a category it had keeps its colour and visibility, a new
- * one takes the palette colour of its index and is shown.
+ * One view's colors and category visibility, carried into another category
+ * list by category: a category it had keeps its color and visibility, a new
+ * one is shown in the palette color of its index when that can be told apart
+ * from the others (`distinct-colors.js`), else in the next one that can.
  *
  * @param {Array<string|number|boolean>} previousCategories
  * @param {Array<string|number|boolean>} categories
@@ -275,5 +282,102 @@ export function carryCategoryStateThroughMerge(transform, fromIndex, toIndex, st
 export function carryCategoryStateByCategory(previousCategories, categories, state) {
   const previousIndexOf = new Map();
   previousCategories.forEach((category, index) => previousIndexOf.set(category, index));
-  return carriedCategoryState(state, categories.length, index => previousIndexOf.get(categories[index]) ?? -1, getCategoryColor);
+  const from = index => previousIndexOf.get(categories[index]) ?? -1;
+  const carried = carriedCategoryState(state, categories.length, from, getCategoryColor);
+  settleDistinctCategoryColors(carried.colors, index => from(index) < 0);
+  return carried;
+}
+
+/**
+ * Build an index mapping that groups categories into new ones: each group
+ * (a label and the old indices it holds) becomes one category, in the order
+ * the groups are given; every category no group holds is kept as it is,
+ * after them in its old order, or, with `restLabel`, joins the category of
+ * that label (a group's, or one more after the groups).
+ *
+ * @param {Array<string|number|boolean>} categories
+ * @param {Array<{label: string, members: number[]}>} groups - each old index in one group at most
+ * @param {string|null} restLabel
+ * @returns {{categories: Array<string|number|boolean>, mapping: Uint32Array, firstOf: Int32Array, membersOf: number[][], groupCount: number}}
+ *   `firstOf`/`membersOf`: by new index, the old categories it holds (the first, and all);
+ *   `groupCount`: the new categories that group (the first ones: the groups, and
+ *   with `restLabel` every category, the rest one too), the others kept as they were
+ */
+export function buildGroupCategoriesTransform(categories, groups, restLabel) {
+  const labels = requireCategories(categories);
+  if (!Array.isArray(groups) || groups.length === 0) {
+    throw new TypeError('Grouping categories requires at least one group.');
+  }
+  const mapping = new Uint32Array(labels.length);
+  const grouped = new Int32Array(labels.length).fill(-1);
+  const next = [];
+  const membersOf = [];
+  const indexOf = new Map();
+  groups.forEach((group, groupIndex) => {
+    if (typeof group?.label !== 'string' || group.label.length === 0 || indexOf.has(group.label)) {
+      throw new TypeError(`Group ${groupIndex} needs a label of its own.`);
+    }
+    if (!Array.isArray(group.members) || group.members.length === 0) {
+      throw new TypeError(`Group ${groupIndex} must hold at least one category.`);
+    }
+    indexOf.set(group.label, next.length);
+    next.push(group.label);
+    // In the order the group lists them: its first is the one it is colored as.
+    membersOf.push([...group.members]);
+    for (const old of group.members) {
+      if (!Number.isSafeInteger(old) || old < 0 || old >= labels.length) {
+        throw new RangeError(`Group ${groupIndex} holds a category out of bounds (${old}).`);
+      }
+      if (grouped[old] !== -1) throw new Error(`Category ${old} is in two groups.`);
+      grouped[old] = groupIndex;
+    }
+  });
+  for (let old = 0; old < labels.length; old++) {
+    if (grouped[old] !== -1) {
+      mapping[old] = grouped[old];
+      continue;
+    }
+    let target;
+    if (restLabel !== null) {
+      if (!indexOf.has(restLabel)) {
+        indexOf.set(restLabel, next.length);
+        next.push(restLabel);
+        membersOf.push([]);
+      }
+      target = indexOf.get(restLabel);
+    } else {
+      if (indexOf.has(labels[old])) throw new Error(`Category ${old} is kept under a label a group takes.`);
+      indexOf.set(labels[old], next.length);
+      target = next.length;
+      next.push(labels[old]);
+      membersOf.push([]);
+    }
+    mapping[old] = target;
+    membersOf[target].push(old);
+  }
+  const firstOf = Int32Array.from(membersOf, members => (members.length === 0 ? -1 : members[0]));
+  return { categories: next, mapping, firstOf, membersOf, groupCount: restLabel === null ? groups.length : next.length };
+}
+
+/**
+ * One view's colors and category visibility, carried into the categories of
+ * a grouping: a kept category keeps its own; each group, in order, takes the
+ * color of the first category it holds when that can be told apart from the
+ * kept categories' and the earlier groups' (`distinct-colors.js`), else the
+ * next palette color that can (F111: two groups whose first categories were
+ * gold and orange looked like one); each is shown while any of its
+ * categories was.
+ *
+ * @param {ReturnType<typeof buildGroupCategoriesTransform>} transform
+ * @param {{colors: Uint8Array, visible: Uint8Array}} state - by old index (`category-state.js`)
+ * @returns {{colors: Uint8Array, visible: Uint8Array}} by new index
+ */
+export function carryCategoryStateThroughGroup(transform, state) {
+  const carried = carriedCategoryState(state, transform.categories.length, index => transform.firstOf[index], getCategoryColor);
+  settleDistinctCategoryColors(carried.colors, index => index < transform.groupCount);
+  // Shown while any of its categories was (the array is still being made: no one shares it).
+  transform.membersOf.forEach((members, index) => {
+    if (members.some(old => state.visible[old] === 1)) carried.visible[index] = 1;
+  });
+  return carried;
 }

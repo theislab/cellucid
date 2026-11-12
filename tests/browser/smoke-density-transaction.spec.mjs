@@ -99,8 +99,8 @@ test('GPU smoke density bounds uploads and draw submissions for large point sets
     };
   });
 
-  // One position staging buffer and one RGBA8 colour staging buffer, each
-  // sized to one batch; every batch uploads its positions then its colours.
+  // One position staging buffer and one RGBA8 color staging buffer, each
+  // sized to one batch; every batch uploads its positions then its colors.
   expect(proof.numericBufferAllocations).toEqual([
     proof.maxBatch * 3 * Float32Array.BYTES_PER_ELEMENT,
     proof.maxBatch * 4,
@@ -230,7 +230,7 @@ test('GPU smoke density streams filtered positions through one bounded staging b
     proof.maxBatch * 4,
   ]);
   expect(proof.drawInstanceCounts).toEqual([proof.maxBatch, 1]);
-  // Colours stream through their own batch-sized staging array beside the
+  // Colors stream through their own batch-sized staging array beside the
   // positions: rgb copied per visible cell, alpha unused.
   expect(proof.uploads.filter(upload => upload.sourceLength === proof.maxBatch * 4)).toEqual([
     {
@@ -777,12 +777,12 @@ test('viewer invalidates smoke resources and requires reload after WebGL context
   });
   // The context is away and the viewer waits for it back
   // (graphics-context-restore.spec.mjs): restoring, no Reload.
-  await expect(page.locator('#cellucid-webgl-context-overlay')).toBeVisible();
-  await expect(page.locator('#cellucid-webgl-context-overlay')).toContainText(
+  await expect(page.locator('#graphics-reset-dialog')).toBeVisible();
+  await expect(page.locator('#graphics-reset-dialog')).toContainText(
     'The graphics were reset by the browser. Restoring them',
   );
   await expect(
-    page.locator('#cellucid-webgl-context-overlay').getByRole('button', {
+    page.locator('#graphics-reset-dialog').getByRole('button', {
       name: 'Reload',
       exact: true,
     }),

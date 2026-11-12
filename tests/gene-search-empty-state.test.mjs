@@ -250,7 +250,7 @@ test('a gene kept active for a moment is prefetched, and moving on cancels it', 
   await wait(250);
   assert.deepEqual(loads.map(load => load.index), [1, 2]);
 
-  // Choosing the prefetched gene shares its load rather than cancelling it.
+  // Choosing the prefetched gene shares its load rather than canceling it.
   keydown('Enter');
   await settleTurn();
   assert.equal(loads[1].signal.aborted, false);

@@ -373,6 +373,8 @@ function renderParams(viewId, forceLOD = 0) {
   return {
     autoFog: false,
     cameraDistance: 4,
+    // The sprite cap (rendering/point-sprite.js).
+    pointSizeMax: 160,
     cameraPosition: Float32Array.from([0, 0, 4]),
     dimensionLevel: DIMENSION,
     fogColor: Float32Array.from([0, 0, 0]),

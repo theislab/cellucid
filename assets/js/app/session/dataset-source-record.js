@@ -103,13 +103,15 @@ export function captureDatasetSourceRecord(dataSourceManager) {
 }
 
 /**
- * Name a recorded source for the person loading the session.
+ * Name a recorded source for the person loading the session: where it opens
+ * from, never the dataset's id (the dataset itself is named by its name, as
+ * the Dataset box shows it: `session-controls.js`).
  *
  * @param {object} record
  * @returns {string}
  */
 export function describeDatasetSourceRecord(record) {
-  if (record.kind === 'sample') return `the sample dataset "${record.dataset}"`;
+  if (record.kind === 'sample') return 'the samples';
   if (record.kind === 'link') return record.locator;
   if (record.kind === 'file') return `the file "${record.name}" on the computer it was saved on`;
   return `the Cellucid server at ${record.url}`;

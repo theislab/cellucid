@@ -90,7 +90,7 @@ async function dismissAllNotifications(page) {
 
 async function expectUserDataReadyNotification(page) {
   const notifications = page.locator('#notification-center .notification');
-  const userReady = notifications.filter({ hasText: 'User data ready:' });
+  const userReady = notifications.filter({ hasText: /Opened .+: \d/ });
   await expect(userReady).toHaveCount(1);
 }
 
@@ -374,7 +374,7 @@ test('session restore rebuilds saved smoke once after retiring current snapshots
   expect(browserErrors).toEqual([]);
 });
 
-test('session restore catches a real control-owner failure and rolls back', async ({
+test('session restore catches a real control-owner failure: that part is not restored and keeps what was shown (F155)', async ({
   page,
 }, testInfo) => {
   const pageErrors = [];
@@ -439,10 +439,14 @@ test('session restore catches a real control-owner failure and rolls back', asyn
   const chooser = await chooserPromise;
   await chooser.setFiles(sessionPath);
 
+  // The rest of the file is restored; the settings, whose owner refused, are
+  // one part not restored, said once in their own words, and keep what was
+  // shown (the control and the renderer agree on it).
   await expect(
-    page.locator('#notification-center .notification-error')
-      .filter({ hasText: 'synthetic smoke target owner failure' }),
+    page.locator('#notification-center .notification-warning .notification-message')
+      .filter({ hasText: /^Session restored but for 1 part\. Settings could not be restored: synthetic smoke target owner failure\. It is left as it was shown\.$/ }),
   ).toHaveCount(1);
+  await expect(page.locator('#notification-center .notification-error')).toHaveCount(0);
   await expect(page.locator('#cloud-resolution')).toHaveValue('15');
   await expect.poll(
     () => page.evaluate(
@@ -454,7 +458,7 @@ test('session restore catches a real control-owner failure and rolls back', asyn
 });
 
 test(
-  'session Save drains a deferred categorical selection before capture',
+  'session Save drains a deferred field selection before capture',
   async ({ page }, testInfo) => {
     const browserErrors = [];
     page.on('console', message => {
@@ -466,8 +470,10 @@ test(
       browserErrors.push(`page: ${error.stack || error.message}`);
     });
 
-    // The forms catalog's Zarr folder dataset, whose categorical codes are
-    // one key (`obs/stage/codes/0`) that can be held.
+    // The forms catalog's Zarr folder dataset. It opens colored by its one
+    // categorical field (`stage`, `first-coloring.js`); its continuous
+    // `pseudotime` is one key (`obs/pseudotime/0`) not read yet, that can be
+    // held.
     await page.goto(
       `/?sampleCatalog=${encodeURIComponent(FORMS_CATALOG_URL)}&dataset=forms-zarr&acceptance=session-field-owner-ci`,
       { waitUntil: 'domcontentloaded' },
@@ -483,7 +489,7 @@ test(
     });
     let codesRequests = 0;
     await page.route(
-      `${FORMS_CATALOG_URL}forms-zarr.zarr/obs/stage/codes/0`,
+      `${FORMS_CATALOG_URL}forms-zarr.zarr/obs/pseudotime/0`,
       async route => {
         codesRequests++;
         await codesGate;
@@ -491,10 +497,11 @@ test(
       },
     );
 
-    const field = page.locator('#categorical-field');
-    await field.selectOption({ label: 'stage' });
+    await expect(page.locator('#categorical-field option:checked')).toHaveText('stage');
+    const field = page.locator('#continuous-field');
+    await field.selectOption({ label: 'pseudotime' });
     await expect.poll(() => codesRequests).toBe(1);
-    await expect(field.locator('option:checked')).toHaveText('stage');
+    await expect(field.locator('option:checked')).toHaveText('pseudotime');
 
     let downloadObserved = false;
     page.once('download', () => {
@@ -513,10 +520,10 @@ test(
       'deferred-field.cellucid-session',
     );
     await download.saveAs(sessionPath);
-    // The session's coloured field is the one chosen while its codes were
+    // The session's colored field is the one chosen while its values were
     // still read: the shown value of the active-field domain names it.
     const activeField = await shownDomainValue(await readFile(sessionPath), 'active-field');
-    expect(JSON.stringify(activeField)).toContain('"stage"');
+    expect(JSON.stringify(activeField)).toContain('"pseudotime"');
     expect(browserErrors).toEqual([]);
   },
 );
@@ -558,7 +565,10 @@ test(
     // (`DataState.listPublishedGenes`), and its arrival refreshes the menus
     // (`genes:listed`). Found in CI: it landed while a categorical choice was
     // read, and the menu said None until the read ended.
+    // The choice under way is the dataset's first coloring (`stage`, its
+    // one categorical field: `first-coloring.js`), read as it opens.
     const geneNames = await holdRequests(`${FORMS_CATALOG_URL}forms-zarr.zarr/var/_index/0`);
+    const codes = await holdRequests(`${FORMS_CATALOG_URL}forms-zarr.zarr/obs/stage/codes/0`);
     await page.goto(
       `/?sampleCatalog=${encodeURIComponent(FORMS_CATALOG_URL)}&dataset=forms-zarr&acceptance=session-field-owner-ci`,
       { waitUntil: 'domcontentloaded' },
@@ -570,10 +580,8 @@ test(
     const search = page.locator('#gene-expression-search');
     await expect(search).toHaveAttribute('placeholder', 'Reading gene names…');
 
-    const codes = await holdRequests(`${FORMS_CATALOG_URL}forms-zarr.zarr/obs/stage/codes/0`);
     const categorical = page.locator('#categorical-field');
     const continuous = page.locator('#continuous-field');
-    await categorical.selectOption({ label: 'stage' });
     await expect.poll(() => codes.requests).toBe(1);
     await expect(categorical.locator('option:checked')).toHaveText('stage');
     await expect(categorical).toBeDisabled();
@@ -1037,7 +1045,11 @@ test('viewer controls reject invalid values atomically and persist one exact bac
     matrices: true,
   });
 
-  await page.locator('#background-select').selectOption('black');
+  // Picked as a person picks (the browser's own, trusted change): only a
+  // person's pick is kept (`render-controls.js`); `selectOption` dispatches a
+  // page event, which a restore or an action also is.
+  await page.locator('#background-select').focus();
+  await page.keyboard.type('Black');
   await expect(page.locator('#background-select')).toHaveValue('black');
   await expect.poll(() => page.evaluate(() => ({
     stored: localStorage.getItem('cellucid_viewer_background'),
@@ -1067,11 +1079,14 @@ test('viewer controls reject invalid values atomically and persist one exact bac
   await expect.poll(
     () => page.evaluate(() => window._cellucidViewer.getSnapshotViews().length),
   ).toBe(1);
-  await page.locator('#render-mode').selectOption('smoke');
-  await expect(page.locator('#render-mode')).toHaveValue('points');
-  await expect(page.locator('.notification-warning')).toContainText(
-    'Volumetric smoke requires a single view. Clear snapshots first.',
+  // Smoke draws one view: its choice is off while a view is kept, and says why (R9R-4).
+  const smokeChoice = page.locator('#render-mode option[value="smoke"]');
+  await expect(smokeChoice).toBeDisabled();
+  await expect(smokeChoice).toHaveAttribute(
+    'title',
+    'volumetric smoke draws one view; remove the kept views first (Clear, beside Layout)',
   );
+  await expect(page.locator('#render-mode')).toHaveValue('points');
 
   expect(browserErrors).toEqual([]);
 });

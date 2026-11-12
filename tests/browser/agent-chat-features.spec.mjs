@@ -19,8 +19,9 @@ import { expect, test } from './helpers/test.mjs';
 import { expectDownloadNamed } from './helpers/downloads.mjs';
 import { START, TRAJECTORY, expectSettledOn, startUrl } from './helpers/dataset-loading.mjs';
 import { dismissWelcome } from './helpers/welcome.mjs';
+import { tabKey } from './helpers/dialog-keys.mjs';
 import {
-  COLOR_BY_CELL_TYPE, agentRequests, installScriptedModel, observeProductErrors, openAgentDataset, openChat,
+  COLOR_BY_SCORE, agentRequests, installScriptedModel, observeProductErrors, openAgentDataset, openChat,
   queueReplies, say, stepFacts, waitForHold, waitForTurnEnd,
 } from './helpers/agent-chat.mjs';
 
@@ -89,17 +90,17 @@ test.describe('agent chat features', () => {
     await dialog.locator('.app-dialog-close').click();
     await expect(dialog).toBeHidden();
 
-    await queueReplies(page, [{ calls: [COLOR_BY_CELL_TYPE] }, { text: 'I may only read here.' }]);
-    await say(page, 'Colour by cell type');
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'I may only read here.' }]);
+    await say(page, 'Color by score');
     await expect(page.locator('#agent-chat-log .agent-tool[data-tool="color_by"]')).toHaveAttribute('data-state', 'refused');
     // No step of the agent's (opening the Agents section above is the person's own step of the layout).
     expect((await stepFacts(page)).filter(step => step.origin === 'agent')).toEqual([]);
     const requests = await agentRequests(page);
     // Told with the message, as Cellucid's addition the model reads.
-    expect(requests[0].messages[0].text).toMatch(/^Colour by cell type\n\n\[Cellucid: Permissions: The person's permissions for agents in Cellucid now \(Read only\): /);
+    expect(requests[0].messages[0].text).toMatch(/^Color by score\n\n\[Cellucid: Permissions: The person's permissions for agents in Cellucid now \(Read only\): /);
     const refusal = requests[1].messages.at(-1).results[0];
     expect(refusal.isError).toBe(true);
-    expect(refusal.content[0].text).toMatch(/do not let agents change anything in this tab, so “Colour the cells by a field or gene” was not done/);
+    expect(refusal.content[0].text).toMatch(/do not let agents change anything in this tab, so “Color the cells by a field or gene” was not done/);
     // Unchanged permissions are not told again.
     await queueReplies(page, [{ text: 'Still reading only.' }]);
     await say(page, 'Fine');
@@ -121,12 +122,12 @@ test.describe('agent chat features', () => {
     await openAgentDataset(page);
     await page.evaluate(async () => {
       const { getActions } = await import('/assets/js/app/actions/index.js');
-      getActions().provideEstimate('color.by', () => ({ ms: 30_000, bytes: null, what: 'colouring every cell' }));
+      getActions().provideEstimate('color.by', () => ({ ms: 30_000, bytes: null, what: 'coloring every cell' }));
     });
     await openChat(page);
     const card = page.locator('#agent-presence .agent-confirm');
-    await queueReplies(page, [{ calls: [COLOR_BY_CELL_TYPE] }, { text: 'never asked for' }]);
-    await page.locator('#agent-chat-input').fill('Colour by cell type');
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'never asked for' }]);
+    await page.locator('#agent-chat-input').fill('Color by score');
     await page.locator('#agent-chat-input').press('Enter');
     await expect(card).toHaveAttribute('data-asking', 'heavy');
     await page.locator('#agent-chat-collapse').click();
@@ -146,27 +147,27 @@ test.describe('agent chat features', () => {
   test('heavy work asks first with its estimate; This chat allows it in that chat only; Always sets the kind', async ({ page, browserName }) => {
     const errors = observeProductErrors(page);
     await openAgentDataset(page);
-    // Colouring estimated, by the page's own measure, to take 30 s here.
+    // Coloring estimated, by the page's own measure, to take 30 s here.
     await page.evaluate(async () => {
       const { getActions } = await import('/assets/js/app/actions/index.js');
-      getActions().provideEstimate('color.by', () => ({ ms: 30_000, bytes: null, what: 'colouring every cell' }));
+      getActions().provideEstimate('color.by', () => ({ ms: 30_000, bytes: null, what: 'coloring every cell' }));
     });
     await openChat(page);
     const card = page.locator('#agent-presence .agent-confirm');
 
-    await queueReplies(page, [{ calls: [COLOR_BY_CELL_TYPE] }, { text: 'Coloured.' }]);
-    await page.locator('#agent-chat-input').fill('Colour by cell type');
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'Colored.' }]);
+    await page.locator('#agent-chat-input').fill('Color by score');
     await page.locator('#agent-chat-input').press('Enter');
     await expect(card).toHaveAttribute('data-asking', 'heavy');
-    await expect(card.locator('.agent-confirm-title')).toHaveText(/^Claude \(chat\) asks to colour the cells by a field or gene: “Coloured by .+”\.$/);
-    await expect(card.locator('.agent-confirm-why')).toHaveText('It is heavy work: Colouring every cell, about 30.0 s on this device.');
+    await expect(card.locator('.agent-confirm-title')).toHaveText(/^Claude \(chat\) asks to color the cells by a field or gene: [^“”]+\.$/);
+    await expect(card.locator('.agent-confirm-why')).toHaveText('It is heavy work: Coloring every cell, about 30.0 s on this device.');
     await expect(page.locator('#agent-chat-log .agent-chat-working')).toHaveAttribute('data-phase', 'asking');
     await expect(page.locator('#agent-chat-status')).toHaveText('Waiting for your answer above…');
     await expect(card.locator('.agent-confirm-allow-here')).toHaveText('This chat');
     // A keyboard user is brought to the question, reaches its answers with Tab, and is brought back after.
     await expect(card).toBeFocused();
     // WebKit on macOS moves to buttons with Option-Tab (Tab alone skips them, as Safari does by default).
-    await page.keyboard.press(browserName === 'webkit' ? 'Alt+Tab' : 'Tab');
+    await page.keyboard.press(tabKey(browserName));
     await expect.poll(() => card.evaluate(element => element.contains(document.activeElement) && element !== document.activeElement)).toBe(true);
     await card.locator('.agent-confirm-allow-here').focus();
     await page.keyboard.press('Enter');
@@ -177,13 +178,13 @@ test.describe('agent chat features', () => {
 
     // The same chat: allowed without asking.
     await queueReplies(page, [{ calls: [{ name: 'color_by', args: { field: null } }] }, { text: 'Back to none.' }]);
-    await say(page, 'Take the colour away');
+    await say(page, 'Take the color away');
     expect((await stepFacts(page)).map(step => step.type)).toEqual(['color.by', 'color.by']);
 
     // A new chat asks again; Always sets heavy work to Allow for every agent.
     await page.locator('#agent-chat-new').click();
-    await queueReplies(page, [{ calls: [COLOR_BY_CELL_TYPE] }, { text: 'Coloured again.' }]);
-    await page.locator('#agent-chat-input').fill('Colour by cell type again');
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'Colored again.' }]);
+    await page.locator('#agent-chat-input').fill('Color by score again');
     await page.locator('#agent-chat-input').press('Enter');
     await expect(card).toHaveCount(1);
     await card.locator('.agent-confirm-allow-always').click();
@@ -226,8 +227,8 @@ test.describe('agent chat features', () => {
     const errors = observeProductErrors(page);
     await openAgentDataset(page);
     await openChat(page);
-    await queueReplies(page, [{ calls: [COLOR_BY_CELL_TYPE] }, { text: 'Coloured by cell type. Each type has its colour.' }]);
-    await say(page, 'Colour by cell type.');
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'Colored by score. Low to high.' }]);
+    await say(page, 'Color by score.');
     const [step] = await stepFacts(page);
     const log = page.locator('#agent-chat-log');
 
@@ -274,27 +275,27 @@ test.describe('agent chat features', () => {
         else window.setTimeout(() => callback(time), 3000);
       });
     });
-    await queueReplies(page, [{ calls: [COLOR_BY_CELL_TYPE] }, { text: 'Coloured by **cell_type**.' }]);
-    await page.locator('#agent-chat-input').fill('Colour by cell type');
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'Colored by **score**.' }]);
+    await page.locator('#agent-chat-input').fill('Color by score');
     await page.locator('#agent-chat-input').press('Enter');
     await expect(page.locator('#agent-chat-input')).toHaveValue('');
     await expect(page.locator('#agent-chat-stop')).toBeHidden();
     // Read once, in the same moment: not a wait for the frame.
-    expect(await page.evaluate(() => [...document.querySelectorAll('#agent-chat-log .agent-msg-agent')].at(-1)?.textContent ?? '')).toContain('Coloured by');
+    expect(await page.evaluate(() => [...document.querySelectorAll('#agent-chat-log .agent-msg-agent')].at(-1)?.textContent ?? '')).toContain('Colored by');
   });
 
   test('Copy, what was sent, the tokens, Edit, Export and Try again', async ({ page }) => {
     const errors = observeProductErrors(page);
     await openAgentDataset(page);
     await openChat(page);
-    await queueReplies(page, [{ calls: [COLOR_BY_CELL_TYPE] }, { text: 'Coloured by **cell_type**.', usage: { input: 1200, output: 30 } }]);
-    await say(page, 'Colour by cell type');
+    await queueReplies(page, [{ calls: [COLOR_BY_SCORE] }, { text: 'Colored by **score**.', usage: { input: 1200, output: 30 } }]);
+    await say(page, 'Color by score');
     const log = page.locator('#agent-chat-log');
 
     const reply = log.locator('.agent-msg-agent').last();
     await reply.locator('.agent-msg-copy').click();
     await expect(reply.locator('.agent-msg-copy')).toHaveText('Copied');
-    expect(await page.evaluate(() => window.__copied)).toEqual(['Coloured by **cell_type**.']);
+    expect(await page.evaluate(() => window.__copied)).toEqual(['Colored by **score**.']);
 
     const foot = log.locator('.agent-turn-foot').last();
     await expect(foot.locator('.agent-turn-sent-line')).toBeHidden();
@@ -306,19 +307,19 @@ test.describe('agent chat features', () => {
     await closeSettings(page);
 
     await log.locator('.agent-msg-user .agent-msg-edit').click();
-    await expect(page.locator('#agent-chat-input')).toHaveValue('Colour by cell type');
+    await expect(page.locator('#agent-chat-input')).toHaveValue('Color by score');
     await expect(page.locator('#agent-chat-input')).toBeFocused();
     await page.locator('#agent-chat-input').fill('');
 
     const downloadPromise = page.waitForEvent('download');
     await page.locator('#agent-chat-export').click();
     const download = await downloadPromise;
-    await expectDownloadNamed(download, /^cellucid-chat-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.md$/);
+    await expectDownloadNamed(download, /^cellucid-chat-\d{8}_\d{6}\.md$/);
     const markdown = await readFile(await download.path(), 'utf8');
     expect(markdown).toContain('# Cellucid chat: Current UI fixture');
-    expect(markdown).toContain('**You**\n\n> Colour by cell type');
-    expect(markdown).toContain('- `color_by` — step "Coloured by cell_type"');
-    expect(markdown).toContain('Coloured by **cell_type**.');
+    expect(markdown).toContain('**You**\n\n> Color by score');
+    expect(markdown).toContain('- `color_by` — step "Colored by score"');
+    expect(markdown).toContain('Colored by **score**.');
 
     // A failed turn offers Try again, which sends its message again as a new turn.
     await queueReplies(page, [{ error: { kind: 'auth', message: 'The provider did not accept this key.' } }]);
@@ -339,12 +340,14 @@ test.describe('agent chat features', () => {
     await openChat(page);
     const chips = page.locator('#agent-chat-log .agent-chat-suggestion');
     await expect(chips.first()).toHaveText('Give me a first look at this dataset');
-    const categorical = await page.evaluate(async () => {
+    // The chips are the dataset's own (its clustering, its field of the cells' identity).
+    const offered = await page.evaluate(async () => {
       const { getActions } = await import('/assets/js/app/actions/index.js');
-      const { outcome } = await getActions().dispatch('fields.list', { kind: 'categorical' });
-      return outcome.fields.find(field => field.categories === undefined || field.categories > 1)?.key ?? null;
+      const { readSuggestionFacts, suggestionsFor } = await import('/assets/js/app/agent/chat/suggestions.js');
+      return suggestionsFor(await readSuggestionFacts(getActions(), 0));
     });
-    if (categorical !== null) await expect(chips.nth(1)).toHaveText(`Annotate the clusters of ${categorical}`);
+    expect(offered.length).toBeGreaterThan(1);
+    await expect(chips).toHaveText(offered);
 
     // `/` outside a field: the collapsed chat opens; open, it focuses the message.
     await page.locator('#agent-chat-collapse').click();

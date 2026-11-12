@@ -113,7 +113,7 @@ test('a ZIP writer refuses an entry it cannot write as asked', async () => {
   assert.throws(() => createZipWriter({}), /write\(part\)/);
 });
 
-test('a ZIP entry keeps its name exactly as given, and two names one once normalised are refused', async () => {
+test('a ZIP entry keeps its name exactly as given, and two names one once normalized are refused', async () => {
   const sink = memorySink();
   const zip = createZipWriter(sink);
   const decomposed = 'cafe\u0301/0';
@@ -122,7 +122,7 @@ test('a ZIP entry keeps its name exactly as given, and two names one once normal
   await assert.rejects(zip.add('caf\u00e9/0', Uint8Array.of(8)), /another Unicode form/);
   await zip.finish();
   const bytes = Buffer.from(sink.bytes());
-  // The name's bytes as given (NFD), never normalised.
+  // The name's bytes as given (NFD), never normalized.
   assert.ok(bytes.includes(Buffer.from(decomposed, 'utf8')));
   assert.ok(!bytes.includes(Buffer.from(decomposed.normalize('NFC'), 'utf8')));
   // The app's reader holds names NFC; a Zarr key in either form finds the entry.
@@ -629,7 +629,12 @@ test('changes are written where they belong: obs columns by original position, u
       ],
       var: [{ name: 'in_set', column: { kind: 'booleans', values: Uint8Array.from({ length: shape[1] }, (_, gene) => gene < 3) } }],
       uns: { note: 'written by a test', removed_nothing: null },
-      cellucid: { history_applied: '[{"tracker":"t"}]', gene_sets: { first: { genes: ['a', 'b'], description: '', origin: 'session' } } },
+      cellucid: {
+        history_applied: '[{"tracker":"t"}]',
+        gene_sets: { first: { genes: ['a', 'b'], description: '', origin: 'session' } },
+        // Descriptive text is written trimmed (R9U-9).
+        description: 'Typed by hand. ',
+      },
     },
   });
   assert.equal(result.priorityOrder, true);
@@ -652,6 +657,7 @@ test('changes are written where they belong: obs columns by original position, u
   assert.equal(copy.root.get('uns/removed_nothing'), null);
   assert.equal(await copy.root.get('uns/cellucid/history_applied').read(), '[{"tracker":"t"}]');
   assert.deepEqual(await copy.root.get('uns/cellucid/gene_sets/first/genes').read(), ['a', 'b']);
+  assert.equal(await copy.root.get('uns/cellucid/description').read(), 'Typed by hand.');
   // Every other key of the record is the source's, and the app opens the copy.
   for (const key of root.get('uns/cellucid').keys()) assert.ok(copy.root.get(`uns/cellucid/${key}`) !== null, `uns['cellucid']['${key}'] is kept`);
   const reader = new AnnDataReader();
@@ -670,10 +676,15 @@ test('an obs column renamed in place keeps its place and values; its old name is
       score: array(Float32Array.of(0.5, 1, 1.5, 2, 2.5, 3)),
       flag: array(Uint8Array.of(1, 0, 1, 0, 1, 0), { dtype: '|b1' }),
     },
+    // Scanpy's colors of a column, and colors of another form (not text).
+    extra: { uns: mapping({ cluster_colors: strings(['#111111', '#222222', '#333333']), label_colors: array(Float32Array.of(1, 2)) }) },
   }));
   await root.load();
   // What the plan reads of a store: its columns, the asked ones whole, as a copy writes columns.
-  const before = await readCopyTarget(root, ['cluster', 'label', 'score', 'flag', 'absent']);
+  const before = await readCopyTarget(root, ['cluster', 'label', 'score', 'flag', 'absent'], {}, { colors: ['cluster', 'label', 'absent'] });
+  // Its uns keys, and the colors asked for: text as stored, null for another form or none (F139).
+  assert.deepEqual(before.unsKeys.sort(), ['cluster_colors', 'label_colors']);
+  assert.deepEqual(before.colors, { cluster: ['#111111', '#222222', '#333333'], label: null, absent: null });
   assert.deepEqual(before.obsColumns, ['cluster', 'label', 'score', 'flag']);
   assert.deepEqual(before.varColumns, []);
   assert.deepEqual(before.cellucid, null);
@@ -693,6 +704,8 @@ test('an obs column renamed in place keeps its place and values; its old name is
         { name: 'cluster', column: { kind: 'numbers', values: fresh } },
         { name: 'mark', column: { kind: 'nullable-boolean', values: Uint8Array.of(1, 1, 0, 0, 1, 0), mask: Uint8Array.of(0, 0, 0, 1, 1, 1) } },
       ],
+      // The colors follow the renamed, relabelled column (as the apply plan says: `colorChanges`).
+      uns: { clusters_colors: ['#111111', '#222222'], cluster_colors: null },
       cellucid: { history_applied: '[{"step":"s1"}]', gene_sets: { Markers: { genes: ['gene'], description: '', origin: 'session', pulled_from: 'viewer', id: 'Markers' } } },
     },
   });
@@ -700,7 +713,9 @@ test('an obs column renamed in place keeps its place and values; its old name is
   assert.deepEqual(copy.root.get('obs').attrs['column-order'], ['clusters', 'text', 'score', 'flag', 'cluster', 'mark'],
     'each renamed column in its place; the old name, free, a new column after the others');
   // Read back as the plan reads a target: every column as it was given.
-  const after = await readCopyTarget(copy.root, ['clusters', 'text', 'cluster', 'mark']);
+  const after = await readCopyTarget(copy.root, ['clusters', 'text', 'cluster', 'mark'], {}, { colors: ['clusters', 'cluster'] });
+  assert.deepEqual(after.unsKeys.sort(), ['cellucid', 'clusters_colors', 'label_colors']);
+  assert.deepEqual(after.colors, { clusters: ['#111111', '#222222'], cluster: null });
   assert.deepEqual({ ...after.columns.clusters, codes: Int8Array.from(after.columns.clusters.codes) }, relabelled);
   assert.deepEqual(after.columns.text, before.columns.label);
   // The packages' records, which opening leaves unread, are read for a plan: the applies before it, the gene sets.
@@ -777,7 +792,7 @@ test('a change a copy cannot make as asked is refused, in one sentence, before a
   await refused({ obs: [{ name: 'x', column: numbers() }, { name: 'x', column: numbers() }] }, /is used twice/);
   // Columns: kind, lengths, parts.
   await refused({ obs: [{ name: 'x', column: {} }] }, /has no kind/);
-  await refused({ obs: [{ name: 'x', column: { kind: 'colours', values: [] } }] }, /none a copy writes/);
+  await refused({ obs: [{ name: 'x', column: { kind: 'colors', values: [] } }] }, /none a copy writes/);
   await refused({ obs: [{ name: 'short', column: numbers(nObs - 1) }] }, /has \d+ values for \d+ rows/);
   await refused({ var: [{ name: 'short', column: numbers(nVars + 1) }] }, /var column 'short' has \d+ values for \d+ rows/);
   await refused({ obs: [{ name: 'x', column: { kind: 'numbers', values: Array(nObs).fill(0) } }] }, /numeric typed array/);
@@ -804,7 +819,7 @@ test('a change a copy cannot make as asked is refused, in one sentence, before a
   await refused({ cellucid: { gene_sets: { 'CD4+/CD8+ T': { genes: ['CD4'] } } } }, /contains a character that cannot appear/);
   await refused({ cellucid: { id: 'not a portable id!' } }, /uns\['cellucid'\]\['id'\]/);
   await refused({ cellucid: { schema: 2 } }, /reads schema 1/);
-  await refused({ cellucid: { name: '  padded  ' } }, /uns\['cellucid'\]\['name'\]/);
+  await refused({ cellucid: { id: ' padded' } }, /uns\['cellucid'\]\['id'\]/);
 });
 
 test('a sparse matrix kept in uns (anndata 0.7 csr_matrix, anndata 0.6 h5sparse) is presented, and copied, as the matrix it is', async () => {

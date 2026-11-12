@@ -78,7 +78,8 @@ export const downloadTrackingMethods = {
       startTime: now,
       lastTime: now,
       lastBytes: 0,
-      speed: 0
+      // The speed once measured over a window of bytes read (null before: a line claims no rate it has not seen).
+      speed: null
     };
 
     const initialProgress = totalBytes === null
@@ -95,7 +96,6 @@ export const downloadTrackingMethods = {
       title: 'Loading',
       message: name,
       progress: initialProgress,
-      speed: 0,
       onCancel
     });
     this.downloadTrackers.set(id, tracker);
@@ -144,7 +144,7 @@ export const downloadTrackingMethods = {
     // Calculate speed (smoothed). Update every ~100ms to avoid excessive DOM work.
     if (timeDelta > 100) {
       const instantSpeed = (bytesDelta / timeDelta) * 1000;
-      tracker.speed = tracker.speed * 0.7 + instantSpeed * 0.3;
+      tracker.speed = tracker.speed === null ? instantSpeed : tracker.speed * 0.7 + instantSpeed * 0.3;
       tracker.lastTime = now;
       tracker.lastBytes = loadedBytes;
     }
@@ -161,10 +161,29 @@ export const downloadTrackingMethods = {
     this._updateNotification(`download-${id}`, {
       type: progress !== null ? NotificationType.PROGRESS : NotificationType.LOADING,
       progress,
-      speed: tracker.speed,
+      ...(tracker.speed === null ? {} : { speed: tracker.speed }),
       message: tracker.totalBytes !== null
         ? `${tracker.name} (${formatBytes(loadedBytes)} / ${formatBytes(tracker.totalBytes)})`
         : `${tracker.name} (${formatBytes(loadedBytes)})`
+    });
+  },
+
+  /**
+   * Name the work a load does now that is not reading bytes (F167: the
+   * cells' totals it sums once read): "<name>: <doing>", without a
+   * percentage, its Cancel kept. The next byte count or its end replaces it.
+   * @param {string} id - Tracker ID
+   * @param {string} doing - the work, as a progress line says it ("Summing …")
+   */
+  phaseDownload(id, doing) {
+    const tracker = requireTracker(this, id);
+    requireNonEmptyString(doing, 'Download phase');
+    this._updateNotification(`download-${id}`, {
+      type: NotificationType.LOADING,
+      progress: null,
+      // Not reading bytes: no rate is shown (it was "0 B/s").
+      speed: null,
+      message: `${tracker.name}: ${doing}`
     });
   },
 
@@ -190,16 +209,20 @@ export const downloadTrackingMethods = {
   },
 
   /**
-   * Fail a download.
+   * Fail a download: "<name>: <sentence>", the failure's own words (an
+   * error's message, the ids it names) under Details.
    * @param {string} id
-   * @param {string} errorMessage
+   * @param {string} errorMessage - One sentence for the person
+   * @param {{details?: string}} [options]
    */
-  failDownload(id, errorMessage) {
+  failDownload(id, errorMessage, { details = '' } = {}) {
     const tracker = requireTracker(this, id);
     requireNonEmptyString(errorMessage, 'Download error message');
+    if (typeof details !== 'string') throw new TypeError('Download failure details must be a string.');
 
     this.fail(`download-${id}`, `${tracker.name}: ${errorMessage}`, {
-      title: 'Loading failed'
+      title: 'Loading failed',
+      ...(details === '' ? {} : { details }),
     });
     this.downloadTrackers.delete(id);
   },

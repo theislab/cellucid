@@ -700,9 +700,9 @@ test('bounded analysis call sites contain no execution-failure backend switch', 
 });
 
 // A failed worker is never revived or recycled; the one worker ever replaced
-// is one still running a task its caller cancelled (worker-pool.js).
+// is one still running a task its caller canceled (worker-pool.js).
 test('analysis worker lifecycle contains no failure restart or heap-recycle path', async () => {
-  const [manager, workerPool, markerDiscovery, cleanup] = await Promise.all([
+  const [manager, workerPool, markerDiscovery] = await Promise.all([
     readFile(new URL('compute-manager.js', COMPUTE_ROOT), 'utf8'),
     readFile(new URL('worker-pool.js', COMPUTE_ROOT), 'utf8'),
     readFile(
@@ -711,13 +711,9 @@ test('analysis worker lifecycle contains no failure restart or heap-recycle path
         import.meta.url
       ),
       'utf8'
-    ),
-    readFile(
-      new URL('../assets/js/app/analysis/shared/resource-cleanup.js', import.meta.url),
-      'utf8'
     )
   ]);
-  const currentLifecycle = [manager, workerPool, markerDiscovery, cleanup].join('\n');
+  const currentLifecycle = [manager, workerPool, markerDiscovery].join('\n');
 
   assert.doesNotMatch(
     currentLifecycle,

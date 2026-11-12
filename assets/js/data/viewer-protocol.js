@@ -22,14 +22,15 @@
  *   (`VIEWER_BINARY_EVENT_HEADER_FIELDS`).
  *
  * **Actions.** Everything a host changes or reads in the viewer is an action
- * of the catalogue (`app/actions/`; the catalogue document both packages
+ * of the catalog (`app/actions/`; the catalog document both packages
  * generate their methods from is `tests/fixtures/action-catalog.json`): one
  * `action` command names it (`action`, its dotted type) with its parameters,
  * and the viewer answers it with one `action_result` (its outcome, a read's
- * result, and the history step it made, or null) or one `command_error`
+ * result, and the history step it made, or null with why a change made none:
+ * `unrecorded`, `VIEWER_ACTION_UNRECORDED`) or one `command_error`
  * carrying the same `requestId`. A host action takes the path a person's
- * control takes: one step of the history, labelled as the host's, undone like
- * any other. Undo, redo and jumps are actions of the catalogue too, and so is
+ * control takes: one step of the history, labeled as the host's, undone like
+ * any other. Undo, redo and jumps are actions of the catalog too, and so is
  * every other history action (`history.*`).
  *
  * **The history.** An action may belong to a host's **turn** (`turn`, its id,
@@ -112,8 +113,8 @@
  * makes it cost, `detail`) and then `agent_answered`; `agent_answer`
  * answers that question from the agent's app (the person answered an MCP
  * elicitation there); `agent_cancel` stops a call the app gave up on.
- * `agent_tools_changed` says the person's settings changed what a tool list
- * says (ask it again).
+ * The tool list never changes with the person's settings (the agent is told
+ * them after its results), so no event says it changed.
  *
  * `GET /_cellucid/protocol` names the channel and lists every command the
  * host may send, which of them it sends as binary frames, and every event
@@ -131,6 +132,9 @@
 import { HOST_LITTLE_ENDIAN as HOST_IS_LITTLE_ENDIAN } from '../formats/io/byte-order.js';
 import { formatCountOf } from '../utils/format-units.js';
 import { allocateTypedArray } from './sparse-column-index.js';
+import { HEX_COLOR, isHexColor } from '../utils/hex-color.js';
+import { hexOfByteArray } from '../utils/byte-text.js';
+import { upperFirst } from '../utils/text-case.js';
 
 /** The document's version: a reader of `viewer-protocol.json` checks it. */
 export const VIEWER_PROTOCOL_SCHEMA = 5;
@@ -148,16 +152,79 @@ export const VIEWER_PAGE_MODE_PARAMETER = 'viewer';
 export const VIEWER_PAGE_PARAMETERS = Object.freeze(['viewer', 'viewerId', 'viewerToken', 'anndata']);
 
 /**
- * The program serving a viewer, as its `GET /_cellucid/info` names it
- * (`runtime`), and what the viewer calls it: `cellucid serve` or a viewer
- * outside a notebook (`python`), a viewer in a Jupyter kernel (`jupyter`),
- * and the R package's viewer (`r`).
+ * What opened a viewer, as its `GET /_cellucid/info` names it (`runtime`),
+ * and the one place the viewer's words for it come from:
+ *
+ * - `name`: what the person reads in a sentence ("the notebook", "the
+ *   `cellucid serve` command"), lowercase, starting with "the"
+ *   (`viewerHostSentenceName` capitalizes it at the start of a sentence);
+ * - `label`: its short name ("Jupyter", "cellucid serve"), shown in the
+ *   Dataset box and the dataset list ("R data");
+ * - `language`: the language its steps in the history are labeled with
+ *   (`python`, `r`);
+ * - `reopen`: one sentence that says how to open the viewer again.
+ *
+ * `jupyter`: a Python notebook kernel (`show_anndata()`, `cellucid.Widget`,
+ * an `AnnDataViewer` or `serve_anndata()` in a notebook); `python`: a Python
+ * script or session outside a notebook (`AnnDataViewer`, `serve_anndata()`);
+ * `cellucid-serve`: the `cellucid serve` command; `cellucid-mcp`: `cellucid
+ * mcp --open`, an agent app's local MCP server; `r`: an R session
+ * (`cellucid_view()`, `cellucid_serve()`, in a notebook too); `r-mcp`: R's
+ * `cellucid_mcp(open = …)`, an agent app's local MCP server.
  */
 export const VIEWER_HOST_RUNTIMES = Object.freeze({
-  python: 'Python',
-  jupyter: 'Jupyter',
-  r: 'R',
+  jupyter: Object.freeze({
+    name: 'the notebook', label: 'Jupyter', language: 'python',
+    reopen: 'Run the notebook cell that opened it again.',
+  }),
+  python: Object.freeze({
+    name: 'the Python session', label: 'Python', language: 'python',
+    reopen: 'Open it again from Python.',
+  }),
+  'cellucid-serve': Object.freeze({
+    name: 'the cellucid serve command', label: 'cellucid serve', language: 'python',
+    reopen: 'Run cellucid serve again.',
+  }),
+  'cellucid-mcp': Object.freeze({
+    name: 'the agent app\'s cellucid mcp server', label: 'cellucid mcp', language: 'python',
+    reopen: 'Restart the cellucid mcp server in the agent app.',
+  }),
+  r: Object.freeze({
+    name: 'the R session', label: 'R', language: 'r',
+    reopen: 'Run cellucid_view() or cellucid_serve() again.',
+  }),
+  'r-mcp': Object.freeze({
+    name: 'the agent app\'s cellucid_mcp() server', label: 'cellucid_mcp()', language: 'r',
+    reopen: 'Restart the cellucid_mcp() server in the agent app.',
+  }),
 });
+
+/** The viewer's words for its host before the host said what it is. */
+export const VIEWER_HOST_UNKNOWN = Object.freeze({
+  name: 'the program serving this viewer', label: null, language: null,
+  reopen: 'Open it again from where it was opened.',
+});
+
+/**
+ * The words for the host `runtime` names (a key of `VIEWER_HOST_RUNTIMES`),
+ * or the neutral ones for null.
+ *
+ * @param {string|null} runtime
+ * @returns {{name: string, label: string|null, language: 'python'|'r'|null, reopen: string}}
+ */
+export function viewerHostWords(runtime) {
+  if (runtime === null) return VIEWER_HOST_UNKNOWN;
+  if (!Object.hasOwn(VIEWER_HOST_RUNTIMES, runtime)) {
+    throw new TypeError(`A viewer host runtime is one of ${Object.keys(VIEWER_HOST_RUNTIMES).join(', ')}`);
+  }
+  return VIEWER_HOST_RUNTIMES[runtime];
+}
+
+/** The host's `name` at the start of a sentence ("The notebook"). */
+export function viewerHostSentenceName(runtime) {
+  const { name } = viewerHostWords(runtime);
+  return upperFirst(name);
+}
 
 /** The viewer's first frame, and the host's answer to it. */
 export const VIEWER_HELLO_FIELDS = Object.freeze(['type', 'viewerId', 'viewerToken']);
@@ -177,9 +244,9 @@ export const VIEWER_CLOSE_CODES = Object.freeze({
 
 /**
  * Every command a host sends as a text frame, with the exact keys it carries.
- * `action`: apply (or read) the catalogue's action `action` (its dotted type,
+ * `action`: apply (or read) the catalog's action `action` (its dotted type,
  * `color.by`) with `params`, a JSON object the action's parameter schema
- * checks, as part of the host's turn `turn` (its id) labelled `turnLabel`, or
+ * checks, as part of the host's turn `turn` (its id) labeled `turnLabel`, or
  * of none (both null); answered by an `action_result` or a `command_error`
  * with the same `requestId`. `requestSessionBundle`: the history as a
  * `.cellucid-session` file (format 4), answered by a `session_bundle` or a
@@ -237,7 +304,7 @@ export const VIEWER_ACTION_ARRAY_FIELDS = Object.freeze(['path', 'type', 'length
  * (`reason`, one sentence a person can act on). `data_mapping`: the data
  * mapping the viewer shows, sent when a dataset opens and whenever it
  * changes, and why it is what it is (`origin`; `notebook` for a host's
- * `mapping.set`). `color_by`: the field the viewer colours by now
+ * `mapping.set`). `color_by`: the field the viewer colors by now
  * (`field` null: none), from `obs` or `var` (a gene, by its identifier: the
  * var index), and, for a gene whose shown name differs from its identifier
  * (the data mapping names the genes by a var column), that name (`symbol`;
@@ -275,7 +342,6 @@ export const VIEWER_EVENT_FIELDS = Object.freeze({
   session_loaded: Object.freeze(['type', 'requestId', 'tracker', 'head']),
   agent_asking: Object.freeze(['type', 'requestId', 'message', 'detail']),
   agent_answered: Object.freeze(['type', 'requestId', 'allowed']),
-  agent_tools_changed: Object.freeze(['type']),
 });
 
 /**
@@ -298,22 +364,46 @@ export const VIEWER_SESSION_LOADED_TRACKER_FIELDS = Object.freeze(['id', 'name']
  * `requestSessionBundle`. `result`: one result (`encodeViewerResult`).
  * `action_result`: the answer to the `action` command of `requestId`: the
  * body is its outcome as UTF-8 JSON (`null` when the action did nothing to
- * report; a read's result otherwise), and `step` the history step it made,
- * `{id, label}`, or null (a read, or a change that changed nothing). The
- * outcome travels in a body because a read's result (a picture of a view, the
- * values of many cells) is as large as it asks for.
+ * report; a read's result otherwise), `step` the history step it made,
+ * `{id, label}`, or null, and `unrecorded` why a change made no step (a key
+ * of `VIEWER_ACTION_UNRECORDED`), null when it made one and for an action
+ * that is no change (a read, a move of the history, an act outside the
+ * state). The outcome travels in a body because a read's result (a picture
+ * of a view, the values of many cells) is as large as it asks for.
  */
 export const VIEWER_BINARY_EVENT_HEADER_FIELDS = Object.freeze({
   selection: Object.freeze(['type', 'source']),
   session_bundle: Object.freeze(['type', 'requestId']),
   result: Object.freeze(['type', 'epoch', 'revision', 'kind', 'id', 'nObs', 'meta', 'cells', 'values']),
-  action_result: Object.freeze(['type', 'requestId', 'step']),
+  action_result: Object.freeze(['type', 'requestId', 'step', 'unrecorded']),
   agent_tools: Object.freeze(['type', 'requestId']),
   agent_result: Object.freeze(['type', 'requestId']),
 });
 
 /** The keys of an `action_result`'s `step`. */
 export const VIEWER_ACTION_STEP_FIELDS = Object.freeze(['id', 'label']);
+
+/**
+ * Why a change made no step of the history (an `action_result`'s
+ * `unrecorded`; the dispatcher's, `app/actions/dispatcher.js`), each with
+ * the sentence a host says to its person after the call that asked
+ * (`viewer.color_by(...): …`): it was so already (`unchanged`); it put back
+ * what the step just before it changed, which is taken out (`retracted`);
+ * the History settings leave this kind of change out (`off`); recording is
+ * paused (`paused`); another tracker was shown meanwhile (`elsewhere`); the
+ * dataset's history has not started (`no-history`). The one closed set:
+ * an agent is told the same reasons (`agent/bridge/mcp-content.js`
+ * `UNRECORDED_NOTES`), and cellucid-python and cellucid-r keep these
+ * sentences (the fixture's `action.unrecorded`).
+ */
+export const VIEWER_ACTION_UNRECORDED = Object.freeze({
+  unchanged: 'it changed nothing (it was so already), so no step was recorded.',
+  retracted: 'it put back what the step just before it changed, so that step was taken out and no step was recorded.',
+  off: 'done, but the History settings do not record this kind of change, so no step was recorded and Undo does not take it back.',
+  paused: 'done, but the history\'s recording is paused, so no step was recorded and Undo does not take it back.',
+  elsewhere: 'done, but another tracker of the history was shown meanwhile, so no step was recorded.',
+  'no-history': 'done, but the dataset\'s history has not started yet, so no step was recorded.',
+});
 
 /** An epoch: 16 lowercase hexadecimal characters (64 random bits). */
 export const VIEWER_RESULT_EPOCH_PATTERN = '^[0-9a-f]{16}$';
@@ -331,7 +421,12 @@ export function isViewerResultEpoch(value) {
  *   its page (`pageId`, `pageName`, the page's `color`) and whether it is
  *   `enabled`. Cells: its members; no values.
  * - `categorical`: a user-defined categorical field (labels, annotations,
- *   clusters): `key`, `categories`, `origin`. Values: category codes.
+ *   clusters): `key`, `categories`, `colors`, `origin`. `colors`: one
+ *   `#rrggbb` (lowercase) a category, in the categories' order -- the colors
+ *   the field is shown in, in the view in focus (the color the person or an
+ *   agent gave a category there, else its `palette`, else Cellucid's own by
+ *   position: the rule a session's apply writes `uns['<key>_colors']` by),
+ *   so a pull writes them. Values: category codes.
  * - `continuous`: a user-defined continuous field or a score: `key`,
  *   `origin`. Values: floats.
  * - `geneSet`: `name`, `description`, `genes` (by identifier: the var
@@ -346,7 +441,7 @@ export function isViewerResultEpoch(value) {
  */
 export const VIEWER_RESULT_META_FIELDS = Object.freeze({
   highlight: Object.freeze(['label', 'tool', 'pageId', 'pageName', 'color', 'enabled']),
-  categorical: Object.freeze(['key', 'categories', 'origin']),
+  categorical: Object.freeze(['key', 'categories', 'colors', 'origin']),
   continuous: Object.freeze(['key', 'origin']),
   geneSet: Object.freeze(['name', 'description', 'genes', 'symbols', 'origin']),
   visibility: Object.freeze([]),
@@ -643,8 +738,8 @@ export function requireViewerResultHeader(header) {
       if (!isExactText(meta.pageId) || !isExactText(meta.pageName, { whitespace: true })) {
         throw new TypeError('A highlight result names its page');
       }
-      if (typeof meta.color !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(meta.color) || typeof meta.enabled !== 'boolean') {
-        throw new TypeError('A highlight result carries its page colour and whether it is enabled');
+      if (!isHexColor(meta.color) || typeof meta.enabled !== 'boolean') {
+        throw new TypeError('A highlight result carries its page color and whether it is enabled');
       }
       if (cells === null || cells < 1 || values !== null) {
         throw new TypeError('A highlight result names its cells, at least one, and no values');
@@ -653,6 +748,10 @@ export function requireViewerResultHeader(header) {
     case 'categorical':
       if (!isExactText(meta.key, { whitespace: true })) throw new TypeError('A categorical result names its key');
       requireStringList(meta.categories, 'A categorical result\'s categories', { allowEmpty: false });
+      if (!Array.isArray(meta.colors) || meta.colors.length !== meta.categories.length
+        || !meta.colors.every(color => typeof color === 'string' && HEX_COLOR.test(color))) {
+        throw new TypeError('A categorical result carries one #rrggbb color (lowercase) for each of its categories');
+      }
       if (!CODE_TYPES.includes(values) || cells === 0) {
         throw new TypeError('A categorical result carries category codes for its cells');
       }
@@ -820,7 +919,7 @@ export function decodeViewerResult(frame) {
 
 const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true });
 
-/** A dotted action type, as the catalogue names one (`app/actions/catalog.js`). */
+/** A dotted action type, as the catalog names one (`app/actions/catalog.js`). */
 const ACTION_TYPE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*)+$/;
 
 /** Whether `value` is a dotted action type (`color.by`); its text is safe to show. */
@@ -1142,10 +1241,6 @@ const EXAMPLE_MAPPING = Object.freeze({
   vectorFields: [],
 });
 
-function hex(bytes) {
-  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
-}
-
 /**
  * One binary `action` example: its header (with the arrays it lists), each
  * array's elements, and its bytes. `arrays` gives `[path, type, elements]`.
@@ -1162,25 +1257,25 @@ function binaryAction(requestId, action, params, arrays, turn = null, turnLabel 
     type: 'action', requestId, action, params, turn, turnLabel,
     arrays: arrays.map(([path, type, elements]) => ({ path, type, length: elements.length })),
   };
-  return { header, arrays: arrays.map(([path, type, elements]) => ({ path, type, elements })), hex: hex(frame) };
+  return { header, arrays: arrays.map(([path, type, elements]) => ({ path, type, elements })), hex: hexOfByteArray(frame) };
 }
 
 /** One `load_session` example: its header, its body as text, and its bytes. */
 function loadSessionCommand(requestId, name, bodyText) {
   const file = new TextEncoder().encode(bodyText);
-  return { header: { type: 'load_session', requestId, name }, bodyText, hex: hex(encodeViewerLoadSession({ requestId, name, file })) };
+  return { header: { type: 'load_session', requestId, name }, bodyText, hex: hexOfByteArray(encodeViewerLoadSession({ requestId, name, file })) };
 }
 
 /** One `action_result` example: its header, its outcome, and its bytes. */
-function actionResultEvent(requestId, outcome, step) {
-  const header = { type: 'action_result', requestId, step };
-  return { header, outcome, hex: hex(encodeViewerBinaryFrame(header, new TextEncoder().encode(JSON.stringify(outcome)))) };
+function actionResultEvent(requestId, outcome, step, unrecorded = null) {
+  const header = { type: 'action_result', requestId, step, unrecorded };
+  return { header, outcome, hex: hexOfByteArray(encodeViewerBinaryFrame(header, new TextEncoder().encode(JSON.stringify(outcome)))) };
 }
 
 /** One binary agent event example (`agent_tools`, `agent_result`): its header, its JSON body, and its bytes. */
 function agentJsonEvent(type, requestId, body) {
   const header = { type, requestId };
-  return { header, body, hex: hex(encodeViewerBinaryFrame(header, new TextEncoder().encode(JSON.stringify(body)))) };
+  return { header, body, hex: hexOfByteArray(encodeViewerBinaryFrame(header, new TextEncoder().encode(JSON.stringify(body)))) };
 }
 
 /** One result example: its header, cells (null: every cell), values (null: none), and bytes. */
@@ -1198,7 +1293,7 @@ function resultEvent(result) {
     header,
     cells: result.cells,
     values: result.values,
-    hex: hex(encodeViewerBinaryFrame(header, body)),
+    hex: hexOfByteArray(encodeViewerBinaryFrame(header, body)),
   };
 }
 
@@ -1317,23 +1412,24 @@ function examples() {
       // The person is asked about an agent's call in the viewer (and answers there, or in the agent's app).
       { type: 'agent_asking', requestId: 'a4', message: 'Claude Code (local) asks to save a copy as a file. It writes a file on this computer.', detail: null },
       { type: 'agent_answered', requestId: 'a4', allowed: false },
-      { type: 'agent_tools_changed' },
     ],
     binaryEvents: [
-      { header: { type: 'selection', source: 'lasso' }, cells: [0, 2, 7], hex: hex(selection) },
-      { header: { type: 'session_bundle', requestId: 'r3' }, bodyText: 'CELLUCID_SESSION\n', hex: hex(bundle) },
+      { header: { type: 'selection', source: 'lasso' }, cells: [0, 2, 7], hex: hexOfByteArray(selection) },
+      { header: { type: 'session_bundle', requestId: 'r3' }, bodyText: 'CELLUCID_SESSION\n', hex: hexOfByteArray(bundle) },
       // A change: its outcome, and the step of the history it made.
-      actionResultEvent('r4', null, { id: 's3', label: 'Coloured by cell_type' }),
+      actionResultEvent('r4', null, { id: 's3', label: 'Colored by cell_type' }),
       actionResultEvent('r11', { name: 'leiden', kind: 'categorical', id: 'user_cat_1' }, { id: 's4', label: 'Added the categorical column leiden' }),
       // A read: its result, and no step.
       actionResultEvent('r5', { head: 's4', steps: [{ id: 's0', label: 'Opened Example' }], note: 'Ünïcode — kept as UTF-8' }, null),
+      // A change that made no step, and why: the cells were colored by cell_type already.
+      actionResultEvent('r16', { field: 'cell_type' }, null, 'unchanged'),
       // An agent's tools (the MCP tools, as its connection may use them), and a call's MCP result.
       agentJsonEvent('agent_tools', 'a1', [{
-        name: 'color_by', title: 'Colour by a field', description: 'Colour the cells by a field.',
+        name: 'color_by', title: 'Color by a field', description: 'Color the cells by a field.',
         inputSchema: { type: 'object', properties: {} },
-        annotations: { title: 'Colour by a field', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        annotations: { title: 'Color by a field', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       }]),
-      agentJsonEvent('agent_result', 'a2', { content: [{ type: 'text', text: '{"step":{"id":"s5","label":"Coloured by cell_type"}}' }], isError: false }),
+      agentJsonEvent('agent_result', 'a2', { content: [{ type: 'text', text: '{"step":{"id":"s5","label":"Colored by cell_type"}}' }], isError: false }),
       agentJsonEvent('agent_result', 'a4', { content: [{ type: 'text', text: 'The person declined: save a copy.' }], isError: true }),
       resultEvent({
         revision: 1, kind: 'highlight', id: 'highlight_1', nObs: 10,
@@ -1343,7 +1439,7 @@ function examples() {
       // A categorical over the open cells of a subsample: code 255 is "no category".
       resultEvent({
         revision: 2, kind: 'categorical', id: 'user_cat_1', nObs: 10,
-        meta: { key: 'annotation', categories: ['B cell', 'T cell'], origin: 'user' },
+        meta: { key: 'annotation', categories: ['B cell', 'T cell'], colors: ['#ff9900', '#0077c8'], origin: 'user' },
         cells: [0, 3, 4, 9], values: [1, 0, 255, 1], valueType: 'uint8',
       }),
       resultEvent({
@@ -1392,7 +1488,9 @@ export function viewerProtocolDocumentFixture() {
       binaryFrame: 'uint32 little-endian header length, UTF-8 JSON header, body',
     },
     page: { parameters: [...VIEWER_PAGE_PARAMETERS], mode: VIEWER_PAGE_MODE_PARAMETER },
-    runtimes: { ...VIEWER_HOST_RUNTIMES },
+    runtimes: Object.fromEntries(
+      Object.entries(VIEWER_HOST_RUNTIMES).map(([runtime, { label, language }]) => [runtime, { label, language }])
+    ),
     protocolDocument: viewerProtocolDocument(),
     commands: Object.fromEntries(Object.entries(VIEWER_COMMAND_FIELDS).map(([type, keys]) => [type, [...keys]])),
     binaryCommands: Object.fromEntries(
@@ -1402,6 +1500,7 @@ export function viewerProtocolDocumentFixture() {
       typePattern: ACTION_TYPE_PATTERN.source,
       arrayFields: [...VIEWER_ACTION_ARRAY_FIELDS],
       stepFields: [...VIEWER_ACTION_STEP_FIELDS],
+      unrecorded: { ...VIEWER_ACTION_UNRECORDED },
       body: 'binary action: each of header.arrays in order, length elements of its type, little-endian, '
         + 'placed in params at its path (keys and list indices ending in a key params does not hold); '
         + 'action_result: the outcome as UTF-8 JSON',

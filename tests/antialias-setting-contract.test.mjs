@@ -179,15 +179,14 @@ test('the preference round-trips in every direction', () => {
   }
 });
 
-test('the preference refuses an unknown mode and a storage that is not one', () => {
+test('the preference refuses an unknown mode and a storage that is not one; no storage is automatic', () => {
   assert.throws(
     () => writeAntialiasPreference(makeStorage(), true),
     /exactly "auto", "on", or "off"/
   );
-  assert.throws(
-    () => resolveAntialiasPreference(null),
-    /current key\/value storage/
-  );
+  // A browser that keeps nothing for the site (`utils/web-storage.js`).
+  assert.deepEqual(resolveAntialiasPreference(null), { mode: 'auto', discarded: null });
+  assert.equal(writeAntialiasPreference(null, 'on'), false);
   assert.throws(
     () => writeAntialiasPreference({ getItem: () => null }, 'on'),
     /current key\/value storage/
@@ -678,10 +677,10 @@ test('a browser that refuses multisampling is reported as a refusal', t => {
   assert.doesNotMatch(dom.hpAntialiasStatus.textContent, /Reload/);
 });
 
-test('a preference that cannot be stored rolls the control and renderer back', t => {
-  // The preference and the renderer are published together or not at all: a box
-  // that survived a failed write would promise a setting on the next load that
-  // was never recorded.
+test('a preference the browser does not keep is made for this page', t => {
+  // A full or refusing store (or none: site data blocked) keeps nothing for
+  // the next visit, but the person's click is still the choice (R9E-5: it was
+  // rolled back, so antialiasing could not be changed at all there).
   const storage = makeStorage();
   t.after(installDocument(storage));
 
@@ -692,9 +691,9 @@ test('a preference that cannot be stored rolls the control and renderer back', t
   dom.hpAntialiasCheckbox.checked = false;
   dom.hpAntialiasCheckbox.dispatchEvent({ type: 'change' });
 
-  assert.equal(dom.hpAntialiasCheckbox.checked, true, 'the box must roll back');
-  assert.equal(viewer.getAntialiasing(), true, 'the renderer must roll back');
-  assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), null);
+  assert.equal(dom.hpAntialiasCheckbox.checked, false, 'the box keeps the click');
+  assert.equal(viewer.getAntialiasing(), false, 'the renderer follows it');
+  assert.equal(storage.getItem(ANTIALIAS_STORAGE_KEY), null, 'nothing is kept');
 });
 
 // ---------------------------------------------------------------------------

@@ -94,7 +94,7 @@ test('the address bar refuses text it does not recognise before connecting', asy
   await page.locator('#data-address').fill('not a link');
   await page.locator('#data-address-open-btn').click();
   await expect(
-    page.locator('#notification-center .notification').filter({ hasText: 'Cellucid does not recognise "not a link"' }),
+    page.locator('#notification-center .notification').filter({ hasText: 'Cellucid does not recognize "not a link"' }),
   ).toHaveCount(1);
 });
 

@@ -523,6 +523,7 @@ test('figure-export highlight failure restores depth writes transactionally', as
         highlightArray: Uint8Array.from([255]),
         outputHeightPx: 16,
         outputWidthPx: 16,
+        viewRect01: { x: 0, y: 0, width: 1, height: 1 },
         pointSizePx: 4,
         positions: Float32Array.from([0, 0, 0]),
         renderState: {
@@ -538,6 +539,8 @@ test('figure-export highlight failure restores depth writes transactionally', as
           modelMatrix: identity(),
           mvpMatrix: identity(),
           pointSize: 4,
+          // The sprite cap the pane draws with (rendering/point-sprite.js).
+          pointSizeMax: 160,
           projectionMatrix: identity(),
           shaderQuality: 'full',
           sizeAttenuation: 1,
@@ -585,8 +588,8 @@ test('figure-export canvas and PNG preserve translucent color during compositing
     ]);
     const session = client.openFigureExportWorkerSession();
     try {
-      // A cell's colour carries no opacity (its alpha byte is its layer), so
-      // the translucent colour is a centroid's, drawn by the same program
+      // A cell's color carries no opacity (its alpha byte is its layer), so
+      // the translucent color is a centroid's, drawn by the same program
       // over a hidden cell.
       const frame = await session.request('rasterizePoints', client.pointRasterArgs(session, {
         positions: Float32Array.from([0, 0, 0]),
@@ -608,6 +611,8 @@ test('figure-export canvas and PNG preserve translucent color during compositing
           modelMatrix: identity(),
           mvpMatrix: identity(),
           pointSize: 16,
+          // The sprite cap the pane draws with (rendering/point-sprite.js).
+          pointSizeMax: 160,
           projectionMatrix: identity(),
           shaderQuality: 'ultralight',
           sizeAttenuation: 0,
@@ -617,7 +622,7 @@ test('figure-export canvas and PNG preserve translucent color during compositing
         },
         outputWidthPx: 16,
         outputHeightPx: 16,
-        viewRect01: null,
+        viewRect01: { x: 0, y: 0, width: 1, height: 1 },
         pointSizePx: 16,
         overlayPoints: {
           positions: Float32Array.from([0, 0, 0]),
@@ -712,6 +717,8 @@ test('repeated raster passes reuse one export context, never losing it', async (
         modelMatrix: identity(),
         mvpMatrix: identity(),
         pointSize: 4,
+        // The sprite cap the pane draws with (rendering/point-sprite.js).
+        pointSizeMax: 160,
         projectionMatrix: identity(),
         shaderQuality: 'ultralight',
         sizeAttenuation: 0,
@@ -726,6 +733,7 @@ test('repeated raster passes reuse one export context, never losing it', async (
           colors: Uint8Array.from([255, 0, 0, 255]),
           outputHeightPx: 8,
           outputWidthPx: 8,
+          viewRect01: { x: 0, y: 0, width: 1, height: 1 },
           pointSizePx: 4,
           positions: Float32Array.from([0, 0, 0]),
           renderState,

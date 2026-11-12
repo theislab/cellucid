@@ -3,7 +3,7 @@
  *
  * Every control here is built by the shared control kit
  * (`ui/components/controls.js`): this module only adds what is specific to
- * analysis forms: a labelled select with an optional (i).
+ * analysis forms: a labeled select with an optional (i).
  *
  * NOTE: Number formatting lives in `ui/components/display-format.js`.
  *
@@ -22,7 +22,7 @@ import { createDomId } from '../../ui/components/dom-id.js';
 export const NONE_VALUE = '-1';
 
 /**
- * A labelled select for an analysis form. What the choices mean is explained
+ * A labeled select for an analysis form. What the choices mean is explained
  * by the field's (i) tip, not by a help line under the select.
  *
  * @param {Object} options

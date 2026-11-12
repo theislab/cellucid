@@ -108,7 +108,7 @@ function createFixture() {
   return { gl, positionBuffer, renderer, snapshot };
 }
 
-test('final snapshot retirement deletes its VAO before colour storage and retains the pooled positions', () => {
+test('final snapshot retirement deletes its VAO before color storage and retains the pooled positions', () => {
   const { gl, positionBuffer, renderer, snapshot } =
     createFixture();
 

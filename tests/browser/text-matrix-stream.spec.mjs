@@ -27,7 +27,7 @@ import { keptStoreDirectories, workersKeepFiles } from './helpers/origin-storage
 test.use({ persistentStorage: true });
 
 const CELLS = 3000;
-/** How the Dataset box writes that count (`display-format.js` `formatCompactCount`). */
+/** How the Dataset box writes that count (`utils/format-units.js` `formatCompactCount`). */
 const CELLS_SHOWN = '3K';
 const GENES = 40;
 const GENE = 3;

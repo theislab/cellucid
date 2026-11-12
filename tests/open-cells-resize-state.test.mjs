@@ -4,11 +4,11 @@
  * grown from `k0` cells to `k`, or cut to it, is, bit for bit, what the
  * same dataset opened at `k` cells directly holds after the same actions —
  * positions of every resident layout and their bounds, loaded obs fields and
- * genes and their caches, continuous statistics and ranges, colours,
+ * genes and their caches, continuous statistics and ranges, colors,
  * visibility, the cell mask, category counts, centroids, highlights (a
  * category or range group takes the visible cells added in it; a group made
  * by hand keeps its cells), user-defined categories (one made from a file's
- * column by edits labels the cells added as opening them would; one labelled
+ * column by edits labels the cells added as opening them would; one labeled
  * by hand leaves them missing) and value fields, scores, the filtered count,
  * the identity and priority. Each structure is asserted on its own.
  *
@@ -204,13 +204,13 @@ function assertSameState(subject, reference, label) {
   for (const name of ['_continuousStats', '_continuousFilter', '_continuousColorRange', '_positiveStats']) {
     assert.deepEqual(fieldOf(s, 'score')[name], fieldOf(r, 'score')[name], `${label}: score ${name}`);
   }
-  sameBits(s.colorsArray, r.colorsArray, `${label}: colours`);
+  sameBits(s.colorsArray, r.colorsArray, `${label}: colors`);
   sameBits(s.categoryTransparency, r.categoryTransparency, `${label}: visibility`);
   sameBits(s.cellVisibilityMask, r.cellVisibilityMask, `${label}: cell mask`);
   assert.deepEqual(s.filteredCount, r.filteredCount, `${label}: filtered count`);
   assert.deepEqual(fieldOf(s, 'cluster')._categoryCounts, fieldOf(r, 'cluster')._categoryCounts, `${label}: category counts`);
   sameBits(s.centroidPositions, r.centroidPositions, `${label}: centroid positions`);
-  sameBits(s.centroidColors, r.centroidColors, `${label}: centroid colours`);
+  sameBits(s.centroidColors, r.centroidColors, `${label}: centroid colors`);
   assert.deepEqual(fieldOf(s, 'cluster').centroidsByLayout.get('X_umap_2d'), fieldOf(r, 'cluster').centroidsByLayout.get('X_umap_2d'), `${label}: centroid table`);
   const groups = state => state.getHighlightPages().map(page => page.highlightedGroups.map(group => ({ type: group.type, label: group.label, cells: Array.from(group.cellIndices), count: group.cellCount })));
   assert.deepEqual(groups(s), groups(r), `${label}: highlight groups`);
@@ -357,7 +357,7 @@ test('a range of which no cell is left is reset and said; a text column with new
   // The cells it held are recoded by label: x (0 → 1), z (1 → 3), missing kept.
   assert.deepEqual(Array.from(label.codes.subarray(0, 6)), [1, 3, 255, 1, 3, 255]);
   assert.deepEqual(Array.from(label.codes.subarray(30, 33)), [0, 2, 3]);
-  assert.deepEqual(label._categoryColors, colorsOf([[0, 1, 0], [0.5, 0.5, 0.5], [1, 1, 0], [0, 0, 1]]), 'a colour set by hand stays with its label');
+  assert.deepEqual(label._categoryColors, colorsOf([[0, 1, 0], [0.5, 0.5, 0.5], [1, 1, 0], [0, 0, 1]]), 'a color set by hand stays with its label');
   assert.deepEqual(visibleListOf(label), [true, false, true, true], 'a hidden category stays hidden');
   assert.deepEqual(result.released, []);
   assert.deepEqual(result.extended, ['label']);

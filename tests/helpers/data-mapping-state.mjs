@@ -3,6 +3,7 @@
  * `app/state/managers/mapping-manager.js`, over the given mapping, so session
  * and UI tests exercise the same refusal and apply rules the app runs.
  */
+import { DataStateExpressionMethods } from '../../assets/js/app/state/managers/expression-values.js';
 import { DataStateMappingMethods } from '../../assets/js/app/state/managers/mapping-manager.js';
 import { DataStateMappingGroupMethods } from '../../assets/js/app/state/managers/mapping-groups.js';
 import { DataStateVarAxisMethods } from '../../assets/js/app/state/managers/var-axis.js';
@@ -22,6 +23,7 @@ export function installDataMappingMethods(
     DataStateMappingGroupMethods,
     DataStateVarAxisMethods,
     DataStateLatentSpaceMethods,
+    DataStateExpressionMethods,
   ]) {
     const descriptors = Object.getOwnPropertyDescriptors(methods.prototype);
     delete descriptors.constructor;

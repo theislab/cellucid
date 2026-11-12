@@ -251,6 +251,11 @@ test('a grid shows t-SNE beside UMAP, and the velocity overlay follows each view
   await expect(picker.locator('option')).toHaveText(['UMAP · 2D', 't-SNE · 2D']);
   const velocity = page.locator('#velocity-overlay-enabled');
   await expect(velocity).toBeEnabled();
+  // An agent's dataset summary names the vector fields the overlay draws (lane-analyst L3-8).
+  expect(await page.evaluate(async () => {
+    const { getActions } = await import('/assets/js/app/actions/index.js');
+    return (await getActions().dispatch('dataset.summary', {})).outcome.vector_fields;
+  })).toEqual(['velocity']);
 
   await page.locator('#split-keep-view-btn').click();
   await expect(page.locator('.split-badge')).toHaveCount(2);
@@ -270,9 +275,10 @@ test('a grid shows t-SNE beside UMAP, and the velocity overlay follows each view
   )), [active, other]);
   expect(shown).not.toEqual(kept);
 
-  // Velocity is bound to X_umap, so it is unavailable while this view shows t-SNE.
+  // Velocity is bound to X_umap, so it is unavailable while this view shows
+  // t-SNE; the block names it as the picker does (R9V-3).
   await expect(velocity).toBeDisabled();
-  await expect(page.locator('#velocity-overlay-info')).toContainText('Vector fields are bound to X_umap');
+  await expect(page.locator('#velocity-overlay-info')).toContainText('Vector fields are bound to UMAP · 2D.');
   await picker.selectOption('X_umap');
   await expect.poll(() => viewLayout(page, active)).toBe('X_umap');
   await expect(velocity).toBeEnabled();
@@ -446,7 +452,7 @@ test('a catalog dataset opens on the embedding its file names, and switches to a
     await expect.poll(() => viewLayout(page, 'live')).toBe(layout);
   }
 
-  // The var column of accessions renames the same genes: a view coloured by
+  // The var column of accessions renames the same genes: a view colored by
   // a gene keeps that gene, now under its id, with the same values.
   const activeGene = () => page.evaluate(() => {
     const state = window._cellucidState;

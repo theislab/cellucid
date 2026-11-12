@@ -12,7 +12,7 @@
  * - holds the viewer channel (`viewer-channel.js`, rules in
  *   `viewer-protocol.js`): one WebSocket to the host, authenticated with the
  *   viewer id and token, carrying the host's commands (an action of the
- *   catalogue -- colour by, highlight, push a column, read the history, … --,
+ *   catalog -- color by, highlight, push a column, read the history, … --,
  *   session capture) to the viewer and the viewer's events (an action's
  *   answer, selection, hover, click, ready, data mapping, results, …) back.
  *   The page reaches the host at the address it was loaded from, so a
@@ -49,12 +49,15 @@ import { publicPageAddress } from './sources/registry.js';
 import {
   VIEWER_CHANNEL_PATH,
   VIEWER_HOST_RUNTIMES,
+  viewerHostSentenceName,
+  viewerHostWords,
   VIEWER_PAGE_MODE_PARAMETER,
   VIEWER_PAGE_PARAMETERS,
   VIEWER_COMMAND_ERROR_REASON_LIMIT,
   VIEWER_DATA_MAPPING_ORIGINS,
   VIEWER_RESULT_META_FIELDS,
   VIEWER_ACTION_STEP_FIELDS,
+  VIEWER_ACTION_UNRECORDED,
   VIEWER_COMMAND_FIELDS,
   VIEWER_SESSION_LOADED_TRACKER_FIELDS,
   isViewerActionType,
@@ -76,7 +79,7 @@ import {
 } from './served-anndata.js';
 import { isPlainRecord, requireExactKeys } from '../utils/exact-record.js';
 import { abortReason, cancelled, cancel, onAbort, throwIfAborted } from '../utils/abort.js';
-import { failureText } from '../utils/errors.js';
+import { createListenerSet } from '../utils/listener-set.js';
 
 /**
  * @typedef {import('./data-source.js').DatasetMetadata} DatasetMetadata
@@ -580,24 +583,17 @@ function deliverCallbacks(callbacks, args) {
 /**
  * Every notebook-initiated command type this bridge accepts.
  *
- * A failure is labelled from this exact list rather than from the raw inbound
+ * A failure is labeled from this exact list rather than from the raw inbound
  * `type`, so no malformed or hostile message can place arbitrary text in the
  * viewer's notification surface.
  */
 const VIEWER_HOST_COMMAND_TYPES = Object.freeze(viewerCommandTypes());
 
 /**
- * The language of each runtime a host names (`VIEWER_HOST_RUNTIMES`):
- * `jupyter` is Python's notebook viewer (R's says `r` in a notebook too).
- */
-const VIEWER_HOST_LANGUAGES = Object.freeze({ python: 'python', jupyter: 'python', r: 'r' });
-
-
-/**
  * Name the host command that one failed viewer-channel frame was carrying.
  *
  * @param {unknown} data - The frame's parsed JSON object.
- * @returns {string|null} One recognised command type, or null when the
+ * @returns {string|null} One recognized command type, or null when the
  *   frame never identified itself as a current command.
  */
 export function describeViewerHostCommandType(data) {
@@ -620,6 +616,11 @@ function describeViewerHostFailureReason(error) {
     : raw;
 }
 
+/** A reason as a sentence of its own: ended once, by its own stop, `?`, `!` or `…`, else a full stop. */
+function endedSentence(text) {
+  return /[.?!…]$/.test(text) ? text : `${text}.`;
+}
+
 /**
  * The request id one failed viewer-channel frame named, when it named one as
  * exact text; null otherwise (`freeze`, or a frame read no further).
@@ -637,36 +638,41 @@ export function describeViewerHostRequestId(data) {
 }
 
 /**
- * Build the exact user-facing text for one failed notebook command.
+ * Build the exact user-facing text for one failed host command.
  *
- * The person watching sees why a notebook's command did nothing (a console
- * entry inside an embedded iframe is no user surface); the notebook learns it
+ * The person watching sees why a host's command did nothing (a console
+ * entry inside an embedded iframe is no user surface); the host learns it
  * from the `command_error` event that names the command's `requestId`, which
- * fails the notebook's request for it. A failed `action` is named by its
+ * fails the host's request for it. A failed `action` is named by its
  * dotted type (`color.by`), which is safe to show: only a type of the
- * catalogue's form is named, any other text is not echoed.
+ * catalog's form is named, any other text is not echoed. The host is named
+ * as `runtime` names it (`viewerHostWords`).
  *
  * @param {string|null} commandType - A value from {@link describeViewerHostCommandType}.
  * @param {unknown} error
- * @param {string|null} [action] - The failed action's type, for an `action`
+ * @param {string|null} action - The failed action's type, for an `action`
+ * @param {string|null} runtime - What opened the viewer (a key of
+ *   `VIEWER_HOST_RUNTIMES`), null before it said
  * @returns {{title: string, message: string}}
  */
-export function describeViewerHostCommandFailure(commandType, error, action = null) {
+export function describeViewerHostCommandFailure(commandType, error, action, runtime) {
   if (commandType !== null && !VIEWER_HOST_COMMAND_TYPES.includes(commandType)) {
     throw new TypeError(
-      'Viewer host command failure type must be one recognised command or null'
+      'Viewer host command failure type must be one recognized command or null'
     );
   }
+  const { name, label } = viewerHostWords(runtime);
+  const Name = viewerHostSentenceName(runtime);
   const subject = commandType === null
-    ? 'A notebook command'
+    ? `A command from ${name}`
     : commandType === 'action' && isViewerActionType(action)
-      ? `The notebook's "${action}" action`
-      : `The notebook "${commandType}" command`;
+      ? `${Name}'s "${action}" action`
+      : `${Name}'s "${commandType}" command`;
   return {
-    title: 'Notebook command failed',
+    title: label === null ? 'Host command failed' : `${label} command failed`,
     message:
-      `${subject} did not run: ${describeViewerHostFailureReason(error)}. ` +
-      'The viewer is unchanged; correct the notebook cell and run it again.'
+      `${subject} did not run: ${endedSentence(describeViewerHostFailureReason(error))} ` +
+      `The viewer is unchanged; correct the call in ${name} and run it again.`
   };
 }
 
@@ -711,11 +717,10 @@ export class ViewerHostDataSource {
      */
     this._heldCommands = [];
 
-    /** @type {Set<Function>} */
-    this._endCallbacks = new Set();
+    this._endCallbacks = createListenerSet('the viewer channel\'s end');
 
-    /** @type {Set<Function>} Run when a dropped channel was opened again. */
-    this._reopenCallbacks = new Set();
+    /** Run when a dropped channel was opened again. */
+    this._reopenCallbacks = createListenerSet('the viewer channel opened again');
 
     /** @type {boolean} */
     this._connected = false;
@@ -842,25 +847,26 @@ export class ViewerHostDataSource {
   }
 
   /**
-   * What the viewer calls the program serving it -- "Python", "Jupyter" or
-   * "R", as its `/_cellucid/info` says -- or null before it answered.
+   * What opened the viewer, as its `/_cellucid/info` names it (a key of
+   * `VIEWER_HOST_RUNTIMES`: `jupyter`, `cellucid-serve`, `r`, …), or null
+   * before it answered. `viewerHostWords` gives the viewer's words for it.
+   *
+   * @returns {string|null}
+   */
+  getHostRuntime() {
+    return this._runtime;
+  }
+
+  /**
+   * The short name of the program serving the viewer ("Jupyter", "cellucid
+   * serve", "R"; `VIEWER_HOST_RUNTIMES`), or null before it answered.
    *
    * @returns {string|null}
    */
   getHostLabel() {
-    return this._runtime === null ? null : VIEWER_HOST_RUNTIMES[this._runtime];
+    return viewerHostWords(this._runtime).label;
   }
 
-  /**
-   * The language of the program serving the viewer, which a step it takes is
-   * labelled with: `python` (a script, or Jupyter -- the runtime of Python's
-   * notebook viewers) or `r`; null before it answered.
-   *
-   * @returns {'python'|'r'|null}
-   */
-  getHostLanguage() {
-    return this._runtime === null ? null : VIEWER_HOST_LANGUAGES[this._runtime];
-  }
 
   _assertAlive() {
     if (this._destroyed) {
@@ -883,7 +889,7 @@ export class ViewerHostDataSource {
   _reportMessageFailure(command, error) {
     const commandType = describeViewerHostCommandType(command);
     const action = commandType === 'action' && isViewerActionType(command.action) ? command.action : null;
-    const failure = describeViewerHostCommandFailure(commandType, error, action);
+    const failure = describeViewerHostCommandFailure(commandType, error, action, this._runtime);
     try {
       console.error(`[ViewerHost] ${failure.message}`, error);
     } catch {
@@ -914,7 +920,7 @@ export class ViewerHostDataSource {
       }
     }
     try {
-      getNotificationCenter().error(failureText(failure), {
+      getNotificationCenter().error(failure.message, {
         category: 'connectivity',
         title: failure.title,
         duration: 0
@@ -922,7 +928,7 @@ export class ViewerHostDataSource {
     } catch (notificationError) {
       try {
         console.error(
-          '[ViewerHost] Notebook command failure notice failed:',
+          '[ViewerHost] Host command failure notice failed:',
           notificationError
         );
       } catch {
@@ -1006,13 +1012,7 @@ export class ViewerHostDataSource {
   _channelEnded(channel, end) {
     if (this._channel !== channel) return;
     this._connected = false;
-    for (const callback of [...this._endCallbacks]) {
-      try {
-        callback(end);
-      } catch (error) {
-        console.error('[ViewerHost] channel-end handler failed:', error);
-      }
-    }
+    this._endCallbacks.notify(end);
   }
 
   _assertLifecycle(revision, label) {
@@ -1187,14 +1187,9 @@ export class ViewerHostDataSource {
         onEnd: end => this._channelEnded(channel, end),
         onReopen: () => {
           if (this._channel !== channel) return;
-          for (const callback of [...this._reopenCallbacks]) {
-            try {
-              callback();
-            } catch (error) {
-              console.error('[ViewerHost] channel-reopen handler failed:', error);
-            }
-          }
+          this._reopenCallbacks.notify();
         },
+        runtime,
         isHostAlive: async () => {
           try {
             // Under the lifecycle: a disconnect stops the question.
@@ -1432,7 +1427,8 @@ export class ViewerHostDataSource {
   /**
    * Run one host action through the app's handler (`onAction`) and answer it
    * with its `action_result`: its outcome (a read's result) as JSON in the
-   * frame's body, and the history step it made. A failure reaches the host
+   * frame's body, the history step it made, and why a change made none
+   * (`unrecorded`, `VIEWER_ACTION_UNRECORDED`). A failure reaches the host
    * as the `command_error` of its `requestId` (`_observeCommand`).
    *
    * @param {{requestId: string, action: string, params: object}} command
@@ -1445,8 +1441,8 @@ export class ViewerHostDataSource {
     const answer = await this._actionHandler({
       action: command.action, params: command.params, turn: command.turn, turnLabel: command.turnLabel,
     });
-    requireExactKeys(answer, ['outcome', 'step'], 'Viewer host action answer');
-    this._sendActionResult(command.requestId, answer.outcome, answer.step);
+    requireExactKeys(answer, ['outcome', 'step', 'unrecorded'], 'Viewer host action answer');
+    this._sendActionResult(command.requestId, answer.outcome, answer.step, answer.unrecorded);
   }
 
   /**
@@ -1527,10 +1523,12 @@ export class ViewerHostDataSource {
    * @param {string} requestId
    * @param {unknown} outcome - JSON (null: nothing to report)
    * @param {{id: string, label: string}|null} step
+   * @param {string|null} unrecorded - why a change made no step (a key of
+   *   `VIEWER_ACTION_UNRECORDED`), null beside a step and for no change
    * @returns {boolean} Whether it was sent
    * @private
    */
-  _sendActionResult(requestId, outcome, step) {
+  _sendActionResult(requestId, outcome, step, unrecorded) {
     this._captureConnection('Viewer host action answer');
     requireExactText(requestId, 'Viewer host action requestId');
     if (step !== null) {
@@ -1538,12 +1536,19 @@ export class ViewerHostDataSource {
       requireExactText(step.id, 'Viewer host action step id');
       requireExactText(step.label, 'Viewer host action step label', { allowWhitespace: true });
     }
+    if (unrecorded !== null && (typeof unrecorded !== 'string' || !Object.hasOwn(VIEWER_ACTION_UNRECORDED, unrecorded))) {
+      throw new TypeError(`Viewer host action unrecorded must be null or one of ${Object.keys(VIEWER_ACTION_UNRECORDED).join(', ')}`);
+    }
+    if (step !== null && unrecorded !== null) {
+      throw new TypeError('Viewer host action unrecorded must be null when the action made a step');
+    }
     requireExactJsonValue(outcome, 'The action\'s outcome');
     if (!this._protocol.events.has('action_result')) return false;
     this._channel.sendBinary({
       type: 'action_result',
       requestId,
-      step
+      step,
+      unrecorded
     }, new Blob([JSON.stringify(outcome)]));
     return true;
   }
@@ -1588,9 +1593,10 @@ export class ViewerHostDataSource {
    */
   _requireHostDatasetShown() {
     if (this.getShownHostDataset() === null) {
+      const { name } = viewerHostWords(this._runtime);
       throw new Error(
-        'the viewer shows another dataset than the one this notebook gave it, so its session is not sent; ' +
-        'open the notebook\'s dataset in the viewer again to capture its session'
+        `the viewer shows another dataset than the one ${name} gave it, so its session is not sent; ` +
+        `open the dataset of ${name} in the viewer again to capture its session`
       );
     }
   }
@@ -1871,7 +1877,7 @@ export class ViewerHostDataSource {
   }
 
   /**
-   * Say which field the viewer colours by now.
+   * Say which field the viewer colors by now.
    *
    * @param {{field: string|null, source: 'obs'|'var'|null, symbol: string|null}} colorBy
    *   `field` a gene's identifier (the var index) or an obs key; `symbol` the
@@ -1880,22 +1886,22 @@ export class ViewerHostDataSource {
    * @returns {boolean} Whether it was sent
    */
   notifyColorBy(colorBy) {
-    requireExactKeys(colorBy, ['field', 'source', 'symbol', 'cells_read'], 'Viewer host colour-by report');
+    requireExactKeys(colorBy, ['field', 'source', 'symbol', 'cells_read'], 'Viewer host color-by report');
     const { field, source, symbol, cells_read: cellsRead } = colorBy;
     if ((field === null) !== (source === null)) {
-      throw new TypeError('Viewer host colour-by names a field and its source, or neither');
+      throw new TypeError('Viewer host color-by names a field and its source, or neither');
     }
     if (symbol !== null && source !== 'var') {
-      throw new TypeError('Viewer host colour-by names a symbol only for a gene');
+      throw new TypeError('Viewer host color-by names a symbol only for a gene');
     }
     if (field !== null) {
-      requireExactText(field, 'Viewer host colour-by field', { allowWhitespace: true });
-      if (source !== 'obs' && source !== 'var') throw new TypeError('Viewer host colour-by source must be obs or var');
+      requireExactText(field, 'Viewer host color-by field', { allowWhitespace: true });
+      if (source !== 'obs' && source !== 'var') throw new TypeError('Viewer host color-by source must be obs or var');
     }
-    if (symbol !== null) requireExactText(symbol, 'Viewer host colour-by symbol', { allowWhitespace: true });
+    if (symbol !== null) requireExactText(symbol, 'Viewer host color-by symbol', { allowWhitespace: true });
     // A gene read for the first open cells only (a gene sample): how many.
     if (cellsRead !== null && (source !== 'var' || !Number.isSafeInteger(cellsRead) || cellsRead < 0)) {
-      throw new TypeError('Viewer host colour-by names the cells read only for a gene, as a count');
+      throw new TypeError('Viewer host color-by names the cells read only for a gene, as a count');
     }
     return this._sendEvent({
       type: 'color_by',
@@ -1912,7 +1918,7 @@ export class ViewerHostDataSource {
 
   /**
    * Register what carries out the host's actions: `handler({action, params})`
-   * applies (or reads) the catalogue's action `action` -- its parameters
+   * applies (or reads) the catalog's action `action` -- its parameters
    * checked by the action's schema, its typed arrays in place -- and resolves
    * to `{outcome, step}`: the action's outcome (JSON; a read's result) and
    * the history step it made as `{id, label}`, or null. A rejection is the
@@ -1987,14 +1993,6 @@ export class ViewerHostDataSource {
       type: 'agent_answered',
       requestId,
       allowed: allowed === true
-    });
-  }
-
-  /** The person's settings changed what a tool list says (`agent_tools_changed`). */
-  notifyAgentToolsChanged() {
-    if (!this._connected) return false;
-    return this._sendEvent({
-      type: 'agent_tools_changed'
     });
   }
 
@@ -2333,7 +2331,7 @@ export class ViewerHostDataSource {
     this._endCatalogGeneration(
       'Viewer host catalog was retired by disconnect'
     );
-    cancel(this._initializationController, 'closed', 'Viewer host initialization was cancelled by disconnect.');
+    cancel(this._initializationController, 'closed', 'Viewer host initialization was canceled by disconnect.');
     this._initializationController = null;
     cancel(this._lifecycleController, 'closed', 'The viewer host was disconnected.');
     this._lifecycleController = null;
@@ -2350,6 +2348,7 @@ export class ViewerHostDataSource {
     this._loadSessionHandler = null;
     this._agentHandler = null;
     this._endCallbacks.clear();
+    this._reopenCallbacks.clear();
   }
 
   _closeChannel() {

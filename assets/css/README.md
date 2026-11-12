@@ -34,7 +34,7 @@ and `accessibility.html`, `assets/auth/callback.html`) and
 the screens shown when the app cannot run (startup failure, code-load failure,
 `<noscript>`). Each says its own thing, built from the same principles:
 
-1. **Tokens only.** Colour, type, spacing, borders, shadows and motion come
+1. **Tokens only.** Color, type, spacing, borders, shadows and motion come
    from `tokens/` and `themes/`; nothing is styled inline or with a raw value.
 2. **Light and dark.** A page follows the theme the visitor chose in the app
    (`theme-init.js`) on the viewer's backdrop, and reads in both.
@@ -85,16 +85,17 @@ a control sits), never a second look for a control.
 | Info button | `button.info-btn[aria-controls]` + `div.info-tooltip[role=dialog][data-info-tip][hidden]`, empty in markup; its text comes from the tip registry `ui/components/info-tips.js` | `createInfoTip`; `info-popovers.js` (one document-level controller) |
 | Checkbox + info | `div.checkbox-info-row` > `label.checkbox-inline` + `button.info-btn` | static |
 | Select, text, whole number, textarea | `.obs-select`; a whole number is `input[type=number]` with an integer `step` | `createSelect`, or the element with `.obs-select` |
-| Menu chosen from like a select (My datasets) | `button.obs-select[aria-haspopup=menu]` (drawn as a select: its value, the chevron) > `div.open-menu-list[role=menu]` of `button.open-menu-item[role=menuitem]`; the item of the value shown `aria-current` and `aria-disabled` | `initOpenDataMenu` (`ui/modules/open-data-menu.js`) |
+| Menu (a list of actions from a button or a point) | `button[aria-haspopup=menu][aria-expanded]` (+ `aria-controls` while open) > `div.open-menu-list[role=menu]` of `button.open-menu-item[role=menuitem]` (`menuitemcheckbox` with `aria-checked`; `.is-danger`; a disabled item stays listed, `aria-disabled`, with why as its title), `div.open-menu-separator`; shown above the page; keys: ↑/↓, Home/End, Escape back to the opener, Tab on from the opener | `openMenu` (`ui/components/menu.js`) for a menu of the moment (`.popup-menu`: a history row or branch, Filter, a highlight page's Combine); `initOpenDataMenu` (`ui/modules/open-data-menu.js`) for one in the markup (Open…, the History ⋯); both `menuKeyDown` |
+| Menu chosen from like a select (My datasets) | `button.obs-select[aria-haspopup=menu]` (drawn as a select: its value, the chevron) > the menu above; the item of the value shown `aria-current` and `aria-disabled` | `initOpenDataMenu` |
 | Decimal number (typed; any locale) | `input.obs-select[type=text][inputmode=decimal][autocomplete=off][spellcheck=false]`, read by `parseDecimalText` (a point or a comma), written with a point; never `input[type=number]`, which refuses a decimal comma in Firefox on a page marked English and shows the system's locale in Chromium (`tests/decimal-number-input-contract.test.mjs`) | `createDecimalInput`, `readDecimalInput`, `writeDecimalInput` |
 | Slider | `label[for]` + `div.slider-row` > `input[type=range]` + `output.slider-value` (or `span`); a value the user can type is `input.obs-select.slider-number` (+ `span.slider-unit`) | `createSliderField` |
 | Checkbox | `label.checkbox-inline` wrapping `input[type=checkbox]` + text | `createCheckbox` |
 | Switch (applies immediately) | `button.switch[role=switch][aria-checked]` > `.switch-track` + `.switch-label` | `createSwitch` |
 | Segmented (2–4 exclusive settings) | `div.segmented[role=group][aria-label]` > `button.segmented-btn[aria-pressed]` | `createSegmented` |
 | Tool or mode choice | `button.btn[aria-pressed]` in a `role=group` | static |
-| Button | `button.btn`; `.btn-primary` for the one action that commits a panel's work; `.btn-compact` inside lists, boxes and rows | `createButton` |
-| Icon button | `button.icon-btn[aria-label][title]` (+ `.icon-btn-danger`) with an `ICONS` glyph | `createIconButton` |
-| Chip (selectable page, group) | `.chip` (+ `.chip-name`, `.chip-count`, `.color-swatch` + `.color-swatch-input`) | per list, cloned from one prototype |
+| Button | `button.btn`; `.btn-primary` for the one action that commits a panel's work; `.btn-compact` for a panel's, a dialog's or a card's own actions where room is short; `.btn-quiet` (no border, no fill, one line, the text size around it) for an action nested inside something smaller than a panel — see "Nested actions" below — and `.btn-quiet.btn-quiet-primary` (accent text) for the one main action there, never a filled button; `.btn-danger` the confirmation that destroys something, wherever it is asked | `createButton` (`variant`: `primary`, `secondary`, `quiet`, `quiet-primary`, `danger`); `buttonClassName(variant)` for template or element-helper markup |
+| Icon button | `button.icon-btn[aria-label][title]` (+ `.icon-btn-danger`) with an `ICONS` glyph (never a typed character such as `✕` or `⋯`) | `createIconButton` |
+| Chip (selectable page, group) | `.chip` (+ `.chip-name`, `.chip-count`, `.color-swatch` + `.color-swatch-input`); a chip's own removal is a muted `×` glyph button named for what it removes ("Delete Page 2", "Remove View 2", "Remove CD3E"), no border or fill, danger text on hover (highlight pages, kept views, gene chips) | per list, cloned from one prototype |
 | Help line | `p.field-help` | `createField({ help })` |
 | Status line | `p.status-line[role=status][aria-live=polite][data-tone]` | `createStatusLine` |
 | Empty state | `p.empty-state` | `createEmptyState` |
@@ -106,14 +107,35 @@ a control sits), never a second look for a control.
 | Collapsible sub-section | `div.disclosure` > `button.disclosure-header[aria-expanded][aria-controls]` + `div.disclosure-content[hidden]`; in a `.disclosure-list` | `createDisclosure`; `bindDisclosure` for template or static markup (`[data-static-disclosure]`) |
 | Collapsible section of a panel (Session › Subsampling, Data mapping) | `div.control-block.disclosure.disclosure-inline.session-disclosure` > `.disclosure-header-row` (`h3.section-title.session-disclosure-heading` > `button.disclosure-header` with `.disclosure-title`, a one-line `.disclosure-desc` summary shown while collapsed, `.disclosure-chevron`; then the `.info-btn`) + `div.disclosure-content[hidden]`; open state kept per viewer in `localStorage` | `initSessionSections` (`ui/modules/session-sections.js`) |
 | Details (the facts behind a short summary: the Dataset box, Cells to open) | `div.disclosure.disclosure-inline.details-disclosure` titled "Details" > `dl.fact-list` of label and value rows (a value's longer text is its `title`) | `renderFactList` (rows `{label, value, title?, href?, lines?}`) |
-| App dialog (Cite, Share, Stored, My datasets) | native `dialog.app-dialog` opened with `showModal()` > `.app-dialog-header` + `.app-dialog-body` (+ `.app-dialog-actions`) | `wireAppDialog` (`components/app-dialog.js`) |
+| Dialog (every modal: Cite, Share, Stored, My datasets, the license, a confirmation, the figure export's warnings, the history's dialogs, agent approvals) | native `dialog.app-dialog` opened with `showModal()` > `.app-dialog-header` + `.app-dialog-body` (+ `.app-dialog-actions`); a dialog that brings its own card (the welcome, the community annotation dialogs) is `dialog.dialog-layer` over the whole screen holding it | `wireAppDialog` (`components/app-dialog.js`) — the only modal implementation: no overlay `div`, no `aria-modal`, no Tab trap of its own |
 
 ### Rules
 
+- **Nested actions are quiet.** Controls get quieter the deeper they sit
+  (owner, 2026-11-11). A panel's, a dialog's or a floating card's own actions
+  are `.btn` (`.btn-primary` for the one that commits); an action inside
+  something smaller — a list item's row or details (history steps, saved
+  states, My datasets, Stored data, Recently deleted, deleted fields,
+  connections), a chat turn or tool row, an agent's activity line, an array's
+  row in Data mapping, a suggestion card in Community annotation — is
+  `.btn-quiet`, its one main action `.btn-quiet-primary`, one line each; a
+  well-known action there (delete, rename, close, more) is an icon button. A
+  row's menu of further actions is named in words ("More…") or drawn with
+  `ICONS.more`, never a typed `⋯`. There is no third, link-like look: the
+  analysis windows' inner actions (Copy genes, CSV, GMT, Recompute, Swap A
+  and B, Score as signature, Reset to defaults, All / None / Invert, a gene
+  set's Clear / Add set / Import / Export) and Community annotation's
+  comment Edit / Delete, View merged, View full evidence and View all
+  comments are `.btn-quiet` too (F102). An underline marks only a link
+  (`a`) or a link inside a sentence (History settings… in the History tip,
+  the gene sample line); the list is held by
+  `tests/nested-actions-quiet-contract.test.mjs`.
+  `tests/nested-actions-quiet-contract.test.mjs` holds the modules of nested
+  areas and fails on a pill or a filled button in them.
 - **States.** Interactive state lives in ARIA (`aria-pressed`, `aria-checked`,
   `aria-expanded`, `aria-selected`, `disabled`) and CSS styles that attribute.
   Visibility is the `hidden` attribute, never an inline `display`. Inline
-  styles are written only for geometry and for colours that are data
+  styles are written only for geometry and for colors that are data
   (`StyleManager.setVariable`); `tests/sidebar-control-standard-contract.test.mjs`
   holds the allowlist.
 - **One look per state.** Hover, focus, active and disabled come from the
@@ -121,7 +143,7 @@ a control sits), never a second look for a control.
   disabled is `--control-disabled-opacity` with `cursor: not-allowed`.
 - **Touch.** See "Rhythm and touch" below. A panel never lists its own
   controls in `layouts/_responsive.css`.
-- **Tokens only.** Component CSS names colours, sizes, radii, shadows,
+- **Tokens only.** Component CSS names colors, sizes, radii, shadows,
   durations and z-indices through tokens. No `!important` outside utilities,
   reduced motion, overrides of third-party or owner-written inline styles,
   and the drag-in-progress states.
@@ -147,7 +169,7 @@ pointer size:
 | `--type-title` | 13px | 14px | semibold | panel summaries, dialog titles, welcome actions |
 | `--type-heading` | 12px | 13px | semibold | `.section-title`, disclosure titles, tip titles |
 | `--type-body` | 12px | 13px | regular | running prose in dialogs, notifications and tips |
-| `--type-label` | 12px | 13px | medium, secondary colour | field labels, captions, view title chips |
+| `--type-label` | 12px | 13px | medium, secondary color | field labels, captions, view title chips |
 | `--type-control` | 12px | 13px | regular | the text inside a field, option rows, switches, list rows |
 | `--type-button` | 12px | 13px | medium | button text, compact buttons included |
 | `--type-hint` | 11px | 12px | regular | help lines, empty states, status lines |
@@ -156,7 +178,7 @@ pointer size:
 
 - The scale is flat on purpose: a title is one step above the one size
   everything else is set in, secondary text one step below, a badge one
-  further. Hierarchy comes from weight and colour, not size. A coarse pointer
+  further. Hierarchy comes from weight and color, not size. A coarse pointer
   raises every role one step (`layouts/_responsive.css`).
 - Interface text is one family (Inter), set as written: no
   `text-transform`, no wide letter-spacing, nothing bolder than semibold.
@@ -167,7 +189,7 @@ pointer size:
   part of the figure, which figure export reproduces at a fixed size.
 - Field text is not raised to 16px on touch screens. iOS focus zoom is
   handled by `ui/core/viewport-init.js`, which adds `maximum-scale=1` on iOS
-  WebKit only (Safari still honours pinch zoom there); the reasoning is in
+  WebKit only (Safari still honors pinch zoom there); the reasoning is in
   that file and in `layouts/_responsive.css`.
 - `tests/ui-type-scale-contract.test.mjs` holds every rule above.
 
@@ -189,8 +211,8 @@ pointer size:
   one-line field cannot carry a pseudo-element, so it gets the same 3px as
   transparent border with its frame drawn as an inset ring.
   Stacked controls keep at least `--space-1-5` between them so one control's
-  extension never covers its neighbour's drawn box. Legend row icons are the
-  one opt-out: rows are packed, so their extension is cancelled.
+  extension never covers its neighbor's drawn box. Legend row icons are the
+  one opt-out: rows are packed, so their extension is canceled.
 - **Compact lists.** A list row (legend categories, shortcuts, kept views,
   keyframes, filters, dataset facts, disclosure headers) is at least
   `--control-list-row-height` (20px) tall on a mouse layout: one line of
@@ -200,7 +222,7 @@ pointer size:
   `--border-default` and a soft `--shadow-*`; a box inside it with
   `--border-light` on a tinted fill; a field, button or switch with
   `--border-control`. `--border-strong` (ink) is kept for a selected or
-  emphasised edge.
+  emphasized edge.
 - **One shape language.** Surfaces (panels, cards, boxes, fields, chips,
   rows, menus, tooltips, dialogs) are square (`--radius-none`); small badges
   are `--radius-sm`; buttons, switches, pills and scrollbar thumbs are
@@ -210,10 +232,14 @@ pointer size:
   shared thin scrollbar at the end of `components/_controls.css`.
 - **One dialog chrome.** Dialog headers, titles and close glyphs share one
   rule set in `components/_modals.css`.
-- **Motion.** Colour feedback uses `--transition-colors` (150ms); moving
+- **Motion.** Color feedback uses `--transition-colors` (150ms); moving
   surfaces (sidebar, notifications, transport bar) use `--duration-normal`.
   Nothing transitions `all`, and `prefers-reduced-motion` stops every
-  transition and animation (`base/_accessibility.css`).
+  transition and animation (`base/_accessibility.css`). Motion drawn by
+  script reads the same preference from `assets/js/utils/reduced-motion.js`:
+  the camera path and the tour arrive without flying, fades complete at
+  once, backdrop looks hold still, and the velocity overlay draws a still
+  picture of the flow.
 
 ### Wording and numbers
 
@@ -221,26 +247,49 @@ pointer size:
   ("Session file", "Gene expression") and are displayed exactly as written.
 - **One level of headings per panel.** A panel's summary names it; inside,
   each group of related controls has one `h3.section-title` of one to three
-  words, and fields are labelled under it. Qualifiers and explanations go in
+  words, and fields are labeled under it. Qualifiers and explanations go in
   the heading's (i) tip, not in the heading.
 - **Every heading and every non-obvious control has an (i) tip** from the
   registry (`ui/components/info-tips.js`): what it does, when to use it and
-  what it costs, how it interacts with neighbouring settings, and one or more
+  what it costs, how it interacts with neighboring settings, and one or more
   short text links to the documentation section that explains it.
   `tests/info-tips-contract.test.mjs` holds the registry, the pinned links and
   their resolution against the documentation source.
 - Labels and headings **never end in a colon**.
-- Status lines and help are full sentences with a full stop; empty states say
-  what is missing ("No keyframes saved yet.").
+- **A full stop ends a sentence, never a fragment** (one rule, everywhere a
+  person reads words). A sentence (a subject and a verb, or an instruction:
+  "Preview is off.", "Agents cannot connect on this page.", "Sign in
+  first.") ends with a full stop wherever it stands: a status line, help, a
+  notice, a tip, an empty state ("No keyframes saved yet."). A fragment ends
+  with none: titles and headings (even when they read as a sentence, "The data
+  could not be opened"), labels, buttons, menu and option items, chips, and
+  *status words*, a few words naming a state ("Saved", "Connected", "Code
+  not accepted", "Repository disconnected"). Several sentences each take
+  their full stop; a status word followed by a sentence takes it after the
+  sentence only.
+- **US spelling** ("color", "neighbor", "gray", "normalize", "center",
+  "catalog", "labeled"): one British word list, `tests/fixtures/spelling.json`
+  (shared byte for byte with cellucid-python and cellucid-r at one pinned
+  digest), is refused by `tests/failure-wording-contract.test.mjs` in the
+  page's prose, the scripts' strings and templates, the relay, the action
+  catalog, every README and guide, and every text a test expects, and by the
+  packages' suites in their messages, help and the documentation. Keys,
+  identifiers and file names keep the spelling they were stored with.
 - Data units are **cells**, not points; "point" is reserved for the rendered
   mark ("Point size").
-- Numbers go through `assets/js/app/ui/components/display-format.js`:
-  compact counts with upper-case suffixes (`15K`, `2.5M`), a spaced unit
-  (`8.0 s`, `1.00 u/s`), an attached `%` and `×` (never the letter x). Exact
+- Numbers go through `assets/js/app/ui/components/display-format.js` and
+  `assets/js/utils/format-units.js`: compact counts with upper-case suffixes
+  (`15K`, `2.5M`, `4M`, never `4.0M`: `formatCompactCount`), a p-value to two
+  significant figures (`formatPValue`), a spaced unit
+  (`8.0 s`, `1.00 u/s`), an attached `×` (never the letter x). Exact
   counts are grouped (`1,234`), and a count with its noun agrees with it
   (`1 cell`, `1,234 cells`): `formatCount`, `formatCountOf` and `countNoun` in
   `assets/js/utils/format-units.js`, never a template like `${n} cells`
-  (`tests/count-noun-agreement-contract.test.mjs`). Placeholders and in-progress text end in
+  (`tests/count-noun-agreement-contract.test.mjs`). A percent has its sign
+  attached (`50%`, never `50 %`) and is `formatPercent` (a value, fixed
+  decimals or significant figures) or `formatShare` (a part of a whole: whole
+  from 10%, never 100% short of it, two significant figures below) of the same
+  module, never a template like `${n}%` (`tests/percent-format-contract.test.mjs`). Placeholders and in-progress text end in
   an ellipsis character (`Search genes…`, `Loading…`).
 
 ## JS Integration (Dynamic UI)

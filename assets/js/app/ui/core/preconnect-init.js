@@ -4,7 +4,7 @@
  * The catalog named by the `cellucid-sample-catalog` meta element is the
  * first cross-origin fetch of a start-up, so its TLS handshake is worth
  * starting while the modules load. A page that was told another catalog
- * (`?sampleCatalog=`, which `data/data-source.js` honours over the meta
+ * (`?sampleCatalog=`, which `data/data-source.js` honors over the meta
  * element) never contacts the default one and must not open a connection to
  * it: a test, a notebook or an offline lab server would reach out to the
  * Internet for nothing, and WebKit reports the failed handshake as a console

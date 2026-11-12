@@ -1,5 +1,5 @@
 // Work under way that can be stopped (a loading or progress card with
-// `onCancel`) shows a button labelled Cancel, as its texts say ("Cancel stops
+// `onCancel`) shows a button labeled Cancel, as its texts say ("Cancel stops
 // it"; the walk of 2026-10-31 found only a "×" on the .h5ad export card). A
 // settled card is dismissed with ×; work under way without `onCancel` has no
 // button at all.

@@ -1,41 +1,23 @@
 /**
- * @fileoverview Shared modal helpers for figure export.
- *
- * Uses lightweight DOM construction (no framework) and relies on CSS tokens
- * defined in `assets/css/components/_figure-export.css`.
+ * @fileoverview The figure export's dialog (the fidelity warnings): an app
+ * dialog (`ui/components/app-dialog.js`) built around the content it is given,
+ * its title the header band and focus on its first button.
  *
  * @module ui/modules/figure-export/components/modal
  */
 
 import { createElement } from '../../../../utils/dom-utils.js';
+import { wireAppDialog } from '../../../components/app-dialog.js';
+import { createDomId } from '../../../components/dom-id.js';
 
-let activeKeydownHandler = null;
-const FOCUSABLE_SELECTOR = [
-  'a[href]',
-  'button',
-  'input',
-  'select',
-  'textarea',
-  '[tabindex]',
-  '[contenteditable="true"]',
-].join(',');
-
-function getFocusableElements(owner) {
-  return Array.from(owner.querySelectorAll(FOCUSABLE_SELECTOR)).filter(
-    element => (
-      element instanceof HTMLElement &&
-      element.tabIndex >= 0 &&
-      element.getAttribute('aria-hidden') !== 'true' &&
-      !('disabled' in element && element.disabled)
-    )
-  );
-}
+/** Whether a figure export dialog is open: one at a time. */
+let active = false;
 
 /**
  * @param {object} options
  * @param {string} options.title
  * @param {HTMLElement} options.content
- * @param {() => void} options.onClose
+ * @param {() => void} options.onClose - Runs once, however it closed.
  * @returns {{ close: () => void }}
  */
 export function showFigureExportModal({ title, content, onClose }) {
@@ -48,124 +30,37 @@ export function showFigureExportModal({ title, content, onClose }) {
   if (typeof onClose !== 'function') {
     throw new TypeError('Figure export modal onClose must be a function.');
   }
-  if (activeKeydownHandler) {
+  if (active) {
     throw new Error('A figure export modal is already active.');
   }
-
-  const existing = document.querySelector('.figure-export-modal');
-  if (existing) {
-    throw new Error('A figure export modal already exists in the document.');
-  }
-
-  const invokingElement =
-    document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-  const modal = createElement('div', {
-    className: 'figure-export-modal',
-    role: 'dialog',
-    ariaModal: 'true',
-    ariaLabel: title
-  });
-
-  const backdrop = createElement('div', { className: 'figure-export-modal-backdrop' });
-  const contentEl = createElement('div', {
-    className: 'figure-export-modal-content',
-    role: 'document',
-    tabIndex: -1,
-  });
-  const titleEl = createElement('div', { className: 'figure-export-modal-title' }, [title]);
-
-  contentEl.appendChild(titleEl);
-  contentEl.appendChild(content);
-  modal.appendChild(backdrop);
-  modal.appendChild(contentEl);
-
-  let closed = false;
-  const backgroundOwners = Array.from(document.body.children)
-    .filter(element => element instanceof HTMLElement)
-    .map(element => ({
-      element,
-      inert: element.inert,
-    }));
-
-  const restoreBackgroundAndFocus = () => {
-    for (const owner of backgroundOwners) {
-      owner.element.inert = owner.inert;
-    }
-    if (
-      invokingElement?.isConnected &&
-      !('disabled' in invokingElement && invokingElement.disabled)
-    ) {
-      invokingElement.focus();
-    }
-  };
-
-  const onKeyDown = (e) => {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      close();
-      return;
-    }
-    if (e.key !== 'Tab') return;
-
-    const focusable = getFocusableElements(contentEl);
-    if (focusable.length === 0) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      contentEl.focus();
-      return;
-    }
-    const activeIndex = focusable.indexOf(document.activeElement);
-    const nextIndex = e.shiftKey
-      ? (activeIndex <= 0 ? focusable.length - 1 : activeIndex - 1)
-      : (
-          activeIndex < 0 || activeIndex === focusable.length - 1
-            ? 0
-            : activeIndex + 1
-        );
-    e.preventDefault();
-    e.stopImmediatePropagation();
-    focusable[nextIndex].focus();
-  };
-
-  const close = () => {
-    if (closed) return;
-    closed = true;
-
-    document.removeEventListener('keydown', onKeyDown, true);
-    if (activeKeydownHandler === onKeyDown) {
-      activeKeydownHandler = null;
-    }
-    modal.remove();
-    restoreBackgroundAndFocus();
-    onClose();
-  };
-
-  backdrop.addEventListener('click', close);
-
-  activeKeydownHandler = onKeyDown;
-  document.addEventListener('keydown', onKeyDown, true);
-
-  for (const owner of backgroundOwners) {
-    owner.element.inert = true;
-  }
-  document.body.appendChild(modal);
-
-  const firstButton = getFocusableElements(contentEl).find(
-    element => element instanceof HTMLButtonElement
-  );
-  if (!(firstButton instanceof HTMLButtonElement)) {
-    document.removeEventListener('keydown', onKeyDown, true);
-    activeKeydownHandler = null;
-    modal.remove();
-    restoreBackgroundAndFocus();
+  const firstButton = Array.from(content.querySelectorAll('button')).find(button => !button.disabled);
+  if (firstButton === undefined) {
     throw new Error(
       'Figure export modal content must contain an enabled focusable button.'
     );
   }
-  firstButton.focus();
 
-  return { close };
+  const heading = createElement('h2', {}, [title]);
+  heading.id = createDomId('figure-export-modal-title');
+  const dialog = createElement('dialog', { className: 'app-dialog figure-export-modal' }, [
+    createElement('div', { className: 'app-dialog-header' }, [heading]),
+    createElement('div', { className: 'figure-export-modal-content' }, [content]),
+  ]);
+  dialog.setAttribute('aria-labelledby', heading.id);
+  const owner = wireAppDialog(dialog, {
+    onClose: () => {
+      active = false;
+      dialog.remove();
+      onClose();
+    },
+  });
+  document.body.append(dialog);
+  try {
+    owner.open(null, { focus: firstButton });
+  } catch (error) {
+    dialog.remove();
+    throw error;
+  }
+  active = true;
+  return { close: owner.close };
 }

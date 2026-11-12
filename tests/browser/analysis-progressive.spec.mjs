@@ -15,7 +15,7 @@ const CELLS = 20_000;
 const TYPES = ['T cell', 'B cell', 'Monocyte', 'NK cell'];
 const SAMPLES = ['s1', 's2', 's3', 's4', 's5', 's6'];
 const CONDITIONS = ['healthy', 'disease'];
-const COST_KEY = 'cellucid:analysis-cost:v2';
+const COST_KEY = 'cellucid:analysis-cost:v3';
 /** The cost model's kind of a Composition run on a sample-catalog dataset (`analysisCostKind`). */
 const COST_KIND = 'Composition · local-demo';
 
@@ -110,15 +110,16 @@ test('a slow run answers on a uniform sample first, then refines to exactly the 
   // the cells that fit in a second.
   const slowContext = await browser.newContext();
   const slowPage = await slowContext.newPage();
-  const slow = await runAndRead(slowPage, await openComposition(slowPage, [{ cells: CELLS, ms: 5_000 }]));
+  const slow = await runAndRead(slowPage, await openComposition(slowPage, [{ cells: CELLS, units: 1, ms: 5_000 }]));
   await closeContextWithApplicationRetirement(slowContext);
-  expect(slow.lines[0]).toMatch(/^First pass: each group's cells in a uniform sample of 20\.0% of the open cells \(about 4,000 of 20,000\) · refining on every cell…$/);
+  // A share of 10% and above is a whole percent (`formatShare`, utils/format-units.js).
+  expect(slow.lines[0]).toMatch(/^First pass: each group's cells in a uniform sample of 20% of the open cells \(about 4,000 of 20,000\) · refining on every cell…$/);
   expect(slow.lines.at(-1)).toBe('Every cell: computed on all cells of its groups (20,000 open cells).');
 
   // Measured fast: one pass.
   const fastContext = await browser.newContext();
   const fastPage = await fastContext.newPage();
-  const fast = await runAndRead(fastPage, await openComposition(fastPage, [{ cells: CELLS, ms: 5 }]));
+  const fast = await runAndRead(fastPage, await openComposition(fastPage, [{ cells: CELLS, units: 1, ms: 5 }]));
   await closeContextWithApplicationRetirement(fastContext);
   expect(fast.lines.some(line => line.startsWith('First pass'))).toBe(false);
 

@@ -13,6 +13,8 @@
  * @module ui/components/hover-context
  */
 
+import { formatPercent, formatPValue } from '../../../../utils/format-units.js';
+
 // =============================================================================
 // HOVER CONTEXT COMPONENT
 // =============================================================================
@@ -218,13 +220,13 @@ export class HoverContext {
     if (markerInfo !== null) {
       fragment.appendChild(this._createTextElement('divider', ''));
       fragment.appendChild(
-        this._createStatRow('p-value:', this._formatPValue(markerInfo.pValue))
+        this._createStatRow('p-value:', formatPValue(markerInfo.pValue))
       );
       if (markerInfo.adjustedPValue !== null) {
         fragment.appendChild(
           this._createStatRow(
             'Adj. p-value:',
-            this._formatPValue(markerInfo.adjustedPValue)
+            formatPValue(markerInfo.adjustedPValue)
           )
         );
       }
@@ -245,7 +247,7 @@ export class HoverContext {
         fragment.appendChild(
           this._createStatRow(
             '% in group:',
-            this._formatPercent(markerInfo.percentInGroup)
+            formatPercent(markerInfo.percentInGroup, 1)
           )
         );
       }
@@ -338,23 +340,7 @@ export class HoverContext {
     return value.toFixed(2);
   }
 
-  /**
-   * Format a p-value for display
-   * @private
-   */
-  _formatPValue(value) {
-    if (value < 0.0001) return value.toExponential(2);
-    if (value < 0.001) return value.toFixed(4);
-    return value.toFixed(3);
-  }
 
-  /**
-   * Format a percentage for display
-   * @private
-   */
-  _formatPercent(value) {
-    return `${value.toFixed(1)}%`;
-  }
 
   /**
    * Reject use after destroy.

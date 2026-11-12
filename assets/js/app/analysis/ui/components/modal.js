@@ -15,6 +15,7 @@ import { purgePlot } from '../../plots/plotly-loader.js';
 import { createExportToolbar } from './export.js';
 import { coalesceToFrame } from '../../../ui/components/controls.js';
 import {
+  FLOATING_MARGIN,
   RESIZE_EDGES,
   clampFloatingPosition,
   keyboardResizeTravel,
@@ -23,6 +24,7 @@ import {
 } from '../../../dockable-accordions/geometry.js';
 import { analysisViewSizes } from '../../shared/analysis-view-sizes.js';
 import { capturePointer } from '../../../ui/pointer-capture.js';
+import { wireAppDialog } from '../../../ui/components/app-dialog.js';
 import { formatCountOf } from '../../../../utils/format-units.js';
 
 // =============================================================================
@@ -60,12 +62,6 @@ function getFocusableElements(modal) {
     }
     return true;
   });
-}
-
-function isTopmostOpenAnalysisModal(modal) {
-  if (typeof document.querySelectorAll !== 'function') return true;
-  const openModals = document.querySelectorAll('.analysis-modal.open');
-  return openModals.length === 0 || openModals[openModals.length - 1] === modal;
 }
 
 function restoreModalFocus(modal) {
@@ -179,14 +175,16 @@ export function createAnalysisModal(options = {}) {
     }
   }
 
-  // Create modal backdrop
-  const modal = document.createElement('div');
+  // The expanded view is a modal dialog: its backdrop covers the page and
+  // closes it, so the page behind is out of use. It is a `<dialog>` opened
+  // through `wireAppDialog`, as every modal of the app: the browser makes
+  // the page inert, holds Tab and gives Escape (it said `aria-modal` with a
+  // hand-made Tab trap, and the page behind stayed reachable).
+  const modal = document.createElement('dialog');
   modal.className = 'analysis-modal';
   const modalId = ++analysisModalIdCounter;
   const titleId = `analysis-modal-title-${modalId}`;
   modal.setAttribute('aria-labelledby', titleId);
-  modal.setAttribute('aria-modal', 'true');
-  modal.setAttribute('role', 'dialog');
   modal.tabIndex = -1;
   modal._cleanupFns = [];
   modal._cleanupDone = false;
@@ -195,6 +193,8 @@ export function createAnalysisModal(options = {}) {
   modal._onCloseError = onCloseError ?? null;
   modal._closePromise = null;
   modal._previouslyFocusedElement = null;
+  // The app dialog it is opened through (`openModal`); null until then.
+  modal._appDialog = null;
 
   const backdrop = document.createElement('div');
   backdrop.className = 'analysis-modal-backdrop';
@@ -454,8 +454,20 @@ function writeContentBox(content, rect) {
   content.style.top = `${Math.round(rect.top)}px`;
   content.style.width = `${Math.round(rect.width)}px`;
   content.style.height = `${Math.round(rect.height)}px`;
-  content.style.maxWidth = 'none';
-  content.style.maxHeight = 'none';
+  capContentToViewport(content);
+}
+
+/**
+ * A view keeps the size it was given; a smaller window only cuts it to the
+ * screen less the margins, as a floating panel is (`_accordion.css`), so
+ * widening the window again gives the size back. Its cap was `none` (to lift
+ * the stylesheet's 860 px), and a view sized on a large window ran past a
+ * smaller one's edges (bug hunt F126). The phone layout's full screen
+ * overrides it (`_modals.css`).
+ */
+function capContentToViewport(content) {
+  content.style.maxWidth = `calc(100vw - ${2 * FLOATING_MARGIN}px)`;
+  content.style.maxHeight = `calc(100dvh - ${2 * FLOATING_MARGIN}px)`;
 }
 
 /**
@@ -735,7 +747,7 @@ function initializeResizers(content, body, footerArea, verticalResizer, horizont
   // Position the intersection resizer at the corner of vertical and horizontal
   // resizers. Layout offsets, not client rectangles: the content box is under
   // a `scale()` open transition, and a rectangle read while it runs is scaled
-  // about the box centre, so the corner landed somewhere different on every
+  // about the box center, so the corner landed somewhere different on every
   // open depending on how far the transition had got.
   const updateIntersectionPosition = () => {
     // The narrow layout hides every internal resizer (`display: none`), and a
@@ -1177,15 +1189,35 @@ function initializeModalDrag(modal, content, header) {
     toggleModalMaximize(modal, content);
   };
 
+  // A smaller window moves the view inside it, whole (its size is cut to the
+  // screen by its cap), once per frame; a view still inside stays where it
+  // is. Without this a view placed on a large window was left past a smaller
+  // one's edges, its header and close button out of reach (bug hunt F126).
+  let reclampFrame = null;
+  const onWindowResize = () => {
+    if (reclampFrame !== null) return;
+    reclampFrame = requestAnimationFrame(() => {
+      reclampFrame = null;
+      if (active !== null || isFullScreenLayout() || content.style.position !== 'absolute') return;
+      const box = contentBox(content);
+      const { x, y } = clampFloatingPosition({ ...box, ...modalViewport() });
+      if (x !== box.left) content.style.left = `${Math.round(x)}px`;
+      if (y !== box.top) content.style.top = `${Math.round(y)}px`;
+    });
+  };
+
   header.addEventListener('pointerdown', onPointerDown);
   header.addEventListener('pointermove', onPointerMove);
   header.addEventListener('pointerup', onPointerUp);
   header.addEventListener('pointercancel', onPointerUp);
   header.addEventListener('dblclick', onDoubleClick);
   window.addEventListener('blur', finishDrag);
+  window.addEventListener('resize', onWindowResize);
 
   return () => {
     finishDrag();
+    window.removeEventListener('resize', onWindowResize);
+    if (reclampFrame !== null) cancelAnimationFrame(reclampFrame);
     header.removeEventListener('pointerdown', onPointerDown);
     header.removeEventListener('pointermove', onPointerMove);
     header.removeEventListener('pointerup', onPointerUp);
@@ -1207,8 +1239,7 @@ function applyRememberedSizes(modal, content, size) {
   const { viewportWidth, viewportHeight } = modalViewport();
   content.style.width = `${Math.round(Math.min(size.width, viewportWidth - 16))}px`;
   content.style.height = `${Math.round(Math.min(size.height, viewportHeight - 16))}px`;
-  content.style.maxWidth = 'none';
-  content.style.maxHeight = 'none';
+  capContentToViewport(content);
   const options = modal.querySelector('.analysis-modal-options');
   const footer = modal.querySelector('.analysis-modal-footer-area');
   const stats = modal.querySelector('.analysis-modal-stats-panel');
@@ -1257,6 +1288,11 @@ export function openModal(modal) {
     ?? null;
 
   document.body.appendChild(modal);
+  // Opened before anything is measured (a closed dialog is not laid out).
+  // Escape and the end of every other way out close the dialog, which asks
+  // the view to close (`requestModalClose`, a no-op once closing began).
+  modal._appDialog = wireAppDialog(modal, { onClose: () => requestModalClose(modal) });
+  modal._appDialog.open(modal._previouslyFocusedElement);
   const content = modal.querySelector('.analysis-modal-content');
   const remembered = modal._sizeKey === null
     ? null
@@ -1267,11 +1303,11 @@ export function openModal(modal) {
   // Force reflow for animation
   modal.offsetHeight;
 
-  // Anchor the content at its centred layout position so a resize grows from
+  // Anchor the content at its centered layout position so a resize grows from
   // the top-left corner. The position is the layout offset, which a transform
   // never changes, so it is read now rather than after the `scale()` open
   // transition: a client rectangle read while that transition runs is scaled
-  // about the box centre, and a timer cannot know when it has finished.
+  // about the box center, and a timer cannot know when it has finished.
   if (content) {
     const { minWidth, minHeight } = contentMinimum(content);
     content.style.setProperty('--modal-min-width', `${minWidth}px`);
@@ -1286,46 +1322,6 @@ export function openModal(modal) {
 
   const focusableEls = getFocusableElements(modal);
   (focusableEls[0] ?? modal).focus();
-
-  // Own Escape and keyboard focus while this is the topmost analysis dialog.
-  const handleEscape = (e) => {
-    if (!isTopmostOpenAnalysisModal(modal)) return;
-    const activeElement = document.activeElement;
-    const activeDialog = activeElement?.closest?.('[role="dialog"]') ?? null;
-    if (activeDialog !== null && activeDialog !== modal) return;
-
-    if (e.key === 'Escape') {
-      e.preventDefault?.();
-      e.stopImmediatePropagation?.();
-      e.stopPropagation?.();
-      requestModalClose(modal);
-      return;
-    }
-    if (e.key !== 'Tab') return;
-
-    const currentFocusable = getFocusableElements(modal);
-    if (currentFocusable.length === 0) {
-      e.preventDefault?.();
-      modal.focus();
-      return;
-    }
-    const first = currentFocusable[0];
-    const last = currentFocusable[currentFocusable.length - 1];
-    if (!modal.contains(activeElement)) {
-      e.preventDefault?.();
-      (e.shiftKey ? last : first).focus();
-      return;
-    }
-    if (e.shiftKey && activeElement === first) {
-      e.preventDefault?.();
-      last.focus();
-    } else if (!e.shiftKey && activeElement === last) {
-      e.preventDefault?.();
-      first.focus();
-    }
-  };
-  modal._escapeHandler = handleEscape;
-  document.addEventListener('keydown', handleEscape, true);
 }
 
 function combineErrors(errors, message) {
@@ -1388,13 +1384,6 @@ function beginModalCleanup(modal) {
   };
   modal._cleanupDone = true;
 
-  // Stop Escape handler (important: openModal doesn't always remove it).
-  if (modal._escapeHandler) {
-    run(() => {
-      document.removeEventListener('keydown', modal._escapeHandler, true);
-    });
-    modal._escapeHandler = null;
-  }
 
   // Slot-owning callers retire their exact child before this parent purge
   // runs. Directly owned modal plots retain synchronous cleanup here.
@@ -1416,13 +1405,24 @@ function beginModalCleanup(modal) {
     modal._cleanupFns.length = 0;
   }
 
+  // Closed at once, faded out after: the dialog leaves the top layer now (the
+  // page is usable again, focus goes back, its notifications go home) and
+  // the view, inert, fades where it was until it is detached (`.closing`,
+  // _modals.css). Left open while it faded, it held the page inert and its
+  // controls in reach for the fade's length after the person closed it.
+  run(() => modal.classList.add('closing'));
+  run(() => { modal.inert = true; });
+  if (modal._appDialog !== null) run(() => modal._appDialog.close());
   run(() => modal.classList.remove('open'));
   let detachTask = Promise.resolve();
+  if (!modal.parentNode && modal._appDialog !== null) run(() => modal._appDialog.destroy());
   if (modal.parentNode) {
     detachTask = new Promise((resolve, reject) => {
       modal._detachTimeout = setTimeout(() => {
         modal._detachTimeout = null;
         try {
+          // Its listeners go with it.
+          if (modal._appDialog !== null) modal._appDialog.destroy();
           if (modal.parentNode) {
             modal.parentNode.removeChild(modal);
           }

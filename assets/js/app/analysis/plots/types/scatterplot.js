@@ -275,7 +275,7 @@ const scatterPlotDefinition = {
         for (const value of pageResult.colorValues) allCategories.add(value ?? 'Unknown');
       }
     }
-    const sharedCategoryColors = generateCategoryColors([...allCategories].filter(c => c != null).sort(), theme);
+    const sharedCategoryColors = generateCategoryColors([...allCategories].filter(c => c != null).sort());
     const listedCategories = new Set();
 
     // Determine if we should show density instead of points
@@ -287,7 +287,7 @@ const scatterPlotDefinition = {
 
       if (!pageResult.xValues || !pageResult.yValues) continue;
 
-      const color = BasePlot.getPageColor(layoutEngine, pageResult.pageId, i);
+      const color = BasePlot.colorOfPage(pageResult, layoutEngine, i);
       // Trace names reach the legend and hover box, both of which Plotly parses
       // for its HTML subset. Page names are user/session supplied.
       const safePageName = escapeHtml(pageResult.pageName ?? '');
@@ -402,8 +402,8 @@ const scatterPlotDefinition = {
                 opacity: pointOpacity,
                 line: { width: 0 }
               },
-            hovertemplate: `${escapeHtml(pageResult.xVariable || 'X')}: %{x:.2f}<br>` +
-              `${escapeHtml(pageResult.yVariable || 'Y')}: %{y:.2f}<br>` +
+            hovertemplate: `${escapeHtml(axisLabel(pageResult, 'x'))}: %{x:.2f}<br>` +
+              `${escapeHtml(axisLabel(pageResult, 'y'))}: %{y:.2f}<br>` +
               `${escapeHtml(pageResult.colorVariable)}: ${escapeHtml(cat)}<extra></extra>`,
             hoverlabel: COMMON_HOVER_STYLE
           });
@@ -424,8 +424,8 @@ const scatterPlotDefinition = {
             line: { width: 0 }
           },
           hovertemplate: `${safePageName}<br>` +
-            `${escapeHtml(pageResult.xVariable || 'X')}: %{x:.2f}<br>` +
-            `${escapeHtml(pageResult.yVariable || 'Y')}: %{y:.2f}<extra></extra>`,
+            `${escapeHtml(axisLabel(pageResult, 'x'))}: %{x:.2f}<br>` +
+            `${escapeHtml(axisLabel(pageResult, 'y'))}: %{y:.2f}<extra></extra>`,
           hoverlabel: COMMON_HOVER_STYLE
         });
       }
@@ -499,7 +499,7 @@ const scatterPlotDefinition = {
         // A variable constant in the page: no correlation, said so.
         const constantName = pageResult.constant === 'both'
           ? 'Both variables'
-          : (pageResult.constant === 'x' ? pageResult.xVariable : pageResult.yVariable) ?? (pageResult.constant === 'x' ? 'X' : 'Y');
+          : axisLabel(pageResult, pageResult.constant);
         stats.push({
           color,
           lines: [
@@ -520,8 +520,8 @@ const scatterPlotDefinition = {
 
     // Get variable names from first result. These are obs/var field names from
     // the dataset and axis titles are parsed for Plotly's HTML subset.
-    const xVariable = escapeHtml(pageResults[0]?.xVariable || 'Variable X');
-    const yVariable = escapeHtml(pageResults[0]?.yVariable || 'Variable Y');
+    const xVariable = escapeHtml(axisLabel(pageResults[0], 'x'));
+    const yVariable = escapeHtml(axisLabel(pageResults[0], 'y'));
 
     layout.xaxis = {
       title: {
@@ -634,7 +634,7 @@ const scatterPlotDefinition = {
         page: pr.pageName,
         r: pr.r?.toFixed(4) ?? 'N/A',
         r_squared: rSquared?.toFixed(4) ?? 'N/A',
-        p_value: pr.pValue?.toExponential(3) ?? 'N/A',
+        p_value: pr.pValue ?? 'N/A',
         slope: pr.slope?.toFixed(4) ?? 'N/A',
         intercept: pr.intercept?.toFixed(4) ?? 'N/A',
         n: pr.xValues?.length || 0
@@ -663,14 +663,31 @@ const scatterPlotDefinition = {
       summaryColumns: statsColumns,
       metadata: {
         plotType: 'scatterplot',
-        xVariable: pageResults[0]?.xVariable || 'X',
-        yVariable: pageResults[0]?.yVariable || 'Y',
+        xVariable: axisLabel(pageResults[0], 'x'),
+        yVariable: axisLabel(pageResults[0], 'y'),
         pageCount: pageResults.length,
         exportDate: new Date().toISOString()
       }
     };
   }
 };
+
+/**
+ * What an axis's values are, as the correlation read them
+ * (`MultiVariableAnalysis.correlationAnalysis`: `xLabel`/`yLabel`, a gene's
+ * values with their units, `geneValueLabel`).
+ *
+ * @param {{xLabel: string, yLabel: string}} pageResult
+ * @param {'x'|'y'} axis
+ * @returns {string}
+ */
+function axisLabel(pageResult, axis) {
+  const label = pageResult?.[`${axis}Label`];
+  if (typeof label !== 'string' || label.length === 0) {
+    throw new TypeError(`A correlation page names what the values on its ${axis} axis are (${axis}Label)`);
+  }
+  return label;
+}
 
 /**
  * Compute confidence band for linear regression

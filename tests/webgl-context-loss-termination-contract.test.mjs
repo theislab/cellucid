@@ -16,9 +16,9 @@
  * on one engine at a time, because it needs the loss to land inside that
  * window.
  *
- * This file holds the halves together: both producers stay recognisable to the
+ * This file holds the halves together: both producers stay recognizable to the
  * one predicate the frame loop uses, and an ordinary GL error stays
- * unrecognised, because absorbing one of those at a frame boundary would bury a
+ * unrecognized, because absorbing one of those at a frame boundary would bury a
  * real defect instead of a handled ending.
  */
 
@@ -66,7 +66,7 @@ test('the GL preflight refusal is recognised by the same predicate', () => {
       assert.equal(
         isContextLostError(error),
         true,
-        'a preflight that met a lost context must raise the same recognisable '
+        'a preflight that met a lost context must raise the same recognizable '
           + 'condition the renderer does',
       );
       assert.match(error.message, /after its WebGL context was lost/);

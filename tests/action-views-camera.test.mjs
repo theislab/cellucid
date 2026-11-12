@@ -14,14 +14,29 @@ import { fileURLToPath } from 'node:url';
 
 import { getActionCatalog, getActions } from '../assets/js/app/actions/index.js';
 import { ActionRefused } from '../assets/js/app/actions/dispatcher.js';
-import { openViewIds, resolveViewName, viewNameAt, viewNameInValue, viewNameOf } from '../assets/js/app/actions/targets/views.js';
+import {
+  checkViewLabel,
+  openViewIds,
+  resolveViewName,
+  viewLabelOf,
+  viewLabelsInValue,
+  viewNameAt,
+  viewNameInValue,
+  viewNameOf,
+  viewWords,
+  withViewLabel,
+} from '../assets/js/app/actions/targets/views.js';
+import { MARKED_QUOTE, PLAIN_QUOTE } from '../assets/js/app/actions/targets/names.js';
 import { initCameraControls } from '../assets/js/app/ui/modules/camera-controls.js';
 import { createDefaultCameraPose } from '../assets/js/rendering/camera-state-contract.js';
 
-function fakeViews({ hidden = false, snapshots = ['snap_1', 'snap_4'] } = {}) {
+function fakeViews({ hidden = false, snapshots = ['snap_1', 'snap_4'], names = {} } = {}) {
   return {
     getLiveViewHidden: () => hidden,
     getSnapshotViews: () => snapshots.map(id => ({ id, label: id })),
+    // The names views were given (`view.rename`).
+    names: new Map(Object.entries(names)),
+    getViewName(id) { return this.names.get(id) ?? null; },
   };
 }
 
@@ -64,6 +79,74 @@ test('a view is named "View N", as the Compare views list numbers its rows', () 
   assert.deepEqual([0, 1, 2].map(index => viewNameInValue(index, true)), ['the hidden live view', 'View 1', 'View 2']);
 });
 
+test('a view given a name is shown with it beside its number, and still addressed by its number', () => {
+  const views = fakeViews({ names: { snap_1: 'Early' } });
+  assert.equal(viewLabelOf(views, 'snap_1'), 'Early');
+  assert.equal(viewLabelOf(views, 'live'), null);
+  // The number stays its address: a name is not a view's name in params.
+  assert.equal(viewNameOf(views, 'snap_1'), 'View 2');
+  assert.throws(() => resolveViewName(views, 'Early'), /"Early" names no view/);
+  assert.equal(viewWords('View 2', 'Early'), 'View 2 "Early"');
+  assert.equal(viewWords('View 2', null), 'View 2');
+  // For an agent, the name is marked as data (someone wrote it).
+  assert.equal(viewWords('View 2', 'Early', MARKED_QUOTE), `${MARKED_QUOTE.bare('View 2')} ${MARKED_QUOTE('Early')}`);
+  assert.equal(viewWords('View 2', 'a "quoted" <name>', PLAIN_QUOTE), 'View 2 "a "quoted" <name>"');
+  assert.deepEqual([0, 1, 2].map(index => viewNameInValue(index, false, [null, 'Early', null])), ['View 1', 'View 2 "Early"', 'View 3']);
+  assert.deepEqual([0, 1].map(index => viewNameInValue(index, true, ['Live', 'Early'])), ['the hidden live view "Live"', 'View 1 "Early"']);
+  assert.equal(viewLabelsInValue({ views: [{}, {}] }), null, 'no view named: no labels');
+  assert.deepEqual(viewLabelsInValue({ views: [{}, { name: 'Early' }] }), [null, 'Early']);
+  assert.equal(viewLabelsInValue(null), null);
+  // An outcome carries the label of a named view only.
+  assert.deepEqual(withViewLabel(null, { view: 'View 1' }), { view: 'View 1' });
+  assert.equal(withViewLabel(null, null), null);
+  assert.deepEqual(withViewLabel('Early', { view: 'View 2' }), { view: 'View 2', label: 'Early' });
+  assert.deepEqual(withViewLabel('Early', null), { label: 'Early' });
+  // A name is one trimmed line, and never "View N" (two views would answer to it).
+  assert.equal(checkViewLabel('Day 7, treated'), 'Day 7, treated');
+  for (const bad of ['', ' Early', 'Early ', 'two\nlines', 42, null]) {
+    assert.throws(() => checkViewLabel(bad), error => error instanceof ActionRefused && error.code === 'bad-name', String(bad));
+  }
+  assert.throws(() => checkViewLabel('View 3'), error => error instanceof ActionRefused
+    && error.message === '"View 3" is how views are numbered; give the view another name, or none to number it again.');
+  assert.equal(checkViewLabel('View three'), 'View three');
+});
+
+test('view.rename: one step on the views, its sentence names the view with the name; view.keep can name the view it keeps', () => {
+  const catalog = getActionCatalog();
+  const rename = catalog.get('view.rename');
+  assert.deepEqual(rename.touches, ['views']);
+  assert.equal(rename.coalesce({ view: 'View 2', name: 'Early' }), 'View 2', 'typing and correcting a name is one step per view');
+  assert.equal(catalog.check('view.rename', { view: 'View 2', name: null }).type, 'view.rename');
+  assert.throws(() => catalog.check('view.rename', { view: 'View 2' }), /name/);
+  assert.throws(() => catalog.check('view.rename', { view: 'View 2', name: ' Early' }), /matches none of its 2 forms/);
+  assert.throws(() => catalog.check('view.rename', { view: 'Early', name: 'Late' }), /must be a view name such as "View 2"/);
+  assert.equal(rename.describe({ view: 'View 2', name: 'Early' }, { view: 'View 2' }), 'Named View 2 "Early"');
+  assert.equal(rename.describe({ view: 'View 2', name: 'Late' }, { view: 'View 2', was: 'Early' }), 'Named View 2 "Late"');
+  assert.equal(rename.describe({ view: 'View 2', name: null }, { view: 'View 2', was: 'Early' }), 'Took the name off View 2 "Early"');
+  assert.equal(rename.code({ view: 'View 2', name: 'Early' }), 'rename_view("View 2", "Early")');
+  assert.equal(rename.code({ view: 'View 2', name: null }), 'rename_view("View 2", None)');
+  assert.equal(rename.describe({ view: 'View 2', name: 'Early' }, null, MARKED_QUOTE), `Named ${MARKED_QUOTE.bare('View 2')} ${MARKED_QUOTE('Early')}`);
+
+  const keep = catalog.get('view.keep');
+  assert.equal(keep.describe({ name: 'Late' }, { view: 'View 3' }), 'Kept the view as View 3 "Late"');
+  assert.equal(keep.code({ name: 'Late' }), 'keep_view(name="Late")');
+  assert.equal(keep.code({ branch: 'Main', name: 'Late' }), 'keep_view(branch="Main", name="Late")');
+  assert.equal(keep.code({}), 'keep_view()');
+  // Every action on a named view says its name beside its number.
+  const camera = { navigationMode: 'orbit', ...createDefaultCameraPose() };
+  camera.orbit = { ...camera.orbit, targetRadius: camera.orbit.radius };
+  for (const [type, params, outcome, sentence] of [
+    ['view.focus', { view: 'View 2' }, { view: 'View 2', label: 'Early' }, 'Selected View 2 "Early"'],
+    ['view.remove', { view: 'View 2' }, { view: 'View 2', label: 'Early' }, 'Removed View 2 "Early"'],
+    ['view.embedding.cycle', { view: 'View 2', dimension: 2 }, { embedding: 't-SNE', label: 'Early' }, 'Showed t-SNE in View 2 "Early"'],
+    ['camera.set', { view: 'View 2', camera }, { view: 'View 2', label: 'Early' }, 'Moved the camera of View 2 "Early"'],
+    ['camera.reset', { view: 'View 2' }, { label: 'Early' }, 'Reset the camera of View 2 "Early"'],
+    ['camera.navigation.set', { view: 'View 2', mode: 'free' }, { label: 'Early' }, 'Navigated View 2 "Early" by free-fly'],
+  ]) {
+    assert.equal(catalog.check(type, params).describe(params, outcome), sentence, type);
+  }
+});
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const VIEW_NAMES_OWNER = path.join('assets', 'js', 'app', 'actions', 'targets', 'views.js');
 
@@ -95,9 +178,9 @@ test('one module names views: nothing else spells "View N" or "the live view" fo
 test('view and camera definitions: names in params, sentences a person reads, one pseudocode line', () => {
   const catalog = getActionCatalog();
   assert.equal(catalog.get('view.focus').params.properties.view.pattern, '^View [1-9][0-9]*$');
-  assert.throws(() => catalog.check('view.focus', { view: 'live' }), /does not have the expected form/);
-  assert.throws(() => catalog.check('view.focus', { view: 'View 0' }), /does not have the expected form/);
-  assert.throws(() => catalog.check('view.focus', { view: 'snap_1' }), /does not have the expected form/);
+  assert.throws(() => catalog.check('view.focus', { view: 'live' }), /must be a view name such as "View 2"/);
+  assert.throws(() => catalog.check('view.focus', { view: 'View 0' }), /must be a view name such as "View 2"/);
+  assert.throws(() => catalog.check('view.focus', { view: 'snap_1' }), /must be a view name such as "View 2"/);
   assert.throws(() => catalog.check('camera.navigation.set', { view: 'View 1', mode: 'fly' }), /must be one of/);
   assert.throws(
     () => catalog.check('view.embedding.set', { view: 'View 1', embedding: { key: 'X_umap', columns: [0, 0] } }),
@@ -116,6 +199,9 @@ test('view and camera definitions: names in params, sentences a person reads, on
     ['view.cameras.link', { linked: true }, null, 'Linked the cameras of views of one embedding', 'link_cameras(True)'],
     ['view.embedding.set', { view: 'View 1', embedding: { key: 'X_pca', columns: [0, 1] } }, null,
       'Showed obsm["X_pca"] [0, 1] in View 1', 'show_embedding("View 1", "X_pca", [0, 1])'],
+    // Shown, it is named as the picker names it (found 2026-11-10: 'Showed obsm["X_umap_2d"] [0, 1] in View 2').
+    ['view.embedding.set', { view: 'View 2', embedding: { key: 'X_umap_2d', columns: [0, 1] } }, { view: 'View 2', embedding: 'UMAP · 2D' },
+      'Showed UMAP · 2D in View 2', 'show_embedding("View 2", "X_umap_2d", [0, 1])'],
     ['view.embedding.cycle', { view: 'View 2', dimension: 2 }, { embedding: 't-SNE' }, 'Showed t-SNE in View 2', 'next_embedding("View 2", 2)'],
     ['cells.visibility.set', { cells: [3, 1], visible: false }, { cells: 2 }, 'Hid 2 cells', 'set_visibility(<2 cells>, visible=False)'],
     ['camera.set', { view: 'View 2', camera }, null, 'Moved the camera of View 2', 'set_camera("View 2", <camera>)'],
@@ -288,8 +374,8 @@ test('a camera gesture is one observed camera.set naming the view and the camera
     before: async () => null,
     after: async () => null,
     failed: async () => {},
-    async observed({ definition, params, meta }) {
-      observed.push([definition.type, params, meta.origin]);
+    async observed({ definition, params, meta, outcome }) {
+      observed.push([definition.type, params, meta.origin, outcome]);
       return null;
     },
   });
@@ -301,7 +387,15 @@ test('a camera gesture is one observed camera.set naming the view and the camera
   viewer.publish({ reason: 'camera', viewId: 'snap_1' });
   viewer.publish({ reason: 'camera-settled', viewId: 'snap_1' });
   await new Promise(resolve => setTimeout(resolve, 0));
-  assert.deepEqual(observed, [['camera.set', { view: 'View 2', camera: cameraAt(4) }, 'user']]);
+  assert.deepEqual(observed, [['camera.set', { view: 'View 2', camera: cameraAt(4) }, 'user', null]]);
+  // A named view's gesture: its step says the name (the outcome's label).
+  viewer.names.set('snap_1', 'Early');
+  viewer.publish({ reason: 'camera-changing', viewId: 'snap_1' });
+  viewer.publish({ reason: 'camera-settled', viewId: 'snap_1' });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(observed.at(-1), ['camera.set', { view: 'View 2', camera: cameraAt(4) }, 'user', { label: 'Early' }]);
+  observed.pop();
+  viewer.names.delete('snap_1');
 
   // A settle for a view no longer open records nothing and throws nothing.
   const errors = [];

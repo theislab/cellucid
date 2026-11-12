@@ -2,16 +2,16 @@
  * @fileoverview Replacing the var axis of a loaded dataset: the gene list a
  * data mapping names (`geneNames`, `expression`; `mapping-groups.js`).
  *
- * The obs axis, highlights, selections, obs filters and colours belong to
+ * The obs axis, highlights, selections, obs filters and colors belong to
  * cells and are untouched. Per view, only what is tied to genes changes:
- * - a view coloured by a gene keeps that gene, with its colour range, log
+ * - a view colored by a gene keeps that gene, with its color range, log
  *   scale and filter. On the same var axis (other gene names, or `X` and a
  *   layer) a gene is the same column, so it is found by position and keeps
  *   its place whatever it is now called; on another axis (to or from `raw`)
  *   it is found by name. Its values are read before anything changes (from
  *   the new matrix, or carried over when the matrix is the same);
- * - a view whose gene is not on the new list loses that colouring (and so
- *   that gene's filter, which applies only to the gene a view is coloured
+ * - a view whose gene is not on the new list loses that coloring (and so
+ *   that gene's filter, which applies only to the gene a view is colored
  *   by), and the gene is reported as dropped;
  * - every other gene is unloaded: the new list loads on demand.
  *
@@ -67,16 +67,22 @@ function valueRange(values) {
   return min <= max ? { min, max } : null;
 }
 
+/** The choices that are thresholds on a gene's values: void in other units. */
+const THRESHOLD_INTENT_KEYS = Object.freeze(['_continuousFilter', '_continuousColorRange', '_useFilterColorRange']);
+
 /**
  * Carry a person's choices for one gene to its field on the new list. A
- * filter or colour range is a threshold on values, so it is kept where it
+ * filter or color range is a threshold on values, so it is kept where it
  * still lies within the new values' range and clamped into it otherwise; a
- * range left empty by the clamp is dropped.
+ * range left empty by the clamp is dropped. Values in other units (another
+ * expression transform, `unitsChanged`) drop every threshold: a range of
+ * counts says nothing of log-normalized values.
  */
-function copyIntent(from, to) {
+function copyIntent(from, to, { unitsChanged = false } = {}) {
   const range = to.values instanceof Float32Array ? valueRange(to.values) : null;
   for (const key of GENE_INTENT_KEYS) {
     if (from[key] === undefined) continue;
+    if (unitsChanged && THRESHOLD_INTENT_KEYS.includes(key)) continue;
     const value = from[key];
     if (key === '_continuousFilter' || key === '_continuousColorRange') {
       if (range === null) continue;
@@ -207,7 +213,7 @@ export class DataStateVarAxisMethods {
 
   /**
    * Install the read gene list of the published dataset. Nothing was
-   * coloured by a gene, renamed or restored while it was pending: no view
+   * colored by a gene, renamed or restored while it was pending: no view
    * changes.
    * @private
    */
@@ -226,7 +232,7 @@ export class DataStateVarAxisMethods {
    * position, or -- when the list it was read from was replaced since (a
    * data mapping applied, by a person or because the values refuted a
    * default) -- the position of the same gene on the list in use, found as a
-   * coloured view's gene is (by position on the same var axis, by name on
+   * colored view's gene is (by position on the same var axis, by name on
    * another). -1 when the list in use has no such gene.
    *
    * @param {object} field - A gene field of this list or of one it replaced
@@ -260,10 +266,10 @@ export class DataStateVarAxisMethods {
   }
 
   /**
-   * The gene each view is coloured by: its view id, the field and the name.
+   * The gene each view is colored by: its view id, the field and the name.
    * @private
    */
-  _viewsColouredByGenes() {
+  _viewsColoredByGenes() {
     const views = [];
     const focused = this.activeViewId;
     for (const viewId of this.viewContexts.keys()) {
@@ -289,41 +295,51 @@ export class DataStateVarAxisMethods {
    *   geneList: Object,
    *   varFieldLoader: Function|null,
    *   sameAxis: boolean,
-   *   sameMatrix: boolean
-   * }} axis - The checked new gene list (`loadGeneList`) and its loader;
-   *   whether it is the same var axis (gene `i` is the same column), and
-   *   whether its values are those of the current matrix.
+   *   sameMatrix: boolean,
+   *   transform: {normalize: boolean, log1p: boolean},
+   *   lineage: Object|null,
+   *   unitsChanged?: boolean
+   * }} axis - The checked new gene list (`loadGeneList`) and its matrix's
+   *   own loader; whether it is the same var axis (gene `i` is the same
+   *   column), and whether its values are those of the current matrix. Its
+   *   genes are shown in `transform` (`expression-values.js`
+   *   `shownVarLoader`; `lineage`: the matrix's cells' totals,
+   *   `matrixLineage`, null with no matrix); `unitsChanged`: the
+   *   values are in other units than now (another transform), so a gene's
+   *   color range and filter are dropped rather than carried.
    * @returns {Promise<{dropped: string[], commit: () => void, rollback: () => void}>}
    */
-  async stageVarAxisReplacement({ geneList, varFieldLoader, sameAxis, sameMatrix }) {
+  async stageVarAxisReplacement({
+    geneList, varFieldLoader, sameAxis, sameMatrix, transform, lineage, unitsChanged = false,
+  }) {
     if (!Array.isArray(geneList?.fields)) {
       throw new TypeError('A var axis requires its gene list.');
     }
     // An empty gene list (no expression matrix) has nothing to load.
     const loader = geneList.fields.length === 0 && varFieldLoader === null
       ? null
-      : requireLoader(varFieldLoader);
+      : this.shownVarLoader(requireLoader(varFieldLoader), transform, { lineage });
     if (sameMatrix && !sameAxis) {
       throw new TypeError('One matrix has one var axis.');
     }
     const newIndexByKey = new Map(geneList.fields.map((field, index) => [field.key, index]));
     const geneCount = this.getVarAxisGeneCount();
-    // Where each coloured view's gene is on the new list, or undefined.
+    // Where each colored view's gene is on the new list, or undefined.
     const resolve = view => {
       if (sameAxis && view.position < geneCount && view.field._isUserDefined !== true) {
         return view.position < geneList.fields.length ? view.position : undefined;
       }
       return newIndexByKey.get(view.key);
     };
-    const coloured = this._viewsColouredByGenes();
+    const colored = this._viewsColoredByGenes();
     const dropped = [...new Set(
-      coloured.filter(view => resolve(view) === undefined).map(view => view.key)
+      colored.filter(view => resolve(view) === undefined).map(view => view.key)
     )];
 
-    // The values of every gene a view stays coloured by, read now. With the
+    // The values of every gene a view stays colored by, read now. With the
     // same matrix, the view's own field already holds them.
     const staged = new Map();
-    for (const view of coloured) {
+    for (const view of colored) {
       const { key } = view;
       const index = resolve(view);
       if (index === undefined || staged.has(index)) continue;
@@ -367,16 +383,16 @@ export class DataStateVarAxisMethods {
           loader,
           staged,
           resolveView: (viewId) => {
-            const entry = coloured.find(view => view.viewId === viewId);
+            const entry = colored.find(view => view.viewId === viewId);
             if (entry === undefined) return { mode: 'keep' };
             const index = resolve(entry);
             return index === undefined
               ? { mode: 'clear' }
-              : { mode: 'gene', index, intentFrom: entry.field };
+              : { mode: 'gene', index, intentFrom: entry.field, unitsChanged };
           },
         });
         // A gene chosen on the replaced list and still being read (a choice
-        // under way) follows its gene to this one, found as a coloured
+        // under way) follows its gene to this one, found as a colored
         // view's gene is.
         const published = this.varData.fields;
         const publishedByKey = new Map(published.map((field, index) => [field.key, index]));
@@ -438,8 +454,8 @@ export class DataStateVarAxisMethods {
   }
 
   /**
-   * Give every view the new list, then recolour each view coloured by a gene.
-   * The focused view is recoloured in place; any other view is focused in
+   * Give every view the new list, then recolor each view colored by a gene.
+   * The focused view is recolored in place; any other view is focused in
    * turn (the same switch a person makes), and focus returns at the end.
    * @private
    */
@@ -450,10 +466,10 @@ export class DataStateVarAxisMethods {
       const context = this.viewContexts.get(viewId);
       context.varData = this._cloneVarData(this.varData);
       if (step.mode === 'gene') {
-        copyIntent(step.intentFrom, context.varData.fields[step.index]);
+        copyIntent(step.intentFrom, context.varData.fields[step.index], { unitsChanged: step.unitsChanged });
         context.activeVarFieldIndex = step.index;
       } else {
-        // Its gene is gone (it is recoloured below) or it is not coloured by
+        // Its gene is gone (it is recolored below) or it is not colored by
         // a gene: no position on the new list is its own.
         if (step.mode === 'clear') context.activeFieldSource = null;
         context.activeVarFieldIndex = -1;
@@ -461,7 +477,7 @@ export class DataStateVarAxisMethods {
     }
     const focusedStep = plan.get(focused);
     if (focusedStep.mode === 'gene') {
-      copyIntent(focusedStep.intentFrom, this.varData.fields[focusedStep.index]);
+      copyIntent(focusedStep.intentFrom, this.varData.fields[focusedStep.index], { unitsChanged: focusedStep.unitsChanged });
       this.setActiveVarField(focusedStep.index);
     } else if (focusedStep.mode === 'clear') {
       this.clearActiveField();
@@ -481,7 +497,7 @@ export class DataStateVarAxisMethods {
 
   /**
    * Put back every view's var state as it was before a replacement, and
-   * recolour the views that were coloured by a gene.
+   * recolor the views that were colored by a gene.
    * @private
    */
   _restoreViewsVarState(views) {
@@ -494,7 +510,7 @@ export class DataStateVarAxisMethods {
       context.activeFieldIndex = saved.activeFieldIndex;
       context.activeVarFieldIndex = saved.activeVarFieldIndex;
     }
-    const recolour = () => {
+    const recolor = () => {
       if (this.activeFieldSource === 'var' && this.activeVarFieldIndex >= 0) {
         this.setActiveVarField(this.activeVarFieldIndex);
       } else if (this.activeFieldSource === 'obs' && this.activeFieldIndex >= 0) {
@@ -508,11 +524,11 @@ export class DataStateVarAxisMethods {
     this.activeFieldSource = own.activeFieldSource;
     this.activeFieldIndex = own.activeFieldIndex;
     this.activeVarFieldIndex = own.activeVarFieldIndex;
-    recolour();
+    recolor();
     for (const viewId of views.keys()) {
       if (viewId === focused) continue;
       this.setActiveView(viewId);
-      recolour();
+      recolor();
     }
     if (this.activeViewId !== focused) this.setActiveView(focused);
     getFieldRegistry().invalidate();

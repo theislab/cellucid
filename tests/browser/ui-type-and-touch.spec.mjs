@@ -8,7 +8,7 @@
  *
  * Touch ("Rhythm and touch"): on a phone every boxed control and option row
  * is drawn compact, 32–38px tall, and its hit area reaches at least 42px by
- * extending past the drawn box. No neighbour's extension may take a point
+ * extending past the drawn box. No neighbor's extension may take a point
  * inside a control's own drawn box. The legend rows' icon buttons opt out of
  * the extension: rows are packed one per line and the row itself is the
  * target there.
@@ -29,7 +29,8 @@ const ROLES = Object.freeze({
   heading: '#sidebar .section-title',
   label: '#sidebar label:not(.checkbox-inline), #sidebar .field-label',
   control: '#sidebar select.obs-select, #sidebar input.obs-select',
-  button: '#sidebar .btn:not(.btn-compact)',
+  // A quiet button (an action nested in a row) speaks at the size of the text around it.
+  button: '#sidebar .btn:not(.btn-compact):not(.btn-quiet)',
   compactButton: '#sidebar .btn-compact',
   hint: '#sidebar .field-help, #sidebar .status-line',
   readout: '#sidebar .slider-value',

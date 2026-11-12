@@ -27,7 +27,7 @@
  * capacity model tiles fixed-width slots across the axis, but the thinner draws
  * at category positions: two labels at the ends of an eight-band axis sit
  * (7/8) × 149 ≈ 130 px apart, while `Ductal` and `Epsilon` need 41 px between
- * their centres to clear each other. Anchoring both ends is not a crowded
+ * their centers to clear each other. Anchoring both ends is not a crowded
  * compromise here; it is three times the room the pair needs.
  */
 import assert from 'node:assert/strict';

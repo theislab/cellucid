@@ -5,7 +5,7 @@
  * a highlight and four analyses (their rows closed but the last), Save, a
  * reload, Load. The restore says "Session fully restored." -- a restored
  * result in a closed row is drawn when the row opens, the restore never
- * waits for that -- the colour controls are usable afterwards, and a gene
+ * waits for that -- the color controls are usable afterwards, and a gene
  * picked then is shown. The loaded history is kept in this browser as it is
  * (`app/history/autosave.js`), and a reload offers to continue it.
  *
@@ -189,7 +189,7 @@ test('a session saved on a gene sample after a share round trip restores to the 
   await applyShare(page, 10, CELLS / 10);
   await applyShare(page, 100, CELLS);
 
-  // A highlight on its own page, coloured by the category.
+  // A highlight on its own page, colored by the category.
   const saved = await page.evaluate(async () => {
     const state = window._cellucidState;
     const index = state.obsData.fields.findIndex(field => field.key === 'cluster');

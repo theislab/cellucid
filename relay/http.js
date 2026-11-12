@@ -48,11 +48,17 @@ export function errorResponse(error, headers = undefined) {
   return jsonResponse(error.body ?? { error: error.message }, error.status, merged);
 }
 
-export function isLoopbackHostname(hostname) {
-  return hostname === 'localhost'
-    || hostname.endsWith('.localhost')
-    || hostname === '[::1]'
-    || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname);
+/**
+ * Whether `hostname` is a loopback host a browser trusts over plain HTTP:
+ * `localhost`, `*.localhost`, 127.0.0.0/8, `::1` (W3C Secure Contexts §3.1),
+ * never `0.0.0.0`. The relay imports nothing outside its folder: this is
+ * the copy of the web app's `utils/loopback.js` `isSecureContextLoopbackHost`,
+ * held to its answers by `tests/community-annotation-worker-duplication-contract.test.mjs`.
+ * @param {string} hostname
+ */
+export function isSecureContextLoopbackHost(hostname) {
+  const host = String(hostname ?? '').toLowerCase().replace(/^\[|\]$/g, '');
+  return host === 'localhost' || host.endsWith('.localhost') || /^127(?:\.\d{1,3}){3}$/.test(host) || host === '::1';
 }
 
 const SIGNING_KEY = /^[A-Za-z0-9_-]{43,}$/;
@@ -87,7 +93,7 @@ export function relayEnvironment(env) {
       throw new RelayHttpError(500, `ALLOWED_ORIGINS contains an invalid origin: ${entry}`);
     }
     const exact = url.origin === entry && !url.username && !url.password;
-    const secure = url.protocol === 'https:' || (url.protocol === 'http:' && isLoopbackHostname(url.hostname));
+    const secure = url.protocol === 'https:' || (url.protocol === 'http:' && isSecureContextLoopbackHost(url.hostname));
     if (!exact || !secure) {
       throw new RelayHttpError(500, `ALLOWED_ORIGINS entries must be exact https origins or loopback http origins: ${entry}`);
     }
@@ -111,7 +117,7 @@ export function relayEnvironment(env) {
  */
 export function relaySite(request) {
   const url = new URL(request.url);
-  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopbackHostname(url.hostname))) {
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isSecureContextLoopbackHost(url.hostname))) {
     throw new RelayHttpError(400, 'The relay answers over https only');
   }
   const origin = url.origin;
@@ -155,6 +161,36 @@ export async function readBody(request, limit) {
     offset += chunk.byteLength;
   }
   return bytes;
+}
+
+/**
+ * The value of the cookie `name` that `request` carries, or null (a name
+ * given twice is no answer: neither is trusted).
+ * @param {Request} request
+ * @param {string} name
+ */
+export function cookieOf(request, name) {
+  const header = request.headers.get('Cookie');
+  if (header === null) return null;
+  const values = header.split(';').map(part => part.trim()).filter(part => part.startsWith(`${name}=`));
+  return values.length === 1 ? values[0].slice(name.length + 1) : null;
+}
+
+/**
+ * CORS headers that let one of the Cellucid pages (`ALLOWED_ORIGINS`) send
+ * a request with its cookies for the relay (`credentials: 'include'`) and
+ * read the answer: the exact origin, never `*`.
+ * @param {string} origin
+ */
+export function credentialedCorsHeaders(origin) {
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age': '600',
+    Vary: 'Origin',
+  };
 }
 
 /** Whether `request` declares a JSON body (any charset). */

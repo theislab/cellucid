@@ -1,6 +1,6 @@
 /**
  * @fileoverview Latent-space outlier quantiles of a categorical field: how far
- * each cell lies from its category's centre in a latent space (scVI, PCA),
+ * each cell lies from its category's center in a latent space (scVI, PCA),
  * as the share of its category at that distance or closer.
  *
  * One rule, bit for bit, wherever the quantiles come from: `prepare()` in
@@ -407,7 +407,7 @@ export function categorySizes(codes, nCategories, minPoints) {
  * placed cells are ranks over `n`: each is `r / n` (as float32,
  * `rankShare`) for a whole `r` from 1 to `n`, and exactly `r` of those cells
  * have a rank of at most `r` (ties share the larger rank). Above 2^24 cells
- * float32 no longer tells neighbouring ranks apart, so a quantile names a
+ * float32 no longer tells neighboring ranks apart, so a quantile names a
  * range of ranks, not one; the check is therefore by ranges, exact at every
  * size: sorted, the cells holding each distinct quantile `q` end at a count
  * `c` (the cells with a quantile of at most `q`), and `c` must be a rank

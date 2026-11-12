@@ -1,7 +1,7 @@
 /**
  * The scale check of one store at one share, in its own process: the reader
  * worker's handler reads, as the app does, the first view (the embedding and
- * the field it is coloured by, after the metadata the app reads first), a
+ * the field it is colored by, after the metadata the app reads first), a
  * first gene, 100 genes, and one analysis (a
  * differential expression's read: every cell of the two largest groups by
  * the 50 genes after the first 100), over a link (`--transport remote`:

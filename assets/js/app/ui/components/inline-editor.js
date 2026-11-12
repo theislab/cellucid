@@ -6,6 +6,8 @@
  *
  * Notes:
  * - Works with typical text elements and also with `<select>` (we hide it temporarily).
+ * - Enter or leaving the box saves; Escape cancels. A value `validate` refuses
+ *   is said on the box (its validity message) and the box stays open.
  * - Styling is handled by CSS (`.inline-rename-input`).
  */
 
@@ -95,8 +97,13 @@ export class InlineEditor {
           if (validate) {
             const result = validate(nextValue);
             if (result !== true) {
+              // Said on the box, as the browser says a refused entry (and
+              // read out), until the name is changed; the box stays open.
+              const reason = typeof result === 'string' ? result : 'Invalid value';
               input.setAttribute('aria-invalid', 'true');
-              input.title = typeof result === 'string' ? result : 'Invalid value';
+              input.title = reason;
+              input.setCustomValidity(reason);
+              input.reportValidity();
               finished = false;
               input.focus();
               return;
@@ -139,9 +146,19 @@ export class InlineEditor {
       }
     });
 
+    // A refusal said on the box goes as the name is changed.
+    input.addEventListener('input', () => {
+      if (input.getAttribute('aria-invalid') !== 'true') return;
+      input.removeAttribute('aria-invalid');
+      input.title = '';
+      input.setCustomValidity('');
+    });
+
+    // Leaving the box names it, as Enter does (a view's and a highlight
+    // page's names work so too); Escape leaves it as it was. Click handlers
+    // (a dialog's buttons) run first.
     input.addEventListener('blur', () => {
-      // Allow click handlers (e.g., on dialog buttons) to run before canceling.
-      setTimeout(() => finish(false), 0);
+      setTimeout(() => finish(true), 0);
     });
 
     requestAnimationFrame(() => {

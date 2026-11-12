@@ -22,7 +22,7 @@
  *
  * A work or school account reads its own files with `Files.Read`; a file a
  * colleague shared needs `Files.Read.All`, asked for only then ("[Ask for
- * access]"), which many organisations let only an administrator approve.
+ * access]"), which many organizations let only an administrator approve.
  *
  * Accepts `1drv.ms/…` share links, `onedrive.live.com/…` links,
  * `<tenant>-my.sharepoint.com/:u:/…` and `<tenant>.sharepoint.com/:u:/…`
@@ -39,6 +39,7 @@ import { registerSourceAccess, revokeSourceAccess } from '../access.js';
 import { getMicrosoftAuth } from '../auth/microsoft.js';
 import { BYTE_SOURCE_FAILURES, HEAD_BYTES, headOfFile, readFileHead } from '../../../formats/io/byte-source.js';
 import { openableNamesText } from '../../input-formats.js';
+import { base64UrlOfBytes, bytesOfBase64Url } from '../../../utils/byte-text.js';
 
 const GRAPH = 'https://graph.microsoft.com/v1.0';
 /**
@@ -55,16 +56,9 @@ const DOWNLOAD_URL = '@microsoft.graph.downloadUrl';
 /** Answers of the download host that mean its URL expired (OneDrive's `tempauth`). */
 const STALE_DOWNLOAD = Object.freeze([401, 403, 404]);
 
-function base64Url(text) {
-  const bytes = new TextEncoder().encode(text);
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
 /** Graph's share id of a sharing link: `u!` and the link in base64url. */
 export function shareIdOf(link) {
-  return `u!${base64Url(link)}`;
+  return `u!${base64UrlOfBytes(new TextEncoder().encode(link))}`;
 }
 
 const SHARE_ID = /^u![A-Za-z0-9_-]+$/;
@@ -72,7 +66,7 @@ const SHARE_ID = /^u![A-Za-z0-9_-]+$/;
 /** The host a share id's link (`u!` and the link in base64url) names, or null. */
 function shareHostOf(shareId) {
   try {
-    const text = atob(shareId.slice(2).replace(/-/g, '+').replace(/_/g, '/'));
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytesOfBase64Url(shareId.slice(2)));
     return new URL(text).host;
   } catch {
     return null;
@@ -183,7 +177,7 @@ export function createOneDriveProvider({ microsoft = null, now = () => Date.now(
     if (!microsoftAuth.signedIn()) onStep?.('Waiting for you to sign in with Microsoft');
     let token = await microsoftAuth.authorize({
       kind: interactive ? 'sign-in' : 'expired',
-      text: interactive ? 'OneDrive file: sign in with Microsoft to open it.' : 'Microsoft sign-in expired.',
+      text: interactive ? 'OneDrive files open after a sign-in.' : 'Microsoft sign-in expired.',
       more,
       signal,
     });
@@ -208,8 +202,8 @@ export function createOneDriveProvider({ microsoft = null, now = () => Date.now(
         onStep?.('Waiting for you to allow Cellucid to read files shared with you');
         token = await microsoftAuth.authorize({
           kind: 'more-access',
-          text: 'This file may belong to someone else in your organisation. Reading it needs your permission ' +
-            'to read files shared with you; your organisation may need to approve Cellucid.',
+          text: 'This file may belong to someone else in your organization. Reading it needs your permission ' +
+            'to read files shared with you; your organization may need to approve Cellucid.',
           more: true,
           signal,
         });
@@ -218,7 +212,7 @@ export function createOneDriveProvider({ microsoft = null, now = () => Date.now(
       if (answer.status === 403 || answer.status === 404) {
         throw refusal(
           'Your Microsoft account cannot open this file: it was not shared with you, the link is wrong, or ' +
-          'your organisation does not allow sharing with you. Ask its owner to share it with your account.',
+          'your organization does not allow sharing with you. Ask its owner to share it with your account.',
           DataSourceErrorCode.PERMISSION_DENIED,
           { status: answer.status }
         );
@@ -371,7 +365,6 @@ export function createOneDriveProvider({ microsoft = null, now = () => Date.now(
           if (signal?.aborted) throw error;
         }
       }
-      const access = downloadAccess(ids, { url: item[DOWNLOAD_URL], cTag: item.cTag }, askedAt, name);
       const display = `${GRAPH}/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(item.id)}/content`;
       const described = await describeRemoteFile({
         url: display,
@@ -387,6 +380,9 @@ export function createOneDriveProvider({ microsoft = null, now = () => Date.now(
         signal,
         onStep,
       });
+      // Registered once the file is described: a refused file holds none
+      // (`sources/access.js`).
+      const access = downloadAccess(ids, { url: item[DOWNLOAD_URL], cTag: item.cTag }, askedAt, name);
       const file = { ...described, resource: Object.freeze({ ...described.resource, access }) };
       // Named from now on by its drive and item, never by the share link.
       return { title: file.title, file, attribution: file.attribution, locator: ids };

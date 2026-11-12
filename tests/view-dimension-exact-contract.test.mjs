@@ -22,6 +22,9 @@ import {
   createDataState,
 } from '../assets/js/app/state/core/data-state.js';
 import { cancellationKind, isCancellation } from '../assets/js/utils/abort.js';
+import { getNotificationCenter } from '../assets/js/app/notification-center.js';
+import { stillFieldText } from '../assets/js/app/unplaced-cells-notice.js';
+import { PARTICLE_RENDER_VS, VELOCITY_STILL_SPEED } from '../assets/js/rendering/overlays/velocity/velocity-shaders.js';
 
 function createDeferred() {
   let reject;
@@ -702,4 +705,70 @@ test('a vector field is refused for a representation it is not bound to', async 
     /not registered/,
   );
   assert.deepEqual(runtime.calls.vectorPublications, []);
+});
+
+/**
+ * Bug hunt round 9, vector-field lane. R9V-6: a field whose every vector is
+ * zero turned on silently and drew nothing, though the read knows its longest
+ * vector. R9V-7: a field that could not be read said its failure twice (the
+ * loading notice failed with it, and the overlay's caller said it again).
+ */
+function vectorNoticeScene(t, loadField) {
+  const said = [];
+  const center = getNotificationCenter();
+  const saved = {};
+  for (const method of ['loading', 'complete', 'info', 'fail', 'dismiss']) {
+    saved[method] = center[method];
+    center[method] = (first, second) => {
+      said.push([method, typeof second === 'string' ? second : first]);
+      return `notice-${said.length}`;
+    };
+  }
+  t.after(() => Object.assign(center, saved));
+  const runtime = createRuntimeViewer();
+  const state = createDataState({ viewer: runtime.viewer, labelLayer: null });
+  state.setDimensionManager(createDimensionManager());
+  state.initScene(new Float32Array(4), { fields: [] });
+  state.setVectorFieldManager({
+    getAvailableFields: () => [{ id: 'velocity', label: 'velocity' }],
+    getDefaultFieldId: () => 'velocity',
+    hasAny: () => true,
+    hasField: fieldId => fieldId === 'velocity',
+    hasFieldLayout: (fieldId, layoutKey) => layoutKey === '2d',
+    loadField,
+    dispose() {},
+  });
+  return { state, said, runtime };
+}
+
+const vectorPayload = maxMagnitude => ({
+  vectors: new Float32Array(4), components: 2, cellCount: 2, maxMagnitude, unplacedCount: 0, unplacedNames: [],
+});
+
+test('a field with no motion at all says so when it is read (R9V-6)', async t => {
+  const { state, said, runtime } = vectorNoticeScene(t, async () => vectorPayload(0));
+  assert.equal(await state.ensureVectorField('velocity', '2d', { silent: false }), true);
+  assert.equal(runtime.calls.vectorPublications.length, 1);
+  assert.deepEqual(said.filter(([method]) => method === 'info').map(([, text]) => text), [
+    'No particle moves in velocity on 2d · 2D: every vector is zero.',
+  ]);
+  assert.equal(
+    stillFieldText({ label: 'velocity', embedding: 'UMAP · 2D', longest: 3.2e-6 }),
+    'No particle moves in velocity on UMAP · 2D: every vector is too short to draw (the longest is 3.2e-6).',
+  );
+  // The floor the notice uses is the one the particle shader discards by.
+  assert.ok(PARTICLE_RENDER_VS.includes(`speed < ${VELOCITY_STILL_SPEED.toFixed(5)})`));
+});
+
+test('a moving field says nothing beyond its read', async t => {
+  const { state, said } = vectorNoticeScene(t, async () => vectorPayload(VELOCITY_STILL_SPEED * 10));
+  await state.ensureVectorField('velocity', '2d', { silent: false });
+  assert.deepEqual(said.map(([method]) => method), ['loading', 'complete']);
+});
+
+test('a field that cannot be read leaves saying so to its caller, once (R9V-7)', async t => {
+  const failure = new RangeError("Vector field 'velocity_umap' cannot be drawn: every cell's vector is missing (NaN or infinite).");
+  const { state, said } = vectorNoticeScene(t, async () => { throw failure; });
+  await assert.rejects(state.ensureVectorField('velocity', '2d', { silent: false }), failure);
+  assert.deepEqual(said.map(([method]) => method), ['loading', 'dismiss']);
 });

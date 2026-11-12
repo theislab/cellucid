@@ -26,9 +26,8 @@ and the history of the dataset shown as a **branch graph**, drawn from the page'
 | `compare.js` | two branches side by side: the views' own actions (`view.keep` with each branch, `view.layout.set`) |
 | `tour.js` | the guided tour: captions with notes and group chapters, camera flights, pause, previous, next, stop; each step shown by `history.jump` |
 | `share.js` | copy pseudocode or methods (`history.pseudocode`, `history.methods`), the printable report with pictures drawn on demand (none stored) |
-| `menu.js` | a menu opened at a row or a button (the Open… menu's look and keys) |
 | `keyboard.js` | Ctrl/⌘+Z and Ctrl/⌘+Shift+Z, left to text fields (only those: a slider, checkbox or select has no undo of its own), dialogs and a selection in progress |
-| `model.js` | pure: how long ago, who acted (the agent's model), flags, a row's words and accessible name, the status line, the tour plan, the graph's keys (`GRAPH_SHORTCUTS`, listed by the History tip) |
+| `model.js` | pure: how long ago, who acted (the agent's model), flags, a row's words and accessible name, the status line, the tour plan (the graph's keys are the History list group of `ui/onboarding/shortcut-table.js`, which the panel and the History tip list) |
 | `dataset-facts.js` | the dataset's name, size, citation and open cells, for the exports |
 | `shared.js` | glyphs, the undo keys of this platform, every question asked in the app's one confirmation dialog (`askHistory` over `components/confirm-dialog.js`), the edit toast with Undo, failures told |
 
@@ -38,19 +37,19 @@ and the history of the dataset shown as a **branch graph**, drawn from the page'
 **The seam to the history core** (`history-source.js`). The panel reads `history.active` (a
 `Tracker` of `app/history/model.js`; collections as maps by id or the model's lists),
 `history.trackers()`, `history.subscribe`, `history.catalog`, and the runtime state that is not a
-record: `history.pending()` ("Branch here": `{name, from}`), `history.stale()` (`[{step, cause, inputs}]`, read as a map by step),
+record: `history.pending()` ("Branch here": `{name, from}`), `history.stale()` (`[{step, cause, inputs, causes}]`, each input with its own cause, read as a map by step),
 `history.pausedChanges()` (domains differing while paused) and `history.setPausedChoice(choice,
 {remember})` (the paused card's Keep and go / Discard and go), and what a delete would do before it is
 asked (`history.deletePlan(id)`, `history.branchDeletePlan(ref, {withSubBranches})`), the values
 a step kept and what is shown (`history.valueAt(step, domain)`, `history.shownValue(domain)`: Show this
 step's view, the tour's cameras while camera moves are not recorded), and where its memory goes
-(`history.pool.byteLength()`, `history.memoryParts()`). It acts only through catalogue actions.
+(`history.pool.byteLength()`, `history.memoryParts()`). It acts only through catalog actions.
 
 **Invariants:**
 - Nothing here keeps a history of its own: every part reads the current history and redraws when it
   tells of a change, at most once a frame and only while the panel can be seen. A dataset switch
   publishes another history (or none) and the panel follows.
-- Every operation is a `history.*` catalogue action dispatched as the person's, the path an agent, a
+- Every operation is a `history.*` catalog action dispatched as the person's, the path an agent, a
   notebook and a replay take; the panel calls no history mutator (History v2 §6 test 3).
 - The graph's DOM holds the rows in view, in the tree's order, never the whole history; a new step
   rewrites only the rows whose words changed, and is laid out from the layout before (only the path's

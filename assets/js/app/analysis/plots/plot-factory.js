@@ -30,6 +30,7 @@ import { isPlotlyPrecomputable, plotlyBoxSummary, sortLikePlotly } from './plotl
 import { POINT_LAYER } from './point-layer.js';
 import { fitToSize } from './size-fit.js';
 import { textHeight, textWidth } from './text-measure.js';
+import { bytesOfHex } from '../../../utils/hex-color.js';
 
 /** A horizontal legend entry: its marker, and the room after its text, in px. */
 const LEGEND_ENTRY_CHROME = 46;
@@ -388,7 +389,7 @@ export class PlotFactory {
    * How many labels fit along a horizontal axis.
    *
    * Upright labels need their own width plus a gap. Rotated ones need enough
-   * spacing that the perpendicular distance between neighbours clears a line of
+   * spacing that the perpendicular distance between neighbors clears a line of
    * text — `spacing × sin(angle)` — which is why rotating buys room but does not
    * make the axis unbounded.
    *
@@ -421,7 +422,7 @@ export class PlotFactory {
   /**
    * `count` indices spread evenly across `length`, first and last included.
    *
-   * Stepping from zero would leave the far end of the axis unlabelled, and
+   * Stepping from zero would leave the far end of the axis unlabeled, and
    * appending the last index to a stepped run puts two labels next to each
    * other at exactly the spacing the step was chosen to avoid.
    *
@@ -490,7 +491,7 @@ export class PlotFactory {
 
     for (let i = 0; i < pageData.length; i++) {
       const pd = pageData[i];
-      const color = BasePlot.getPageColor(layoutEngine, pd.pageId, i);
+      const color = BasePlot.colorOfPage(pd, layoutEngine, i);
 
       // Optionally pre-filter to finite values. A page whose values are all
       // finite is passed through as is — typed, not copied into a boxed
@@ -843,7 +844,7 @@ export class PlotFactory {
     } = options;
 
     const variableName = valueAxisLabel === undefined
-      ? BasePlot.getVariableName(pageData)
+      ? BasePlot.getValueLabel(pageData)
       : valueAxisLabel;
     if (typeof variableName !== 'string' || variableName.length === 0) {
       throw new TypeError('Distribution axis label must be a non-empty string');
@@ -900,7 +901,7 @@ export class PlotFactory {
     const { logX = false, logY = false, histnorm = '' } = options;
 
     // Dataset-supplied field name reaching a markup-parsing axis title.
-    const variableName = escapeHtml(BasePlot.getVariableName(pageData));
+    const variableName = escapeHtml(BasePlot.getValueLabel(pageData));
 
     layout.xaxis = {
       title: variableName,
@@ -1022,7 +1023,7 @@ export class PlotFactory {
       columns,
       metadata: {
         pageCount: pageData.length,
-        variable: pageData[0]?.variableInfo?.name || 'Value',
+        variable: pageData.length === 0 ? 'Value' : BasePlot.getValueLabel(pageData),
         exportDate: new Date().toISOString(),
         ...options.metadata
       }
@@ -1205,11 +1206,7 @@ export class PlotFactory {
    * @returns {string} RGBA color string
    */
   static hexToRgba(hex, alpha) {
-    const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-    if (!result) return `rgba(100,100,100,${alpha})`;
-    const r = parseInt(result[1], 16);
-    const g = parseInt(result[2], 16);
-    const b = parseInt(result[3], 16);
+    const [r, g, b] = bytesOfHex(hex) ?? [100, 100, 100];
     return `rgba(${r},${g},${b},${alpha})`;
   }
 

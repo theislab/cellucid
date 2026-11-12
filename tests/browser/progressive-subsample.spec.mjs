@@ -2,11 +2,11 @@
  * Progressive subsampled reading, in the app (`anndata/prefix-column-index.js`).
  *
  * - A gene of a subsample's cell-major matrix shows on a sample of the open
- *   cells before its index is built: its first colours come with the cells
- *   not read yet in the missing colour (NaN), then the whole gene.
+ *   cells before its index is built: its first colors come with the cells
+ *   not read yet in the missing color (NaN), then the whole gene.
  * - Raising the subsample in place (Cells to open, same method and seed)
  *   keeps the gene index of the cells already open: the next gene shows
- *   on at least those cells from its first colours. (That only the new
+ *   on at least those cells from its first colors. (That only the new
  *   cells are indexed is held exactly by `tests/progressive-subsample.test.mjs`.)
  *
  * Fixture: a synthetic `.zarr.zip` of 2,400 cells whose CSR `X` holds 600
@@ -58,7 +58,7 @@ function collectBrowserErrors(page) {
   return errors;
 }
 
-/** Record every partial colouring of a gene: how many open cells it was shown on. */
+/** Record every partial coloring of a gene: how many open cells it was shown on. */
 async function recordPartials(page) {
   await page.evaluate(() => {
     const state = window._cellucidState;

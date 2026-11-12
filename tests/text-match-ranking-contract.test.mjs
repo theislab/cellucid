@@ -3,7 +3,7 @@
  * most likely meant first (`app/utils/text-match.js`): the name itself, then
  * names starting with the query, then names containing it, each in list
  * order. The gene search took the first substring match in file order, so
- * `TNF` + Enter coloured by whichever of `C1QTNF1`, `TNFAIP3` or `TNF` came
+ * `TNF` + Enter colored by whichever of `C1QTNF1`, `TNFAIP3` or `TNF` came
  * first in the file.
  */
 import assert from 'node:assert/strict';

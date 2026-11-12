@@ -30,7 +30,7 @@ const COORDINATOR_URL = new URL(
 
 /**
  * Every call of the form `owner.method?.()` or `owner.method()` in one body,
- * plus bare calls, normalised to a comparable name.
+ * plus bare calls, normalized to a comparable name.
  */
 function callsIn(body, shared = null) {
   // One caller delegates to the extracted sequence rather than repeating it,

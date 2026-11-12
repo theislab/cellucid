@@ -23,11 +23,11 @@ import {
 } from '../assets/js/rendering/shaders/centroid-shaders.js';
 
 /**
- * Hidden points must be rejected before rasterisation.
+ * Hidden points must be rejected before rasterization.
  *
  * `gl_PointSize = 0.0` does not do that. `ALIASED_POINT_SIZE_RANGE` starts at
  * 1.0 on the ANGLE/Metal driver this ships against, so a zero-size point is
- * clamped up to one pixel, assembled, rasterised, and only then thrown away —
+ * clamped up to one pixel, assembled, rasterized, and only then thrown away —
  * measured directly: a shipped-shader point with alpha 0 lit 1 pixel with MSAA
  * off and 4 with MSAA on, while the same point moved outside the clip volume
  * lit none.
@@ -35,7 +35,7 @@ import {
  * Two consequences, both observed at ten million points:
  *
  *  - Cost. With everything hidden the GPU frame was 12x more expensive than it
- *    needed to be, and hiding 90 % of the dataset made rendering *no faster*
+ *    needed to be, and hiding 90% of the dataset made rendering *no faster*
  *    than showing all of it.
  *  - Correctness. `HP_FS_ULTRALIGHT` has no `discard`, so in that quality a
  *    hidden point still writes depth and occludes visible points behind it —
@@ -61,7 +61,7 @@ import {
  *
  * CEL-0241 — the last two offenders, and why the rule now has no exceptions.
  *
- * Generalising the sweep found two live shaders it could never have seen:
+ * Generalizing the sweep found two live shaders it could never have seen:
  * `HP_VS_HIGHLIGHT` and `CENTROID_VS`. Both were recorded as exceptions on the
  * ground that their fragment shaders discard, so neither could write depth over
  * a visible point. That reasoning was sound, and it was still the wrong thing
@@ -84,7 +84,7 @@ import {
  *  - The picture does not move. Framebuffer digest with the shipped fragment
  *    shaders is identical with and without the rejection, for both shaders,
  *    against a twin arm that re-measured the first one last.
- *  - Rasterised fragments, counted before any discard, fall by exactly 4096 —
+ *  - Rasterized fragments, counted before any discard, fall by exactly 4096 —
  *    one per hidden vertex, which is `ALIASED_POINT_SIZE_RANGE[0] = 1.0`
  *    clamping the zero-size point back up to a pixel.
  *  - With the fragment discard removed — the state either shader reaches the
@@ -227,7 +227,7 @@ const LITERAL_CLIP_POSITION =
 /**
  * Whether a branch moves the vertex outside the clip volume.
  *
- * The clip test is `-w <= c <= w` and a point sprite is clipped on its centre,
+ * The clip test is `-w <= c <= w` and a point sprite is clipped on its center,
  * so one component failing it by any margin rejects the primitive. `w` must be
  * finite and positive: `w = 0` is a degenerate position, not a rejection.
  */
@@ -296,7 +296,7 @@ const LIVE_POINT_VERTEX_SHADERS = Object.freeze({
  *
  * Their discards are no longer the only thing stopping a hidden point from
  * writing depth — the vertex rejection is — but they are still the second line
- * of defence, and `HP_FS_ULTRALIGHT`'s deliberate lack of one is what makes
+ * of defense, and `HP_FS_ULTRALIGHT`'s deliberate lack of one is what makes
  * `HP_VS_LIGHT`'s rejection a correctness fix rather than only a cost fix.
  */
 const DISCARDING_FRAGMENT_SHADERS = Object.freeze({
@@ -342,7 +342,7 @@ test('every live point vertex shader rejects a hidden vertex from the clip volum
 
 test('the rejected position is genuinely outside the clip volume for w = 1', () => {
   // Clip test is -w <= c <= w. Whatever constant the shaders use must fail it
-  // by a wide margin, since a point sprite is clipped on its centre.
+  // by a wide margin, since a point sprite is clipped on its center.
   for (const [name, source] of Object.entries(LIVE_POINT_VERTEX_SHADERS)) {
     const rejection = clipRejection(source);
     assert.ok(rejection, `${name} has no rejected position constant`);
@@ -383,7 +383,7 @@ test('the fragment shaders that discard still do, and the one that does not is n
 test('the no-depth shaders blend a hidden point to nothing instead of discarding it', () => {
   // HP_FS_LIGHT_NO_DEPTH runs only in passes without depth, where a
   // zero-alpha fragment under the straight-alpha blend leaves the pixel as it
-  // was. Its second line of defence is therefore a zero output under exactly
+  // was. Its second line of defense is therefore a zero output under exactly
   // HP_FS_LIGHT's discard conditions, and it must never discard: the absence
   // of a discard is the whole reason it exists.
   // The disc test is the antialiased rim's coverage: zero exactly where

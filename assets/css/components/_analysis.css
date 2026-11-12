@@ -370,7 +370,7 @@
   margin-top: var(--control-row-gap);
 }
 
-/* The page colour input is the chip button's sibling (a control cannot sit
+/* The page color input is the chip button's sibling (a control cannot sit
    inside a button), laid over the swatch the button draws: chip padding plus
    its border from the chip's edge. */
 .analysis-page-chip > .color-swatch-input {
@@ -392,7 +392,7 @@
   font-style: italic;
 }
 
-/* One page chip: the toggle button and, beside it, the colour input laid
+/* One page chip: the toggle button and, beside it, the color input laid
    over the swatch the button draws. */
 .analysis-page-chip {
   position: relative;
@@ -790,19 +790,19 @@
   flex-shrink: 0;
 }
 
-.multi-select-dropdown-btn {
-  font-size: var(--type-button);
-  line-height: var(--leading-none);
-}
-
 .multi-select-dropdown-btn[aria-expanded="true"] {
   background: var(--color-interactive-primary);
   color: var(--color-text-inverse);
   border-color: var(--color-interactive-primary);
 }
 
+/* A popover in the top layer, placed under its button (`top`/`left` inline). */
 .multi-select-dropdown-panel {
   position: fixed;
+  inset: auto;
+  margin: 0;
+  padding: 0;
+  color: var(--color-text-primary);
   width: 220px;
   max-width: calc(100vw - 40px);
   background: var(--color-surface-elevated);
@@ -983,6 +983,8 @@
 .insights-stats-table td:first-child {
   font-weight: var(--font-weight-regular);
   color: var(--color-text-secondary);
+  /* A long field name wraps inside its cell: the table never runs past the panel. */
+  overflow-wrap: anywhere;
 }
 
 /* Collapsible Page Selector Section (a .disclosure-inline) */
@@ -1299,32 +1301,14 @@
   color: var(--color-accent-text);
 }
 
-/* A text-weight action: Reset, All / None / Invert, Add set, Import. */
-.analysis-link-btn {
-  align-self: flex-start;
-  min-height: var(--control-target-min);
-  padding: 0 var(--space-1);
-  border: none;
-  background: none;
-  font: inherit;
-  font-size: var(--type-hint);
-  color: var(--color-text-secondary);
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  cursor: pointer;
-}
-
-.analysis-link-btn:hover {
-  color: var(--color-text-primary);
-}
-
-.analysis-link-btn:focus-visible {
-  outline: var(--border-width-2) solid var(--color-accent);
-  outline-offset: 1px;
-}
-
+/* A lone quiet action in a column of fields (`.btn-quiet`: Reset to
+   defaults, Swap A and B) keeps its own width: at the column's end or start. */
 .analysis-options-reset {
   align-self: flex-end;
+}
+
+.de-swap {
+  align-self: flex-start;
 }
 
 .analysis-number-input[aria-invalid="true"],
@@ -1644,15 +1628,20 @@ button.analysis-chip {
   min-height: 24px;
   border: none;
   background: none;
-  color: inherit;
+  /* Quiet by the secondary text color, never by opacity (lens-a11y LF-10). */
+  color: var(--color-text-secondary);
   font: inherit;
   cursor: pointer;
-  opacity: var(--opacity-70);
 }
 
 .gene-chip-remove:hover,
 .gene-chip-remove:focus-visible {
-  opacity: 1;
+  color: var(--color-text-primary);
+}
+
+/* On a not-found gene's warning fill, the chip's own warning text. */
+.gene-chip-missing .gene-chip-remove {
+  color: inherit;
 }
 
 .gene-set-tools,
@@ -1741,7 +1730,7 @@ button.analysis-chip {
   color: var(--color-text-secondary);
 }
 
-/* A gene of a result: choosing it colours the cells by it. */
+/* A gene of a result: choosing it colors the cells by it. */
 .analysis-gene-link {
   border: none;
   background: none;

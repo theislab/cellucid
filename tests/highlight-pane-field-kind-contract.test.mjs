@@ -39,7 +39,7 @@ const CONTINUOUS_FIELD = Object.freeze({
 const POINT_COUNT = 4;
 
 // `StyleManager.setVariable` silently ignores anything that is not an
-// HTMLElement, so the page tab strip would render no colours at all without a
+// HTMLElement, so the page tab strip would render no colors at all without a
 // constructor for the stubs to be instances of.
 class HTMLElementStub {}
 globalThis.HTMLElement = HTMLElementStub;
@@ -186,6 +186,8 @@ function createState() {
     getCellIndicesForRange() {
       return [];
     },
+    // What a field's values are in (an annotation group on a gene names them).
+    getLegendModel() { return { values: null }; },
     getFieldForView(viewId) {
       reads.push(viewId);
       return fieldsByView.get(viewId) ?? null;

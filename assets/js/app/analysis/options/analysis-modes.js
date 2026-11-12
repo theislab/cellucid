@@ -6,7 +6,7 @@
  * are derived from this list and the schemas, so a new option needs no
  * action code and a new analysis is one entry here.
  *
- * Pure (no DOM): importable in Node, where the action catalogue is built.
+ * Pure (no DOM): importable in Node, where the action catalog is built.
  *
  * @module analysis/options/analysis-modes
  */

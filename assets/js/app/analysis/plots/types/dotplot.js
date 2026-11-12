@@ -2,18 +2,19 @@
  * Dot plot and matrix plot of genes across cell groups (scanpy
  * `pl.dotplot` / `pl.matrixplot`).
  *
- * Each dot is one gene in one group: its colour the gene's (scaled) mean
+ * Each dot is one gene in one group: its color the gene's (scaled) mean
  * expression there, its area the fraction of the group's cells expressing it.
  * As in scanpy the dot area grows as the fraction to the power 1.5, scaled so
  * the largest fraction (rounded up to the next 10%) fills the largest dot.
- * Genes given as named sets are bracketed and labelled above the plot. The
- * matrix plot is the same table as coloured cells without the sizes.
+ * Genes given as named sets are bracketed and labeled above the plot. The
+ * matrix plot is the same table as colored cells without the sizes.
  *
  * The plot is laid out for the size it is drawn at (`viewport`): the names
- * shrink and turn to fit their rows and columns, and the colour bar and the
+ * shrink and turn to fit their rows and columns, and the color bar and the
  * size legend stand in a column right of the plot, placed in pixels, so no
- * label lands on another at any size (`dotplotMinimumWidth`: the narrowest
- * box that names every gene and group).
+ * label lands on another at any size (`dotplotMinimumWidth` and
+ * `dotplotMinimumHeight`: the narrowest and the shortest box that names every
+ * gene and group).
  *
  * Data (built by `ui/analysis-types/dotplot-ui.js`):
  *   genes        gene names, in plot order
@@ -25,7 +26,7 @@
  *   cellCounts   number[] cells per group
  *   measured     Uint32Array, gene-major: the group's cells with a value of
  *                the gene (a cell a modality did not measure has none)
- *   colorLabel   the colour bar title
+ *   colorLabel   the color bar title
  *   colorMap     'Reds' | 'Viridis' | 'Blues'
  *   maxDotSize   'auto' or a diameter in px
  *   cellSizePx   the room one row/column gets, for the automatic largest dot
@@ -38,8 +39,9 @@
 import { PlotFactory, PlotRegistry, BasePlot, COMMON_HOVER_STYLE } from '../plot-factory.js';
 import { getPlotTheme } from '../../shared/plot-theme.js';
 import { escapeHtml } from '../../../utils/dom-utils.js';
-import { textHeight, textWidth } from '../text-measure.js';
-import { formatCountOf, formatSignificant } from '../../../../utils/format-units.js';
+import { bytesOfHex } from '../../../../utils/hex-color.js';
+import { lineBoxHeight, textHeight, textWidth } from '../text-measure.js';
+import { formatCountOf, formatPercent, formatSignificant } from '../../../../utils/format-units.js';
 
 /**
  * A dot's hover: its gene and group, the group's cells (and how many hold a
@@ -53,7 +55,7 @@ function dotHoverText(data, gene, group, geneName, groupName) {
     ? `${formatCountOf(cells, 'cell')}, ${formatCountOf(measured, 'cell')} with a value`
     : formatCountOf(cells, 'cell');
   return `${geneName} in ${groupName} (${counted})<br>`
-    + `mean ${formatSignificant(data.mean[at])} · ${formatSignificant(data.fraction[at] * 100)}% expressing`;
+    + `mean ${formatSignificant(data.mean[at])} · ${formatPercent(data.fraction[at] * 100, { figures: 3 })} expressing`;
 }
 
 /**
@@ -75,9 +77,10 @@ function colorAt(map, t) {
   const [t0, c0] = map[at - 1];
   const [t1, c1] = map[at];
   const f = t1 > t0 ? (clamped - t0) / (t1 - t0) : 0;
-  const channel = (hex, offset) => Number.parseInt(hex.slice(offset, offset + 2), 16);
-  const mix = offset => Math.round(channel(c0, offset) + (channel(c1, offset) - channel(c0, offset)) * f);
-  return `rgb(${mix(1)}, ${mix(3)}, ${mix(5)})`;
+  const from = bytesOfHex(c0);
+  const to = bytesOfHex(c1);
+  const mix = channel => Math.round(from[channel] + (to[channel] - from[channel]) * f);
+  return `rgb(${mix(0)}, ${mix(1)}, ${mix(2)})`;
 }
 
 /** scanpy's `size_exponent`. */
@@ -89,14 +92,14 @@ const SIZE_LEGEND_TITLE = ['Fraction of cells', 'expressing'];
 /** Font sizes of the legends' titles and of their labels. */
 const LEGEND_TITLE_SIZE = 10;
 const LEGEND_LABEL_SIZE = 9;
-/** The colour bar's thickness, and the room between the legends and what is beside them, in px. */
+/** The color bar's thickness, and the room between the legends and what is beside them, in px. */
 const COLORBAR_THICKNESS = 10;
 const LEGEND_GAP = 8;
-/** The colour bar's length, in px: its share of the plot's height, within these. */
+/** The color bar's length, in px: its share of the plot's height, within these. */
 const COLORBAR_LENGTH = Object.freeze({ share: 0.38, min: 30, max: 140 });
 /** The smallest row of the size legend: one line of its labels, with the label's frame. */
 const SIZE_ROW_MIN = Math.ceil(textHeight(1, LEGEND_LABEL_SIZE)) + 3;
-/** Padding Plotly keeps around the colour bar, in px. */
+/** Padding Plotly keeps around the color bar, in px. */
 const COLORBAR_XPAD = 2;
 /** Gene-set names above the plot: their font, how far above it the first row stands, and the rows' pitch. */
 const SET_NAME_SIZE = 10;
@@ -137,13 +140,24 @@ function largestDot(data) {
   return Math.max(6, Math.min(28, data.cellSizePx * 0.9));
 }
 
-/** A colour bar tick as Plotly writes it, near enough to size its labels: three significant digits. */
+/** A color bar tick as Plotly writes it, near enough to size its labels: three significant digits. */
 function tickText(value) {
   return Number.isFinite(value) ? String(Number(value.toPrecision(3))).replace('-', '−') : '';
 }
 
 /** The smallest names, in px: below this they would not be read. */
 const SMALLEST_NAME_SIZE = 7;
+
+/**
+ * The room one name takes beside the next (a row's, or a column's turned to
+ * run down): the box this engine draws its label in, to a whole pixel, and
+ * one more. Plotly puts each name on a pixel, so names 10.8 px apart are 10
+ * px apart one row and 11 the next: a box of 10.8 overlapped its neighbor
+ * in Firefox (found 2026-11-10).
+ */
+function nameSlot(font) {
+  return Math.ceil(lineBoxHeight(font)) + 1;
+}
 
 function widestOf(labels, font) {
   return Math.max(0, ...labels.map(label => textWidth(label, font)));
@@ -169,7 +183,7 @@ function namesFor(data, viewport, rightMargin, top) {
     const tickfont = { family: theme.fontFamily, size, color: theme.text };
     const left = Math.ceil(widestOf(down, tickfont)) + 14;
     const columns = (viewport.width - left - rightMargin) / Math.max(1, across.length);
-    const line = textHeight(1, size);
+    const line = nameSlot(tickfont);
     // As before, many or long gene names run down; any that do not fit across do too.
     const upright = across.length <= 6 && longest <= 8 && widestOf(across, tickfont) + 4 <= columns;
     const bottom = Math.ceil(upright ? line : widestOf(across, tickfont)) + 10;
@@ -195,12 +209,30 @@ export function dotplotMinimumWidth(data, height) {
   const { across, down } = axisNames(data, data.swap === true);
   const tickfont = { family: theme.fontFamily, size: SMALLEST_NAME_SIZE };
   const right = frameOf(data, { width: Number.MAX_SAFE_INTEGER, height }).margin.r;
-  return Math.ceil(widestOf(down, tickfont) + 14 + across.length * (textHeight(1, SMALLEST_NAME_SIZE) + 1) + right);
+  return Math.ceil(widestOf(down, tickfont) + 14 + across.length * nameSlot(tickfont) + right);
+}
+
+/**
+ * The shortest box, in px, at which the dot plot names every group (or
+ * gene, swapped) running down without one name on another: a row a line of
+ * the smallest names high, below the set names and above the names across,
+ * turned to run down (the most room they take).
+ *
+ * @param {Object} data - The plot data
+ * @param {number} width - The width it will be drawn at
+ */
+export function dotplotMinimumHeight(data, width) {
+  const theme = getPlotTheme();
+  const { across, down } = axisNames(data, data.swap === true);
+  const tickfont = { family: theme.fontFamily, size: SMALLEST_NAME_SIZE };
+  const top = frameOf(data, { width, height: Number.MAX_SAFE_INTEGER }).margin.t;
+  const bottom = Math.ceil(widestOf(across, tickfont)) + 10;
+  return Math.ceil(top + bottom + down.length * nameSlot(tickfont)) + 1;
 }
 
 /**
  * The plot's frame in px at the size it is drawn at: the margins, the
- * names, and the column right of the plot where the colour bar and the size
+ * names, and the column right of the plot where the color bar and the size
  * legend stand one under the other. Everything beside the plot is placed in
  * px from here, so no legend lands on a label, or on the other legend, at
  * any size.
@@ -288,7 +320,7 @@ function frameOf(data, viewport) {
     }
     const largestShown = Math.min(largestDot(data), row - 3);
     const fractions = LEGEND_FRACTIONS.map(step => step * dotMax);
-    const labels = fractions.map(value => `${Math.round(value * 100)}%`);
+    const labels = fractions.map(value => formatPercent(value * 100));
     sizeLegend = {
       top: barLength + LEGEND_GAP,
       titleHeight,
@@ -406,7 +438,7 @@ const dotplotDefinition = {
   // Every gene and group is named; the labels shrink to fit instead.
   fitTickLabels: false,
 
-  // Colour map and dot size are the analysis's own options (Layout), carried
+  // Color map and dot size are the analysis's own options (Layout), carried
   // in the data, so the expanded view has no second copy of them.
   defaultOptions: {},
   optionSchema: {},
@@ -421,7 +453,7 @@ const dotplotDefinition = {
     const escapedGenes = data.genes.map(gene => escapeHtml(gene));
     const escapedGroups = data.groups.map(group => escapeHtml(group));
     const colorscale = DOTPLOT_COLOR_MAPS[data.colorMap];
-    // The colour bar heads the column right of the plot (`frameOf`).
+    // The color bar heads the column right of the plot (`frameOf`).
     const { colorbar: bar } = frameOf(data, viewport);
     const colorbar = {
       thicknessmode: 'pixels',
@@ -446,7 +478,7 @@ const dotplotDefinition = {
     if (data.layout === 'violin') return violinTraces(data, colorscale, colorbar, escapedGenes, escapedGroups);
 
     if (matrix) {
-      // Rows down, columns across; the colour of each cell.
+      // Rows down, columns across; the color of each cell.
       const z = [];
       const text = [];
       const downCount = swap ? geneCount : groupCount;
@@ -468,8 +500,10 @@ const dotplotDefinition = {
       return [{
         type: 'heatmap',
         z,
-        x: across.map(label => escapeHtml(label)),
-        y: down.map(label => escapeHtml(label)),
+        // One position per entry (a gene in two sets is a column in each):
+        // a name-keyed category axis would fold a repeated name into one.
+        x: across.map((_, index) => index),
+        y: down.map((_, index) => index),
         text,
         hovertemplate: '%{text}<extra></extra>',
         hoverlabel: COMMON_HOVER_STYLE,
@@ -490,8 +524,8 @@ const dotplotDefinition = {
     for (let gene = 0; gene < geneCount; gene++) {
       for (let group = 0; group < groupCount; group++) {
         const at = gene * groupCount + group;
-        x.push(swap ? escapedGroups[group] : escapedGenes[gene]);
-        y.push(swap ? escapedGenes[gene] : escapedGroups[group]);
+        x.push(swap ? group : gene);
+        y.push(swap ? gene : group);
         size.push(dotDiameter(data.fraction[at], dotMax, largest));
         color.push(Number.isFinite(data.color[at]) ? data.color[at] : null);
         text.push(dotHoverText(data, gene, group, escapedGenes[gene], escapedGroups[group]));
@@ -522,29 +556,20 @@ const dotplotDefinition = {
   buildLayout(data, _options, _layoutEngine, viewport) {
     const theme = getPlotTheme();
     const swap = data.swap === true;
-    const matrix = data.layout === 'matrix';
-    const dot = data.layout === 'dot';
     const layout = BasePlot.createLayout({ showLegend: false });
     const { across, down } = axisNames(data, swap);
     const frame = frameOf(data, viewport);
     const { tickfont } = frame;
-    // A violin is drawn at numeric positions, so its axes are numeric with
-    // the names as ticks; dots and cells sit on category axes.
-    // Plotly thins a crowded category axis by itself; naming every category
-    // as a tick keeps every name.
-    const ticks = labels => (dot || matrix
-      ? {
-        type: 'category',
-        tickmode: 'array',
-        tickvals: labels.map(label => escapeHtml(label)),
-        ticktext: labels.map(label => escapeHtml(label))
-      }
-      : {
-        type: 'linear',
-        tickmode: 'array',
-        tickvals: labels.map((_, index) => index),
-        ticktext: labels.map(label => escapeHtml(label))
-      });
+    // Every layout (dots, cells, violins) is drawn at numeric positions, one
+    // per entry, with the names as ticks: a category axis keyed by name would
+    // fold a gene that is in two sets into one column, and Plotly thins a
+    // crowded axis by itself where every name here is a tick.
+    const ticks = labels => ({
+      type: 'linear',
+      tickmode: 'array',
+      tickvals: labels.map((_, index) => index),
+      ticktext: labels.map(label => escapeHtml(label))
+    });
     // The margins are the labels' own (`frameOf`): the legends right of the
     // plot are placed from them.
     layout.xaxis = {
@@ -569,7 +594,7 @@ const dotplotDefinition = {
     };
     layout.annotations = [];
     const shapes = [];
-    // The size legend, under the colour bar: its title, then one dot per
+    // The size legend, under the color bar: its title, then one dot per
     // fraction with its label, each row in px from the plot's top.
     const legend = frame.sizeLegend;
     if (legend !== null) {
@@ -644,7 +669,7 @@ const dotplotDefinition = {
     for (const [index, label] of down.entries()) {
       layout.annotations.push({
         xref: 'paper', x: 0, xanchor: 'right', xshift: -6,
-        yref: 'y', y: dot || matrix ? escapeHtml(label) : index, yanchor: 'middle',
+        yref: 'y', y: index, yanchor: 'middle',
         text: escapeHtml(label), showarrow: false, font: tickfont
       });
     }

@@ -520,13 +520,13 @@ function requireExactColors(colors, pointCount) {
 }
 
 /**
- * The colours of the lower layers (`cellLayerColors`): `{zero, unread}`,
+ * The colors of the lower layers (`cellLayerColors`): `{zero, unread}`,
  * three bytes each.
  */
 export function requireSmokeLayerColors(layerColors) {
   const isBytes = rgb => Array.isArray(rgb) && rgb.length === 3 && rgb.every(channel => Number.isInteger(channel) && channel >= 0 && channel <= 255);
   if (layerColors === null || typeof layerColors !== 'object' || !isBytes(layerColors.zero) || !isBytes(layerColors.unread)) {
-    throw new TypeError('GPU smoke density layer colours must be {zero, unread}, three bytes each.');
+    throw new TypeError('GPU smoke density layer colors must be {zero, unread}, three bytes each.');
   }
   return layerColors;
 }
@@ -725,11 +725,11 @@ function releaseTrackedResource(gl, resources, resource, deleteMethod, label) {
 /**
  * Builds one native RGBA8 density volume without synchronizing pixels through
  * JavaScript. All intermediate work stays on the GPU:
- * R32F density atlas + RGBA32F colour atlas -> max reduction -> normalized
+ * R32F density atlas + RGBA32F color atlas -> max reduction -> normalized
  * RGBA8 atlas -> 3D slice copies. Red is the normalized density; green, blue
- * and alpha are the mean display colour of the cells there, premultiplied by
+ * and alpha are the mean display color of the cells there, premultiplied by
  * that density (see density-shaders.js), so the cloud carries the active
- * field's colours.
+ * field's colors.
  *
  * The caller must provide a clean WebGL error state. Every mutable binding and
  * capability touched by this transaction is restored on success and failure;
@@ -805,7 +805,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     );
   }
   const colors = requireExactColors(options.colors, pointCount);
-  // The colours of the lower layers over the view's background
+  // The colors of the lower layers over the view's background
   // (`rendering/read-cell-layer.js` `cellLayerColors`); a white view's without.
   const layerColors = requireSmokeLayerColors(
     Object.hasOwn(options, 'layerColors') ? options.layerColors : cellLayerColors([1, 1, 1])
@@ -899,7 +899,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     transientFramebuffers.push(framebuffer);
     const colorFramebuffer = gl.createFramebuffer();
     if (!colorFramebuffer) {
-      throw new Error('GPU smoke density colour framebuffer allocation failed.');
+      throw new Error('GPU smoke density color framebuffer allocation failed.');
     }
     transientFramebuffers.push(colorFramebuffer);
 
@@ -930,7 +930,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       gl.FLOAT
     );
     transientTextures.push(colorAtlas);
-    attachColorTarget(gl, colorFramebuffer, colorAtlas, 'colour accumulation');
+    attachColorTarget(gl, colorFramebuffer, colorAtlas, 'color accumulation');
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     const positionBuffer = gl.createBuffer();
@@ -986,10 +986,10 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
     );
     gl.vertexAttribDivisor(resources.splatLocs.a_cornerIndex, 0);
 
-    // Colour pass: one point vertex per cell.
+    // Color pass: one point vertex per cell.
     const colorVertexArray = gl.createVertexArray();
     if (!colorVertexArray) {
-      throw new Error('GPU smoke density colour VAO allocation failed.');
+      throw new Error('GPU smoke density color VAO allocation failed.');
     }
     transientVertexArrays.push(colorVertexArray);
     gl.bindVertexArray(colorVertexArray);
@@ -1239,7 +1239,7 @@ export function buildDensityTextureGPU(gl, positions, options = {}) {
       transientTextures,
       colorAtlas,
       'deleteTexture',
-      'completed colour atlas'
+      'completed color atlas'
     );
     releaseTrackedResource(
       gl,
@@ -1456,7 +1456,7 @@ export function createDensityTexture3D(gl, volumeDesc) {
   const { data: volume, gridSize } = requireSmokeVolume(volumeDesc, 'Smoke density texture');
 
   // Convert float [0,1] to the GPU build's RGBA8 layout: density in red and
-  // white, density-premultiplied, in the colour channels.
+  // white, density-premultiplied, in the color channels.
   const texData = new Uint8Array(gridSize * gridSize * gridSize * 4);
   for (let i = 0; i < volume.length; i++) {
     const value = volume[i];
@@ -1617,7 +1617,7 @@ export function smokeOccupancyGridSize(gridSize) {
  * Derives the two volumes the ray march reads beside the density, once per
  * published density volume and light direction:
  *
- * - lighting (RG16F, half the grid): the density integrated towards the key
+ * - lighting (RG16F, half the grid): the density integrated toward the key
  *   light and over the sky (LIGHT_VOLUME_FS). It replaces the shadow ray the
  *   march used to cast from every sample of every frame: one filtered fetch
  *   instead of a loop, and the shadow now crosses the whole cloud rather than

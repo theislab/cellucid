@@ -59,9 +59,11 @@ state is an `input`, a `select` or a section.
 ## How a restored control reaches the thing it controls
 
 There is no registry mapping an id to a setter. A control is restored by writing its DOM value and
-then **dispatching the event its owner listens for** (`change` for checkboxes and selects, `input`
-for the rest). The owner's own listener publishes the value to the viewer, to `DataState`, or to
-wherever that control leads.
+then **dispatching the event its owner listens for** (`change` for checkboxes and selects; `input`
+then `change` for the rest, as a person's drag ends with its release: an owner may follow `input`
+on the next frame and apply only on `change`, as the vector field's Particle density does). The
+owner's own listener publishes the value to the viewer, to `DataState`, or to wherever that
+control leads.
 
 - **The owner's listener must already be attached when a restore runs.** A dispatch with no
   listener does nothing, silently. Every control in the inventory is wired by `initUI` before the
@@ -73,7 +75,7 @@ wherever that control leads.
   then puts back what was shown). Silence is never an outcome.
 
 `restoreUIControls` restores in a fixed order (accordions, checkboxes, selects, ranges, numbers,
-colours, texts). `deferControlIds` moves named controls to the end and returns the
+colors, texts). `deferControlIds` moves named controls to the end and returns the
 function that applies them; `withholdControlIds` names controls validated and never applied (Smoke
 on a device that cannot draw it: the mode is reported instead, `state/domains/settings.js`).
 
@@ -82,7 +84,9 @@ follow the embedding the active view shows (the vector-field block, where a fiel
 embedding): their records are checked for shape with every other control, but their values are
 checked and applied only by the returned function, after the embeddings and the active view are
 back. The `views` domain is restored before `settings` (domain order), so a settings restore
-applies them in the same call. `embeddingDependentControlIds()` lists them.
+applies them in the same call. `embeddingDependentControlIds()` lists them. The returned function
+restores selects before checkboxes (the choice, then the switch that shows it): `Show overlay`
+switched on before `Vector field` began showing the field the page had (R9V-1).
 
 A slider marked `data-session-preference` saves a **preference its owner keeps**, not the value it
 shows. `#connectivity-limit` (Max edges) is the one in the interface today: its range follows the
@@ -100,7 +104,8 @@ restore, as for every other control.
   `ui/core/antialias-preference.js`). A restore that set it made a shared state the last writer of
   a preference that describes the machine.
 - Any control whose id was minted on the page by `createDomId` (`ui/components/dom-id.js`,
-  `isGeneratedDomId`): such an id names nothing on another page; what the control shows is held by
+  `isGeneratedDomId`: the id holds `--`, the separator only a minted id, or one made from it, holds),
+  never a hand-written id: such an id names nothing on another page; what the control shows is held by
   the state that renders it (the continuous legend's range sliders: the `filters` and `colors`
   domains).
 - Any subtree marked `data-state-serializer-skip="true"`: the Figure export root (its settings are

@@ -6,13 +6,13 @@
  *
  * Filters act on the view in focus, as the sidebar does. A categorical
  * filter may be on any categorical column, shown or not; a range or outlier
- * filter is set on the field the view is coloured by, as the legend sets it.
+ * filter is set on the field the view is colored by, as the legend sets it.
  *
  * @module app/actions/definitions/filters
  */
 
 import { defineAction } from '../catalog.js';
-import { formatCountOf } from '../../../utils/format-units.js';
+import { formatBound, formatCountOf, formatPercent } from '../../../utils/format-units.js';
 import { PLAIN_QUOTE } from '../targets/names.js';
 import {
   CATEGORY_FIELD, CATEGORY_LABEL, FIELD, SHOWN_FIELD_READS, VISIBLE_CELLS_READS,
@@ -28,7 +28,7 @@ const KIND_WORDS = Object.freeze({
 });
 
 /**
- * A range or outlier filter of the field the view in focus is coloured by:
+ * A range or outlier filter of the field the view in focus is colored by:
  * kept within the open cells' values (an outlier filter's quantiles are of
  * the open cells).
  */
@@ -119,12 +119,12 @@ export const filterActions = Object.freeze([
   defineAction({
     type: 'filter.continuous.range',
     title: 'Set a visible range',
-    summary: 'Show only the cells whose value of a continuous field or gene lies in [min, max]; the colours follow when they are rescaled to the range.',
+    summary: 'Show only the cells whose value of a continuous field or gene lies in [min, max]; the colors follow when they are rescaled to the range.',
     group: 'Filters',
     params: {
       type: 'object', additionalProperties: false, required: ['field', 'min', 'max'],
       properties: {
-        field: { ...FILTERED_FIELD, description: 'The continuous field or gene the view in focus is coloured by, by name.' },
+        field: { ...FILTERED_FIELD, description: 'The continuous field or gene the view in focus is colored by, by name.' },
         min: { type: 'number' },
         max: { type: 'number' },
       },
@@ -135,7 +135,7 @@ export const filterActions = Object.freeze([
     effect: 'state',
     // A slider drag is one step.
     coalesce: p => fieldCoalesceKey(p.field),
-    describe: (p, outcome, quote = PLAIN_QUOTE) => `Showed ${fieldWords(p.field, quote)} from ${p.min} to ${p.max}`,
+    describe: (p, outcome, quote = PLAIN_QUOTE) => `Showed ${fieldWords(p.field, quote)} from ${formatBound(p.min)} to ${formatBound(p.max)}`,
     code: p => `visible_range(${fieldArgument(p.field)}, ${p.min}, ${p.max})`,
   }),
   defineAction({
@@ -145,7 +145,7 @@ export const filterActions = Object.freeze([
     group: 'Filters',
     params: {
       type: 'object', additionalProperties: false, required: ['field'],
-      properties: { field: { ...FILTERED_FIELD, description: 'The continuous field or gene the view in focus is coloured by, by name.' } },
+      properties: { field: { ...FILTERED_FIELD, description: 'The continuous field or gene the view in focus is colored by, by name.' } },
     },
     touches: ['filters', 'colors'],
     reads: [],
@@ -162,7 +162,7 @@ export const filterActions = Object.freeze([
     params: {
       type: 'object', additionalProperties: false, required: ['field', 'threshold'],
       properties: {
-        field: { ...CATEGORY_FIELD, description: 'The categorical column the view in focus is coloured by, by name.' },
+        field: { ...CATEGORY_FIELD, description: 'The categorical column the view in focus is colored by, by name.' },
         threshold: { type: 'number', minimum: 0, maximum: 1, description: 'The quantile above which cells are hidden; 1 hides none.' },
       },
     },
@@ -173,7 +173,7 @@ export const filterActions = Object.freeze([
     coalesce: p => fieldCoalesceKey(p.field),
     describe: (p, outcome, quote = PLAIN_QUOTE) => (p.threshold >= 0.9999
       ? `Showed every outlier of ${quote.bare(p.field.key)}`
-      : `Hid outliers of ${quote.bare(p.field.key)} above ${Math.round(p.threshold * 100)} %`),
+      : `Hid outliers of ${quote.bare(p.field.key)} above ${formatPercent(p.threshold * 100)}`),
     code: p => `outlier_filter(${JSON.stringify(p.field.key)}, ${p.threshold})`,
   }),
   defineAction({

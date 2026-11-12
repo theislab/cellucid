@@ -19,7 +19,7 @@
  * half the minimum cell, and turns from a minor into a major mark over one
  * further ratio. Because the weight depends only on spacing, a pixel can
  * evaluate the three families around its own footprint and still agree with
- * its neighbours, so the pattern crossfades with zoom and never pops. Rules and
+ * its neighbors, so the pattern crossfades with zoom and never pops. Rules and
  * dots have a constant width in CSS pixels, so they read the same on a DPR 1
  * and a DPR 3 screen, and they are anti-aliased against the pixel footprint.
  *
@@ -39,7 +39,7 @@
 export const STUDIO_LATTICE = Object.freeze({
   /** Spacing of family 0; integer coordinates are always on the lattice. */
   base: 1.0,
-  /** Spacing ratio between neighbouring families (major every fifth mark). */
+  /** Spacing ratio between neighboring families (major every fifth mark). */
   ratio: 5,
   /** A family starts to fade in at this fraction of its surface's minimum cell. */
   fadeInFraction: 0.6,
@@ -77,7 +77,7 @@ export const STUDIO_MARKS = Object.freeze({
 export const STUDIO_STAGE = Object.freeze({
   /** Gap between the lowest cell and the floor, in normalized data units. */
   floorClearance: 0.12,
-  /** The floor is at full strength within this radius of the data centre. */
+  /** The floor is at full strength within this radius of the data center. */
   innerRadius: 2.6,
   /** ...and has faded out completely at this radius. */
   outerRadius: 8.5,
@@ -91,7 +91,7 @@ export const STUDIO_STAGE = Object.freeze({
   clearanceFade: 0.06,
   /**
    * The pool under the data reaches this many of the data's half-extents
-   * from its centre...
+   * from its center...
    */
   poolReach: 1.8,
   /** ...and is never narrower than this fraction of its wider half-extent. */
@@ -105,14 +105,14 @@ export const STUDIO_STAGE = Object.freeze({
 export const STUDIO_SURFACE_TRANSITION_SECONDS = 0.3;
 
 /**
- * Exact 8-bit colours, so the page colour in `assets/css` and the WebGL
- * clear colour are the same value with no rounding seam between them.
+ * Exact 8-bit colors, so the page color in `assets/css` and the WebGL
+ * clear color are the same value with no rounding seam between them.
  *
- * - `surface` is the clear colour, the CSS page colour and the backdrop's
- *   colour at every pane edge.
- * - `glow` is the backdrop's colour at the centre of the presented area: a
+ * - `surface` is the clear color, the CSS page color and the backdrop's
+ *   color at every pane edge.
+ * - `glow` is the backdrop's color at the center of the presented area: a
  *   soft, dithered rise in lightness that gives the stage depth.
- * - `ink` is the colour marks are drawn in, at the per-class alphas.
+ * - `ink` is the color marks are drawn in, at the per-class alphas.
  * - `poolAlpha` is the strength of the soft pool of ink on the floor under
  *   the data: a contact shadow on the light stage, a pool of light on the
  *   dark one.
@@ -152,7 +152,7 @@ export const STUDIO_PALETTES = Object.freeze({
 });
 
 /**
- * An 8-bit palette colour as the 0..1 triple WebGL takes.
+ * An 8-bit palette color as the 0..1 triple WebGL takes.
  *
  * @param {readonly number[]} rgb8
  * @returns {number[]}
@@ -214,7 +214,7 @@ export function studioFamilyLevel(surface, footprint, pixelRatio) {
 }
 
 /**
- * The strength the shader gives a mark at its centre, where every family it
+ * The strength the shader gives a mark at its center, where every family it
  * belongs to covers it fully: the strongest of the families the fragment
  * evaluates (`level` to `level + 2`) that contain the mark, which are those
  * up to `coarsestLevel`. Mirrors the family loop of `studioLatticeMarks`
@@ -257,7 +257,7 @@ export function studioMarkStrength({
 
 /**
  * The falloff of the glow and of the pool at a radius normalized to their
- * ellipse: 1 at the centre, 0 on and outside it. Mirrors `studioFalloff` in
+ * ellipse: 1 at the center, 0 on and outside it. Mirrors `studioFalloff` in
  * `STUDIO_FS_SOURCE`.
  *
  * @param {number} radius
@@ -266,7 +266,7 @@ export function studioFalloff(radius) {
   return 1 - smoothstep(0, 1, radius);
 }
 
-/** The fade with a plane's distance from the data centre (floor only). */
+/** The fade with a plane's distance from the data center (floor only). */
 export function studioStageFade(radius) {
   return 1 - smoothstep(STUDIO_STAGE.innerRadius, STUDIO_STAGE.outerRadius, radius);
 }
@@ -316,7 +316,7 @@ export function resolveStudioSurfaceWeights(planarity, out) {
  * - `floorY`: the floor, `floorClearance` under the lowest cell.
  * - `flat`: whether the embedding is 1-D or 2-D. Its dot surface is then the
  *   data plane itself (z = 0), so the dots stay registered with the cells.
- * - `stageX`, `centerY`, `stageZ`: the data centre (`stageX`, `stageZ` is
+ * - `stageX`, `centerY`, `stageZ`: the data center (`stageX`, `stageZ` is
  *   also the floor point under it).
  * - `extentX`, `extentY`, `extentZ`: the data's half-extents.
  *
@@ -404,10 +404,10 @@ const _poolAxis = [0, 0];
  *
  * The pool is the floor ellipse under the data's footprint, `poolReach`
  * half-extents wide, seen through the pane's camera. It is taken as the
- * affine image of the unit circle at its centre — exactly what an SVG or
+ * affine image of the unit circle at its center — exactly what an SVG or
  * Canvas radial gradient can express — so the screen and an exported figure
  * draw the same ellipse. `gate` fades it with the camera's height above the
- * floor and with how obliquely the camera sees the stage centre; it is 0
+ * floor and with how obliquely the camera sees the stage center; it is 0
  * when the pool is not drawn.
  *
  * Writes into `out` (no allocation): `gate`, `centerX`, `centerY`, and the

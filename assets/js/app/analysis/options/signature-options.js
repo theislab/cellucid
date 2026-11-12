@@ -4,6 +4,15 @@
  * Context (`GeneSignatureUI._getOptionsContext`):
  *   getGenes()       the dataset's gene names (matching and autocomplete)
  *   getMarkerSets()  one set per group of the last marker genes result, or null
+ *   categoricalFields  [{key}] with two or more categories ("Group by")
+ *   groupsFor(entry, record)  the categories of `record.groupBy`
+ *   pages            [{id, name}] (the "Cells" choice)
+ *
+ * The cells scored: the highlight pages chosen above the options (Group by
+ * empty), or each category of a field (Group by a field: its categories in
+ * the chosen cells, "Groups to score" of them), as Marker genes and the dot
+ * plot group, so scoring a program per cell type takes one run, not a
+ * highlight page per type.
  *
  * Display options (re-drawn without scoring again): plotType, rescale,
  * layout.
@@ -11,13 +20,15 @@
  * @module analysis/options/signature-options
  */
 
-import { defineOptions } from './option-schema.js';
+import { CELL_SCOPE_MEANS, defineOptions } from './option-schema.js';
+import { cellScopeChoices } from './marker-options.js';
 
 export const SIGNATURE_METHODS = Object.freeze(['mean', 'median', 'mean_z', 'module', 'ucell']);
 
 export const SIGNATURE_OPTIONS = defineOptions({
   id: 'signature',
   groups: [
+    { id: 'cells', title: 'Groups and cells', tip: 'signature-group-by' },
     { id: 'scoring', title: 'Scoring', tip: 'signature-methods' },
     { id: 'display', title: 'Display', tip: 'analysis-signature' },
   ],
@@ -28,7 +39,31 @@ export const SIGNATURE_OPTIONS = defineOptions({
       defaultText: 'One empty set',
     },
     {
+      key: 'groupBy', kind: 'select', label: 'Group by', tip: 'signature-group-by', group: 'essentials',
+      means: 'empty: the highlight pages chosen; or a categorical field: each of its categories scored and compared, no highlight page needed',
+      default: '',
+      defaultText: 'Pages (the highlight pages chosen)',
+      choices: context => [
+        { value: '', label: 'Pages' },
+        ...(context?.categoricalFields ?? []).map(field => ({ value: field.key, label: field.key })),
+      ],
+    },
+    {
+      key: 'groups', kind: 'groups', label: 'Groups to score', tip: 'signature-group-by', group: 'cells',
+      default: { mode: 'all' },
+      when: record => record.groupBy !== '',
+    },
+    {
+      key: 'cells', kind: 'select', label: 'Cells', tip: 'signature-group-by', group: 'cells',
+      means: CELL_SCOPE_MEANS,
+      default: 'all',
+      defaultText: 'All cells',
+      choices: cellScopeChoices,
+      when: record => record.groupBy !== '',
+    },
+    {
       key: 'method', kind: 'select', label: 'Method', tip: 'signature-methods', group: 'scoring',
+      means: 'mean, median or mean_z (each gene z-scored) of the set\'s genes; module: scanpy\'s score_genes (minus binned control genes); ucell: rank-based',
       default: 'mean',
       choices: [
         { value: 'mean', label: 'Mean' },

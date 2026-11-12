@@ -144,7 +144,7 @@ test('a large user field is laid in whole, with centroids for the one resident l
     userFields: [{
       id: 'user_cat_1', source: 'obs', kind: 'category', key: 'restored_groups', deleted: false, purged: false,
       createdAt: 1, sourceField: null, operation: null, categories, codes: { cells: null, values: codes },
-      sourcePages: [], overlapStrategy: 'first', overlapLabel: null, intersectionLabels: null, uncoveredLabel: null,
+      sourcePages: [], overlapStrategy: 'first', overlapLabel: null, intersectionLabels: null, uncoveredLabel: null, palette: null,
     }],
   };
   const { state, viewer } = stateWithResidentLayout(pointCount);

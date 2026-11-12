@@ -30,10 +30,10 @@
  *   completed, until the tab closes (`holdTranscodedStore`). A held
  *   directory is never removed.
  * - A directory nobody holds is removed when it is incomplete (a closed or
- *   crashed tab's pass, a cancelled one), kept for one tab only, or written
+ *   crashed tab's pass, a canceled one), kept for one tab only, or written
  *   by another store revision: when the app starts
  *   (`sweepAbandonedTranscodes`), before a new pass begins, and at once
- *   after a cancelled pass (`removeTranscodedStore`, which waits for the
+ *   after a canceled pass (`removeTranscodedStore`, which waits for the
  *   stopped worker's lock to go).
  * - Room is made under the browser's real quota
  *   (`navigator.storage.estimate()`, read when a pass starts): when a
@@ -78,12 +78,14 @@ import {
   CHECK_PAGE_BYTES, PageChecksums, checkedRead, checksumBytes, checksumOf, checksumsFit, checksumsFromBytes, pageChecksumsOf,
 } from '../../../formats/io/page-checks.js';
 import { formatBytes, formatCountOf } from '../../../utils/format-units.js';
-import { createOpaqueId } from '../../../app/utils/opaque-id.js';
+import { createOpaqueId } from '../../../utils/opaque-id.js';
+import { sha256Hex } from '../../../utils/sha256.js';
 import { linkIdentity } from '../../sources/link-credentials.js';
 import { addressOf, fileIdentityOf, persistsAcrossVisits } from '../../sources/identity.js';
 import { ARRAY_PIECE_BYTES } from '../../../utils/large-arrays.js';
 import { allocateTypedArray } from '../../sparse-column-index.js';
 import { KeptBytesMissing, readWhole, requireHeld, writeAt, writeWhole } from '../../../formats/io/sync-access.js';
+import { createListenerSet } from '../../../utils/listener-set.js';
 
 export const TRANSCODED_DIRECTORY = 'cellucid-transcoded';
 
@@ -122,7 +124,7 @@ const JOURNAL = 'j.bin';
  * revision is removed, never read: raise it whenever a transcoder's output
  * changes (`tests/transcode-cache-contract.test.mjs` fails until it is).
  */
-export const KEPT_STORE_REVISION = 13;
+export const KEPT_STORE_REVISION = 16;
 
 /**
  * The revision of what a gene index kept in this browser holds
@@ -133,7 +135,7 @@ export const KEPT_STORE_REVISION = 13;
  * chunk decoders (`tests/kept-column-index-contract.test.mjs` pins the
  * digest of that code, comments aside, and fails until it is raised).
  */
-export const KEPT_INDEX_REVISION = 9;
+export const KEPT_INDEX_REVISION = 11;
 
 /**
  * The revision of the raw bytes of remote files kept in this browser: a
@@ -206,9 +208,7 @@ export function cacheKey(identity) {
 
 /** Hex SHA-256 of a source's cache key: the manifest names it whole, a directory by its start. */
 export async function identityDigest(identity) {
-  const bytes = new TextEncoder().encode(canonicalJson(cacheKey(identity)));
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-  return [...digest].map(byte => byte.toString(16).padStart(2, '0')).join('');
+  return sha256Hex(new TextEncoder().encode(canonicalJson(cacheKey(identity))));
 }
 
 /**
@@ -1039,7 +1039,7 @@ async function forgetKept(identity, environment, { current }) {
 }
 
 /** Whoever shows what is kept hears when the page starts holding a newly kept directory (`onKeptStoresChange`). */
-const keptStoreListeners = new Set();
+const keptStoreListeners = createListenerSet('what is kept in this browser');
 
 /**
  * Hear when what is kept changed in this page: a directory kept since (a
@@ -1051,19 +1051,12 @@ const keptStoreListeners = new Set();
  * @returns {() => void}
  */
 export function onKeptStoresChange(listener) {
-  keptStoreListeners.add(listener);
-  return () => keptStoreListeners.delete(listener);
+  return keptStoreListeners.add(listener);
 }
 
 /** Tell whoever shows what is kept that it changed (`onKeptStoresChange`). */
 function announceKeptStores() {
-  for (const listener of keptStoreListeners) {
-    try {
-      listener();
-    } catch {
-      // A listener's failure is its own.
-    }
-  }
+  keptStoreListeners.notify();
 }
 
 /** The directories this page holds for the tab's life, each with what lets it go. */

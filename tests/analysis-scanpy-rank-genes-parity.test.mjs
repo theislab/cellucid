@@ -19,13 +19,13 @@
  * Tolerances, each for a stated reason:
  * - scanpy stores `scores` and `logfoldchanges` as float32 and the kernel
  *   keeps them in Float32Array lanes: equal within one float32 ulp (the two
- *   float64 values may round to neighbouring float32s);
+ *   float64 values may round to neighboring float32s);
  * - the fractions are float32 lanes in percent: within one float32 ulp;
  * - p-values: both sides evaluate the normal / t tail in float64 with
  *   different special-function code (SciPy cephes, our incomplete gamma and
  *   beta): rank tests within relative 1e-12 (measured: 2e-14). scanpy's
  *   t-test variance is `E[x²] − E[x]²`, which cancels, where ours is the
- *   centred sum of squares: t-test p-values within relative 1e-10
+ *   centered sum of squares: t-test p-values within relative 1e-10
  *   (measured: 2.3e-11, on a gene whose variance is small beside its mean);
  * - every input value is a multiple of 1/4, so sums, means and rank sums are
  *   exact on both sides; the U statistic is compared exactly.

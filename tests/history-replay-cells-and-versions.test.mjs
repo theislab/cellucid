@@ -35,9 +35,9 @@ const DEFINITIONS = [
     touches: ['highlights'], reads: [], effect: 'state', describe: p => `Marked ${p.cells.length} cells`, code: () => 'mark()',
   }),
   defineAction({
-    type: 'color.by', title: 'Colour by', summary: 'Colour by a field.', group: 'Colours',
+    type: 'color.by', title: 'Color by', summary: 'Color by a field.', group: 'Colors',
     params: { type: 'object', additionalProperties: false, required: ['field'], properties: { field: { type: 'string' } } },
-    touches: ['colors'], reads: [], effect: 'view', describe: p => `Coloured by ${p.field}`, code: () => 'color_by()',
+    touches: ['colors'], reads: [], effect: 'view', describe: p => `Colored by ${p.field}`, code: () => 'color_by()',
   }),
   defineAction({
     type: 'column.build', title: 'Build a column', summary: 'A column from the outcome of each category.', group: 'Fields',
@@ -87,11 +87,11 @@ test('a step naming cells applies only on the dataset it was recorded on, whatev
   await a.dispatcher.dispatch('cells.mark', { n_obs: 4, cells: [0, 2] });
   const plan = replayPlanOf(a.history.snapshot());
 
-  // Another dataset of as many cells: the colour applies, the cells do not.
+  // Another dataset of as many cells: the color applies, the cells do not.
   const b = page({ id: 'dataset-b', name: 'Dataset B' });
   await b.history.startTracker({ name: 'Mine' });
   const other = await b.history.replay(plan);
-  assert.deepEqual(other.report.map(entry => [entry.label, entry.outcome]), [['Coloured by leiden', 'applied'], ['Marked 2 cells', 'unmatched']]);
+  assert.deepEqual(other.report.map(entry => [entry.label, entry.outcome]), [['Colored by leiden', 'applied'], ['Marked 2 cells', 'unmatched']]);
   assert.equal(other.report[1].reason, 'It names cells of "Dataset A" by their positions, which are not this dataset\'s cells, so it is not applied here.');
   assert.deepEqual(b.calls, ['color.by'], 'the step naming cells is never dispatched');
   assert.deepEqual(b.state.highlights, { cells: [] });
@@ -107,10 +107,10 @@ test('a step naming cells applies only on the dataset it was recorded on, whatev
 test('a branch applied again on its own history names its own cells, even for a dataset with no identity', async () => {
   const a = page({ id: null, name: 'Local file' }, { withHistoryActions: true });
   await a.history.startTracker({ name: 'Cells' });
-  const colour = (await a.dispatcher.dispatch('color.by', { field: 'leiden' })).step;
+  const color = (await a.dispatcher.dispatch('color.by', { field: 'leiden' })).step;
   await a.dispatcher.dispatch('cells.mark', { n_obs: 4, cells: [1] });
-  // Without the colour: the later step, naming cells, is applied again on its own dataset.
-  const { outcome } = await a.dispatcher.dispatch('history.branch.without', { step: colour.id });
+  // Without the color: the later step, naming cells, is applied again on its own dataset.
+  const { outcome } = await a.dispatcher.dispatch('history.branch.without', { step: color.id });
   assert.deepEqual(outcome.report.map(entry => entry.outcome), ['applied']);
   assert.deepEqual(a.state.highlights, { cells: [1] });
   const { outcome: verified } = await a.dispatcher.dispatch('history.verify', { branch: 'Main' });
@@ -140,7 +140,7 @@ test('parameters of a values-only earlier version: put back by their values wher
   a.state.overlays = { column: null };
   await a.history.reconcile();
   const here = await a.history.replay(plan);
-  assert.deepEqual(here.report.map(entry => [entry.label, entry.outcome]), [['Built a column', 'applied'], ['Coloured by community', 'applied']]);
+  assert.deepEqual(here.report.map(entry => [entry.label, entry.outcome]), [['Built a column', 'applied'], ['Colored by community', 'applied']]);
   assert.equal(a.state.overlays.column, 'T,B', 'its values, as recorded');
   assert.equal(a.calls.filter(type => type === 'column.build').length, 1, 'never dispatched again');
   const putBack = a.history.active.steps.get(here.report[0].step);

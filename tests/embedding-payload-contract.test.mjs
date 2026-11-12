@@ -29,7 +29,7 @@ function bits(values) {
   return Array.from(new Uint32Array(values.buffer, values.byteOffset, values.length));
 }
 
-/** The format's rule, written out: centred per axis, one 2 / max range scale, float32 once. */
+/** The format's rule, written out: centered per axis, one 2 / max range scale, float32 once. */
 function formatRule(values, width) {
   const mins = new Array(width).fill(Infinity);
   const maxs = new Array(width).fill(-Infinity);

@@ -18,7 +18,7 @@ const keyframeModule = await import(
 const { createPlaybackController } = await import(
   '../assets/js/app/ui/modules/cinematic-camera/playback-controller.js'
 );
-const { resolveSegmentDurations } = await import(
+const { resolvePathTiming } = await import(
   '../assets/js/app/ui/modules/cinematic-camera/interpolation-engine.js'
 );
 const { createTransportBar } = await import(
@@ -183,15 +183,19 @@ test('Play resumes from the position an idle path was scrubbed to', () => {
       `the camera must stay near the scrubbed viewpoint; target was ${JSON.stringify(applied.at(-1).orbit.target)}`
     );
 
+    // A stop that leaves the camera where it is keeps the position the
+    // transport shows (R9R-7); the bar's Stop (back to the first keyframe)
+    // clears it, so the next Play starts at the top.
     controller.stop({ resetCamera: false });
-
-    // An explicit Stop clears the scrub, so the next Play starts at the top.
+    assert.ok(controller.getProgress() > 0.4, 'a stop in place keeps the position');
+    controller.stop({ resetCamera: true });
+    assert.equal(controller.getProgress(), 0);
     applied.length = 0;
     controller.play();
     assert.equal(harness.advance(16), true);
     assert.ok(
       applied.at(-1).orbit.target[0] < 0.1,
-      'Stop must clear the scrub so Play restarts from the first keyframe'
+      'the bar\'s Stop must clear the scrub so Play restarts from the first keyframe'
     );
     controller.stop({ resetCamera: false });
 
@@ -233,10 +237,8 @@ test('a live pace change retimes the running path instead of drifting from its c
     });
     controller.on('timeUpdate', update => updates.push(update));
 
-    const slowDuration = resolveSegmentDurations(store.getAll(), 1)
-      .reduce((sum, value) => sum + value, 0);
-    const fastDuration = resolveSegmentDurations(store.getAll(), 4)
-      .reduce((sum, value) => sum + value, 0);
+    const slowDuration = resolvePathTiming(store.getAll(), 1).total;
+    const fastDuration = resolvePathTiming(store.getAll(), 4).total;
     assert.ok(slowDuration > fastDuration);
 
     controller.play();

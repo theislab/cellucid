@@ -1,6 +1,6 @@
 /**
  * Memory kept only for speed (geometry of representations no view shows,
- * colour stores kept for switching back) is released when, and only when, an
+ * color stores kept for switching back) is released when, and only when, an
  * allocation is refused (`HighPerfRenderer._allocateGpu`). Nothing is evicted
  * while an allocation fits, so a switch back stays free whenever memory
  * allows; a refusal releases everything kept and tries once more.

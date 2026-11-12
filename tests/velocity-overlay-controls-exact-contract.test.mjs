@@ -12,6 +12,7 @@ import {
 import {
   validateVelocityOverlayConfig,
 } from '../assets/js/rendering/overlays/velocity/velocity-overlay.js';
+import { representationName } from '../assets/js/data/representation-names.js';
 
 const NUMERIC_VALUES = Object.freeze({
   velocityDensityInput: '15',
@@ -129,6 +130,8 @@ function makeState(overrides = {}) {
     getActiveViewId: () => 'live',
     getViewLayoutKey: () => 'X_umap',
     viewContexts: new Map([['live', { id: 'live' }]]),
+    // The DataState naming every menu uses (`representationNameOf`), over no dataset keys.
+    representationNameOf: layout => representationName(layout),
     getDimensionManager: () => ({
       getLayout: layoutKey => ({ layoutKey, label: 'UMAP', dimension: 2 }),
     }),
@@ -471,9 +474,9 @@ test('velocity enable failure settles visibly without an unhandled event rejecti
 
   assert.equal(enabledCheckbox.checked, false);
   assert.equal(dom.velocitySettings.hidden, true);
-  assert.equal(dom.velocityInfo.textContent, 'Failed to load vector field.');
+  assert.equal(dom.velocityInfo.textContent, 'The vector field could not be shown.');
   assert.deepEqual(notificationEvents, [[
-    initializationFailure.message,
+    `The vector field could not be shown: ${initializationFailure.message}`,
     { category: 'render' },
   ]]);
 });
@@ -702,7 +705,12 @@ test('velocity controls expose no clamp, coercion, or first-field substitution p
     source,
     /\b(?:Number\.)?parse(?:Int|Float)\s*\(|\bclamp(?:Int|Float)?\b/
   );
-  assert.doesNotMatch(source, /fieldsForDim\[0\]/);
+  // The first field is taken only when it is the only one bound to the
+  // embedding shown (R9V-4); among several, none is guessed.
+  assert.deepEqual(
+    source.match(/.*fieldsForDim\[0\].*/g).map(line => line.trim()),
+    ['if (fieldsForDim.length === 1) return fieldsForDim[0].id;'],
+  );
   assert.doesNotMatch(source, /Boolean\(syncLodCheckbox\.checked\)/);
   assert.doesNotMatch(source, /\?\./);
   assert.doesNotMatch(source, /console\.warn|err\?\.message/);

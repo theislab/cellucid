@@ -4,7 +4,7 @@
  * A categorical column's code width decides two coupled things: which code is
  * reserved for "missing", and how many real categories are left. If a reader
  * and a writer disagree by one, nothing throws — the reader either reads the
- * missing marker as a real category or a real category as missing, and colours
+ * missing marker as a real category or a real category as missing, and colors
  * cells by a label they do not have. These tests pin the pairing, and pin that
  * no reader in `assets/js/data` re-derives it locally.
  */

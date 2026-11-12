@@ -8,7 +8,7 @@
  * where the gene index that read builds is kept, or why it cannot be kept
  * (every gene then reads the matrix again) and what makes it fit. A
  * matrix whose open cells are in priority order (a subsample) is indexed in
- * segments (`anndata/prefix-column-index.js`): the gene's colours fill in on
+ * segments (`anndata/prefix-column-index.js`): the gene's colors fill in on
  * a growing sample of the cells, and the notice says when the first appear.
  * A gene sample (`subsample-plan.js`, `genes`: a gene read for the first
  * open cells only) is named in one sentence everywhere (`geneSampleText`),
@@ -20,6 +20,7 @@
 
 import { countNoun, formatBytes, formatCount, formatCountOf, formatRemaining } from '../utils/format-units.js';
 import { PLACES, placePath } from '../app/ui/place-names.js';
+import { upperFirst } from '../utils/text-case.js';
 
 /** Where what is kept in this browser is listed and removed. */
 const STORED_PLACE = placePath(PLACES.session, PLACES.stored);
@@ -95,7 +96,7 @@ export function geneLayoutFacts(layout, { cells, amount = null }) {
   if (reason === null) return null;
   const { stored, part, each } = WHOLE_MATRIX_LAYOUTS[layout];
   return [
-    { label: 'Stored', value: stored, title: `${reason[0].toUpperCase()}${reason.slice(1)}.` },
+    { label: 'Stored', value: stored, title: `${upperFirst(reason)}.` },
     { label: 'One gene reads', value: `${Number.isFinite(cells) ? `the ${part} of ${formatCountOf(cells, 'open cell')}` : `every open cell's ${part}`}${amount === null ? '' : ` (${amount})`}`, title: `Every open cell's ${each} is read once, for the first gene.` },
     { label: 'Later genes', value: 'only their own values', title: 'They reuse the gene index the first gene builds.' },
     { label: 'Faster', value: 'fewer cells, or a gene-major copy', title: 'Open fewer cells, or open a copy written gene-major: cellucid.prepare() in Python or cellucid_prepare() in R writes one, and its genes read only their own values.' },
@@ -118,7 +119,7 @@ export function factsText(rows) {
  * in one line said by the legend and the figure's note alike: the cells not
  * read faded toward the background, and, when its zeros are drawn gray (gray
  * for zero on, or a log scale: `zeroGray.drawn` of the legend model), the
- * cells read where it is 0 gray; the others are in the colour scale.
+ * cells read where it is 0 gray; the others are in the color scale.
  *
  * @param {boolean} zeroGray - Whether the gene's zeros are drawn gray
  * @returns {string}
@@ -150,24 +151,18 @@ export function geneSampleText(genes, { plural = false, format = formatCount } =
  * nothing to download" when nothing is downloaded. `compact`: the words
  * beside the action, which fit the narrowest panel beside its button --
  * the time in its largest unit ("9.1 GB, ~1.3 h", "kept here"); the exact
- * words in its tooltip.
+ * words in its tooltip, which say when the cells' totals of normalized
+ * values are part of it (`totals`, `state/managers/field/gene-sample.js`).
  *
- * @param {{bytes: number, ms: number|null}} cost
+ * @param {{bytes: number, ms: number|null, totals?: Object|null}} cost
  * @param {{compact?: boolean}} [options]
  * @returns {string}
  */
 export function geneSampleCostText(cost, { compact = false } = {}) {
   if (!(cost.bytes > 0)) return compact ? 'kept here' : 'kept here, nothing to download';
-  const time = cost.ms === null ? [] : [compact ? roughRemaining(cost.ms) : formatRemaining(cost.ms)];
-  return [formatBytes(cost.bytes), ...time].join(', ');
-}
-
-/** A time to come in its largest unit, about: "~40 s", "~12 min", "~1.3 h". */
-export function roughRemaining(ms) {
-  if (ms < 60_000) return formatRemaining(ms);
-  if (ms < 3_600_000) return `~${Math.round(ms / 60_000)} min`;
-  const hours = ms / 3_600_000;
-  return `~${hours < 10 ? Math.round(hours * 10) / 10 : Math.round(hours)} h`;
+  const time = cost.ms === null ? [] : [formatRemaining(cost.ms, { compact })];
+  const totals = !compact && cost.totals != null ? ', with the cells\' totals of normalized values' : '';
+  return `${[formatBytes(cost.bytes), ...time].join(', ')}${totals}`;
 }
 
 /**
@@ -191,7 +186,7 @@ export function geneSampleFacts(genes) {
   if (fit?.limit === 'geneTime') {
     rows.push({
       label: 'Sized to',
-      value: `a gene in about ${Math.round(fit.budgetMs / 1000)} s here`,
+      value: `a gene in ${formatRemaining(fit.budgetMs)} here`,
       title: fit.neededMs === null
         ? `This connection is not measured yet on this visit (nothing was downloaded to open it), so the first gene of ${fit.matrix}, the matrix genes are read from, is read for the cells kept in this browser; it measures the connection, and genes are then read for more cells within the same time.`
         : `Every open cell would take ${formatRemaining(fit.neededMs)} for the first gene of ${fit.matrix}, the matrix genes are read from, on this connection.`,
@@ -231,7 +226,7 @@ export function geneSampleFacts(genes) {
  * The plan of one gene read before it is read, or null when the gene reads
  * only its own entries (a gene-major matrix, or an index already built): a
  * short line (`summary`: what it reads and how long, and where its first
- * colours show) and the fact rows behind it (`rows`: why, from the layout,
+ * colors show) and the fact rows behind it (`rows`: why, from the layout,
  * and what follows).
  *
  * @param {Object|null} plan - `geneReadPlan`
@@ -258,17 +253,17 @@ export function geneReadPlanFacts(plan) {
     rows.push({ label: 'Kept here', value: `${formatBytes(kept)} of ${formatBytes(stored)}`, title: `Downloaded on an earlier visit and kept in this browser: read from this computer, not downloaded again (${STORED_PLACE}).` });
   }
   if (progressive !== null && progressive.done > 0) {
-    rows.push({ label: 'Indexed already', value: formatCountOf(progressive.done, 'open cell'), title: 'Their colours show at once; the others fill in as they are read, and show as missing until then.' });
+    rows.push({ label: 'Indexed already', value: formatCountOf(progressive.done, 'open cell'), title: 'Their colors show at once; the others fill in as they are read, and show as missing until then.' });
   } else if (progressive !== null) {
     const first = progressive.nextStoredBytes !== null ? ` (${formatBytes(progressive.nextStoredBytes)})` : '';
-    rows.push({ label: 'First colours', value: `on ${formatCount(progressive.next)} of ${formatCountOf(progressive.cells, 'cell')}${first}`, title: 'A sample of the open cells; the others fill in as they are read, and show as missing until then.' });
+    rows.push({ label: 'First colors', value: `on ${formatCount(progressive.next)} of ${formatCountOf(progressive.cells, 'cell')}${first}`, title: 'A sample of the open cells; the others fill in as they are read, and show as missing until then.' });
   }
   if (plan.sample != null) {
     rows.unshift({ label: 'Genes read', value: `${formatCount(plan.sample.cells)} of ${formatCountOf(plan.sample.of, 'open cell')}`, title: `A sample of the open cells; the others show no value until read (${GENES_READ_PLACE}).` });
   }
   const index = plan.index;
   if (index !== null && index.placement === null) {
-    rows.push({ label: 'Gene index', value: 'cannot be kept: every gene reads it again', title: `${index.refusal[0].toUpperCase()}${index.refusal.slice(1)}. Opening a subsample of the cells makes the index fit.` });
+    rows.push({ label: 'Gene index', value: 'cannot be kept: every gene reads it again', title: `${upperFirst(index.refusal)}. Opening a subsample of the cells makes the index fit.` });
   } else if (index !== null && index.passes === 2) {
     const again = index.secondPassStoredBytes !== null ? formatBytes(index.secondPassStoredBytes) : 'the matrix';
     rows.push({ label: 'Gene index', value: `${again} read once more, kept ${index.placement === 'disk' ? 'on disk' : 'in memory'}`, title: 'Later genes read only it.' });

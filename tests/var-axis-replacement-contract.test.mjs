@@ -2,20 +2,21 @@
  * Replacing the var axis (`state/managers/var-axis.js`), the gene list a data
  * mapping's gene names and expression matrix name, on a real DataState with a
  * kept view:
- * - a view coloured by a gene keeps it by name, at its new position, with its
+ * - a view colored by a gene keeps it by name, at its new position, with its
  *   filter, and shows the new values;
  * - a gene missing from the new list is dropped and reported, and that view
- *   loses its gene colouring (and so its gene filter);
+ *   loses its gene coloring (and so its gene filter);
  * - obs state, the cell mask and the highlight are untouched;
  * - on the same var axis a gene is its position (another name for the same
  *   column), and when the matrix is the same its values are carried;
- * - rollback restores the previous list and colouring exactly.
+ * - rollback restores the previous list and coloring exactly.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { DataState } from '../assets/js/app/state/core/data-state.js';
 import { createInMemoryDimensionManager } from '../assets/js/data/dimension-manager.js';
+import { RAW_VALUES } from '../assets/js/data/expression-transform.js';
 
 const N = 4;
 
@@ -73,7 +74,7 @@ async function makeState() {
   state.initVarData(geneList(['A', 'B', 'C']));
   state._resetViewContexts();
 
-  // The live view is coloured by B with a filter; a kept view by C.
+  // The live view is colored by B with a filter; a kept view by C.
   await state.ensureVarFieldLoaded(1, { silent: true });
   state.varData.fields[1]._continuousFilter = { min: 15, max: 35 };
   state.varData.fields[1]._useLogScale = true;
@@ -102,13 +103,13 @@ test('views keep their genes by name on a new gene list, with their filters', as
   state.on('var-axis:changed', payload => events.push(payload));
 
   const nextReads = [];
-  const step = await state.stageVarAxisReplacement({
+  const step = await state.stageVarAxisReplacement({ transform: RAW_VALUES,
     geneList: geneList(['C', 'B', 'D']),
     varFieldLoader: loaderFor({ B: [11, 21, 31, 41], C: [50, 60, 70, 80], D: [0, 0, 0, 1] }, nextReads),
     sameAxis: false,
     sameMatrix: false,
   });
-  // Staging read the two genes the views are coloured by, and changed nothing.
+  // Staging read the two genes the views are colored by, and changed nothing.
   assert.deepEqual(nextReads.sort(), ['B', 'C']);
   assert.deepEqual(step.dropped, []);
   assert.equal(activeGene(state, 'live').key, 'B');
@@ -127,7 +128,7 @@ test('views keep their genes by name on a new gene list, with their filters', as
   assert.equal(kept.key, 'C');
   assert.equal(kept.index, 0);
   assert.deepEqual(kept.values, [50, 60, 70, 80]);
-  // Genes nobody is coloured by are not read; they load on demand.
+  // Genes nobody is colored by are not read; they load on demand.
   assert.equal(state.varData.fields[2].key, 'D');
   assert.equal(state.varData.fields[2].loaded, false);
   // Cells belong to cells: the mask and the obs field are untouched.
@@ -139,9 +140,9 @@ test('views keep their genes by name on a new gene list, with their filters', as
   assert.deepEqual(events, [{ generation: 1, dropped: [] }]);
 });
 
-test('a gene missing from the new list is dropped, and that view loses its gene colouring', async () => {
+test('a gene missing from the new list is dropped, and that view loses its gene coloring', async () => {
   const { state } = await makeState();
-  const step = await state.stageVarAxisReplacement({
+  const step = await state.stageVarAxisReplacement({ transform: RAW_VALUES,
     geneList: geneList(['B', 'D']),
     varFieldLoader: loaderFor({ B: [1, 1, 1, 1], D: [2, 2, 2, 2] }, []),
     sameAxis: false,
@@ -160,7 +161,7 @@ test('on the same var axis a gene is its position, whatever it is now called', a
   const { state } = await makeState();
   const before = state.varData.fields[1].values;
   const reads = [];
-  const step = await state.stageVarAxisReplacement({
+  const step = await state.stageVarAxisReplacement({ transform: RAW_VALUES,
     geneList: geneList(['a1', 'b1', 'c1']),
     varFieldLoader: loaderFor({}, reads),
     sameAxis: true,
@@ -181,7 +182,7 @@ test('on the same var axis a gene is its position, whatever it is now called', a
 test('the same axis with another matrix keeps positions and reads the new values', async () => {
   const { state } = await makeState();
   const reads = [];
-  const step = await state.stageVarAxisReplacement({
+  const step = await state.stageVarAxisReplacement({ transform: RAW_VALUES,
     geneList: geneList(['A', 'B', 'C']),
     varFieldLoader: loaderFor({ B: [0, 20, 25, 30], C: [1, 2, 3, 4] }, reads),
     sameAxis: true,
@@ -192,7 +193,7 @@ test('the same axis with another matrix keeps positions and reads the new values
   // The filter is clamped into the new values' range.
   assert.deepEqual(activeGene(state, 'live').field._continuousFilter, { min: 15, max: 30 });
   await assert.rejects(
-    state.stageVarAxisReplacement({
+    state.stageVarAxisReplacement({ transform: RAW_VALUES,
       geneList: geneList(['A']),
       varFieldLoader: loaderFor({}, []),
       sameAxis: false,
@@ -202,11 +203,11 @@ test('the same axis with another matrix keeps positions and reads the new values
   );
 });
 
-test('rollback restores the previous gene list and every view\'s colouring', async () => {
+test('rollback restores the previous gene list and every view\'s coloring', async () => {
   const { state } = await makeState();
   const previousFields = state.varData.fields.map(field => field.key);
   const previousLoader = state.varFieldLoader;
-  const step = await state.stageVarAxisReplacement({
+  const step = await state.stageVarAxisReplacement({ transform: RAW_VALUES,
     geneList: geneList(['B', 'D']),
     varFieldLoader: loaderFor({ B: [9, 9, 9, 9] }, []),
     sameAxis: false,
@@ -224,7 +225,7 @@ test('rollback restores the previous gene list and every view\'s colouring', asy
 
 test('an empty gene list needs no loader', async () => {
   const { state } = await makeState();
-  const step = await state.stageVarAxisReplacement({
+  const step = await state.stageVarAxisReplacement({ transform: RAW_VALUES,
     geneList: { n_points: N, fields: [] },
     varFieldLoader: null,
     sameAxis: false,
@@ -235,7 +236,7 @@ test('an empty gene list needs no loader', async () => {
   assert.equal(state.getVarAxisGeneCount(), 0);
   assert.equal(state.activeFieldSource, null);
   await assert.rejects(
-    state.stageVarAxisReplacement({ geneList: geneList(['B']), varFieldLoader: null, sameAxis: false, sameMatrix: false }),
+    state.stageVarAxisReplacement({ transform: RAW_VALUES, geneList: geneList(['B']), varFieldLoader: null, sameAxis: false, sameMatrix: false }),
     /field loader/
   );
 });
@@ -247,7 +248,7 @@ test('a gene field of a replaced list is located on the list in use: by position
 
   // The same axis under other names (or the same matrix read another way):
   // the same column, whatever it is called now.
-  const renamed = await state.stageVarAxisReplacement({
+  const renamed = await state.stageVarAxisReplacement({ transform: RAW_VALUES,
     geneList: geneList(['a1', 'b1', 'c1']),
     varFieldLoader: loaderFor({ a1: [1, 1, 1, 1], b1: [2, 2, 2, 2], c1: [3, 3, 3, 3] }, []),
     sameAxis: true,
@@ -258,7 +259,7 @@ test('a gene field of a replaced list is located on the list in use: by position
   assert.equal(state.varData.fields[state.locateVarField(c)].key, 'c1');
 
   // Another axis: by name, through every replacement since.
-  const other = await state.stageVarAxisReplacement({
+  const other = await state.stageVarAxisReplacement({ transform: RAW_VALUES,
     geneList: geneList(['c1', 'x', 'a1']),
     varFieldLoader: loaderFor({ c1: [3, 3, 3, 3], x: [0, 0, 0, 0], a1: [1, 1, 1, 1] }, []),
     sameAxis: false,
@@ -279,13 +280,13 @@ test('a gene or a field with nothing to draw is refused before the active field 
   empty.values = new Float32Array(N).fill(Number.NaN);
   empty.loaded = true;
   const shown = { gene: state.activeVarFieldIndex, field: state.activeFieldIndex, source: state.activeFieldSource };
-  const colours = state.colorsArray.slice();
+  const colors = state.colorsArray.slice();
   assert.throws(() => state.setActiveVarField(0), /no value|cannot be shown|not measured/i);
   assert.deepEqual({ gene: state.activeVarFieldIndex, field: state.activeFieldIndex, source: state.activeFieldSource }, shown);
-  assert.deepEqual(state.colorsArray, colours);
+  assert.deepEqual(state.colorsArray, colors);
 
   state.obsData.fields.push({ key: 'score', kind: 'continuous', values: new Float32Array(N).fill(Number.NaN), loaded: true });
   assert.throws(() => state.setActiveField(1), /no value|cannot be shown|not measured/i);
   assert.deepEqual({ gene: state.activeVarFieldIndex, field: state.activeFieldIndex, source: state.activeFieldSource }, shown);
-  assert.deepEqual(state.colorsArray, colours);
+  assert.deepEqual(state.colorsArray, colors);
 });

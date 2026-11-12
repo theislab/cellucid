@@ -6,12 +6,12 @@ import { loadSyntheticDataset } from './helpers/synthetic-dataset.mjs';
 import { openCollapsedPanels } from './helpers/panels.mjs';
 
 /**
- * UX-8: a gene's cells that do not express it are the neutral no-value grey
+ * UX-8: a gene's cells that do not express it are the neutral no-value gray
  * (`writeContinuousColors`, alpha byte BENEATH_ALPHA_BYTE), and they are
  * drawn beneath the expressing cells (`HighPerfRenderer`, two passes over the
  * same points): in 2D by blending order, in 3D at every depth tie. Held
  * against a reference that draws the expressing cells alone: every pixel a
- * red expressing cell paints there it also paints with the grey cells drawn,
+ * red expressing cell paints there it also paints with the gray cells drawn,
  * at full detail and at every forced level of detail, culled or not.
  */
 
@@ -27,11 +27,11 @@ async function open(page) {
 }
 
 /**
- * Publish the layout and the sparse gene's colours. 2D: the view is made a 2D
+ * Publish the layout and the sparse gene's colors. 2D: the view is made a 2D
  * view (`setViewEmbedding`), drawn without depth. 3D: a flat sheet facing the
  * camera (the orbit looks down -z), so every overlap is a depth tie; on a
  * sheet seen at an angle, an overlap is a real difference in depth, which the
- * nearer cell wins whatever its colour.
+ * nearer cell wins whatever its color.
  */
 function publish(page, dimension) {
   return page.evaluate(({ dimension, every }) => {

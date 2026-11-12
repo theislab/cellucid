@@ -14,14 +14,15 @@
  */
 
 import {
-  CITATION_PATH,
   CITING_PAGE_URL,
   apa,
   apaParts,
   bibtex,
   parsePreferredCitation,
+  readCitationFile,
 } from '../../citation.js';
-import { copyWithFeedback, wireAppDialog } from '../components/app-dialog.js';
+import { wireAppDialog } from '../components/app-dialog.js';
+import { copyText } from '../../utils/clipboard.js';
 
 function requireById(ownerDocument, id) {
   const element = ownerDocument.getElementById(id);
@@ -62,11 +63,7 @@ export function initCiteDialog({ ownerDocument = document, fetchText = null } = 
   const copyBibtex = requireById(ownerDocument, 'cite-copy-bibtex');
   const openers = Array.from(ownerDocument.querySelectorAll('[data-cite-open]'));
   if (openers.length === 0) throw new TypeError('The Cite dialog has no opener.');
-  const read = fetchText ?? (async () => {
-    const response = await fetch(CITATION_PATH, { cache: 'no-cache' });
-    if (!response.ok) throw new Error(`CITATION.cff answered ${response.status}.`);
-    return response.text();
-  });
+  const read = fetchText ?? readCitationFile;
 
   const owner = wireAppDialog(dialog);
   const controller = new AbortController();
@@ -105,10 +102,10 @@ export function initCiteDialog({ ownerDocument = document, fetchText = null } = 
     }, { signal: controller.signal });
   }
   copyReference.addEventListener('click', () => {
-    if (citation !== null) void copyWithFeedback(copyReference, apa(citation));
+    if (citation !== null) void copyText(apa(citation), { what: 'the reference', button: copyReference });
   }, { signal: controller.signal });
   copyBibtex.addEventListener('click', () => {
-    if (citation !== null) void copyWithFeedback(copyBibtex, bibtex(citation));
+    if (citation !== null) void copyText(bibtex(citation), { what: 'the BibTeX entry', button: copyBibtex });
   }, { signal: controller.signal });
 
   return {

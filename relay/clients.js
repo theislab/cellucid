@@ -256,10 +256,19 @@ export async function resolveClient(clientId, keys, fetchImpl) {
   });
 }
 
+/** What an app on this computer that no host vouches for is called (a loopback redirect, no client document). */
+export const LOCAL_APP_NAME = 'An app on this computer';
+
 /**
- * How the person sees who asks: the agent's name (Claude, ChatGPT, or the
- * client's own name), the host that vouches for it, where the answer goes,
- * and whether the app runs on this computer.
+ * How the person sees who asks: `agent`, the name every place shows (the
+ * waiting page, the approval, the connections, the confirm cards, the
+ * history's steps): Claude or ChatGPT when their host vouches for them, else
+ * the host that vouches for the app (its client document's, or its https
+ * redirect's), else `LOCAL_APP_NAME`; never the name an app gives itself,
+ * since anyone can register an app called "Claude" (LG-W4, F122). `name`:
+ * that self-given name, shown in quotes as what it calls itself; `known`:
+ * Claude or ChatGPT. Also where the answer goes and whether the app runs on
+ * this computer.
  * @param {{registration: string, name: string|null, verifiedHost: string|null}} client
  * @param {string} redirectUri the redirect URI of this authorization
  */
@@ -269,7 +278,7 @@ export function clientDisplay(client, redirectUri) {
   const host = client.verifiedHost ?? (loopback ? null : redirectHost);
   const known = host !== null && Object.hasOwn(KNOWN_AGENTS, host) ? KNOWN_AGENTS[host] : null;
   return Object.freeze({
-    agent: known ?? client.name ?? host ?? 'An app on this computer',
+    agent: known ?? host ?? LOCAL_APP_NAME,
     name: client.name,
     host,
     redirectHost,

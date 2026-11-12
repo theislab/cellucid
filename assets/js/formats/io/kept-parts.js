@@ -90,6 +90,7 @@
  * @module formats/io/kept-parts
  */
 
+import { isLoopbackHostname } from '../../utils/loopback.js';
 import { KeptCopyDamage } from './page-checks.js';
 import { BYTE_SOURCE_FAILURES, ByteSourceError, fetchOnce, httpByteSource } from './byte-source.js';
 import { routedFetch } from './host-fetch.js';
@@ -106,6 +107,7 @@ import {
 import { persistsAcrossVisits } from '../../data/sources/identity.js';
 import { allocateTypedArray } from '../../data/sparse-column-index.js';
 import { settleQuietly } from '../../utils/errors.js';
+import { debounce } from '../../utils/debounce.js';
 
 /** The kept parts in this realm that write a journal: what `flushKeptParts` asks to hold. */
 const live = new Set();
@@ -286,7 +288,8 @@ export class KeptParts {
     this._keeping = true;
     /** Pieces written since the provider last confirmed the version (a source whose reads name none). */
     this._unconfirmed = 0;
-    this._quietTimer = null;
+    /** Closes the journal once the reads went quiet for the link's retransmission timeout (`_quietMs`). */
+    this._closeWhenQuiet = debounce(() => void this.flush(), () => this._quietMs(), { unref: true });
     this._stats = { keptReads: 0, keptBytes: 0, written: 0 };
     this.loaded = false;
     this.ready = null;
@@ -406,7 +409,7 @@ export class KeptParts {
   /** Forget every kept copy of the file (every kind, every version: `space.js` `forgetKeptFile`). */
   async _forgetAll() {
     this._keeping = false;
-    clearTimeout(this._quietTimer);
+    this._closeWhenQuiet.cancel();
     this._objects.clear();
     const batches = [...this._batches];
     this._batches.clear();
@@ -603,9 +606,7 @@ export class KeptParts {
     // Once the reads go quiet for the link's retransmission timeout, the
     // journal is closed: another reader (a tab, the next generation of this
     // dataset in another worker) reads a journal only once its writer closed it.
-    clearTimeout(this._quietTimer);
-    this._quietTimer = setTimeout(() => void this.flush(), this._quietMs());
-    this._quietTimer.unref?.();
+    this._closeWhenQuiet();
   }
 
   /**
@@ -625,8 +626,7 @@ export class KeptParts {
   }
 
   async _closeOwn() {
-    clearTimeout(this._quietTimer);
-    this._quietTimer = null;
+    this._closeWhenQuiet.cancel();
     const pending = this._journal;
     const journal = await pending;
     if (journal == null || this._journal !== pending) return;
@@ -666,7 +666,7 @@ export class KeptParts {
   async close() {
     await this.flush();
     this._keeping = false;
-    clearTimeout(this._quietTimer);
+    this._closeWhenQuiet.cancel();
     live.delete(this);
     for (const batch of this._batches) batch.release();
   }
@@ -691,8 +691,7 @@ function sameMachine(href) {
     return false;
   }
   if (url.origin === EMBEDDED_HOST_ORIGIN || url.protocol === 'file:') return true;
-  const host = url.hostname.replace(/^\[|\]$/g, '');
-  return host === 'localhost' || host.endsWith('.localhost') || /^127\./.test(host) || host === '::1' || host === '0.0.0.0';
+  return isLoopbackHostname(url.hostname);
 }
 
 /**
